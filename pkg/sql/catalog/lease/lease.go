@@ -2081,9 +2081,29 @@ func (m *Manager) AcquireByName(
 		if err != nil {
 			return nil, err
 		}
-		return validateDescriptorForReturn(leasedDesc)
+		
+		// Cached descriptor may have had different name at requst time
+		// (eg the descriptor was rename after the timestamp or if the name
+		// was reused by a different descripttor). ONly use the result if
+		// the name matches at the request time
+		if NameMatchesDescriptor(leasedDesc.Underlying(), parentID, parentSchemaID, name) {
+			return validateDescriptorForReturn(leasedDesc)
+		}
+		leasedDesc.Release(ctx)
+	
 	}
 
+	// todo: doing the get the histdescid case
+	if histID := m.names.getHistoricalID(parentID, parentSchemaID, name, timestamp.GetTimestamp()); histID != descpb.InvalidID {
+		leasedDesc, err := m.Acquire(ctx, timestamp, histID)
+		if err == nil {
+			if NameMatchesDescriptor(leasedDesc.Underlying(), parentID, parentSchemaID, name) {
+				return validateDescriptorForReturn(leasedDesc)
+			}
+			leasedDesc.Release(ctx)
+		}
+	}
+	
 	// We failed to find something in the cache, or what we found is not
 	// guaranteed to be valid by the time we use it because we don't have a
 	// lease with at least a bit of lifetime left in it. So, we do it the hard
