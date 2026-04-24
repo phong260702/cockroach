@@ -2381,7 +2381,28 @@ func (m *Manager) AcquireByName(
 		if err != nil {
 			return nil, err
 		}
-		return validateDescriptorForReturn(leasedDesc)
+		// The cached descriptor may have had a different name at the request
+		// timestamp (e.g. the descriptor was renamed after the timestamp, or
+		// the name was reused by a different descriptor). Only use the result
+		// if the name matches at the requested timestamp.
+		if NameMatchesDescriptor(leasedDesc.Underlying(), parentID, parentSchemaID, name) {
+			return validateDescriptorForReturn(leasedDesc)
+		}
+		leasedDesc.Release(ctx)
+	}
+
+	// Check the historical name cache before falling back to a KV lookup.
+	// This handles the case where a descriptor was renamed: the name cache
+	// records the old name->ID mapping so we can resolve it without a
+	// round-trip to KV.
+	if histID := m.names.getHistoricalID(parentID, parentSchemaID, name, timestamp.GetTimestamp()); histID != descpb.InvalidID {
+		leasedDesc, err := m.Acquire(ctx, timestamp, histID)
+		if err == nil {
+			if NameMatchesDescriptor(leasedDesc.Underlying(), parentID, parentSchemaID, name) {
+				return validateDescriptorForReturn(leasedDesc)
+			}
+			leasedDesc.Release(ctx)
+		}
 	}
 
 	// We failed to find something in the cache, or what we found is not
