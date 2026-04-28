@@ -2082,18 +2082,20 @@ func (m *Manager) AcquireByName(
 			return nil, err
 		}
 
-		// Cached descriptor may have had different name at requst time
-		// (eg the descriptor was rename after the timestamp or if the name
+		// The cached descriptor may have had different name at requst timestamp
+		// (e.g. the descriptor was rename after the timestamp or if the name
 		// was reused by a different descripttor). ONly use the result if
-		// the name matches at the request time
+		// the name matches at the request time.
 		if NameMatchesDescriptor(leasedDesc.Underlying(), parentID, parentSchemaID, name) {
 			return validateDescriptorForReturn(leasedDesc)
 		}
 		leasedDesc.Release(ctx)
-
 	}
 
-	// todo: doing the get the histdescid case
+	// Check the historical name cache before falling back to a KV lookup.
+	// This handle the case where descriptor was renamed: the name cache
+	// records the old name -> ID mapping so we can resolve it without
+	// round trip to KV.
 	if histID := m.names.getHistoricalID(parentID, parentSchemaID, name, timestamp.GetTimestamp()); histID != descpb.InvalidID {
 		leasedDesc, err := m.Acquire(ctx, timestamp, histID)
 		if err == nil {
