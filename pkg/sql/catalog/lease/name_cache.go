@@ -18,7 +18,8 @@ import (
 
 func makeNameCache() nameCache {
 	return nameCache{
-		historical: make(map[historicalCacheKey][]historicalEntry),
+		historical:     make(map[historicalCacheKey][]historicalEntry),
+		historicalByID: make(map[descpb.ID][]historicalCacheKey),
 	}
 }
 
@@ -54,6 +55,11 @@ type nameCache struct {
 	// by the name that was displaced. This allows AcquireByName to resolve a
 	// name at a historical timestamp without a KV round-trip.
 	historical map[historicalCacheKey][]historicalEntry
+
+	// historicalByID is a reverse index from descriptor ID to the set of
+	// historicalCacheKeys that contain entries for that ID. It exists solely
+	// to make cleanup in remove() O(1) instead of a full map scan.
+	historicalByID map[descpb.ID][]historicalCacheKey
 }
 
 // Resolves a (qualified) name to the descriptor's ID.
@@ -143,6 +149,7 @@ func (c *nameCache) insert(ctx context.Context, desc *descriptorVersionState) {
 				modTime:    prev.GetModificationTime(),
 				expiration: desc.GetModificationTime(),
 			})
+			c.historicalByID[prev.GetID()] = append(c.historicalByID[prev.GetID()], key)
 		}
 	}
 
@@ -157,15 +164,30 @@ func (c *nameCache) remove(desc *descriptorVersionState) {
 	if got := c.descriptors.GetByID(desc.GetID()); got == desc {
 		c.descriptors.Remove(desc.GetID())
 	}
+	// Clean up any historical name mappings recorded for this descriptor.
+	// Using the reverse index avoids a full scan of the historical map.
+	id := desc.GetID()
+	for _, key := range c.historicalByID[id] {
+		entries := c.historical[key]
+		filtered := entries[:0]
+		for _, e := range entries {
+			if e.id != id {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(c.historical, key)
+		} else {
+			c.historical[key] = filtered
+		}
+	}
+	delete(c.historicalByID, id)
 }
 
 // getHistoricalID looks up a historical name->ID mapping for the given name at
 // the given timestamp. It returns descpb.InvalidID if no valid mapping is found.
 func (c *nameCache) getHistoricalID(
-	parentID descpb.ID,
-	parentSchemaID descpb.ID,
-	name string,
-	timestamp hlc.Timestamp,
+	parentID descpb.ID, parentSchemaID descpb.ID, name string, timestamp hlc.Timestamp,
 ) descpb.ID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

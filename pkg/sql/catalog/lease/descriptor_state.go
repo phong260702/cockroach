@@ -308,6 +308,7 @@ func (t *descriptorState) removeInactiveVersions(ctx context.Context) []*storedL
 	for _, desc := range append([]*descriptorVersionState(nil), t.mu.active.data...) {
 		if desc.refcount.Load() == 0 {
 			t.mu.active.remove(desc)
+			t.m.names.remove(desc)
 			func() {
 				desc.mu.Lock()
 				defer desc.mu.Unlock()
