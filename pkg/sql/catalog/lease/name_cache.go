@@ -22,13 +22,15 @@ func makeNameCache() nameCache {
 	}
 }
 
-
+// historicalCacheKey identifies a descriptor name at a point in time.
 type historicalCacheKey struct {
-	parentID descpb.ID
+	parentID       descpb.ID
 	parentSchemaID descpb.ID
-	name string
+	name           string
 }
 
+// historicalEntry records a descriptor's ID and the time range which
+// it held a given time.
 type historicalEntry struct {
 	id descpb.ID
 	// modTime is the modificationtime when the descritpor was given this name
@@ -38,11 +40,16 @@ type historicalEntry struct {
 	expiration hlc.Timestamp
 }
 
+// nameCache is a cache of descriptor's name -> leased descriptor state mapping
+// the Manager updates the cache everytime a lease is acquired or released.
+// The cache maintains the latest version for each name, plus a historical log
+// of old name mapping for descriptors that have been renamed,
+// allowing timestamp-aware lookup without hitting the KV store.
 // All methods are thread-safe.
 type nameCache struct {
 	mu          syncutil.RWMutex
 	descriptors nstree.NameMap
-	
+
 	historical map[historicalCacheKey][]historicalEntry
 }
 
@@ -114,26 +121,27 @@ func (c *nameCache) insert(ctx context.Context, desc *descriptorVersionState) {
 	}
 
 	// If the same descriptor ID was perviously cached under different name,
-	// record the historical mapping
+	// record the historical mapping so that timestamp-aware lookup can find it
+	// without a KV round trip.
 	if !desc.SkipNamespace() {
 		if prev, prevOk := c.descriptors.GetByID(desc.GetID()).(*descriptorVersionState); prevOk &&
 			!prev.SkipNamespace() &&
 			(prev.GetName() != desc.GetName() ||
 				prev.GetParentID() != desc.GetParentID() ||
 				prev.GetParentSchemaID() != desc.GetParentSchemaID()) {
-			// The descriptor was renamed. Record the old name -> ID mapping
+			// The descriptor was renamed. Record the old name -> ID mapping.
 			key := historicalCacheKey{
-				parentID: prev.GetParentID(),
+				parentID:       prev.GetParentID(),
 				parentSchemaID: prev.GetParentSchemaID(),
-				name:	prev.GetName(),
+				name:           prev.GetName(),
 			}
 
 			c.historical[key] = append(c.historical[key], historicalEntry{
-				id: prev.GetID(),
-				modTime: prev.GetModificationTime(),
+				id:         prev.GetID(),
+				modTime:    prev.GetModificationTime(),
 				expiration: desc.GetModificationTime(),
 			})
-					
+
 		}
 	}
 
@@ -151,23 +159,20 @@ func (c *nameCache) remove(desc *descriptorVersionState) {
 }
 
 // getHistoricalID look up historical name -> ID mapping for the given name
-// at the given timestamp. It return descpb.InvalidID if no valid mapping is foind
+// at the given timestamp. It return descpb.InvalidID if no valid mapping is found.
 func (c *nameCache) getHistoricalID(
-	parentID descpb.ID,
-	parentSchemaID descpb.ID,
-	name string,
-	timestamp hlc.Timestamp,
+	parentID descpb.ID, parentSchemaID descpb.ID, name string, timestamp hlc.Timestamp,
 ) descpb.ID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	key := historicalCacheKey{
-		parentID: 		parentID,
+		parentID:       parentID,
 		parentSchemaID: parentSchemaID,
-		name:			name,
+		name:           name,
 	}
 
-	for  _, entry := range c.historical[key] {
+	for _, entry := range c.historical[key] {
 		if entry.modTime.LessEq(timestamp) && timestamp.Less(entry.expiration) {
 			return entry.id
 		}
