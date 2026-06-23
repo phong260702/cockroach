@@ -305,10 +305,11 @@ func (t *descriptorState) removeInactiveVersions(ctx context.Context) []*storedL
 	var leases []*storedLease
 	// A copy of t.mu.active.data must be made since t.mu.active.data will be changed
 	// within the loop.
+	var removed []*descriptorVersionState
 	for _, desc := range append([]*descriptorVersionState(nil), t.mu.active.data...) {
 		if desc.refcount.Load() == 0 {
 			t.mu.active.remove(desc)
-			t.m.names.remove(desc)
+			removed = append(removed, desc)
 			func() {
 				desc.mu.Lock()
 				defer desc.mu.Unlock()
@@ -320,6 +321,16 @@ func (t *descriptorState) removeInactiveVersions(ctx context.Context) []*storedL
 					leases = append(leases, l)
 				}
 			}()
+		}
+	}
+	// Clean up name cache entries only after all inactive versions have been
+	// removed, so we can tell whether any version of the descriptor is still
+	// live. Historical entries in nameCache are valid for as long as any
+	// version of the descriptor exists; removing them while an older version is
+	// still active would cause unnecessary cache misses.
+	if len(t.mu.active.data) == 0 {
+		for _, desc := range removed {
+			t.m.names.remove(desc)
 		}
 	}
 	return leases
