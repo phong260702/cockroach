@@ -351,6 +351,11 @@ func (*DummyEvalPlanner) ExecutorConfig() interface{} {
 	return nil
 }
 
+// TimeSeriesQuerier is part of the eval.Planner interface.
+func (*DummyEvalPlanner) TimeSeriesQuerier() eval.TimeSeriesQuerier {
+	return nil
+}
+
 // Optimizer is part of the cat.Catalog interface.
 func (*DummyEvalPlanner) Optimizer() interface{} {
 	return nil
@@ -621,8 +626,8 @@ func (ep *DummyEvalPlanner) InsertStatementHint(
 	statementFingerprint string,
 	hint hintpb.StatementHintUnion,
 	optDatabase string,
-) (int64, error) {
-	return 0, nil
+) (int64, int64, error) {
+	return 0, 0, nil
 }
 
 // DeleteStatementHint is part of the eval.Planner interface.

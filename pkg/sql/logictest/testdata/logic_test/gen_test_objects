@@ -179,17 +179,17 @@ query T
 SELECT table_name FROM [SHOW TABLES]
 ORDER BY table_name
 ----
-i😰nspect_errors
-mvcc_statistics
-proteC ted_ts_records
-r\\x86egion_\\U000B092Dlivenes s
-replication_critical_localities
-statement_bundle_chunks
-statement_diagnost ics
+j%pob_status
+job_Info
+job_progress
+join_tokens
+lease%p
+migrations
+role_id_.seq
+span_cou nt
 sta😣tement_statistics
-tab͇le_statistics
-tenant_usage
-users
+tenant  s
+use  rs
 
 # Again, the column names are randomized.
 query TTT
@@ -198,26 +198,27 @@ WHERE table_catalog = 'newdb2' AND table_schema = 'public'
 ORDER BY table_name, column_name
 LIMIT 20
 ----
-i😰nspect_errors          " id"            oid
-i😰nspect_errors          " primary_key"   text
-i😰nspect_errors          "%verror😌_type"  text
-i😰nspect_errors          aost😹            timestamp with time zone
-i😰nspect_errors          database_id      oid
-i😰nspect_errors          "deta*😫ils"      jsonb
-i😰nspect_errors          error_id         uuid
-i😰nspect_errors          job_id           bigint
-i😰nspect_errors          rowid            bigint
-i😰nspect_errors          "sche m̻%pa_id"  oid
-mvcc_statistics          "Table_id"       bigint
-mvcc_statistics          created_at       timestamp with time zone
-mvcc_statistics          database_id      bigint
-mvcc_statistics          index_id         bigint
-mvcc_statistics          rowid            bigint
-mvcc_statistics          statistics       jsonb
-"proteC ted_ts_records"  "id              "                         uuid
-"proteC ted_ts_records"  meta_type        text
-"proteC ted_ts_records"  m😛eta            bytea
-"proteC ted_ts_records"  "nu m_spans"     bigint
+"j%pob_status"  " written"         timestamp with time zone
+"j%pob_status"  "job_ id"          bigint
+"j%pob_status"  rowid              bigint
+"j%pob_status"  status             text
+"job_Info"      " info_key"        text
+"job_Info"      "job""_\\u0EECid"  bigint
+"job_Info"      rowid              bigint
+"job_Info"      value              bytea
+"job_Info"      "wri😈Tten"         timestamp with time zone
+job_progress    "f""raction"       double precision
+job_progress    "j""ob_id "        bigint
+job_progress    resolved           numeric
+job_progress    rowid              bigint
+job_progress    written            timestamp with time zone
+join_tokens     expiratio😺n        timestamp with time zone
+join_tokens     id                 uuid
+join_tokens     rowid              bigint
+join_tokens     "s%pecret"         bytea
+"lease%p"       "cr
+db_region"  bytea
+"lease%p"   desc_id  bigint
 
 subtest templates/different_templates_in_each_db
 
@@ -235,15 +236,15 @@ SELECT quote_ident(database_name), quote_ident(schema_name), quote_ident(name)
 FROM "".crdb_internal.tables WHERE database_name ILIKE '%d%b%t%'
 ORDER BY database_name, schema_name, name
 ----
-"d%qbt_1"  public  cluster_metrics
-"d%qbt_1"  public  "job%p_info"
-"d%qbt_1"  public  "tr ansaction_diagnostics_requests"
-"d%qbt_2"  public  rangelog
-"d%qbt_2"  public  "replication_sta ts"
-"d%qbt_2"  public  span_stat̲s_buckets
-dbt_3      public  "descrip%to%qr_id_seq"
-dbt_3      public  replication_stats
-dbt_3      public  statement_activity
+"d%qbt_1"  public  "ad̷visoRy_locks"
+"d%qbt_1"  public  job_progress
+"d%qbt_1"  public  zones
+"d%qbt_2"  public  "join_tokens"
+"d%qbt_2"  public  span_stats_buckets
+"d%qbt_2"  public  table_statistics
+dbt_3      public  descriptor_id_seq
+dbt_3      public  "mvcc_statistics\r"
+dbt_3      public  "scheduled_job,s"
 
 
 statement ok

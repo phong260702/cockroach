@@ -162,6 +162,13 @@ func TestLogic_alter_default_privileges_with_grant_option(
 	runLogicTest(t, "alter_default_privileges_with_grant_option")
 }
 
+func TestLogic_alter_domain(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "alter_domain")
+}
+
 func TestLogic_alter_external_connection(
 	t *testing.T,
 ) {
@@ -582,6 +589,13 @@ func TestLogic_crdb_internal_default_privileges(
 	runLogicTest(t, "crdb_internal_default_privileges")
 }
 
+func TestLogic_crdb_internal_tsdb_query(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "crdb_internal_tsdb_query")
+}
+
 func TestLogic_create_as(
 	t *testing.T,
 ) {
@@ -771,6 +785,13 @@ func TestLogic_distsql_join(
 	runLogicTest(t, "distsql_join")
 }
 
+func TestLogic_distsql_plan_locality_filter(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "distsql_plan_locality_filter")
+}
+
 func TestLogic_distsql_srfs(
 	t *testing.T,
 ) {
@@ -825,6 +846,13 @@ func TestLogic_drop_procedure(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "drop_procedure")
+}
+
+func TestLogic_drop_provisioned_roles(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "drop_provisioned_roles")
 }
 
 func TestLogic_drop_role_with_default_privileges(
@@ -1007,6 +1035,13 @@ func TestLogic_fk_read_committed(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "fk_read_committed")
+}
+
+func TestLogic_fk_subset_unique(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "fk_subset_unique")
 }
 
 func TestLogic_float(
@@ -1807,6 +1842,13 @@ func TestLogic_pg_extension(
 	runLogicTest(t, "pg_extension")
 }
 
+func TestLogic_pg_locks(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "pg_locks")
+}
+
 func TestLogic_pg_lsn(
 	t *testing.T,
 ) {
@@ -1982,6 +2024,13 @@ func TestLogic_procedure_cte(
 	runLogicTest(t, "procedure_cte")
 }
 
+func TestLogic_procedure_dcl(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure_dcl")
+}
+
 func TestLogic_procedure_ddl(
 	t *testing.T,
 ) {
@@ -1994,6 +2043,13 @@ func TestLogic_procedure_deps(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "procedure_deps")
+}
+
+func TestLogic_procedure_late_binding(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure_late_binding")
 }
 
 func TestLogic_procedure_params(
@@ -2108,6 +2164,13 @@ func TestLogic_refcursor(
 	runLogicTest(t, "refcursor")
 }
 
+func TestLogic_references_privilege(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "references_privilege")
+}
+
 func TestLogic_rename_atomic(
 	t *testing.T,
 ) {
@@ -2169,6 +2232,20 @@ func TestLogic_reset(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "reset")
+}
+
+func TestLogic_resource_group(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "resource_group")
+}
+
+func TestLogic_resource_group_session_var(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "resource_group_session_var")
 }
 
 func TestLogic_restore(

@@ -1353,6 +1353,9 @@ func (node *CreateTable) Doc(p *PrettyCfg) pretty.Doc {
 	clauses := make([]pretty.Doc, 0, 4)
 	if node.As() {
 		clauses = append(clauses, p.Doc(node.AsSource))
+		if node.WithNoData {
+			clauses = append(clauses, pretty.Keyword("WITH NO DATA"))
+		}
 	}
 	if node.PartitionByTable != nil {
 		clauses = append(clauses, p.Doc(node.PartitionByTable))
@@ -1919,6 +1922,12 @@ func (node *UniqueConstraintTableDef) Doc(p *PrettyCfg) pretty.Doc {
 	if node.PartitionByIndex != nil {
 		clauses = append(clauses, p.Doc(node.PartitionByIndex))
 	}
+	if node.StorageParams != nil {
+		clauses = append(clauses, p.bracketKeyword(
+			"WITH", "(",
+			p.Doc(&node.StorageParams),
+			")", ""))
+	}
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
@@ -1928,12 +1937,6 @@ func (node *UniqueConstraintTableDef) Doc(p *PrettyCfg) pretty.Doc {
 			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
 	case node.Invisibility.Value == 1.0:
 		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
-	}
-	if node.StorageParams != nil {
-		clauses = append(clauses, p.bracketKeyword(
-			"WITH", "(",
-			p.Doc(&node.StorageParams),
-			")", ""))
 	}
 
 	if len(clauses) == 0 {

@@ -712,6 +712,8 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 				{"external_connections"},
 				{"locations"},
 				{"privileges"},
+				{"resource_group_id_seq"},
+				{"resource_groups"},
 				{"role_id_seq"},
 				{"role_members"},
 				{"role_options"},
@@ -722,6 +724,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 				{"tenant_settings"},
 				{"ui"},
 				{"users"},
+				{"vcpu_usage"},
 				{"zones"},
 			},
 		)
@@ -808,6 +811,8 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 				{"external_connections"},
 				{"locations"},
 				{"privileges"},
+				{"resource_group_id_seq"},
+				{"resource_groups"},
 				{"role_id_seq"},
 				{"role_members"},
 				{"role_options"},
@@ -818,6 +823,7 @@ func TestClusterRestoreFailCleanup(t *testing.T) {
 				{"tenant_settings"},
 				{"ui"},
 				{"users"},
+				{"vcpu_usage"},
 				{"zones"},
 			},
 		)

@@ -33,6 +33,7 @@ var (
 	errFactorialOfNegative = pgerror.New(pgcode.NumericValueOutOfRange, "factorial of a negative number is undefined")
 	errFactorialOverflow   = pgerror.New(pgcode.NumericValueOutOfRange, "value overflows numeric format")
 	errIntOutOfRange       = pgerror.New(pgcode.NumericValueOutOfRange, "bigint out of range")
+	errInputOutOfRange     = pgerror.New(pgcode.NumericValueOutOfRange, "input is out of range")
 
 	bigTen = apd.NewBigInt(10)
 )
@@ -75,30 +76,45 @@ var mathBuiltins = map[string]builtinDefinition{
 
 	"acos": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if x < -1.0 || x > 1.0 {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Acos(x))), nil
 		}, "Calculates the inverse cosine of `val`.", volatility.Immutable),
 	),
 
 	"acosd": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if x < -1.0 || x > 1.0 {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(radToDeg * math.Acos(x))), nil
 		}, "Calculates the inverse cosine of `val` with the result in degrees", volatility.Immutable),
 	),
 
 	"acosh": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if x < 1.0 {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Acosh(x))), nil
 		}, "Calculates the inverse hyperbolic cosine of `val`.", volatility.Immutable),
 	),
 
 	"asin": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if x < -1.0 || x > 1.0 {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Asin(x))), nil
 		}, "Calculates the inverse sine of `val`.", volatility.Immutable),
 	),
 
 	"asind": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if x < -1.0 || x > 1.0 {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(radToDeg * math.Asin(x))), nil
 		}, "Calculates the inverse sine of `val` with the result in degrees.", volatility.Immutable),
 	),
@@ -123,6 +139,9 @@ var mathBuiltins = map[string]builtinDefinition{
 
 	"atanh": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if x < -1.0 || x > 1.0 {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Atanh(x))), nil
 		}, "Calculates the inverse hyperbolic tangent of `val`.", volatility.Immutable),
 	),
@@ -153,12 +172,18 @@ var mathBuiltins = map[string]builtinDefinition{
 
 	"cos": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Cos(x))), nil
 		}, "Calculates the cosine of `val`.", volatility.Immutable),
 	),
 
 	"cosd": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Cos(degToRad * x))), nil
 		}, "Calculates the cosine of `val` where `val` is in degrees.", volatility.Immutable),
 	),
@@ -171,12 +196,18 @@ var mathBuiltins = map[string]builtinDefinition{
 
 	"cot": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(1 / math.Tan(x))), nil
 		}, "Calculates the cotangent of `val`.", volatility.Immutable),
 	),
 
 	"cotd": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(1 / math.Tan(degToRad*x))), nil
 		}, "Calculates the cotangent of `val` where `val` is in degrees.", volatility.Immutable),
 	),
@@ -520,12 +551,18 @@ var mathBuiltins = map[string]builtinDefinition{
 
 	"sin": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Sin(x))), nil
 		}, "Calculates the sine of `val`.", volatility.Immutable),
 	),
 
 	"sind": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Sin(degToRad * x))), nil
 		}, "Calculates the sine of `val` where `val` is in degrees.", volatility.Immutable),
 	),
@@ -583,12 +620,18 @@ var mathBuiltins = map[string]builtinDefinition{
 
 	"tan": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Tan(x))), nil
 		}, "Calculates the tangent of `val`.", volatility.Immutable),
 	),
 
 	"tand": makeBuiltin(defProps(),
 		floatOverload1(func(x float64) (tree.Datum, error) {
+			if math.IsInf(x, 0) {
+				return nil, errInputOutOfRange
+			}
 			return tree.NewDFloat(tree.DFloat(math.Tan(degToRad * x))), nil
 		}, "Calculates the tangent of `val` where `val` is in degrees.", volatility.Immutable),
 	),
@@ -690,6 +733,18 @@ var mathBuiltins = map[string]builtinDefinition{
 						"lower and upper bounds must be finite",
 					)
 				}
+				if count <= 0 {
+					return nil, pgerror.New(
+						pgcode.InvalidArgumentForWidthBucketFunction,
+						"count must be greater than zero",
+					)
+				}
+				if b1 == b2 {
+					return nil, pgerror.New(
+						pgcode.InvalidArgumentForWidthBucketFunction,
+						"lower bound cannot equal upper bound",
+					)
+				}
 				if math.IsInf(operand, 1) {
 					return tree.NewDInt(tree.DInt(count + 1)), nil
 				}
@@ -711,6 +766,18 @@ var mathBuiltins = map[string]builtinDefinition{
 				b1 := float64(tree.MustBeDInt(args[1]))
 				b2 := float64(tree.MustBeDInt(args[2]))
 				count := int(tree.MustBeDInt(args[3]))
+				if count <= 0 {
+					return nil, pgerror.New(
+						pgcode.InvalidArgumentForWidthBucketFunction,
+						"count must be greater than zero",
+					)
+				}
+				if b1 == b2 {
+					return nil, pgerror.New(
+						pgcode.InvalidArgumentForWidthBucketFunction,
+						"lower bound cannot equal upper bound",
+					)
+				}
 				return tree.NewDInt(tree.DInt(widthBucket(operand, b1, b2, count))), nil
 			},
 			Info: "return the bucket number to which operand would be assigned in a histogram having count " +
@@ -781,7 +848,7 @@ func ceilImpl() builtinDefinition {
 func powImpls() builtinDefinition {
 	return makeBuiltin(defProps(),
 		floatOverload2("x", "y", func(x, y float64) (tree.Datum, error) {
-			return tree.NewDFloat(tree.DFloat(math.Pow(x, y))), nil
+			return eval.FloatPow(x, y)
 		}, "Calculates `x`^`y`.", volatility.Immutable),
 		decimalOverload2("x", "y", func(x, y *apd.Decimal) (tree.Datum, error) {
 			dd := &tree.DDecimal{}

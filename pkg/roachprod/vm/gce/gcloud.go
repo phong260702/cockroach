@@ -42,10 +42,12 @@ import (
 )
 
 const (
-	ProviderName       = "gce"
-	DefaultMachineType = "n2-standard-4"
-	DefaultImage       = "ubuntu-2204-jammy-v20260414"
-	ARM64Image         = "ubuntu-2204-jammy-arm64-v20260414"
+	ProviderName                = "gce"
+	DefaultMachineType          = "n2-standard-4"
+	DefaultARM64MachineType     = "c4a-standard-4"
+	DefaultARM64LSSDMachineType = "c4a-standard-4-lssd"
+	DefaultImage                = "ubuntu-2204-jammy-v20260414"
+	ARM64Image                  = "ubuntu-2204-jammy-arm64-v20260414"
 	// TODO(DarrylWong): Upgrade FIPS to Ubuntu 22 when it is available.
 	FIPSImage           = "ubuntu-pro-fips-2004-focal-v20230811"
 	defaultImageProject = "ubuntu-os-cloud"
@@ -241,8 +243,9 @@ func runJSONCommand(args []string, parsed interface{}) error {
 		// TODO(peter,ajwerner): Remove this hack once gcloud behaves when adding
 		// new zones.
 		if matched, _ := regexp.Match(`.*Unknown zone`, stderr); !matched {
-			return errors.Wrapf(err, "failed to run: gcloud %s\nstdout: %s\nstderr: %s\n",
+			err = errors.Wrapf(err, "failed to run: gcloud %s\nstdout: %s\nstderr: %s\n",
 				strings.Join(args, " "), bytes.TrimSpace(rawJSON), bytes.TrimSpace(stderr))
+			return maybeGCECapacityError(err, stderr)
 		}
 	}
 
@@ -742,8 +745,9 @@ func (p *Provider) CreateVolumeSnapshot(
 		return vm.VolumeSnapshot{}, err
 	}
 	return vm.VolumeSnapshot{
-		ID:   createJsonResponse.ID,
-		Name: createJsonResponse.Name,
+		ID:     createJsonResponse.ID,
+		Name:   createJsonResponse.Name,
+		Status: createJsonResponse.Status,
 	}, nil
 }
 
@@ -755,7 +759,7 @@ func (p *Provider) ListVolumeSnapshots(
 		"--project", p.GetProject(),
 		"snapshots",
 		"list",
-		"--format", "json(name,id)",
+		"--format", "json(name,id,status)",
 	}
 	var filters []string
 	// Only list snapshots that are fully created. Without this filter,
@@ -786,8 +790,9 @@ func (p *Provider) ListVolumeSnapshots(
 			continue
 		}
 		snapshots = append(snapshots, vm.VolumeSnapshot{
-			ID:   snapshotJson.ID,
-			Name: snapshotJson.Name,
+			ID:     snapshotJson.ID,
+			Name:   snapshotJson.Name,
+			Status: snapshotJson.Status,
 		})
 	}
 	sort.Sort(vm.VolumeSnapshots(snapshots))
@@ -1003,23 +1008,32 @@ func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) 
 		}
 	}
 
-	// Unfortunately the above responses contain no common identifier to join
-	// on, so we must resort to indexing. This does not work if the number of
-	// attached disks is different from the number of described volumes, i.e.
-	// if the cluster is using local SSDs.
-	if len(attachedDisks) != len(describedVolumes) {
-		err := errors.Newf("expected to find the same number of attached disks (%d) as described volumes (%d)",
-			len(attachedDisks), len(describedVolumes))
-		return nil, errors.WithHint(err, "is the cluster using local SSD?")
+	// We join the two sets based on their disk name. describedVolumes contains
+	// the metadata required, so we iterate over describedVolumes to retrieve the
+	// needed information. Local SSDs appear in attachedDisks, so we drop them
+	// when creating the bootByName mapping and exclude them from the join. The
+	// boot disk only holds the OS so it is skipped in the join loop. Described
+	// volumes with no matching attached disks are logged and skipped as this can
+	// happen when the two gcloud responses disagree (during a detach).
+	bootByName := make(map[string]bool, len(attachedDisks))
+	for _, a := range attachedDisks {
+		if a.Source == "" && a.Type == "SCRATCH" {
+			continue
+		}
+		bootByName[lastComponent(a.Source)] = a.Boot
 	}
 
 	var volumes []vm.Volume
-	for idx := range attachedDisks {
-		attachedDisk := attachedDisks[idx]
-		if attachedDisk.Boot {
+	for _, describedVolume := range describedVolumes {
+		isBoot, ok := bootByName[describedVolume.Name]
+		if !ok {
+			l.Printf("WARNING: described volume %q on VM %q has no matching attached disk; skipping",
+				describedVolume.Name, v.Name)
 			continue
 		}
-		describedVolume := describedVolumes[idx]
+		if isBoot {
+			continue
+		}
 		size, err := strconv.Atoi(describedVolume.SizeGB)
 		if err != nil {
 			return nil, err
@@ -1168,18 +1182,14 @@ type ProjectsVal struct {
 // https://cloud.google.com/compute/docs/regions-zones#available
 //
 // Note that the default zone (the first zone returned by this
-// function) is always in the us-east1 region (or us-central1 for
-// ARM64 builds), but we randomize the specific zone. This is to avoid
-// "zone exhausted" errors in one particular zone, especially during
-// nightly roachtest runs.
-// TODO(manojpillai): use same defaults for ARM64, given c4a wide availability.
-// But review roachtest impact before changing.
+// function) is always in the us-east1 region, but we randomize the
+// specific zone. This is to avoid "zone exhausted" errors in one
+// particular zone, especially during nightly roachtest runs.
+//
+// T2A and C4A machine types use DefaultT2AZones and DefaultC4AZones
+// respectively because they are not available in all zones.
 func DefaultZones(arch string, geoDistributed bool) []string {
-	zones := []string{"us-east1-b", "us-east1-c", "us-east1-d"}
-	if vm.ParseArch(arch) == vm.ArchARM64 {
-		// T2A instances are only available in us-central1 in NA.
-		zones = []string{"us-central1-a", "us-central1-b", "us-central1-f"}
-	}
+	zones := defaultRetryZoneCandidates()
 	rand.Shuffle(len(zones), func(i, j int) { zones[i], zones[j] = zones[j], zones[i] })
 
 	if geoDistributed {
@@ -1197,6 +1207,64 @@ func DefaultZones(arch string, geoDistributed bool) []string {
 	}
 
 	return []string{zones[0]}
+}
+
+func defaultRetryZoneCandidates() []string {
+	return []string{"us-east1-b", "us-east1-c", "us-east1-d"}
+}
+
+// DefaultRetryZoneCandidates returns the default non-geo GCE zone pool for the
+// selected machine type. Roachtest uses it to choose a different zone after
+// provider capacity failures.
+func DefaultRetryZoneCandidates(machineType string) []string {
+	machineType = strings.ToLower(machineType)
+	switch {
+	case strings.HasPrefix(machineType, "t2a-"):
+		return []string{"us-central1-a", "us-central1-b", "us-central1-f"}
+	case strings.HasPrefix(machineType, "c4a-"):
+		return slices.DeleteFunc(defaultRetryZoneCandidates(), func(z string) bool {
+			return !IsSupportedC4AZone([]string{z})
+		})
+	default:
+		return defaultRetryZoneCandidates()
+	}
+}
+
+// DefaultC4AZones returns default zones for C4A machine types. C4A is
+// broadly available but not in all zones, so geo clusters drop unsupported
+// zones. The round-robin node placement handles uneven zone counts.
+func DefaultC4AZones(geoDistributed bool) []string {
+	zones := DefaultZones("", geoDistributed)
+	return slices.DeleteFunc(zones, func(z string) bool {
+		return !IsSupportedC4AZone([]string{z})
+	})
+}
+
+// DefaultT2AZones returns default zones for T2A machine types.
+func DefaultT2AZones(geoDistributed bool) []string {
+	usCentral := []string{"us-central1-a", "us-central1-b", "us-central1-f"}
+	rand.Shuffle(len(usCentral), func(i, j int) {
+		usCentral[i], usCentral[j] = usCentral[j], usCentral[i]
+	})
+	if !geoDistributed {
+		return []string{usCentral[0]}
+	}
+
+	europe := []string{"europe-west4-a", "europe-west4-b", "europe-west4-c"}
+	asia := []string{"asia-southeast1-b", "asia-southeast1-c"}
+	rand.Shuffle(len(europe), func(i, j int) { europe[i], europe[j] = europe[j], europe[i] })
+	rand.Shuffle(len(asia), func(i, j int) { asia[i], asia[j] = asia[j], asia[i] })
+
+	return []string{
+		usCentral[0],
+		europe[0],
+		asia[0],
+		usCentral[1],
+		europe[1],
+		asia[1],
+		usCentral[2],
+		europe[2],
+	}
 }
 
 // Set is part of the pflag.Value interface.
@@ -1392,12 +1460,13 @@ func (o *ProviderOpts) useArmAMI() bool {
 }
 
 func (o *ProviderOpts) machineTypeSupportsLocalSSD() bool {
-	info, err := gcedb.GetMachineInfo(o.MachineType)
-	return err == nil && len(info.AllowedLocalSSDCount) > 0
+	_, err := AllowedLocalSSDCount(o.MachineType)
+	return err == nil
 }
 
 // autoStorageType returns "pd-ssd" if the machine type supports it, otherwise
-// returns "hyperdisk-balanced".
+// "hyperdisk-balanced" if available. Unknown machine types preserve the legacy
+// pd-ssd default.
 func autoStorageType(machineType string) string {
 	info, err := gcedb.GetMachineInfo(machineType)
 	switch {
@@ -1408,10 +1477,12 @@ func autoStorageType(machineType string) string {
 		return "pd-ssd"
 	case slices.Contains(info.StorageTypes, "hyperdisk-balanced"):
 		return "hyperdisk-balanced"
-	default:
+	case len(info.StorageTypes) > 0:
 		// All known machine support either "pd-ssd" or "hyperdisk-balanced",
 		// but leave a fallback in case that changes.
 		return info.StorageTypes[0]
+	default:
+		return "pd-ssd"
 	}
 }
 
@@ -1576,18 +1647,29 @@ func computeZones(opts vm.CreateOpts, providerOpts *ProviderOpts) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	if len(zones) == 0 {
+	machineTypeLower := strings.ToLower(providerOpts.MachineType)
+	if strings.HasPrefix(machineTypeLower, "t2a-") {
+		if len(zones) == 0 {
+			zones = DefaultT2AZones(opts.GeoDistributed)
+		}
+		if !IsSupportedT2AZone(zones) {
+			return nil, errors.Newf(
+				"T2A instances are not supported outside of [%s]",
+				strings.Join(SupportedT2AZones, ","),
+			)
+		}
+	} else if strings.HasPrefix(machineTypeLower, "c4a-") {
+		if len(zones) == 0 {
+			zones = DefaultC4AZones(opts.GeoDistributed)
+		}
+		if !IsSupportedC4AZone(zones) {
+			return nil, errors.Newf(
+				"C4A instances are not supported in [%s]",
+				strings.Join(UnsupportedC4AZones, ","),
+			)
+		}
+	} else if len(zones) == 0 {
 		zones = DefaultZones(opts.Arch, opts.GeoDistributed)
-	}
-	if providerOpts.useArmAMI() {
-		if len(providerOpts.Zones) == 0 {
-			zones = []string{"us-central1-a"}
-		}
-
-		if strings.HasPrefix(strings.ToLower(providerOpts.MachineType), "t2a-") &&
-			!IsSupportedT2AZone(providerOpts.Zones) {
-			return nil, errors.Newf("T2A instances are not supported outside of [%s]", strings.Join(SupportedT2AZones, ","))
-		}
 	}
 	return zones, nil
 }
@@ -1613,7 +1695,7 @@ func (p *Provider) computeInstanceArgs(
 	if providerOpts.useArmAMI() && (opts.Arch != "" && opts.Arch != string(vm.ArchARM64)) {
 		return nil, cleanUpFn, errors.Errorf("machine type %s is arm64, but requested arch is %s", providerOpts.MachineType, opts.Arch)
 	}
-	if opts.SSDOpts.UseLocalSSD && !providerOpts.machineTypeSupportsLocalSSD() {
+	if opts.SSDOpts.UseLocalSSD && !providerOpts.BootDiskOnly && !providerOpts.machineTypeSupportsLocalSSD() {
 		return nil, cleanUpFn, errors.Errorf("local SSDs are not supported with %s instance types, use --local-ssd=false", providerOpts.MachineType)
 	}
 	if providerOpts.useArmAMI() {
@@ -1675,34 +1757,12 @@ func (p *Provider) computeInstanceArgs(
 	if !providerOpts.BootDiskOnly {
 		if opts.SSDOpts.UseLocalSSD {
 
-			counts, err := AllowedLocalSSDCount(providerOpts.MachineType)
+			attachCount, err := localSSDAttachCount(l, providerOpts)
 			if err != nil {
 				return nil, cleanUpFn, err
 			}
-
-			// If only one count is allowed, the VM will be automatically
-			// configured with that count of local SSDs.
-			if len(counts) == 1 {
-				// If only one count is allowed, the VM will be automatically
-				// configured with that count of local SSDs.
-				// In case the user specified a different count, warn it will be overriden.
-				if providerOpts.SSDCount != counts[0] {
-					l.Printf(
-						"WARNING: %[1]q only supports %[2]d local SSDs. Setting --gce-local-ssd-count to %[2]d",
-						providerOpts.MachineType,
-						counts[0],
-					)
-				}
-			} else {
-				// Make sure the minimum number of local SSDs is met.
-				minCount := counts[0]
-				if providerOpts.SSDCount < minCount {
-					l.Printf("WARNING: SSD count must be at least %d for %q. Setting --gce-local-ssd-count to %d", minCount, providerOpts.MachineType, minCount)
-					providerOpts.SSDCount = minCount
-				}
-				for i := 0; i < providerOpts.SSDCount; i++ {
-					args = append(args, "--local-ssd", "interface=NVME")
-				}
+			for i := 0; i < attachCount; i++ {
+				args = append(args, "--local-ssd", "interface=NVME")
 			}
 
 			// Add `discard` for Local SSDs on NVMe, as is advised in:
@@ -1883,6 +1943,7 @@ func waitForGroupStability(l *logger.Logger, project, groupName string, zones []
 			cmd := exec.Command("gcloud", groupStableArgs...)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
+				err = annotateGCECapacityError(maybeGCECapacityError(err, output), zone)
 				return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", groupStableArgs, output)
 			}
 			return nil
@@ -2001,6 +2062,7 @@ func (p *Provider) Create(
 					cmd := exec.Command("gcloud", argsWithHost...)
 					output, err := cmd.CombinedOutput()
 					if err != nil {
+						err = maybeGCECapacityError(err, output)
 						return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", argsWithHost, output)
 					}
 					return nil
@@ -2201,6 +2263,7 @@ func (p *Provider) Grow(
 				cmd := exec.Command("gcloud", argsWithName...)
 				output, err := cmd.CombinedOutput()
 				if err != nil {
+					err = maybeGCECapacityError(err, output)
 					return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", argsWithName, output)
 				}
 				return nil
@@ -2685,14 +2748,56 @@ func (p *Provider) ListLoadBalancers(_ *logger.Logger, vms vm.List) ([]vm.Servic
 //
 // Returns an error if the machine type is unknown or does not support local SSDs.
 func AllowedLocalSSDCount(machineType string) ([]int, error) {
+	counts, _, err := localSSDConfig(machineType)
+	return counts, err
+}
+
+func localSSDConfig(machineType string) ([]int, bool, error) {
 	info, err := gcedb.GetMachineInfo(machineType)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if len(info.AllowedLocalSSDCount) == 0 {
-		return nil, fmt.Errorf("machine type %q does not support local SSD", machineType)
+	counts := slices.Clone(info.AllowedLocalSSDCount)
+	counts = slices.DeleteFunc(counts, func(count int) bool {
+		return count <= 0
+	})
+	if len(counts) == 0 {
+		return nil, false, fmt.Errorf("machine type %q does not support local SSD", machineType)
 	}
-	return info.AllowedLocalSSDCount, nil
+	return counts, info.LocalSSDAutoAttached, nil
+}
+
+func localSSDAttachCount(l *logger.Logger, providerOpts *ProviderOpts) (int, error) {
+	counts, autoAttached, err := localSSDConfig(providerOpts.MachineType)
+	if err != nil {
+		return 0, err
+	}
+
+	if autoAttached {
+		if providerOpts.SSDCount != counts[0] {
+			l.Printf(
+				"WARNING: %[1]q only supports %[2]d local SSDs. Setting --gce-local-ssd-count to %[2]d",
+				providerOpts.MachineType,
+				counts[0],
+			)
+			providerOpts.SSDCount = counts[0]
+		}
+		return 0, nil
+	}
+
+	minCount := counts[0]
+	if providerOpts.SSDCount < minCount {
+		l.Printf(
+			"WARNING: SSD count must be at least %d for %q. Setting --gce-local-ssd-count to %d",
+			minCount,
+			providerOpts.MachineType,
+			minCount,
+		)
+		providerOpts.SSDCount = minCount
+	}
+	// Preserve the legacy behavior for counts above the minimum: pass them
+	// through and let GCE reject unsupported values.
+	return providerOpts.SSDCount, nil
 }
 
 // N.B. neither boot disk nor additional persistent disks are assigned VM labels by default.

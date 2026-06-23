@@ -65,6 +65,14 @@ type StoreTestingKnobs struct {
 	// handled and the batch is retried.
 	TestingConcurrencyRetryFilter kvserverbase.ReplicaConcurrencyRetryFilter
 
+	// TestingBackpressureCallbackRegistered, if set, is called from
+	// (*Replica).maybeBackpressureBatch after a backpressure callback has been
+	// successfully registered with the split queue. Tests use this to
+	// deterministically learn that a backpressured write is waiting on the
+	// callback (and thus will observe the split's outcome), which avoids
+	// time-based coordination on slow hardware.
+	TestingBackpressureCallbackRegistered func(roachpb.RangeID)
+
 	// TestingProposalFilter is called before proposing each command.
 	TestingProposalFilter kvserverbase.ReplicaProposalFilter
 	// TestingProposalSubmitFilter can be used by tests to observe and optionally
@@ -353,6 +361,9 @@ type StoreTestingKnobs struct {
 	// HandleSnapshotDone is run after the entirety of receiving a snapshot,
 	// regardless of whether it succeeds, gets cancelled, times out, or errors.
 	HandleSnapshotDone func()
+	// BeforeClearSnapshotScratchOnStart is called just before cleaning scratch
+	// files on startup is executed.
+	BeforeClearSnapshotScratchOnStart func()
 	// ReplicaAddSkipLearnerRollback causes replica addition to skip the learner
 	// rollback that happens when either the initial snapshot or the promotion of
 	// a learner to a voter fails.

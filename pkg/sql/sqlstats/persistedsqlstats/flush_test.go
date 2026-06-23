@@ -839,16 +839,11 @@ func TestSQLStatsStmtSampling(t *testing.T) {
 	sqlStats := s.SQLServer().(*sql.Server).GetSQLStatsProvider()
 	appStats := sqlStats.GetApplicationStats(appName)
 
-	checkSampled := func(fingerprint string, implicitTxn bool, expectedPreviouslySampledState bool) {
+	checkSampled := func(fingerprint string, expectedPreviouslySampledState bool) {
+		previouslySampled := appStats.StatementSampled(fingerprint, dbName)
 
-		previouslySampled := appStats.StatementSampled(
-			fingerprint,
-			implicitTxn,
-			dbName,
-		)
-
-		errMessage := fmt.Sprintf("validate: %s, implicit: %t expected sample before: %t, actual sample before: %t\n",
-			fingerprint, implicitTxn, expectedPreviouslySampledState, previouslySampled)
+		errMessage := fmt.Sprintf("validate: %s, expected sample before: %t, actual sample before: %t\n",
+			fingerprint, expectedPreviouslySampledState, previouslySampled)
 		require.Equal(t, expectedPreviouslySampledState, previouslySampled, errMessage)
 	}
 
@@ -857,33 +852,22 @@ func TestSQLStatsStmtSampling(t *testing.T) {
 		// If the sampling rate is 0, we shouldn't trace any statements for sql stats.
 		sqlRun.Exec(t, "SELECT 1")
 		sqlRun.Exec(t, "SELECT 1, 2")
-		checkSampled("SELECT 1", true /* implicitTxn */, false /* sampled */)
-		checkSampled("SELECT 1, 2", true /* implicitTxn */, false /* sampled */)
+		checkSampled("SELECT 1", false /* sampled */)
+		checkSampled("SELECT 1, 2", false /* sampled */)
 		sqlRun.Exec(t, `SET CLUSTER SETTING sql.txn_stats.sample_rate = 0.01;`)
 	})
 
 	t.Run("sampling on", func(t *testing.T) {
 		sqlRun.Exec(t, `SET CLUSTER SETTING sql.txn_stats.sample_rate = 0.01;`)
 		// To start, we should not have any statements sampled.
-		checkSampled("SELECT _", true /* implicit */, false /* sampled */)
-		checkSampled("SELECT _, _", true /* implicit */, false /* sampled */)
+		checkSampled("SELECT _", false /* sampled */)
+		checkSampled("SELECT _, _", false /* sampled */)
 		// Execute each of the above statements to trigger a trace. We
 		// trace all statements the app hasn't seen before.
 		sqlRun.Exec(t, "SELECT 1")
 		sqlRun.Exec(t, "SELECT 1, 2")
-		checkSampled("SELECT _", true /* implicit */, true /* sampled */)
-		checkSampled("SELECT _, _", true /* implicit */, true /* sampled */)
-
-		// Now we'll execute each of the above statements again in explicit transactions.
-		// These should be treated as new statements and should be sampled.
-		checkSampled("SELECT _", false /* implicit */, false /* sampled */)
-		checkSampled("SELECT _, _", false /* implicit */, false /* sampled */)
-
-		sqlRun.Exec(t, "BEGIN; SELECT 1; COMMIT;")
-		sqlRun.Exec(t, "BEGIN; SELECT 1, 2; COMMIT;")
-
-		checkSampled("SELECT _", false /* implicit */, true /* sampled */)
-		checkSampled("SELECT _, _", false /* implicit */, true /* sampled */)
+		checkSampled("SELECT _", true /* sampled */)
+		checkSampled("SELECT _, _", true /* sampled */)
 	})
 
 }
@@ -1137,6 +1121,12 @@ func (s *stubTime) Now() time.Time {
 	return timeutil.Now()
 }
 
+// fingerprintIDHex returns the hex fingerprint_id for stmtNoConst executed
+// against the default database.
+func fingerprintIDHex(stmtNoConst string) string {
+	return sqlstatstestutil.FingerprintIDHex(stmtNoConst, "defaultdb")
+}
+
 func verifyInsertedFingerprintExecCount(
 	t *testing.T,
 	sqlConn *sqlutils.SQLRunner,
@@ -1153,7 +1143,7 @@ SELECT
 FROM
     system.transaction_statistics T,
     system.statement_statistics S
-WHERE S.metadata ->> 'query' = $1
+WHERE S.fingerprint_id = decode($1, 'hex')
 	  AND T.aggregated_ts = $2
     AND T.node_id = $3
     AND T.app_name = 'flush_unit_test'
@@ -1161,7 +1151,7 @@ WHERE S.metadata ->> 'query' = $1
     AND S.node_id = T.node_id
     AND S.aggregated_ts = T.aggregated_ts
     AND S.app_name = T.app_name
-`, fingerprint, ts, instanceID)
+`, fingerprintIDHex(fingerprint), ts, instanceID)
 
 	require.True(t, row.Next(), "no stats found for fingerprint: %s", fingerprint)
 
@@ -1190,12 +1180,12 @@ SELECT
 FROM
 	system.statement_statistics
 WHERE
-	metadata ->> 'query' = $1 AND
+	fingerprint_id = decode($1, 'hex') AND
   node_id = $2 AND
   app_name = 'flush_unit_test'
 GROUP BY
   (fingerprint_id, node_id)
-`, fingerprint, instanceID)
+`, fingerprintIDHex(fingerprint), instanceID)
 
 	var stmtFingerprintID string
 	var numOfInsertedStmtEntry int64
@@ -1299,9 +1289,9 @@ SELECT
 FROM
 	system.statement_statistics
 WHERE
-	metadata ->> 'query' = $1 AND
+	fingerprint_id = decode($1, 'hex') AND
   app_name = $2
-`, fingerprint, appName)
+`, fingerprintIDHex(fingerprint), appName)
 
 	var gatewayNodeID int64
 	var allNodesIds string

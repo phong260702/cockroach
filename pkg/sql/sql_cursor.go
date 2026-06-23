@@ -58,10 +58,11 @@ func (p *planner) DeclareCursor(ctx context.Context, s *tree.DeclareCursor) (pla
 			ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
 			ie.SetSessionData(sd)
 			ie.extraTxnState = &extraTxnState{
-				txn:                p.Txn(),
-				descCollection:     p.Descriptors(),
-				jobs:               p.extendedEvalCtx.jobs,
-				schemaChangerState: p.extendedEvalCtx.SchemaChangerState,
+				txn:                 p.Txn(),
+				descCollection:      p.Descriptors(),
+				jobs:                p.extendedEvalCtx.jobs,
+				schemaChangerState:  p.extendedEvalCtx.SchemaChangerState,
+				advisoryLockManager: p.extendedEvalCtx.advisoryLockManager,
 			}
 			if err := p.checkIfCursorExists(s.Name); err != nil {
 				return nil, err
@@ -287,8 +288,8 @@ func (b *fetchMoveNodeBase) nextInternal(ctx context.Context) (bool, error) {
 		case tree.FetchFirst:
 			switch b.cursor.curRow {
 			case 0:
-				_, err := b.cursor.Next(ctx)
-				return true, err
+				more, err := b.cursor.Next(ctx)
+				return more, err
 			case 1:
 				return true, nil
 			}

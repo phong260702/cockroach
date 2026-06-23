@@ -380,7 +380,7 @@ job's progress payload:
   written by producers no longer on the new plan.
 
 Closed ticks need nothing in the checkpoint — their markers are
-already durable on S3 and discoverable via the LIST walk.
+already durable on S3.
 
 **On resume:**
 
@@ -401,11 +401,15 @@ already durable on S3 and discoverable via the LIST walk.
 
 Events flushed between the persisted frontier and the crash get
 re-derived from the resumed rangefeed; the new files have new
-random names and are recorded fresh. The narrow race where the
-coordinator wrote a close marker but died before persisting
-that fact is handled by the resume-time LIST walk — markers
-that already exist on S3 win, and the coordinator skips
-re-opening those ticks.
+random names and are recorded fresh. If the coordinator wrote a
+close marker but died before persisting that fact, the tick is
+re-closed on resume with the re-derived data — the overwritten
+manifest is correct because the catch-up scan re-delivers every
+event past the persisted frontier. The pre-crash data files for
+the tick become orphaned on storage, but orphaned files are an
+inevitable consequence of any write-then-record design and are
+harmless (readers only consult files listed in the manifest).
+No resume-time LIST walk is needed.
 
 ##### Job creation
 
@@ -590,108 +594,352 @@ consumed by non-backup callers too (§2 restore, §3
 rangefeed-client wrapper). Lean toward the latter so the
 dependency direction stays clean.
 
-#### Span coverage tracking
+#### Scope and coverage tracking
 
-The log's covered spans evolve over time as schema changes
-add and drop tables or indexes. Three pieces make this work:
-an artifact (the coverage manifest), a control-plane signal
-(the schema descriptor rangefeed), and a mid-tick transition
-protocol that reuses the crash-recovery flushorder bump.
+The log job watches a *scope* — the set of descriptors whose
+KV traffic must end up in the log. Scope membership is fixed
+in identity at job creation; the resolved span set the
+producers actually subscribe to evolves underneath as schema
+changes happen within those identities. Three pieces make
+this work: a small `Scope` interface the writer holds, a
+control-plane signal (the schema descriptor rangefeed at the
+coordinator), and an artifact that publishes the resolved
+spans (the coverage manifest).
+
+##### Scope: identity-based, sourced from BACKUP
+
+The revlog job is a sibling of a parent BACKUP — it doesn't
+exist in isolation. Its scope is therefore exactly what that
+parent BACKUP resolved its targets to, captured by ID at job
+creation:
+
+- For `BACKUP DATABASE foo`: `ResolvedCompleteDbs = {foo's
+  database descriptor ID at parent-BACKUP time}` plus
+  `ResolvedTargets` for any tables the planner enumerated.
+- For `BACKUP TABLE foo.bar, foo.baz`:
+  `ResolvedTargets = {bar.id, baz.id}`, no ExpandedDbs.
+- For `BACKUP` (cluster): a `FullCluster` flag. The
+  curated system-table allowlist
+  (`GetSystemTablesToIncludeInClusterBackup`) is also part of
+  the scope — RESTORE needs the system rows, the BACKUP
+  includes them, the log has to track them.
+
+The scope is **not** the SQL target string. We never
+re-resolve "DATABASE foo" by name; if `foo` is dropped and a
+new database is created with the same name, the new
+database has a different descriptor ID, is a different
+scope, and would need a different revlog. This is a
+deliberate divergence from how scheduled BACKUP thinks about
+scope (re-resolve by name each run) and aligns the revlog
+with how PCR / LDR think about identity.
+
+The predicate is small: a descriptor change matters to the
+scope iff
+`desc.ID ∈ ResolvedTargets`,
+or `desc.ParentID ∈ ResolvedCompleteDbs`,
+or (`FullCluster` and `desc.ID` is not the system DB and not
+in the cluster-backup exclusion list). The rangefeed
+callback runs the predicate; non-matching events are
+ignored. The coordinator never imports BACKUP's
+target-syntax machinery; that lives entirely behind the
+`Scope` interface, whose concrete implementation in
+`pkg/backup` calls `spansForAllTableIndexes` (the same
+merger BACKUP uses for its own export-spans / PTS) so we
+don't duplicate span derivation.
+
+DROP narrows the watched span set. Once a descriptor enters
+DROP state, its span exits the resolved set: a RESTORE at a
+time after the DROP wouldn't include the table anyway (the
+schema state at the restore HLC has it marked dropped), so
+the GC tombstones that are the only remaining KV traffic on
+the span are pure cost. The descriptor rangefeed keeps
+watching the system.descriptor row so we still record the
+DROP transition in the schema-delta stream and so we
+eventually observe the descriptor's removal from KV.
+
+##### Schema descriptor rangefeed (control plane)
+
+The coordinator subscribes one rangefeed at startHLC to the
+`system.descriptor` table span. Descriptor change values
+are buffered as they arrive and processed in HLC order on
+each rangefeed checkpoint; the per-checkpoint batch drives
+all of:
+
+1. **Schema-delta write** for each matching descriptor
+   change in the batch — `log/schema/descs/<HLC>/<desc-id>.pb`
+   with the new descriptor body, or a nil-payload
+   tombstone for deletions (per `revlog-format.md` §3 / §6).
+2. **Coverage manifest write** for each distinct scope
+   transition in the batch — one coverage entry per
+   transition at the transition's `T_change`, so reader
+   lookups at any AOST in the batch's window get the right
+   span set. Pure metadata changes (column rename, etc.)
+   produce schema deltas but no coverage entries.
+3. **Replan signal** sent at most once per batch if any
+   change widened the resolved span set. Coalescing churn
+   per checkpoint avoids a long migration causing one
+   replan per descriptor write while still preserving
+   per-transition coverage entries.
+4. **Tick-close gating.** Each rangefeed checkpoint also
+   forwards the coordinator's descriptor frontier; the
+   tick close loop only seals ticks whose end is below
+   `min(data frontier, descriptor frontier)`. Without this
+   gate a late-delivered descriptor change inside an
+   already-closed tick would mean the recorded coverage /
+   schema state was wrong for some events.
+5. **Termination check.** After processing the batch, if
+   the resolved span set is empty at the checkpoint ts,
+   `Scope.Terminated` is consulted. On true, the writer's
+   outer loop exits successfully (see "Termination" below).
 
 ##### Coverage manifest (artifact)
 
-A separate object is written whenever the covered spans
-change — initially at job-launch with the starting span
+A separate object is written whenever the resolved span set
+changes — initially at job launch with the starting span
 set, then again at each relevant descriptor change. Each
-captures the scope spec (e.g. "cluster", "database:foo")
-and the expanded span set effective from a given HLC
-forward. Readers answer "which spans were covered at time
-T?" by looking up the latest entry whose effective HLC ≤
-T. Lookups let consumers distinguish "absent because no
-event happened" from "absent because we weren't watching."
+captures the scope spec (e.g. "cluster",
+"targets:db:5,desc:7") and the resolved span set effective
+from a given HLC forward. The writer may also re-emit the
+current coverage unchanged to refresh against bucket TTL on
+long-lived logs (the latest entry must remain accessible to
+readers; otherwise a coverage gap would appear after the
+TTL window).
+
+Readers answer "which spans were covered at time T?" by
+looking up the latest entry whose effective HLC ≤ T.
+Lookups let consumers distinguish "absent because no event
+happened" from "absent because we weren't watching."
 
 Path layout, lookup protocol, and proto schema: see
 `pkg/revlog/revlog-format.md` §5.
 
-##### Schema descriptor rangefeed (control plane)
+##### Mid-job span widening: flow restart
 
-The log job's coordinator subscribes its own rangefeed to the
-schema descriptor system table (or the relevant subset for
-the log's scope). This rangefeed serves two purposes:
+A producer's rangefeed subscription is fixed at processor
+startup. New spans created after that — a CREATE TABLE in a
+covered DB, a CREATE INDEX on a covered table — fall outside
+every running producer's subscription, so their writes never
+reach the log unless we do something about it. (Tables, not
+databases, own keyspace in CRDB; a database is a naming
+relationship, not a keyspace allocation, so there's no "wide
+DB-level subscription" trick — a CREATE TABLE inside a
+covered DB allocates a fresh table ID from the cluster's
+counter and its `/Table/<new_id>/...` keyspace lives nowhere
+near any existing producer's subscription.)
 
-1. **Tick close gating.** A tick can only be sealed once the
-   descriptor rangefeed's frontier has advanced past the
-   tick's end. Even if every data producer's frontier is past
-   the tick end, the coordinator must have evidence that no
-   schema change happened during the tick before writing the
-   close marker — otherwise a late-delivered descriptor
-   change inside the tick would mean the recorded coverage
-   was wrong for some events in the tick.
-2. **Span-change detection.** When the descriptor rangefeed
-   delivers any descriptor change at `T_change`, the
-   coordinator **re-resolves the job's target spec** (cluster
-   / database / table) into a fresh span set and **compares
-   to the currently-covered span set**. If they differ,
-   spans changed at `T_change` and the mid-tick transition
-   protocol below kicks in. If they match (a descriptor
-   mutation that doesn't affect the resolved spans — e.g. a
-   column rename, an unrelated table elsewhere in the
-   cluster), no replan is needed; the coordinator just
-   records that the descriptor frontier has advanced past
-   `T_change` and continues. Re-resolve-and-compare is
-   simpler and more robust than maintaining a per-scope
-   filter that tries to guess which descriptor mutations
-   matter.
+When the descfeed's per-checkpoint batch contains a
+widening change, the descfeed:
 
-##### Mid-tick span change protocol
+1. Adds the newly-introduced spans to the manager's
+   per-span frontier at zero so they're visible to the
+   producer's per-span bookkeeping for the next flow.
+2. Computes the restart start time as
+   `min(currentDataFrontier, T_change)` where `T_change`
+   is the earliest widening event in the batch.
+3. Signals the outer flow loop with the new full span set
+   and the restart start time.
 
-When a span change at `T_change` falls inside an open tick,
-the coordinator orchestrates a transition that keeps the
-wall-clock-aligned tick model intact:
+The outer loop cancels the running inner flow and re-plans
+with the new spans. The new flow's producers open their
+rangefeed with `WithInitialScan` and a pre-populated
+frontier built from `ResumeStateForPartition`:
 
-1. Wait for the data producers' frontier to pass `T_change` —
-   so all events with MVCC ts < `T_change` for the *old* span
-   set are durably flushed and reported.
-2. Cancel the existing flow.
-3. Write a new coverage manifest entry effective at
-   `T_change` with the new span set.
-4. Launch a new flow on the new spans, starting at
-   `T_change`. Per-tick flushorder for any in-flight tick is
-   bumped to `max(prior flushorder for the tick) + 1` —
-   exactly the same machinery as crash-recovery resume (see
-   "Progress checkpointing"). The new flow's files for the
-   in-flight tick land at strictly higher flushorder than
-   the old flow's contributions.
-5. The tick eventually closes normally at its wall-clock
-   boundary. Its marker contains both flows' files in the
-   right order; per-key revision ordering is preserved by
-   the standard read rule (lower flushorder first).
+- Old spans (already at or beyond the rangefeed's start
+  time per the resume state) are skipped by the rangefeed
+  library's per-span init-scan gate — `runInitialScan`
+  walks the frontier and only scans spans whose ts is
+  empty or strictly below the rangefeed's start ts.
+- Newly-introduced spans (at zero in the resume state) are
+  scanned at the rangefeed's start ts; the scan output
+  materializes their pre-existing state, and subsequent
+  events stream in via the normal rangefeed path.
+- The first flow uses the same machinery, with all
+  original-scope spans pre-forwarded to `startHLC` in the
+  resume state so the initial scan is a no-op for them
+  (otherwise we'd init-scan the entire backed-up keyspace
+  and re-export everything).
 
-The reader has no special case: it sees a normal tick whose
-marker happens to list files from two flows. Coverage is
-looked up via the coverage manifest, not derived from tick
-contents.
+Per-tick flushorder for any in-flight tick is bumped to
+`max(prior flushorder for the tick) + 1` — same machinery
+as crash-recovery resume (see "Progress checkpointing").
+The new flow's files for the in-flight tick land at
+strictly higher flushorder than the old flow's
+contributions; per-key revision ordering survives the
+restart.
 
-The alternative — closing a "stub" tick at `T_change` and
-starting a new tick mid-second — would break the
-wall-clock-aligned tick invariant, complicate marker
-discovery with variable-length ticks, and duplicate
-machinery already provided by the resume protocol. Rejected.
+The TickManager and persister are shared across iterations,
+so closed ticks and the high-water keep advancing.
+Open-tick file lists from the prior incarnation get
+included in the eventual close marker through the
+rehydrate path.
+
+We do **not** wait for the data frontier to pass
+`T_change` before restarting. The initial scan is the
+mechanism that bridges the gap: any pre-`T_change` state
+of a newly-in-scope span is captured by the scan; events
+streamed thereafter cover the rest.
+
+##### Pre-publication captures
+
+A consequence of capturing newly-in-scope spans via initial
+scan at `min(currentDataFrontier, T_change)` — which can be
+strictly less than `T_change` itself — is that the log's
+data files for a newly-introduced span may contain events
+at MVCC timestamps earlier than the coverage entry that
+brought the span into scope. Concretely, a schema change
+that publishes a descriptor at `T_change` may have written
+intermediate KV state during a backfill window before
+`T_change`; rangefeed catch-up after the initial scan
+delivers those pre-`T_change` MVCC versions to the writer,
+and they land in the log under the span's keyspace.
+
+This is correct because:
+
+- At the **catalog layer**, SQL invariants (cross-index
+  consistency, FK validity, table publicness) only hold
+  after the descriptor publication transaction commits at
+  `T_change`. Intermediate KV state during a backfill,
+  IMPORT, or any other "write KV first, publish desc
+  atomically" operation is physically present at the KV
+  layer but not exposed via SQL.
+- The **sum** of all MVCC revisions of the span through
+  `T_change` is, by construction, a valid SQL-ready state:
+  the schema-change machinery is responsible for ensuring
+  that publishing the descriptor coincides with a coherent
+  KV state.
+- Restore is **all-or-nothing** per span. The coverage
+  manifest is a step function: at AOST `T < T_change`, the
+  span is excluded entirely (the prior coverage entry
+  doesn't include it) — the log's pre-`T_change` events
+  for it are never read. At AOST `T ≥ T_change`, the span
+  is included and **every** event in its data files is
+  replayed. The sum produces the SQL-valid state at
+  `T_change`, and subsequent events bring it forward to
+  AOST. There is no AOST that produces a half-published
+  state visible to the user.
+
+This invariant — that a downstream consumer can observe
+raw KV writes including pre-publication backfill state and,
+by replaying through the publication ts, arrive at a
+SQL-valid state — is the same one that **PCR / LDR**
+relies on. PCR's logical replication subscribes a
+rangefeed to source spans, replicates pre-publication
+backfill writes verbatim, and trusts that replay through
+the descriptor's commit ts produces a consistent
+destination state. The continuous backup writer uses the
+same mechanism (rangefeed + initial scan) and the same
+invariant.
+
+A secondary precedent is **BACKUP introduced spans**: when
+an incremental backup discovers a span that came into
+scope between full and incremental, it does a
+revision-history export over `(0, BackupStartTime]` for
+that span, capturing the full MVCC history including any
+pre-publication backfill writes. Restore replays the full
+set; the same invariant produces a SQL-valid state. The
+mechanism differs (bulk export vs. live rangefeed) but
+the underlying property is identical.
+
+Reader contract: see `pkg/revlog/revlog-format.md` §5
+("Coverage vs. data files"). Readers must gate "is this
+span in scope at AOST?" via coverage but must **not**
+clip events for an in-scope span by the HLC of its
+introducing coverage entry.
+
+##### Termination: scope dissolved
+
+The log job exits successfully when its scope dissolves —
+every entry in `ResolvedTargets` is in DROP state or absent
+from KV, *and* every entry in `ResolvedCompleteDbs` is in
+DROP / absent. Empty resolved spans alone is not enough: a
+live database with no tables is a perfectly valid scope
+that should keep the descriptor rangefeed watching for a
+future CREATE TABLE.
+
+Cluster mode (`FullCluster=true`) effectively never
+terminates. The system-table allowlist guarantees a
+non-empty span set as long as the tenant exists; the only
+path to termination is the tenant itself going away, which
+takes the job out via a different mechanism (tenant
+teardown stops the resumer).
+
+The check fires after each in-scope descriptor event (the
+only point at which scope state can change). On a positive
+result the descfeed returns `ErrScopeTerminated`, the
+coordinator cancels the flow, and the resumer reports
+success.
 
 ##### Edge case: chronically slow descriptor rangefeed
 
-If the descriptor rangefeed lags behind the data rangefeeds,
-ticks cannot close until it catches up — even when data is
-fully flushed. This throttles RPO without bounding it. A
-metric on `descriptor_frontier_lag` and an alert if it
-exceeds a threshold is enough; remediation (cancel + restart
-the descriptor sub, fall back to alternative detection) is
-out of scope here.
+If the descriptor rangefeed lags behind the data
+rangefeeds, ticks cannot close until it catches up — even
+when data is fully flushed. This throttles RPO without
+bounding it. A metric on `descriptor_frontier_lag` and an
+alert if it exceeds a threshold is enough; remediation
+(cancel + restart the descriptor sub, fall back to
+alternative detection) is out of scope here.
+
+##### Lifecycle coupling to BACKUP runs
+
+A revlog's scope is anchored to one specific parent BACKUP
+run. The job creation dance described above ("Job creation")
+runs at the parent BACKUP's execution time and snapshots
+*that* run's resolved targets into the new revlog's
+details. The revlog then carries those identities for its
+entire lifetime. It does not chase the SQL meaning of the
+target string into future BACKUPs.
+
+This produces a natural coupling between the revlog's
+lifecycle and the BACKUP chain it serves:
+
+- **Initial creation.** First `BACKUP ... WITH REVISION
+  STREAM` for a destination resolves its targets, creates
+  the parent BACKUP, and (if no live revlog marker exists)
+  creates the sibling revlog with roots = those resolved
+  IDs.
+- **Subsequent runs that match.** Later BACKUPs to the same
+  destination find the marker and no-op. As long as the
+  revlog's roots are still alive, this is correct: the
+  revlog continues covering the same identities the new
+  BACKUP would have covered, since name resolution
+  produces the same IDs.
+- **Subsequent runs that don't match.** If a DROP +
+  CREATE has reassigned the target name to a new
+  descriptor ID, the prior revlog's roots will eventually
+  dissolve (when the old IDs are fully gone) and the
+  revlog will terminate successfully. The next BACKUP run
+  for that name discovers the marker is terminal (job
+  state = succeeded) and creates a fresh revlog with the
+  new resolved IDs. Multi-generation marker rotation
+  (descending-`now()` suffix; see TODO in the existing
+  marker code) is the mechanism that makes this discovery
+  possible.
+
+Two consequences worth calling out:
+
+- **Coverage gap between BACKUP runs across an identity
+  swap.** Between when a DROP + CREATE swaps the target's
+  identity and when the next BACKUP run creates a fresh
+  revlog with the new IDs, the new descriptor's data is
+  being written but no revlog is watching it. Restore to a
+  time in that window is served only by the most-recent
+  BACKUP, not by log-replay extending it. The RPO property
+  RESTORE provides on top of a BACKUP+log chain is
+  "sub-minute RPO continuously, *modulo* the granularity at
+  which BACKUPs themselves anchor scope." Customers running
+  schedules at hourly cadence (or finer) get hourly-modulo
+  RPO across identity swaps.
+- **Scheduled BACKUPs are the natural driver.** A
+  scheduled `BACKUP DATABASE foo WITH REVISION STREAM`
+  running every N minutes both keeps the BACKUP chain
+  fresh and re-discovers any scope dissolution
+  promptly — each scheduled run is the chance to create a
+  successor revlog if the previous one terminated.
 
 #### Schema descriptor capture
 
-Span coverage tracking (above) tells a reader **which key
-spans were covered at time T**. That's enough for rangefeed
+Coverage tracking (above) tells a reader **which key spans
+were covered at time T**. That's enough for rangefeed
 consumers — they only need to know which spans of KV pairs to
 expect from the log. RESTORE needs more: to interpret the
 encoded KV bytes back into rows, it needs the **table
@@ -704,23 +952,35 @@ serving a different reader.
 
 ##### Schema manifest (artifact)
 
-A separate object is written every time the descriptor
-rangefeed delivers a change. Each captures a snapshot of
-the descriptor set in scope at a given HLC — the table /
-type / etc. descriptors the log job is covering at that
-moment. Restore reads these to interpret KV bytes back into
-rows correctly across DDL boundaries during log replay;
-rangefeed consumers don't read this — only RESTORE does.
+One object is written **per descriptor per change** —
+per-descriptor deltas, not per-event full snapshots. The
+base full backup supplies the starting descriptor catalog;
+each entry in this stream is a delta applied on top during
+log replay.
 
-Each entry is a full snapshot of the in-scope descriptor
-set — typically a few KB to low MB depending on cluster
-size, written infrequently (only on DDL events). A delta
-encoding (changed descriptors only, periodic full
-snapshots) is a possible later optimization if size
-becomes a concern.
+- For a descriptor change (CREATE, ALTER, schema mutation,
+  state transition into DROP): the new descriptor body is
+  written verbatim.
+- For a descriptor deletion (the system.descriptor row is
+  gone from KV): a nil-payload tombstone is written
+  (matching the format spec's tombstone framing — the
+  4-byte magic-only object).
+
+A single DDL transaction touching multiple descriptors
+writes one object per descriptor under the same HLC folder.
+
+Restore walks `log/schema/descs/` in HLC order between the
+base backup time and the restore AOST, applying each delta
+to the running descriptor set. Rangefeed consumers don't
+read this — only RESTORE does.
 
 Path layout, lookup protocol, and proto schema: see
 `pkg/revlog/revlog-format.md` §6.
+
+The earlier RFC sketched per-event full snapshots of the
+in-scope descriptor set. Deltas are smaller, simpler to
+write, and naturally let RESTORE replay descriptor changes
+in lockstep with KV events at the same HLC.
 
 ##### Relationship to span coverage
 
@@ -728,20 +988,19 @@ Both manifests are written in response to descriptor
 changes by the same coordinator, but they're independent
 in cadence:
 
-- Spans always change as a consequence of descriptor
-  changes (spans are derived from descriptors), so a span
-  change always coincides with a descriptor change.
-- Descriptors can change without spans changing (e.g.
-  column rename, default value change, type change on an
-  existing column). In that case only the schema manifest
-  gets a new entry; the coverage manifest does not (its
-  content would be identical to the prior entry).
+- Coverage entries are written only when the resolved span
+  set actually changes. Schema-only changes (column
+  rename, default value change) don't move spans and
+  produce no coverage entry.
+- Schema entries are written for every in-scope descriptor
+  change. Schema events are therefore a strict superset of
+  coverage events.
 
 Keeping them in separate artifact streams preserves
-single-responsibility: rangefeed consumers consult
-coverage only; restore consults both. Folding schema into
-coverage would force every rangefeed consumer to read
-descriptors it never uses.
+single-responsibility: rangefeed consumers consult coverage
+only; restore consults both. Folding schema into coverage
+would force every rangefeed consumer to read descriptors it
+never uses.
 
 ##### Joint concern with §2 "Schema"
 
@@ -792,20 +1051,245 @@ the encoding chosen here determines the read API there.
 
 #### Schema
 
-Replay reads descriptor revisions from the log and applies them at
-the right times across the replay window so that data ingested
-between two DDL events is interpreted under the correct descriptor.
-Must coordinate with §1 "Reflecting schema changes" — the encoding
-chosen there determines the read API here.
+During restore planning, the set of descriptors available for
+restore target resolution is constructed by starting with the
+descriptors in the base backup and then playing back the changes
+recorded in `log/schema/descs/` up to the requested AOST. This
+playback modifies, deletes, and adds descriptors chronologically,
+producing the actual descriptor set as of the restore time. This
+is necessary because descriptors may have been introduced only
+in the revision log — e.g., a table created after the last
+backup but before AOST — and those must be resolvable as restore
+targets.
 
-TODO — separate session.
+The resulting descriptor set is what restore planning uses when
+resolving the user's `RESTORE` target expressions (database
+names, table names, etc.) to concrete descriptor IDs.
 
-#### (rest TODO — per-component session)
+Must coordinate with §1 "Schema descriptor capture" — the
+encoding chosen there determines the read API here.
 
-Which DistMerge primitive(s) to reuse vs. fork; AddSSTable batching
-and pacing; integration with `RESTORE ... AS OF SYSTEM TIME`
-syntax; per-table point-in-time restore UX; resumability state and
-on-disk staging area.
+#### Log replay pipeline
+
+Restore from a continuous backup is a two-step process: restore
+the base backup via the existing path (online restore is the
+expected default), then replay the suffix of the log that covers
+`(backup.end_time, AOST]`. The log is time-ordered (events are
+bucketed into 10-second ticks by MVCC timestamp); KV ingest
+requires key-ordered SSTs. The volume of revisions in the replay
+window is assumed to exceed available memory, so a streaming /
+spilling approach is required. The solution is a three-phase
+distributed merge pipeline, reusing the same architectural
+pattern as the index backfill distributed merge
+(`pkg/sql/bulkmerge`).
+
+##### Phase 1: Tick assignment (planning)
+
+The coordinator discovers all closed ticks in
+`(backup.end_time, AOST]` via `LogReader.Ticks()` — the
+time-prefix LIST walk specified in the format doc. Ticks are
+**shuffled** (deterministic shuffle seeded by the job ID) and
+assigned to SQL instances via round-robin. The shuffle is
+critical: without it, contiguous ticks would be assigned to the
+same node, and traffic spikes during certain time periods would
+create skew — one node gets most of the data-heavy ticks while
+others sit idle. Shuffling spreads hot ticks uniformly across the
+cluster.
+
+Each node receives a `RevlogLocalMergeSpec` proto listing its
+assigned ticks, the revlog external-storage URI, a
+`nodelocal://` output prefix, and the target AOST.
+
+##### Phase 2: Local merge (per-node)
+
+Each node reads its assigned ticks from cloud storage via the
+`revlog` reader API (`GetTickReader`, `Events()`). Events from
+multiple ticks are fed into a k-way merge. The merge key is
+`(user_key ASC, mvcc_ts ASC)` — the same ordering used within
+revlog data files.
+
+**Deduplication.** For each user key, only the latest MVCC
+revision with `ts ≤ AOST` is kept — including if that revision
+is a tombstone, since we may need to shadow a key present in
+the restored backup. Earlier revisions of the same key are
+discarded. This is correct because restore wants the state
+*as of* AOST, not the full revision history.
+
+**Key prefix rewriting.** Phase 2 also performs source→target
+table-ID prefix rewriting using `KeyRewriter` from
+`pkg/backup/key_rewriter.go`. Since Phase 2 already allocates
+keys to convert from revlog encoding to MVCC `EngineKey`
+encoding (the log stores MVCC timestamps in ascending order;
+engine keys require descending), key prefix rewriting is done
+at the same time with no additional cost. This establishes a
+clean boundary: Phase 2 output is entirely in the
+**target-keyspace**. Phase 3 can therefore work exclusively in
+target-keyspace for span assignment, partitioning, and
+ingest — no rewriting logic is needed in the final merge path.
+
+The merged, deduplicated, rewritten output is written as
+standard MVCC-encoded SSTs (CockroachDB `EngineKey` encoding,
+not revlog encoding) to
+`nodelocal://<instance>/crdb-revlog-merge/<job_id>/`. These SSTs
+are directly compatible with `bulkmerge.Merge()` and
+`AddSSTable` — no re-encoding is needed in Phase 3.
+
+**Key sampling.** Each node collects row samples from its
+output stream (reservoir sampling) and returns them alongside
+SST metadata (URI, key span, size, key count) to the
+coordinator. These samples are used in Phase 3 to identify
+spans introduced by the revision log that were not part of
+the original restore. Sampling also enables more intelligent
+split-point decisions when write volume is heavily skewed —
+e.g., one table received a burst of writes dwarfing all
+others. Without sampling, split points would be derived from
+local SST file boundaries, which reflect time-partitioned
+assignment rather than actual key-space density.
+
+##### Phase 3: Final merge and ingest
+
+The coordinator collects all intermediate SST manifests and
+key samples from Phase 2. Because Phase 2 performs key prefix
+rewriting, all intermediate SSTs are already in the
+**target-keyspace** — span assignment and partitioning operate
+entirely in the target-keyspace with no further rewriting
+needed.
+
+**New span discovery.** The revision log may contain spans
+that were not part of the original restore's split-and-scatter
+— for example, if a user dropped all tables in a database and
+recreated them within the backup chain, the recreated tables
+have new span ranges. The coordinator identifies these by
+subtracting the spans that were restored in the regular restore
+from the key samples returned by Phase 2. The remaining spans
+are new — the coordinator chunks them and performs
+split-and-scatter so that every span the revision log will
+ingest has been assigned to a node.
+
+With all spans accounted for, the coordinator uses
+`PartitionSpans` to obtain a partitioning and node assignment
+from the existing range layout, then calls
+`bulkmerge.Merge()` with this partitioning.
+
+`bulkmerge.Merge()` is **reused as-is** — no fork, no
+modification. The intermediate SSTs from Phase 2 are standard
+MVCC-encoded SSTs on `nodelocal://`, which is exactly the input
+format `bulkmerge` expects. The existing infrastructure handles:
+
+- DistSQL flow planning (MergeLoopback → BulkMerge →
+  MergeCoordinator)
+- Remote blob streaming via gRPC
+- Task assignment with row-sample-based split points
+- KV ingestion via `kvStorageWriter` → `SSTBatcher` →
+  `AddSSTable`
+
+The only configuration differences from the index backfill
+caller: `EnforceUniqueness` is false (the revlog legitimately
+contains overwrites of the same key across ticks), and
+`WriteTimestamp` is set to `Clock().Now()` (see "Timestamp
+handling" below).
+
+##### Why time-partitioned assignment
+
+With N nodes and T ticks, each tick containing F files
+(typically 1–10):
+
+- **Time-partitioned** (each node gets T/N complete ticks):
+  each node reads all files in its assigned ticks
+  sequentially. Total reads across the cluster: T × F. Each
+  read is a full GET of the file.
+- **Key-partitioned** (each node handles a slice of the
+  keyspace across all ticks): every node must open every
+  tick's files and seek to its key range. Total reads across
+  the cluster: N × T × F. Each read is a partial-file read
+  (seek + bounded scan), which on object storage translates
+  to a range-GET that is no cheaper than a full GET for small
+  files.
+
+For realistic numbers (T = 100K ticks for a ~12-day window at
+10s ticks, F = 5 avg files/tick, N = 10 nodes):
+time-partitioned = 500K full reads; key-partitioned = 5M
+partial reads. The 10× difference is entirely in cloud API
+calls, which dominate both cost and latency.
+
+#### Timestamp handling
+
+##### MVCC timestamp rewriting
+
+MVCC timestamp rewriting **must happen in Phase 3**, not Phase 2.
+Because work is time-partitioned, a key modified in two different
+ticks will be assigned to different nodes. Each node's local
+deduplication only sees its own assigned ticks, so both revisions
+survive Phase 2 — node A holds the key at `ts=100` and node B
+holds it at `ts=200`. During Phase 3's cross-node merge, the
+original MVCC timestamps are needed to determine which revision
+is newer and should win. If Phase 2 rewrote timestamps to
+`Clock().Now()`, all revisions would carry the same timestamp
+and the merge could not distinguish them.
+
+Phase 3 (`bulkmerge`'s `kvStorageWriter`) already rewrites MVCC
+timestamps — it sets `key.Timestamp = writeTS` for every key
+before passing it to `SSTBatcher`. This happens *after* the
+merge iterator has resolved cross-node key conflicts using the
+original timestamps, so no information is lost.
+
+##### Write timestamp ordering
+
+The existing restore path writes all ingested data at a timestamp
+obtained from `Clock().Now()` at the time of ingest (via
+`SSTBatcher`). The revlog replay phase runs *after* the main
+restore completes. By construction, `Clock().Now()` at revlog
+ingest time is later than `Clock().Now()` at main restore ingest
+time. Since MVCC resolution picks the latest writer for a given
+key, revlog data naturally supersedes backup data for any key that
+was modified during the replay window. No special timestamp
+coordination, write barriers, or multi-version reasoning is
+needed.
+
+The AOST does *not* become the write timestamp — it controls which
+revlog events are **included** (the deduplication filter in Phase
+2 discards events with `ts > AOST`), not the MVCC timestamp at
+which data is written into KV. This matches the existing restore's
+timestamp strategy exactly.
+
+#### Integration with existing restore flow
+
+The revlog replay is called at the end of `doResume()` in the
+restore job. The feature is gated behind `buildutil.CrdbTestBuild`
+and the `RevisionLogTimestamp` field in `RestoreDetails`; when
+empty, the replay phase is a no-op and the restore proceeds
+exactly as it does today.
+
+#### Syntax and UX
+
+User-facing syntax:
+`RESTORE ... FROM ... AS OF SYSTEM TIME <ts>`.
+No special option is needed — restore planning detects the
+presence of a revision log at the backup location automatically.
+`AS OF SYSTEM TIME` is **mandatory** when a revision log is
+present (restoring "as of latest" is ill-defined for a live
+log).
+
+TODO — planning-time validation steps and `SHOW BACKUP`
+extension to surface the log's resolved time and restorability
+window.
+
+#### Resumability
+
+TODO — resumability state, on-disk staging area lifecycle, and
+idempotency strategy for partial replay.
+
+#### Implementation sketch / key files
+
+| File | Role |
+|------|------|
+| `pkg/revlog/reader.go` | `LogReader`, `TickReader`, `Event` API |
+| `pkg/sql/sem/tree/backup.go` | `RestoreOptions` struct |
+| `pkg/jobs/jobspb/jobs.proto` | `RestoreDetails` (`revision_log_timestamp`) |
+| `pkg/backup/restore_planning.go` | Restore planning + validation |
+| `pkg/backup/restore_revision_log.go` | Orchestration (new file) |
+| `pkg/backup/restore_job.go` | `doResume()` call site |
+| `pkg/sql/bulkmerge/merge.go` | `bulkmerge.Merge()` (reused as-is) |
 
 ---
 

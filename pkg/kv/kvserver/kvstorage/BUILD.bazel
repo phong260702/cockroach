@@ -25,6 +25,7 @@ go_library(
         "//pkg/kv/kvserver/kvstorage/wag",
         "//pkg/kv/kvserver/kvstorage/wag/wagpb",
         "//pkg/kv/kvserver/logstore",
+        "//pkg/kv/kvserver/raftlog",
         "//pkg/kv/kvserver/rditer",
         "//pkg/kv/kvserver/spanset",
         "//pkg/raft/raftpb",
@@ -50,6 +51,7 @@ go_test(
     name = "kvstorage_test",
     srcs = [
         "cluster_version_test.go",
+        "create_test.go",
         "datadriven_test.go",
         "destroy_test.go",
         "init_test.go",

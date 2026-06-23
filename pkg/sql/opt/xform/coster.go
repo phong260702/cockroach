@@ -587,6 +587,9 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 	case opt.LimitOp:
 		cost = c.computeLimitCost(candidate.(*memo.LimitExpr))
 
+	case opt.LockOp:
+		cost = c.computeLockCost(candidate.(*memo.LockExpr), required)
+
 	case opt.OffsetOp:
 		cost = c.computeOffsetCost(candidate.(*memo.OffsetExpr))
 
@@ -635,6 +638,11 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 	// row count of the local branch. Is there a better approach?
 	if required.RemoteBranch {
 		cost.C /= 10
+	}
+
+	// Penalize expressions that don't match the PlanGram.
+	if physical.VisibleToPlanGram(candidate.Op()) && !required.PlanGram.Matches(candidate, c.mem.Metadata()) {
+		cost.Penalties |= memo.PlanGramMismatchPenalty
 	}
 
 	// Add a one-time cost for any operator with unbounded cardinality. This
@@ -1573,6 +1581,28 @@ func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.R
 func (c *coster) computeLimitCost(limit *memo.LimitExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
 	cost := memo.Cost{C: limit.Relational().Statistics().RowCount * cpuCostFactor}
+	return cost
+}
+
+func (c *coster) computeLockCost(lock *memo.LockExpr, required *physical.Required) memo.Cost {
+	// The Lock operator is implemented as a lookup join into the primary index,
+	// so its cost resembles that of an index lookup join: a per-lookup cost to
+	// seek into the primary index plus a per-row cost to retrieve the locked
+	// columns. The Lock passes through its input rows, so it locks (and is
+	// costed over) as many rows as flow into it. Crucially, when a limit hint
+	// flows down from above, the Lock only needs to lock that many rows. This
+	// makes plans that push the Lock below a row-reducing operation (so it only
+	// locks ~K rows) cheaper than plans that lock every input row before
+	// discarding all but K above the Lock.
+	rowCount := lock.Relational().Statistics().RowCount
+	if required.LimitHint != 0 {
+		rowCount = math.Min(rowCount, required.LimitHint)
+	}
+
+	cost := memo.Cost{C: rowCount * randIOCostFactor}
+	perRowCost := lookupJoinRetrieveRowCost +
+		c.rowScanCost(lock.Table, cat.PrimaryIndex, lock.LockCols).C
+	cost.C += rowCount * perRowCost
 	return cost
 }
 

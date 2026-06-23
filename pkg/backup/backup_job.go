@@ -53,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -364,7 +365,7 @@ func backup(
 		numTotalSpans += len(spec.IntroducedSpans) + len(spec.Spans)
 	}
 
-	progressLogger := jobs.DeprecatedNewChunkProgressLoggerForJob(job, numTotalSpans, job.FractionCompleted(), jobs.DeprecatedProgressUpdateOnly)
+	progressLogger := jobs.DeprecatedNewChunkProgressLoggerForJob(job, numTotalSpans, job.FractionCompleted(), 1.0, jobs.DeprecatedProgressUpdateOnly)
 
 	requestFinishedCh := make(chan struct{}, numTotalSpans) // enough buffer to never block
 	var jobProgressLoop func(ctx context.Context) error
@@ -751,7 +752,9 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		// Update the job payload (non-volatile job definition) once, with the now
 		// resolved destination, updated description, etc. If we resume again we'll
 		// skip this whole block so this isn't an excessive update of payload.
-		if err := b.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		//
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		if err := b.job.DeprecatedNoTxn().Update(ctx, func(txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
 			if err := md.CheckRunningOrReverting(); err != nil {
 				return err
 			}
@@ -1483,8 +1486,7 @@ func getTenantInfo(
 		}
 	}
 	if len(tenants) > 0 && jobDetails.RevisionHistory {
-		return spans, tenants, errors.UnimplementedError(
-			errors.IssueLink{IssueURL: build.MakeIssueURL(47896)},
+		return spans, tenants, unimplemented.NewWithIssue(47896,
 			"can not backup tenants with revision history",
 		)
 	}
@@ -2076,6 +2078,10 @@ func maybeWriteBackupLock(
 
 // getCompletedSpans inspects a backup manifest and returns all spans and
 // introduced spans that have already been backed up.
+//
+// NB: This function is currently only used for the purposes of filtering.
+// There are circumstances where spans will be added to both completedSpans and completedIntroducedSpans,
+// in order to direct filtering correctly, as these spans overlap both span groups.
 func getCompletedSpans(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
@@ -2111,6 +2117,7 @@ func getCompletedSpans(
 
 	// Add the spans for any tables that are excluded from backup to the set of
 	// already-completed spans, as there is nothing to do for them.
+	excludedTableIDs := make(map[descpb.ID]struct{})
 	descs := iterFactory.NewDescIter(ctx)
 	defer descs.Close()
 	for ; ; descs.Next() {
@@ -2120,11 +2127,44 @@ func getCompletedSpans(
 			break
 		}
 
-		if tbl, _, _, _, _ := descpb.GetDescriptors(descs.Value()); tbl != nil && tbl.ExcludeDataFromBackup {
+		tbl, _, _, _, _ := descpb.GetDescriptors(descs.Value())
+		if tbl != nil && tbl.ExcludeDataFromBackup {
+			excludedTableIDs[tbl.ID] = struct{}{}
 			prefix := execCtx.ExecCfg().Codec.TablePrefix(uint32(tbl.ID))
-			completedSpans = append(completedSpans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
+			span := roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
+			completedSpans = append(completedSpans, span)
+			completedIntroducedSpans = append(completedIntroducedSpans, span)
 		}
 	}
+
+	// If this is a revision history backup, also check revisions to exclude from export requests.
+	if backupManifest.MVCCFilter == backuppb.MVCCFilter_All {
+		descRevs := iterFactory.NewDescriptorChangesIter(ctx)
+		defer descRevs.Close()
+		for ; ; descRevs.Next() {
+			if ok, err := descRevs.Valid(); err != nil {
+				return nil, nil, err
+			} else if !ok {
+				break
+			}
+
+			rev := descRevs.Value()
+			if rev.Desc == nil {
+				continue
+			}
+			tbl, _, _, _, _ := descpb.GetDescriptors(rev.Desc)
+			if tbl != nil && tbl.ExcludeDataFromBackup {
+				if _, ok := excludedTableIDs[tbl.ID]; !ok {
+					excludedTableIDs[tbl.ID] = struct{}{}
+					prefix := execCtx.ExecCfg().Codec.TablePrefix(uint32(tbl.ID))
+					span := roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
+					completedSpans = append(completedSpans, span)
+					completedIntroducedSpans = append(completedIntroducedSpans, span)
+				}
+			}
+		}
+	}
+
 	return completedSpans, completedIntroducedSpans, nil
 }
 

@@ -354,10 +354,15 @@ SHOW INDEXES FROM information_schema.tables
 ----
 table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible  visibility
 
-query TTTTB colnames
+query TTTTB colnames,nosort
 SHOW CONSTRAINTS FROM information_schema.tables
 ----
-table_name  constraint_name  constraint_type  details  validated
+table_name  constraint_name                     constraint_type  details   validated
+tables      tables_is_insertable_into_not_null  NOT NULL         NOT NULL  true
+tables      tables_table_catalog_not_null       NOT NULL         NOT NULL  true
+tables      tables_table_name_not_null          NOT NULL         NOT NULL  true
+tables      tables_table_schema_not_null        NOT NULL         NOT NULL  true
+tables      tables_table_type_not_null          NOT NULL         NOT NULL  true
 
 query TTTTTB colnames
 SHOW GRANTS ON information_schema.tables
@@ -1657,18 +1662,25 @@ system              public             29_78_4_not_null                         
 system              public             29_78_5_not_null                                                                                                value IS NOT NULL
 system              public             29_78_6_not_null                                                                                                node_id IS NOT NULL
 system              public             29_78_7_not_null                                                                                                last_updated IS NOT NULL
-system              public             29_79_1_not_null                                                                                                id IS NOT NULL
-system              public             29_79_2_not_null                                                                                                fingerprint_id IS NOT NULL
-system              public             29_79_3_not_null                                                                                                fingerprint IS NOT NULL
-system              public             29_79_4_not_null                                                                                                summary IS NOT NULL
-system              public             29_79_5_not_null                                                                                                db IS NOT NULL
-system              public             29_79_6_not_null                                                                                                metadata IS NOT NULL
-system              public             29_79_7_not_null                                                                                                created_at IS NOT NULL
-system              public             29_79_8_not_null                                                                                                last_upserted IS NOT NULL
+system              public             29_79_1_not_null                                                                                                fingerprint_id IS NOT NULL
+system              public             29_79_2_not_null                                                                                                fingerprint IS NOT NULL
+system              public             29_79_3_not_null                                                                                                summary IS NOT NULL
+system              public             29_79_4_not_null                                                                                                db IS NOT NULL
+system              public             29_79_5_not_null                                                                                                metadata IS NOT NULL
+system              public             29_79_6_not_null                                                                                                created_at IS NOT NULL
+system              public             29_79_7_not_null                                                                                                last_upserted IS NOT NULL
 system              public             29_7_1_not_null                                                                                                 value IS NOT NULL
 system              public             29_80_1_not_null                                                                                                database_id IS NOT NULL
 system              public             29_80_2_not_null                                                                                                lock_type IS NOT NULL
 system              public             29_80_3_not_null                                                                                                lock_key IS NOT NULL
+system              public             29_81_1_not_null                                                                                                id IS NOT NULL
+system              public             29_81_2_not_null                                                                                                name IS NOT NULL
+system              public             29_81_3_not_null                                                                                                config IS NOT NULL
+system              public             29_82_1_not_null                                                                                                value IS NOT NULL
+system              public             29_83_1_not_null                                                                                                node_id IS NOT NULL
+system              public             29_83_2_not_null                                                                                                license_id IS NOT NULL
+system              public             29_83_3_not_null                                                                                                period_start IS NOT NULL
+system              public             29_83_4_not_null                                                                                                vcpus IS NOT NULL
 system              public             29_8_1_not_null                                                                                                 id IS NOT NULL
 system              public             29_9_1_not_null                                                                                                 crdb_region IS NOT NULL
 system              public             check_bounds                                                                                                    ((start_key < end_key))
@@ -1679,6 +1691,7 @@ system              public             check_crdb_internal_end_time_start_time_s
 system              public             check_crdb_internal_end_time_start_time_shard_16                                                                ((crdb_internal_end_time_start_time_shard_16 IN (0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8, 8:::INT8, 9:::INT8, 10:::INT8, 11:::INT8, 12:::INT8, 13:::INT8, 14:::INT8, 15:::INT8)))
 system              public             check_crdb_internal_last_updated_shard_8                                                                        ((crdb_internal_last_updated_shard_8 IN (0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8)))
 system              public             check_crdb_internal_last_updated_table_id_shard_16                                                              ((crdb_internal_last_updated_table_id_shard_16 IN (0:::INT8, 1:::INT8, 2:::INT8, 3:::INT8, 4:::INT8, 5:::INT8, 6:::INT8, 7:::INT8, 8:::INT8, 9:::INT8, 10:::INT8, 11:::INT8, 12:::INT8, 13:::INT8, 14:::INT8, 15:::INT8)))
+system              public             check_id_reserved_range                                                                                         ((id >= 16:::INT8))
 system              public             check_sampling_probability                                                                                      ((sampling_probability BETWEEN 0.0:::FLOAT8 AND 1.0:::FLOAT8))
 system              public             check_sampling_probability                                                                                      ((sampling_probability BETWEEN 0.0:::FLOAT8 AND 1.0:::FLOAT8))
 system              public             check_singleton                                                                                                 ((singleton))
@@ -3087,6 +3100,7 @@ admin    test           DELETE             NULL
 admin    test           DROP               NULL
 admin    test           INSERT             NULL
 admin    test           MAINTAIN           NULL
+admin    test           REFERENCES         NULL
 admin    test           REPLICATIONDEST    NULL
 admin    test           REPLICATIONSOURCE  NULL
 admin    test           SELECT             NULL
@@ -3102,6 +3116,7 @@ root     test           DELETE             NULL
 root     test           DROP               NULL
 root     test           INSERT             NULL
 root     test           MAINTAIN           NULL
+root     test           REFERENCES         NULL
 root     test           REPLICATIONDEST    NULL
 root     test           REPLICATIONSOURCE  NULL
 root     test           SELECT             NULL
@@ -3918,6 +3933,8 @@ distribute_join_row_count_threshold                              1000
 distribute_scan_row_count_threshold                              10000
 distribute_sort_row_count_threshold                              1000
 distsql_plan_gateway_bias                                        2
+distsql_plan_locality_filter                                     ·
+distsql_plan_locality_filter_strict                              off
 distsql_prevent_partitioning_soft_limited_scans                  on
 distsql_use_reduced_leaf_write_sets                              on
 enable_auto_rehoming                                             off
@@ -3946,6 +3963,7 @@ force_savepoint_restart                                          off
 foreign_key_cascades_limit                                       10000
 idle_in_transaction_session_timeout                              0
 idle_session_timeout                                             0
+in_hot_standby                                                   off
 index_join_streamer_batch_size                                   8.0 MiB
 index_recommendations_enabled                                    off
 initial_retry_backoff_for_read_committed                         2
@@ -3987,6 +4005,7 @@ optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables  on
 optimizer_enable_lock_elision                                    on
 optimizer_hoist_uncorrelated_equality_subqueries                 on
 optimizer_inline_any_unnest_subquery                             on
+optimizer_inline_placeholder_equalities                          on
 optimizer_merge_joins_enabled                                    on
 optimizer_min_row_count                                          1
 optimizer_plan_lookup_joins_with_reverse_scans                   on
@@ -4026,7 +4045,7 @@ parallelize_multi_key_lookup_joins_avg_lookup_ratio              10
 parallelize_multi_key_lookup_joins_avg_lookup_row_size           100 KiB
 parallelize_multi_key_lookup_joins_enabled                       off
 parallelize_multi_key_lookup_joins_max_lookup_ratio              10000
-parallelize_multi_key_lookup_joins_only_on_mr_mutations          on
+parallelize_multi_key_lookup_joins_only_on_mr_mutations          off
 password_encryption                                              scram-sha-256
 pg_dump_compatibility                                            off
 pg_trgm.similarity_threshold                                     0.3
@@ -4041,9 +4060,11 @@ recursion_depth_limit                                            1000
 register_latch_wait_contention_events                            off
 reorder_joins_limit                                              8
 require_explicit_primary_keys                                    off
+resource_group                                                   ·
 results_buffer_size                                              524288
 role                                                             none
 row_security                                                     on
+scram_iterations                                                 10610
 search_path                                                      "$user", public
 serial_normalization                                             rowid
 server_encoding                                                  UTF8

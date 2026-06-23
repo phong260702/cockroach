@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag/wagpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -72,6 +73,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -123,8 +125,9 @@ type testStoreOpts struct {
 	// If createSystemRanges is not set, the store will have a single range. If
 	// set, the store will have all the system ranges that are generally created
 	// for a cluster at boostrap.
-	createSystemRanges bool
-	bootstrapVersion   roachpb.Version // defaults to TestingClusterVersion
+	createSystemRanges  bool
+	bootstrapVersion    roachpb.Version // defaults to TestingClusterVersion
+	useSeparatedEngines bool
 }
 
 func (opts *testStoreOpts) splits() (_kvs []roachpb.KeyValue, _splits []roachpb.RKey) {
@@ -225,7 +228,14 @@ func createTestStoreWithoutStart(
 	// to do the same (with some effort). That's unlikely to happen soon, so
 	// let's continue to use the system config span.
 	cfg.SpanConfigsDisabled = true
-	eng := kvstorage.MakeEngines(storage.NewDefaultInMemForTesting())
+	var eng kvstorage.Engines
+	if opts.useSeparatedEngines {
+		eng = kvstorage.MakeSeparatedEnginesForTesting(
+			storage.NewDefaultInMemForTesting(), storage.NewDefaultInMemForTesting(),
+		)
+	} else {
+		eng = kvstorage.MakeEngines(storage.NewDefaultInMemForTesting())
+	}
 	stopper.AddCloser(&eng)
 	require.Nil(t, cfg.Transport)
 
@@ -412,6 +422,86 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 		memMS.AgeTo(diskMS.LastUpdateNanos)
 		require.Equal(t, memMS, diskMS)
 		return true // more
+	})
+}
+
+// TestStoreStartClearsSnapshotStorageScratch verifies the scratch directory's
+// lifecycle across Store.Start, for both single and separated engines:
+//
+//  1. Leftover scratch files (simulating a crash mid-snapshot) survive past
+//     the point where WAG replay would consume them. This is checked via the
+//     BeforeClearSnapshotScratchOnStart knob.
+//  2. The same files are then removed by Clear before Start returns.
+//
+// TODO(sep-raft-log): Ensure that the test still passes after introducing WAG
+// replay. It is essential to have a flush after finishing WAG replay to avoid
+// deleting files that would be needed in case of a crash.
+func TestStoreStartClearsSnapshotStorageScratch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testutils.RunTrueAndFalse(t, "separated", func(t *testing.T, sepEng bool) {
+		ctx := context.Background()
+		stopper := stop.NewStopper()
+		defer stopper.Stop(ctx)
+		cfg := TestStoreConfig(nil)
+
+		// The knob fires during Start, by which point env and ssts (assigned
+		// below after the store is built) are populated. The closure captures
+		// them by reference.
+		var env *fs.Env
+		var ssts []string
+		var preClearCalls int
+		var preClearErrs []error
+		cfg.TestingKnobs.BeforeClearSnapshotScratchOnStart = func() {
+			preClearCalls++
+			for _, p := range ssts {
+				if _, statErr := env.Stat(p); statErr != nil {
+					preClearErrs = append(preClearErrs,
+						errors.Wrapf(statErr, "scratch file %s missing at pre-clear hook", p))
+				}
+			}
+		}
+
+		store := createTestStoreWithoutStart(
+			ctx, t, stopper, testStoreOpts{useSeparatedEngines: sepEng}, &cfg,
+		)
+
+		// Seed a leftover scratch file under the snapshot storage directory.
+		// We deliberately skip scratch.Close() to simulate a node that crashed
+		// mid-snapshot and never ran the per-snapshot cleanup.
+		scratch := store.sstSnapshotStorage.NewScratchSpace(
+			roachpb.RangeID(42), uuid.MakeV4(), cfg.Settings,
+		)
+		f, err := scratch.NewFile(ctx, 0)
+		require.NoError(t, err)
+		require.NoError(t, f.Write([]byte("leftover sst")))
+		require.NoError(t, f.Finish())
+
+		env = store.StateEngine().Env()
+		ssts = scratch.SSTs()
+		require.NotEmpty(t, ssts)
+
+		// Sanity check: the leftover file exists before Start.
+		for _, p := range ssts {
+			_, statErr := env.Stat(p)
+			require.NoError(t, statErr, "scratch file %s should exist before Start", p)
+		}
+
+		require.NoError(t, store.Start(ctx, stopper))
+		store.WaitForInit()
+
+		// (1) The pre-clear hook ran exactly once, with all leftover files
+		// still on disk. This is where WAG replay would consume them.
+		require.Equal(t, 1, preClearCalls, "pre-clear knob should fire exactly once")
+		require.Empty(t, preClearErrs, "leftover scratch files should survive past WAG replay")
+
+		// (2) Scratch file should have been removed by Start.
+		for _, p := range ssts {
+			_, statErr := env.Stat(p)
+			require.True(t, oserror.IsNotExist(statErr),
+				"scratch file %s should be removed by Start, got err=%v", p, statErr)
+		}
 	})
 }
 
@@ -4431,6 +4521,53 @@ func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
 	require.True(t, mark.Is(7))
 }
 
+// TestStoreGetOrCreateReplicaWritesWAGNode tests that creating an uninitialized
+// replica via getOrCreateReplica writes a WAG EventCreate node to the log
+// engine.
+func TestStoreGetOrCreateReplicaWritesWAGNode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	cfg := TestStoreConfig(hlc.NewClockForTesting(manual))
+	cfg.TestingKnobs.DontCloseTimestamps = true
+	cfg.TestingKnobs.DisableMergeWaitForReplicasInit = true
+	store := createTestStoreWithConfig(
+		ctx, t, stopper, testStoreOpts{useSeparatedEngines: true}, &cfg,
+	)
+
+	id := roachpb.FullReplicaID{RangeID: 42, ReplicaID: 7}
+	repl, created, err := store.getOrCreateReplica(ctx, id, &roachpb.ReplicaDescriptor{
+		NodeID:    store.NodeID(),
+		StoreID:   store.StoreID(),
+		ReplicaID: id.ReplicaID,
+	})
+	require.NoError(t, err)
+	require.True(t, created)
+	repl.raftMu.Unlock()
+
+	// Scan the log engine for WAG nodes and verify an EventCreate was written
+	// for the replica we just created.
+	var it wag.Iterator
+	var found bool
+	for _, node := range it.Iter(ctx, store.LogEngine()) {
+		for _, ev := range node.Events {
+			if ev.Addr.RangeID == id.RangeID {
+				require.Equal(t, wagpb.EventCreate, ev.Type)
+				require.Equal(t, id.ReplicaID, ev.Addr.ReplicaID)
+				require.EqualValues(t, 0, ev.Addr.Index)
+				found = true
+			}
+		}
+	}
+	require.NoError(t, it.Error())
+	require.True(t, found, "expected to find an EventCreate WAG node for r%d", id.RangeID)
+}
+
 // TestSplitPreApplyInitializesTruncatedState ensures that the Raft truncated
 // state for the RHS is correctly initialized when calling splitPreApply.
 func TestSplitPreApplyInitializesTruncatedState(t *testing.T) {
@@ -4522,8 +4659,9 @@ func TestSplitPreApplyWithSeparatedEngines(t *testing.T) {
 	rhsDesc.AddReplica(1, 1, roachpb.VOTER_FULL)
 
 	in := splitPreApplyInput{
+		rhsID:               roachpb.FullReplicaID{RangeID: rhsDesc.RangeID, ReplicaID: 1},
+		rhsSpan:             rhsDesc.RSpan(),
 		rhsDestroyed:        false,
-		rhsDesc:             rhsDesc,
 		initClosedTimestamp: hlc.Timestamp{WallTime: 100},
 	}
 

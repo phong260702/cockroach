@@ -8,7 +8,6 @@ package perturbation
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/rand"
 	"time"
 
@@ -33,7 +32,16 @@ var _ perturbation = &slowDisk{}
 func (s *slowDisk) setup() variations {
 	s.slowLiveness = true
 	s.walFailover = true
-	return setup(s, math.Inf(1))
+	// With walFailover=true and 2 disks per node (the default for the full
+	// variant), raft log writes fail over to the non-throttled store, so
+	// foreground throughput is expected to stay close to baseline even
+	// while the staller is active. Default thresholds apply to both
+	// intervals; we keep the 1.25x floor (rather than tightening) only to
+	// avoid flakes from the slowLiveness leg, which routes liveness
+	// heartbeats through the slow disk. The metamorphic variant exercises
+	// configurations where walFailover is off and throughput can drop
+	// substantially -- those should override impact independently.
+	return setup(s, defaultThresholds())
 }
 
 func (s *slowDisk) setupMetamorphic(rng *rand.Rand) variations {

@@ -505,6 +505,13 @@ func TestLogic_crdb_internal_default_privileges(
 	runLogicTest(t, "crdb_internal_default_privileges")
 }
 
+func TestLogic_crdb_internal_tsdb_query(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "crdb_internal_tsdb_query")
+}
+
 func TestLogic_create_as(
 	t *testing.T,
 ) {
@@ -902,6 +909,13 @@ func TestLogic_fk_read_committed(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "fk_read_committed")
+}
+
+func TestLogic_fk_subset_unique(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "fk_subset_unique")
 }
 
 func TestLogic_float(
@@ -1520,6 +1534,13 @@ func TestLogic_pg_extension(
 	runLogicTest(t, "pg_extension")
 }
 
+func TestLogic_pg_locks(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "pg_locks")
+}
+
 func TestLogic_pg_lsn(
 	t *testing.T,
 ) {
@@ -1688,6 +1709,13 @@ func TestLogic_procedure_cte(
 	runLogicTest(t, "procedure_cte")
 }
 
+func TestLogic_procedure_dcl(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure_dcl")
+}
+
 func TestLogic_procedure_ddl(
 	t *testing.T,
 ) {
@@ -1800,6 +1828,13 @@ func TestLogic_refcursor(
 	runLogicTest(t, "refcursor")
 }
 
+func TestLogic_references_privilege(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "references_privilege")
+}
+
 func TestLogic_rename_atomic(
 	t *testing.T,
 ) {
@@ -1861,6 +1896,13 @@ func TestLogic_reset(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "reset")
+}
+
+func TestLogic_resource_group(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "resource_group")
 }
 
 func TestLogic_retry(

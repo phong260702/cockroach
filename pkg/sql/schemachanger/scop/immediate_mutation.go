@@ -904,6 +904,22 @@ type RemoveTypeComment struct {
 	TypeID descpb.ID
 }
 
+// UpsertFunctionComment is used to add a comment to a function (or
+// procedure). Functions and procedures share descriptor space, so a single
+// op covers both.
+type UpsertFunctionComment struct {
+	immediateMutationOp
+	FunctionID descpb.ID
+	Comment    string
+}
+
+// RemoveFunctionComment is used to delete a comment associated with a
+// function (or procedure).
+type RemoveFunctionComment struct {
+	immediateMutationOp
+	FunctionID descpb.ID
+}
+
 // UpsertDatabaseComment is used to add a comment to a database.
 type UpsertDatabaseComment struct {
 	immediateMutationOp
@@ -1095,6 +1111,13 @@ type UpdateUserPrivileges struct {
 type UpdateOwner struct {
 	immediateMutationOp
 	Owner scpb.Owner
+}
+
+// RemoveOwner is a noop. The descriptor drop or the UpdateOwner handles the
+// state change.
+type RemoveOwner struct {
+	immediateMutationOp
+	DescriptorID descpb.ID
 }
 
 type CreateSchemaDescriptor struct {
@@ -1364,4 +1387,53 @@ type RemoveEnumTypeValue struct {
 	TypeID                 descpb.ID
 	PhysicalRepresentation []byte
 	LogicalRepresentation  string
+}
+
+// AddDomainNotNull installs a NOT NULL constraint on a domain type descriptor
+// in the VALIDATING state.
+type AddDomainNotNull struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// MakeValidatedDomainNotNullPublic transitions a domain's NOT NULL constraint
+// from VALIDATING to ENFORCING.
+type MakeValidatedDomainNotNullPublic struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// MakePublicDomainNotNullValidated transitions a domain's NOT NULL constraint
+// from ENFORCING to DROPPING.
+type MakePublicDomainNotNullValidated struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// RemoveDomainNotNull removes the NOT NULL constraint from a domain type
+// descriptor.
+type RemoveDomainNotNull struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// SetDomainConstraintName sets the name of a constraint on a domain type
+// descriptor.
+type SetDomainConstraintName struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+	Name         string
+}
+
+// RemoveDomainConstraintName replaces a constraint's name on a domain type
+// descriptor with a placeholder.
+type RemoveDomainConstraintName struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
 }

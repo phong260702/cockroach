@@ -34,7 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgconn"
 	pgproto3 "github.com/jackc/pgproto3/v2"
 	pgx "github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
@@ -259,7 +261,6 @@ func TestPGPrepareFail(t *testing.T) {
 		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of placeholder $2",
 		"SELECT $1 > 0 AND NOT $1":                  "pq: placeholder $1 already has type int, cannot assign bool",
 		"CREATE TABLE $1 (id INT)":                  "pq: at or near \"1\": syntax error",
-		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <anyelement> (returning <string>)",
 		"SELECT $0 > 0":                             "pq: lexical error: placeholder index must be between 1 and 65536",
 		"SELECT $2 > 0":                             "pq: could not determine data type of placeholder $1",
 		"SELECT 3 + CASE (4) WHEN 4 THEN $1 END":    "pq: could not determine data type of placeholder $1",
@@ -530,7 +531,10 @@ func TestPGPreparedQuery(t *testing.T) {
 		}},
 		{"SHOW CONSTRAINTS FROM system.users", []preparedQueryTest{
 			baseTest.Results("users", "primary", "PRIMARY KEY", "PRIMARY KEY (username ASC)", true).
-				Results("users", "users_user_id_idx", "UNIQUE", "UNIQUE (user_id ASC)", true),
+				Results("users", "users_isRole_not_null", "NOT NULL", "NOT NULL", true).
+				Results("users", "users_user_id_idx", "UNIQUE", "UNIQUE (user_id ASC)", true).
+				Results("users", "users_user_id_not_null", "NOT NULL", "NOT NULL", true).
+				Results("users", "users_username_not_null", "NOT NULL", "NOT NULL", true),
 		}},
 		{"SHOW TIME ZONE", []preparedQueryTest{
 			baseTest.Results("UTC"),
@@ -1800,6 +1804,85 @@ func TestSessionParameters(t *testing.T) {
 			t.Logf("server says %s = %q", test.varName, gotVal)
 			if gotVal != test.val {
 				t.Fatalf("expected %q, got %q", test.val, gotVal)
+			}
+		})
+	}
+}
+
+// TestPgDumpCompatibilityAppNameDefault verifies that connecting with the
+// application_name used by the PostgreSQL dump/restore client tools defaults
+// pg_dump_compatibility to "cockroachdb" (emitting a NOTICE), while an explicit
+// value in the connection string is always honored and ordinary applications
+// are unaffected.
+func TestPgDumpCompatibilityAppNameDefault(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{Insecure: true})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	host, ports, _ := net.SplitHostPort(s.AdvSQLAddr())
+	port, _ := strconv.Atoi(ports)
+
+	baseCfg, err := pgx.ParseConfig(
+		fmt.Sprintf("postgresql://%s@%s:%d/defaultdb?sslmode=disable", username.RootUser, host, port),
+	)
+	require.NoError(t, err)
+	baseCfg.TLSConfig = nil
+
+	testData := []struct {
+		name           string
+		appName        string
+		explicit       string // if non-empty, pg_dump_compatibility sent explicitly
+		expectedCompat string
+		expectNotice   bool
+	}{
+		{name: "pg_dump defaults to cockroachdb", appName: "pg_dump", expectedCompat: "cockroachdb", expectNotice: true},
+		{name: "pg_restore defaults to cockroachdb", appName: "pg_restore", expectedCompat: "cockroachdb", expectNotice: true},
+		{name: "pg_dumpall defaults to cockroachdb", appName: "pg_dumpall", expectedCompat: "cockroachdb", expectNotice: true},
+		{name: "explicit off is honored", appName: "pg_dump", explicit: "off", expectedCompat: "off", expectNotice: false},
+		{name: "explicit postgres is honored", appName: "pg_dump", explicit: "postgres", expectedCompat: "postgres", expectNotice: false},
+		{name: "ordinary app name is unaffected", appName: "psql", expectedCompat: "off", expectNotice: false},
+	}
+
+	for _, test := range testData {
+		t.Run(test.name, func(t *testing.T) {
+			var mu syncutil.Mutex
+			var notices []string
+			cfg := baseCfg.Copy()
+			cfg.RuntimeParams = map[string]string{"application_name": test.appName}
+			if test.explicit != "" {
+				cfg.RuntimeParams["pg_dump_compatibility"] = test.explicit
+			}
+			cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+				mu.Lock()
+				defer mu.Unlock()
+				notices = append(notices, n.Message)
+			}
+
+			db, err := pgx.ConnectConfig(ctx, cfg)
+			require.NoError(t, err)
+			defer func() { _ = db.Close(ctx) }()
+
+			var gotCompat string
+			require.NoError(t, db.QueryRow(ctx, "SHOW pg_dump_compatibility").Scan(&gotCompat))
+			require.Equal(t, test.expectedCompat, gotCompat)
+
+			mu.Lock()
+			defer mu.Unlock()
+			var pgDumpNotices []string
+			for _, msg := range notices {
+				if strings.Contains(msg, "pg_dump_compatibility") {
+					pgDumpNotices = append(pgDumpNotices, msg)
+				}
+			}
+			if test.expectNotice {
+				require.Lenf(t, pgDumpNotices, 1, "notices: %v", notices)
+				require.Contains(t, pgDumpNotices[0], test.appName)
+			} else {
+				require.Emptyf(t, pgDumpNotices, "unexpected notices: %v", notices)
 			}
 		})
 	}

@@ -600,6 +600,24 @@ var (
 	)
 	sqlfmtLen = flag.Int("line-length", tree.DefaultPrettyCfg().LineWidth,
 		"target line length when using -rewrite-sql")
+
+	// metamorphicDisableOptRuleProbability and metamorphicOptimizerCostPerturbation
+	// mirror the testing_optimizer_cost_perturbation and
+	// testing_optimizer_disable_rule_probability session settings used by costfuzz and
+	// unoptimized-query-oracle. They are only applied when
+	// COCKROACH_LOGIC_TEST_OPTIMIZER_METAMORPHIC=true so that logictest files with
+	// fixed query plans are not perturbed during normal CI runs.
+	metamorphicDisableOptRuleProbability = metamorphic.ConstantWithTestChoice(
+		"logictest-disable-opt-rule-probability", float64(0), float64(0.5), float64(1.0))
+	// metamorphicOptimizerCostPerturbation mirrors the range used by costfuzz
+	// (see testing_optimizer_cost_perturbation). 0.1 exercises mild plan
+	// variation while 1.0 stress-tests extreme perturbations.
+	metamorphicOptimizerCostPerturbation = metamorphic.ConstantWithTestChoice(
+		"logictest-optimizer-cost-perturbation", float64(0), float64(0.1), float64(1.0))
+
+	logicTestOptimizerMetamorphicEnabled = envutil.EnvOrDefaultBool(
+		"COCKROACH_LOGIC_TEST_OPTIMIZER_METAMORPHIC", false)
+
 	disableOptRuleProbability = flag.Float64(
 		"disable-opt-rule-probability", 0,
 		"disable transformation rules in the cost-based optimizer with the given probability.")
@@ -613,6 +631,9 @@ var (
 	)
 	defaultWorkmem = flag.Bool("default-workmem", false,
 		"disable randomization of sql.distsql.temp_storage.workmem",
+	)
+	traceOnError = flag.Bool("trace-on-error", false,
+		"enable SQL session tracing for each statement/query and dump the trace to a file on failure",
 	)
 	// globalMVCCRangeTombstone will write a global MVCC range tombstone across
 	// the entire user keyspace during cluster bootstrapping. This should not
@@ -1101,6 +1122,10 @@ type logicTest struct {
 	// traceFile holds the current trace file between "traceon"
 	// and "traceoff" directives.
 	traceFile *os.File
+	// traceDir holds the directory for --trace-on-error output files. It
+	// points to the test's log scope directory so that traces are written
+	// alongside CockroachDB logs and survive test failure.
+	traceDir string
 	// verbose indicate whether -v was passed.
 	verbose bool
 	// perErrorSummary retains the per-error list of failing queries
@@ -1133,6 +1158,13 @@ type logicTest struct {
 	// entire test to be skipped and the below skippedOnRetry to be set to true.
 	skipOnRetry    bool
 	skippedOnRetry bool
+
+	// skippedDueToSnappy is sticky once set: it indicates that the
+	// "Can't find decompressor for snappy" infra flake was detected
+	// (#124966), the testserver cluster has been stopped, and the
+	// remainder of the test should be skipped rather than run further
+	// directives against the dead cluster.
+	skippedDueToSnappy bool
 
 	// declarativeCorpusCollector used to save declarative schema changer state
 	// to disk.
@@ -1185,6 +1217,97 @@ func (t *logicTest) traceStop() {
 		t.traceFile.Close()
 		t.traceFile = nil
 	}
+}
+
+// enableSessionTracing enables SQL session tracing if --trace-on-error is set.
+// It should be called before executing a statement or query. The caller must
+// call disableSessionTracing after execution completes to stop recording.
+func (t *logicTest) enableSessionTracing() {
+	if !*traceOnError {
+		return
+	}
+	if _, err := t.db.Exec("SET TRACING = on"); err != nil {
+		t.t().Logf("warning: could not enable session tracing: %v", err)
+	}
+}
+
+// disableSessionTracing disables SQL session tracing if --trace-on-error is
+// set. It should be called after a statement or query has completed execution,
+// including after all result rows have been consumed and closed. The recorded
+// trace remains available via SHOW TRACE FOR SESSION until the next SET TRACING
+// = on.
+func (t *logicTest) disableSessionTracing() {
+	if !*traceOnError {
+		return
+	}
+	if _, err := t.db.Exec("SET TRACING = off"); err != nil {
+		t.t().Logf("warning: could not disable session tracing: %v", err)
+	}
+}
+
+// dumpSessionTrace retrieves the most recent session trace and writes it to a
+// file. pos is the file:line of the failing directive and sql is the SQL text
+// that was executed. The trace file is written to the test's log scope
+// directory so that it survives test failure.
+func (t *logicTest) dumpSessionTrace(pos, sql string) {
+	if !*traceOnError {
+		return
+	}
+	rows, err := t.db.Query(
+		"SELECT age, message, tag, location, operation FROM [SHOW TRACE FOR SESSION]",
+	)
+	if err != nil {
+		t.t().Logf("warning: could not retrieve session trace: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Session trace for failed statement at %s\n", pos)
+	fmt.Fprintf(&buf, "SQL: %s\n", sql)
+	fmt.Fprintf(&buf, "%s\n", strings.Repeat("-", 80))
+
+	tw := tabwriter.NewWriter(&buf, 0, 1, 2, ' ', 0)
+	fmt.Fprintf(tw, "AGE\tMESSAGE\tTAG\tLOCATION\tOPERATION\n")
+	for rows.Next() {
+		var age, message, tag, location, operation string
+		if err := rows.Scan(&age, &message, &tag, &location, &operation); err != nil {
+			t.t().Logf("warning: error scanning trace row: %v", err)
+			return
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", age, message, tag, location, operation)
+	}
+	if err := tw.Flush(); err != nil {
+		t.t().Logf("warning: error flushing trace writer: %v", err)
+		return
+	}
+	if err := rows.Err(); err != nil {
+		t.t().Logf("warning: error reading trace rows: %v", err)
+		return
+	}
+
+	// Build a short, filesystem-safe name from pos (e.g. "\n/long/path/to/jobs:30").
+	// Use only the base filename and line number to avoid exceeding the OS
+	// filename length limit (255 bytes) with long Bazel sandbox paths.
+	cleanPos := strings.TrimLeft(pos, "\n")
+	if i := strings.LastIndex(cleanPos, "/"); i >= 0 {
+		cleanPos = cleanPos[i+1:]
+	}
+	cleanPos = strings.ReplaceAll(cleanPos, ":", "_")
+
+	// Write to the test's log scope directory so that traces appear
+	// alongside CockroachDB logs and survive test failure.
+	if t.traceDir == "" {
+		t.t().Logf("warning: no trace directory configured; skipping trace dump")
+		return
+	}
+	filename := filepath.Join(t.traceDir, fmt.Sprintf("trace_%s.txt", cleanPos))
+
+	if err := os.WriteFile(filename, buf.Bytes(), 0644); err != nil {
+		t.t().Logf("warning: could not write trace file: %v", err)
+		return
+	}
+	t.t().Logf("session trace written to %s", filename)
 }
 
 // substituteVars replaces all occurrences of "$abc", where "abc" is a variable
@@ -1483,6 +1606,8 @@ func (t *logicTest) handleWaitForInitErr(ts testserver.TestServer, err error) {
 			if ts != nil {
 				ts.Stop()
 			}
+			t.skippedDueToSnappy = true
+			t.testserverCluster = nil
 			t.t().Skip("ignoring init did not finish for node error due to snappy error")
 		}
 	}
@@ -1531,12 +1656,15 @@ func (t *logicTest) newCluster(
 		return st
 	}
 	setSQLTestingKnobs := func(knobs *base.TestingKnobs) {
+		disableProb, costPerturb := optimizerTestingKnobValues(
+			serverArgs, *disableOptRuleProbability, *optimizerCostPerturbation,
+		)
 		knobs.SQLEvalContext = &eval.TestingKnobs{
 			AssertBinaryExprReturnTypes:     true,
 			AssertUnaryExprReturnTypes:      true,
 			AssertFuncExprReturnTypes:       true,
-			DisableOptimizerRuleProbability: *disableOptRuleProbability,
-			OptimizerCostPerturbation:       *optimizerCostPerturbation,
+			DisableOptimizerRuleProbability: disableProb,
+			OptimizerCostPerturbation:       costPerturb,
 			ForceProductionValues:           serverArgs.ForceProductionValues,
 			UnsafeOverride: func() *bool {
 				v := t.allowUnsafe.Load()
@@ -2403,6 +2531,9 @@ func (t *logicTest) processTestFile(path string, config logictestbase.TestCluste
 		if *maxErrs > 0 && t.failures >= *maxErrs {
 			break
 		}
+		if t.skippedDueToSnappy {
+			break
+		}
 		// If subtest has no name, then it is not a subtest, so just run the lines
 		// in the overall test. Note that this can only happen in the first subtest.
 		if len(subtest.name) == 0 {
@@ -2422,6 +2553,10 @@ func (t *logicTest) processTestFile(path string, config logictestbase.TestCluste
 			})
 			t.maybeSkipOnRetry(nil)
 		}
+	}
+	if t.skippedDueToSnappy && !t.rootT.Failed() {
+		skip.IgnoreLintf(t.rootT,
+			"skipping remainder of test due to snappy infra flake; see #124966")
 	}
 
 	if (*rewriteResultsInTestfiles || *rewriteSQL) && !t.rootT.Failed() {
@@ -2859,6 +2994,9 @@ func (t *logicTest) processSubtest(
 			}
 			if !s.Skip {
 				for i := 0; i < repeat; i++ {
+					if !stmt.expectAsync {
+						t.enableSessionTracing()
+					}
 					var cont bool
 					var err error
 					if t.retry {
@@ -2871,7 +3009,11 @@ func (t *logicTest) processSubtest(
 					} else {
 						cont, err = t.execStatement(stmt, disableCFMutator)
 					}
+					if !stmt.expectAsync {
+						t.disableSessionTracing()
+					}
 					if err != nil {
+						t.dumpSessionTrace(stmt.pos, stmt.sql)
 						if !cont {
 							return err
 						}
@@ -3185,6 +3327,11 @@ func (t *logicTest) processSubtest(
 			}
 
 			if !s.Skip {
+				// Save the original SQL before kvtrace rewrites it to
+				// a filtering SELECT. We use this for trace-on-error so
+				// the trace dump labels the original statement.
+				origSQL := query.sql
+
 				if query.kvtrace {
 					_, err := t.db.Exec("SET TRACING=on,kv")
 					if err != nil {
@@ -3244,12 +3391,19 @@ func (t *logicTest) processSubtest(
 				}
 
 				for i := 0; i < repeat; i++ {
+					// Enable session tracing unless the query already manages
+					// its own tracing (kvtrace, noticetrace) or runs async.
+					traceThis := !query.kvtrace && !query.noticetrace && !query.expectAsync
+					if traceThis {
+						t.enableSessionTracing()
+					}
+					var queryErr error
 					if t.retry && !*rewriteResultsInTestfiles {
 						if err := testutils.SucceedsWithinError(func() error {
 							t.purgeZoneConfig()
 							return t.execQuery(query)
 						}, t.retryDuration); err != nil {
-							t.Error(err)
+							queryErr = err
 						}
 					} else {
 						if t.retry && *rewriteResultsInTestfiles {
@@ -3261,8 +3415,19 @@ func (t *logicTest) processSubtest(
 							time.Sleep(time.Second * 2)
 						}
 						if err := t.execQuery(query); err != nil {
-							t.Error(err)
+							queryErr = err
 						}
+					}
+					if traceThis {
+						t.disableSessionTracing()
+					}
+					if queryErr != nil {
+						// For kvtrace queries, the session trace from the
+						// original statement is still available because the
+						// filtering SELECT doesn't start a new trace. Pass
+						// origSQL so the dump labels the actual statement.
+						t.dumpSessionTrace(query.pos, origSQL)
+						t.Error(queryErr)
 					}
 				}
 			} else {
@@ -3931,7 +4096,8 @@ func (t *logicTest) execQuery(query logicQuery) error {
 				} else if pgErr := (*pq.Error)(nil); errors.As(execErr, &pgErr) &&
 					(pgcode.MakeCode(string(pgErr.Code)) == pgcode.Syntax ||
 						pgcode.MakeCode(string(pgErr.Code)) == pgcode.InvalidParameterValue ||
-						pgcode.MakeCode(string(pgErr.Code)) == pgcode.InvalidTextRepresentation) {
+						pgcode.MakeCode(string(pgErr.Code)) == pgcode.InvalidTextRepresentation ||
+						pgcode.MakeCode(string(pgErr.Code)) == pgcode.DatatypeMismatch) {
 					prep, execErr = t.db.Prepare(p.SQL)
 					args = []interface{}{}
 				}
@@ -4705,6 +4871,35 @@ type TestServerArgs struct {
 	BatchBytesLimitLowerBound int64
 	// If set, sql.distsql.direct_columnar_scans.enabled is set to false.
 	DisableDirectColumnarScans bool
+	// If set, testing optimizer perturbation knobs are forced to 0. This is
+	// needed for tests with fixed query plans in expected output (e.g. EXPLAIN
+	// tests and SQLite logic tests).
+	DisableOptimizerPerturbations bool
+}
+
+func optimizerTestingKnobValues(
+	serverArgs TestServerArgs, disableFlag, costFlag float64,
+) (disableProb, costPerturb float64) {
+	disableProb = disableFlag
+	costPerturb = costFlag
+	if serverArgs.ForceProductionValues || serverArgs.DisableOptimizerPerturbations {
+		return 0, 0
+	}
+	if logicTestOptimizerMetamorphicEnabled {
+		// Only apply the metamorphic constant when no explicit non-zero value
+		// was passed via the command-line flag. This lets callers override the
+		// metamorphic behaviour (e.g. -disable-opt-rule-probability=0.3) while
+		// still getting metamorphic defaults in unattended runs. Note: the
+		// metamorphic constant itself may be 0 (one of its valid choices), in
+		// which case the assignment is a no-op.
+		if disableProb == 0 {
+			disableProb = metamorphicDisableOptRuleProbability
+		}
+		if costPerturb == 0 {
+			costPerturb = metamorphicOptimizerCostPerturbation
+		}
+	}
+	return disableProb, costPerturb
 }
 
 // RunLogicTests runs logic tests for all files matching the given glob.
@@ -4790,6 +4985,7 @@ func RunLogicTest(
 		perErrorSummary:            make(map[string][]string),
 		rng:                        rng,
 		declarativeCorpusCollector: cc,
+		traceDir:                   logScope.GetDirectory(),
 	}
 	lt.allowUnsafe.Store(true)
 	if *printErrorSummary {

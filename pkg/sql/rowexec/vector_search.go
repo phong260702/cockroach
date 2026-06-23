@@ -71,6 +71,9 @@ func newVectorSearchProcessor(
 	rerankMultiplier := int(flowCtx.EvalCtx.SessionData().VectorSearchRerankMultiplier)
 	v.searcher.Init(flowCtx.EvalCtx,
 		idx, flowCtx.Txn, &spec.GetFullVectorsFetchSpec, searchBeamSize, maxResults, rerankMultiplier)
+	if mgr, ok := flowCtx.Cfg.VecIndexManager.(*vecindex.Manager); ok {
+		v.searcher.SetTestingKnobs(mgr.TestingKnobs())
+	}
 	colTypes := make([]*types.T, len(v.fetchSpec.FetchedColumns))
 	for i, col := range v.fetchSpec.FetchedColumns {
 		colTypes[i] = col.Type
@@ -111,7 +114,7 @@ func newVectorSearchProcessor(
 
 // Start is part of the RowSource interface.
 func (v *vectorSearchProcessor) Start(ctx context.Context) {
-	v.StartInternal(
+	_ = v.StartInternal(
 		ctx, "vector search", &v.contentionEventsListener,
 		&v.scanStatsListener, &v.tenantConsumptionListener,
 	)
@@ -194,7 +197,7 @@ func (v *vectorSearchProcessor) execStatsForTrace() *execinfrapb.ComponentStats 
 			BytesRead:           optional.MakeUint(uint64(kvStats.KVBytesRead)),
 			KVPairsRead:         optional.MakeUint(uint64(kvStats.KVPairsRead)),
 			KVTime:              optional.MakeTimeValue(kvStats.KVTime),
-			KVCPUTime:           optional.MakeTimeValue(time.Duration(kvStats.KVCPUTime)),
+			LocalKVCPUTime:      optional.MakeTimeValue(time.Duration(kvStats.LocalKVCPUTime)),
 			ContentionTime:      optional.MakeTimeValue(v.contentionEventsListener.GetContentionTime()),
 			LockWaitTime:        optional.MakeTimeValue(v.contentionEventsListener.GetLockWaitTime()),
 			LatchWaitTime:       optional.MakeTimeValue(v.contentionEventsListener.GetLatchWaitTime()),
@@ -217,6 +220,7 @@ func (v *vectorSearchProcessor) generateMeta() []execinfrapb.ProducerMetadata {
 
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.KVCPUTime = kvStats.KVCPUTime
+	meta.Metrics.LocalKVCPUTime = kvStats.LocalKVCPUTime
 	meta.Metrics.BytesRead = kvStats.KVBytesRead
 
 	// Currently, vector search is not distributed, but when distribution
@@ -275,6 +279,9 @@ func newVectorMutationSearchProcessor(
 		return nil, err
 	}
 	v.searcher.Init(flowCtx.EvalCtx, idx, flowCtx.Txn, &spec.GetFullVectorsFetchSpec)
+	if mgr, ok := flowCtx.Cfg.VecIndexManager.(*vecindex.Manager); ok {
+		v.searcher.SetTestingKnobs(mgr.TestingKnobs())
+	}
 
 	// Pass through the input columns, and add the partition column and optional
 	// quantized vector column.
@@ -476,7 +483,7 @@ func (v *vectorMutationSearchProcessor) execStatsForTrace() *execinfrapb.Compone
 			BytesRead:           optional.MakeUint(uint64(kvStats.KVBytesRead)),
 			KVPairsRead:         optional.MakeUint(uint64(kvStats.KVPairsRead)),
 			KVTime:              optional.MakeTimeValue(kvStats.KVTime),
-			KVCPUTime:           optional.MakeTimeValue(time.Duration(kvStats.KVCPUTime)),
+			LocalKVCPUTime:      optional.MakeTimeValue(time.Duration(kvStats.LocalKVCPUTime)),
 			ContentionTime:      optional.MakeTimeValue(v.contentionEventsListener.GetContentionTime()),
 			LockWaitTime:        optional.MakeTimeValue(v.contentionEventsListener.GetLockWaitTime()),
 			LatchWaitTime:       optional.MakeTimeValue(v.contentionEventsListener.GetLatchWaitTime()),
@@ -497,6 +504,7 @@ func (v *vectorMutationSearchProcessor) generateMeta() []execinfrapb.ProducerMet
 
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.KVCPUTime = kvStats.KVCPUTime
+	meta.Metrics.LocalKVCPUTime = kvStats.LocalKVCPUTime
 	meta.Metrics.BytesRead = kvStats.KVBytesRead
 
 	// Currently, vector mutation search is not distributed, but when

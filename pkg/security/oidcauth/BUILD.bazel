@@ -40,6 +40,7 @@ go_library(
 
 go_test(
     name = "oidcauth_test",
+    size = "medium",
     srcs = [
         "authentication_oidc_test.go",
         "authorization_oidc_test.go",
@@ -50,7 +51,6 @@ go_test(
     embed = [":oidcauth"],
     deps = [
         "//pkg/base",
-        "//pkg/ccl",
         "//pkg/roachpb",
         "//pkg/security/certnames",
         "//pkg/security/provisioning",

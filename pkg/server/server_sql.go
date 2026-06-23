@@ -94,6 +94,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/rangeprober"
 	"github.com/cockroachdb/cockroach/pkg/sql/regions"
+	"github.com/cockroachdb/cockroach/pkg/sql/resourcegroupcache"
 	"github.com/cockroachdb/cockroach/pkg/sql/rolemembershipcache"
 	"github.com/cockroachdb/cockroach/pkg/sql/scheduledlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
@@ -428,6 +429,12 @@ type sqlServerArgs struct {
 
 	// tenantTimeSeriesServer is used to make TSDB queries by the DB Console.
 	tenantTimeSeriesServer *ts.TenantServer
+
+	// timeSeriesQuerier exposes the TSDB to SQL through
+	// crdb_internal.tsdb_query generator builtin.
+	// For the system tenant this wraps *ts.Server;
+	// For secondary tenants it wraps *ts.TenantServer.
+	timeSeriesQuerier eval.TimeSeriesQuerier
 
 	tenantCapabilitiesReader sql.SystemTenantOnly[tenantcapabilities.Reader]
 }
@@ -808,6 +815,11 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	rangeStatsFetcher := rangestats.NewFetcher(cfg.db)
 
 	vecIndexManager := vecindex.NewManager(ctx, cfg.stopper, &cfg.Settings.SV, codec, cfg.internalDB)
+
+	if vecIndexKnobs, ok := cfg.TestingKnobs.VecIndexTestingKnobs.(*vecindex.VecIndexTestingKnobs); ok && vecIndexKnobs != nil {
+		vecIndexManager.SetTestingKnobs(vecIndexKnobs)
+	}
+
 	cfg.registry.AddMetricStruct(vecIndexManager.Metrics())
 
 	// Set up the DistSQL server.
@@ -934,7 +946,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 
 	var isAvailable func(sqlInstanceID base.SQLInstanceID) bool
-	nodeLiveness, hasNodeLiveness := cfg.nodeLiveness.Optional(47900)
+	nodeLiveness, hasNodeLiveness := cfg.nodeLiveness.Optional()
 	if hasNodeLiveness {
 		isAvailable = func(sqlInstanceID base.SQLInstanceID) bool {
 			return nodeLiveness.GetNodeVitalityFromCache(roachpb.NodeID(sqlInstanceID)).IsLive(livenesspb.DistSQL)
@@ -1003,6 +1015,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		SQLLiveness:             cfg.sqlLivenessProvider,
 		JobRegistry:             jobRegistry,
 		VirtualSchemas:          virtualSchemas,
+		TimeSeriesQuerier:       cfg.timeSeriesQuerier,
 		HistogramWindowInterval: cfg.HistogramWindowInterval(),
 		RangeDescriptorCache:    cfg.distSender.RangeDescriptorCache(),
 		RoleMemberCache: rolemembershipcache.NewMembershipCache(
@@ -1051,16 +1064,18 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		),
 
 		TableStatsCache: stats.NewTableStatisticsCache(
-			cfg.TableStatCacheSize,
+			ctx,
 			cfg.Settings,
 			cfg.internalDB,
 			cfg.stopper,
+			serverCacheMemoryMonitor,
 		),
 
 		QueryCache: querycache.New(cfg.QueryCacheSize),
 		StatementHintsCache: hints.NewStatementHintsCache(
 			cfg.clock, cfg.rangeFeedFactory, cfg.stopper, codec, cfg.internalDB, cfg.Settings,
 		),
+		ResourceGroupCache:         resourcegroupcache.New(),
 		VecIndexManager:            vecIndexManager,
 		RowMetrics:                 &rowMetrics,
 		InternalRowMetrics:         &internalRowMetrics,
@@ -2008,6 +2023,16 @@ func (s *SQLServer) startLicenseEnforcer(ctx context.Context, knobs base.Testing
 	if err != nil {
 		log.Dev.Warningf(ctx, "failed to start the license enforcer: %v", err)
 	}
+
+	// TODO(sadaf-crl): Start the vCPU audit writer here once system.vcpu_hours_audit
+	// is created and writeVCPUAuditRecord is wired up with a real SQL INSERT.
+	// Only start for the system tenant since audit records go to a system table.
+	//   if s.execCfg.Codec.ForSystemTenant() {
+	//     nodeID := s.execCfg.NodeInfo.NodeID.SQLInstanceID()
+	//     if err := licenseEnforcer.StartVCPUAuditWriter(ctx, s.stopper, nodeID); err != nil {
+	//       log.Dev.Warningf(ctx, "failed to start vCPU audit writer: %v", err)
+	//     }
+	//   }
 }
 
 func (s *SQLServer) disableLicenseEnforcement(ctx context.Context) {

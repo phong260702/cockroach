@@ -8,7 +8,7 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -531,11 +531,7 @@ func newAlterFunctionDependentObjectsError(
 	operation, detail string, fnDesc *funcdesc.Mutable, dependentObjects []redact.RedactableString,
 ) error {
 	joined := redact.Join(", ", dependentObjects)
-	err := errors.UnimplementedErrorf(
-		errors.IssueLink{
-			IssueURL: build.MakeIssueURL(83233),
-			Detail:   detail,
-		},
+	err := unimplemented.NewWithIssueDetailf(83233, detail,
 		"cannot %s function %q because other objects ([%s]) still depend on it",
 		operation, fnDesc.Name, joined.StripMarkers())
 	return errors.WithSafeDetails(err, "dependents: %s", joined)
@@ -556,7 +552,15 @@ func getFuncRefsDisallowingAlter(
 		}
 		switch t := desc.(type) {
 		case catalog.TableDescriptor:
-			if !t.IsView() && len(dep.TriggerIDs) == 0 && len(dep.PolicyIDs) == 0 {
+			// Trigger and policy back-references only block renames/schema
+			// changes once the cluster version reaches V26_3_Start. During
+			// a rolling upgrade from v26.2, some nodes may not enforce this
+			// check, so we skip it until all nodes are guaranteed to agree.
+			checkTriggerPolicyDeps := params.p.ExecCfg().Settings.Version.IsActive(
+				params.ctx, clusterversion.V26_3_Start,
+			)
+			hasTriggerPolicyDeps := len(dep.TriggerIDs) > 0 || len(dep.PolicyIDs) > 0
+			if !t.IsView() && !(checkTriggerPolicyDeps && hasTriggerPolicyDeps) {
 				continue
 			}
 			fullyResolvedName, err := params.p.GetQualifiedTableNameByID(

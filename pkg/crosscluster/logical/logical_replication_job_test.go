@@ -1718,7 +1718,7 @@ func TestCreateTableSkipForeignKeys(t *testing.T) {
 		}
 
 		if !skipFKs {
-			destDB.ExpectErr(t, "invalid outbound foreign key", stmt, aURL.String())
+			destDB.ExpectErr(t, "not in the replication set", stmt, aURL.String())
 			return
 		}
 
@@ -2200,7 +2200,8 @@ func TestLogicalReplicationPlanner(t *testing.T) {
 	})
 	t.Run("generatePlan uses the latest replicated time for planning", func(t *testing.T) {
 		replicatedTime := hlc.Timestamp{WallTime: 142}
-		require.NoError(t, sj.Job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		require.NoError(t, sj.Job.DeprecatedNoTxn().Update(ctx, func(txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
 			prog := md.Progress.Details.(*jobspb.Progress_LogicalReplication).LogicalReplication
 			prog.ReplicatedTime = replicatedTime
 			ju.UpdateProgress(md.Progress)
@@ -2530,6 +2531,8 @@ func TestLogicalReplicationSchemaChanges(t *testing.T) {
 
 		// Drop table is blocked
 		{"drop table", "DROP TABLE tab", false},
+		// Drop database cascade is blocked.
+		{"drop database cascade", "DROP DATABASE a CASCADE", false},
 
 		// Dissalow storage param updates if is not the only change.
 		{"disable schema locked", "ALTER TABLE tab SET (schema_locked = false)", true},
@@ -3112,6 +3115,7 @@ func TestSchemaValidation(t *testing.T) {
 		name        string
 		sourceSetup []string
 		destSetup   []string
+		mode        string
 		expectedErr string
 	}
 
@@ -3251,6 +3255,19 @@ func TestSchemaValidation(t *testing.T) {
 			},
 			expectedErr: "cannot create logical replication stream: RefCursor is not supported by LDR",
 		},
+		{
+			name: "txn_mode_virtual_computed_in_unique_index",
+			mode: "transactional",
+			destSetup: []string{
+				"ALTER TABLE tab ADD COLUMN virtual_col INT AS (pk + 1) VIRTUAL",
+				"CREATE UNIQUE INDEX virtual_idx ON tab(virtual_col)",
+			},
+			sourceSetup: []string{
+				"ALTER TABLE tab ADD COLUMN virtual_col INT AS (pk + 1) VIRTUAL",
+				"CREATE UNIQUE INDEX virtual_idx ON tab(virtual_col)",
+			},
+			expectedErr: "cannot create logical replication stream: table tab has a virtual computed column virtual_col that is a key of unique index virtual_idx",
+		},
 	}
 
 	for i, tc := range validationTests {
@@ -3277,10 +3294,14 @@ func TestSchemaValidation(t *testing.T) {
 				dbSource.Exec(t, sql)
 			}
 
+			mode := tc.mode
+			if mode == "" {
+				mode = "validated"
+			}
 			dbDest.ExpectErr(
 				t,
 				tc.expectedErr,
-				"CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = 'validated'",
+				fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = '%s'", mode),
 				sourceURL.String(),
 			)
 			replicationtestutils.WaitForAllProducerJobsToFail(t, dbSource)

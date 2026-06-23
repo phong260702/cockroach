@@ -110,6 +110,7 @@ func (f SingleNodeTestClusterFactory) Run(
 // Start implements the TestServerFactory interface.
 func (f SingleNodeTestClusterFactory) Start(ctx context.Context, t *testing.T) TestServer {
 	args := base.TestServerArgs{
+		ExternalIODir: t.TempDir(),
 		Knobs: base.TestingKnobs{
 			SQLEvalContext: &eval.TestingKnobs{
 				ForceProductionValues: true,
@@ -162,7 +163,7 @@ func newJobsKnobs() *jobs.TestingKnobs {
 	}{
 		m: make(map[jobspb.JobID]struct{}),
 	}
-	jobKnobs.BeforeUpdate = func(orig, updated jobs.JobMetadata) error {
+	jobKnobs.BeforeUpdate = func(orig, updated jobs.DeprecatedJobMetadata) error {
 		sc := orig.Payload.GetNewSchemaChange()
 		if sc == nil {
 			return nil

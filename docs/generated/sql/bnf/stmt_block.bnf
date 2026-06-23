@@ -82,9 +82,14 @@ comment_stmt ::=
 	| 'COMMENT' 'ON' 'SCHEMA' qualifiable_schema_name 'IS' comment_text
 	| 'COMMENT' 'ON' 'TYPE' type_name 'IS' comment_text
 	| 'COMMENT' 'ON' 'TABLE' table_name 'IS' comment_text
+	| 'COMMENT' 'ON' 'VIEW' view_name 'IS' comment_text
+	| 'COMMENT' 'ON' 'SEQUENCE' sequence_name 'IS' comment_text
 	| 'COMMENT' 'ON' 'COLUMN' column_path 'IS' comment_text
 	| 'COMMENT' 'ON' 'INDEX' table_index_name 'IS' comment_text
 	| 'COMMENT' 'ON' 'CONSTRAINT' constraint_name 'ON' table_name 'IS' comment_text
+	| 'COMMENT' 'ON' 'FUNCTION' function_with_paramtypes 'IS' comment_text
+	| 'COMMENT' 'ON' 'PROCEDURE' function_with_paramtypes 'IS' comment_text
+	| 'COMMENT' 'ON' 'ROUTINE' function_with_paramtypes 'IS' comment_text
 
 execute_stmt ::=
 	'EXECUTE' table_alias_name execute_param_clause
@@ -203,6 +208,7 @@ legacy_end_stmt ::=
 alter_stmt ::=
 	alter_ddl_stmt
 	| alter_external_connection_stmt
+	| alter_resource_group_stmt
 	| alter_role_stmt
 	| alter_virtual_cluster_stmt
 
@@ -224,6 +230,7 @@ create_stmt ::=
 	| create_changefeed_stmt
 	| create_extension_stmt
 	| create_external_connection_stmt
+	| create_resource_group_stmt
 	| create_logical_replication_stream_stmt
 	| create_schedule_stmt
 
@@ -236,8 +243,10 @@ delete_stmt ::=
 drop_stmt ::=
 	drop_ddl_stmt
 	| drop_role_stmt
+	| drop_provisioned_roles_stmt
 	| drop_schedule_stmt
 	| drop_external_connection_stmt
+	| drop_resource_group_stmt
 
 explain_stmt ::=
 	'EXPLAIN' explainable_stmt
@@ -307,6 +316,8 @@ show_stmt ::=
 	| show_create_stmt
 	| show_create_schedules_stmt
 	| show_create_external_connections_stmt
+	| show_resource_group_stmt
+	| show_resource_groups_stmt
 	| show_databases_stmt
 	| show_enums_stmt
 	| show_external_connections_stmt
@@ -399,6 +410,12 @@ qualifiable_schema_name ::=
 type_name ::=
 	db_object_name
 
+view_name ::=
+	table_name
+
+sequence_name ::=
+	db_object_name
+
 column_path ::=
 	name
 	| prefixed_column_path
@@ -409,6 +426,10 @@ table_index_name ::=
 
 constraint_name ::=
 	name
+
+function_with_paramtypes ::=
+	db_object_name func_params
+	| db_object_name
 
 table_alias_name ::=
 	name
@@ -480,9 +501,6 @@ savepoint_name ::=
 opt_concurrently ::=
 	'CONCURRENTLY'
 	| 
-
-view_name ::=
-	table_name
 
 opt_as_of_clause ::=
 	as_of_clause
@@ -598,6 +616,7 @@ alter_ddl_stmt ::=
 	| alter_partition_stmt
 	| alter_schema_stmt
 	| alter_type_stmt
+	| alter_domain_stmt
 	| alter_default_privileges_stmt
 	| alter_changefeed_stmt
 	| alter_backup_stmt
@@ -610,6 +629,10 @@ alter_ddl_stmt ::=
 alter_external_connection_stmt ::=
 	'ALTER' 'EXTERNAL' 'CONNECTION' label_spec 'AS' string_or_placeholder
 	| 'ALTER' 'EXTERNAL' 'CONNECTION' 'IF' 'EXISTS' label_spec 'AS' string_or_placeholder
+
+alter_resource_group_stmt ::=
+	'ALTER' 'RESOURCE' 'GROUP' name with_resource_group_options
+	| 'ALTER' 'RESOURCE' 'GROUP' 'IF' 'EXISTS' name with_resource_group_options
 
 alter_role_stmt ::=
 	'ALTER' role_or_group_or_user role_spec opt_role_options
@@ -695,6 +718,10 @@ create_extension_stmt ::=
 create_external_connection_stmt ::=
 	'CREATE' 'EXTERNAL' 'CONNECTION' label_spec 'AS' string_or_placeholder
 
+create_resource_group_stmt ::=
+	'CREATE' 'RESOURCE' 'GROUP' name with_resource_group_options
+	| 'CREATE' 'RESOURCE' 'GROUP' 'IF' 'NOT' 'EXISTS' name with_resource_group_options
+
 create_logical_replication_stream_stmt ::=
 	'CREATE' 'LOGICALLY' 'REPLICATED' logical_replication_resources 'FROM' logical_replication_resources 'ON' string_or_placeholder opt_logical_replication_create_table_options
 
@@ -753,12 +780,19 @@ drop_role_stmt ::=
 	'DROP' role_or_group_or_user role_spec_list
 	| 'DROP' role_or_group_or_user 'IF' 'EXISTS' role_spec_list
 
+drop_provisioned_roles_stmt ::=
+	'DROP' 'PROVISIONED' 'ROLES' opt_with_drop_provisioned_roles_options opt_limit_clause
+
 drop_schedule_stmt ::=
 	'DROP' 'SCHEDULE' a_expr
 	| 'DROP' 'SCHEDULES' select_stmt
 
 drop_external_connection_stmt ::=
 	'DROP' 'EXTERNAL' 'CONNECTION' string_or_placeholder
+
+drop_resource_group_stmt ::=
+	'DROP' 'RESOURCE' 'GROUP' name
+	| 'DROP' 'RESOURCE' 'GROUP' 'IF' 'EXISTS' name
 
 explainable_stmt ::=
 	preparable_stmt
@@ -925,6 +959,12 @@ show_create_schedules_stmt ::=
 show_create_external_connections_stmt ::=
 	'SHOW' 'CREATE' 'ALL' 'EXTERNAL' 'CONNECTIONS'
 	| 'SHOW' 'CREATE' 'EXTERNAL' 'CONNECTION' string_or_placeholder
+
+show_resource_group_stmt ::=
+	'SHOW' 'RESOURCE' 'GROUP' name
+
+show_resource_groups_stmt ::=
+	'SHOW' 'RESOURCE' 'GROUPS'
 
 show_databases_stmt ::=
 	'SHOW' 'DATABASES' with_comment
@@ -1146,6 +1186,10 @@ index_name ::=
 standalone_index_name ::=
 	db_object_name
 
+func_params ::=
+	'(' func_params_list ')'
+	| '(' ')'
+
 unreserved_keyword ::=
 	'ABORT'
 	| 'ABSOLUTE'
@@ -1299,6 +1343,7 @@ unreserved_keyword ::=
 	| 'GRANTEE'
 	| 'GRANTS'
 	| 'GROUPS'
+	| 'HANDLER'
 	| 'HASH'
 	| 'HEADER'
 	| 'HIGH'
@@ -1320,6 +1365,7 @@ unreserved_keyword ::=
 	| 'INDEXES'
 	| 'INHERITS'
 	| 'INJECT'
+	| 'INLINE'
 	| 'INPUT'
 	| 'INSERT'
 	| 'INSPECT'
@@ -1464,8 +1510,10 @@ unreserved_keyword ::=
 	| 'PRIORITY'
 	| 'PRIVILEGES'
 	| 'PUSH'
+	| 'PROCEDURAL'
 	| 'PROCEDURE'
 	| 'PROCEDURES'
+	| 'PROVISIONED'
 	| 'PROVISIONSRC'
 	| 'PUBLIC'
 	| 'PUBLICATION'
@@ -1498,6 +1546,7 @@ unreserved_keyword ::=
 	| 'REPLICATION'
 	| 'RESET'
 	| 'RESOLVED'
+	| 'RESOURCE'
 	| 'RESTART'
 	| 'RESTORE'
 	| 'RESTRICT'
@@ -1514,6 +1563,7 @@ unreserved_keyword ::=
 	| 'ROLES'
 	| 'ROLLBACK'
 	| 'ROLLUP'
+	| 'ROUTINE'
 	| 'ROUTINES'
 	| 'ROWS'
 	| 'RULE'
@@ -1629,6 +1679,7 @@ unreserved_keyword ::=
 	| 'USERS'
 	| 'VALID'
 	| 'VALIDATE'
+	| 'VALIDATOR'
 	| 'VALUE'
 	| 'VARIABLES'
 	| 'VARYING'
@@ -1735,6 +1786,7 @@ privilege ::=
 	name
 	| 'CREATE'
 	| 'GRANT'
+	| 'REFERENCES'
 	| 'SELECT'
 
 type_name_list ::=
@@ -1850,6 +1902,23 @@ alter_type_stmt ::=
 	| 'ALTER' 'TYPE' type_name 'SET' 'SCHEMA' schema_name
 	| 'ALTER' 'TYPE' type_name 'OWNER' 'TO' role_spec
 
+alter_domain_stmt ::=
+	'ALTER' 'DOMAIN' type_name 'SET' 'DEFAULT' a_expr
+	| 'ALTER' 'DOMAIN' type_name 'DROP' 'DEFAULT'
+	| 'ALTER' 'DOMAIN' type_name 'SET' 'NOT' 'NULL'
+	| 'ALTER' 'DOMAIN' type_name 'DROP' 'NOT' 'NULL'
+	| 'ALTER' 'DOMAIN' type_name 'ADD' 'CONSTRAINT' name 'CHECK' '(' a_expr ')' opt_validate_behavior
+	| 'ALTER' 'DOMAIN' type_name 'ADD' 'CHECK' '(' a_expr ')' opt_validate_behavior
+	| 'ALTER' 'DOMAIN' type_name 'ADD' 'CONSTRAINT' name 'NOT' 'NULL' opt_validate_behavior
+	| 'ALTER' 'DOMAIN' type_name 'ADD' 'NOT' 'NULL' opt_validate_behavior
+	| 'ALTER' 'DOMAIN' type_name 'DROP' 'CONSTRAINT' 'IF' 'EXISTS' constraint_name opt_drop_behavior
+	| 'ALTER' 'DOMAIN' type_name 'DROP' 'CONSTRAINT' constraint_name opt_drop_behavior
+	| 'ALTER' 'DOMAIN' type_name 'RENAME' 'CONSTRAINT' constraint_name 'TO' constraint_name
+	| 'ALTER' 'DOMAIN' type_name 'VALIDATE' 'CONSTRAINT' constraint_name
+	| 'ALTER' 'DOMAIN' type_name 'OWNER' 'TO' role_spec
+	| 'ALTER' 'DOMAIN' type_name 'RENAME' 'TO' name
+	| 'ALTER' 'DOMAIN' type_name 'SET' 'SCHEMA' schema_name
+
 alter_default_privileges_stmt ::=
 	'ALTER' 'DEFAULT' 'PRIVILEGES' opt_for_roles opt_in_schemas abbreviated_grant_stmt
 	| 'ALTER' 'DEFAULT' 'PRIVILEGES' opt_for_roles opt_in_schemas abbreviated_revoke_stmt
@@ -1888,6 +1957,9 @@ alter_job_stmt ::=
 label_spec ::=
 	string_or_placeholder
 	| 'IF' 'NOT' 'EXISTS' string_or_placeholder
+
+with_resource_group_options ::=
+	'WITH' '(' resource_group_option_list ')'
 
 role_or_group_or_user ::=
 	'ROLE'
@@ -1956,8 +2028,8 @@ create_table_stmt ::=
 	| 'CREATE' opt_persistence_temp_table 'TABLE' 'IF' 'NOT' 'EXISTS' table_name '(' opt_table_elem_list ')' opt_partition_by_table opt_table_with opt_create_table_on_commit opt_locality
 
 create_table_as_stmt ::=
-	'CREATE' opt_persistence_temp_table 'TABLE' table_name create_as_opt_col_list opt_table_with 'AS' select_stmt opt_create_table_on_commit
-	| 'CREATE' opt_persistence_temp_table 'TABLE' 'IF' 'NOT' 'EXISTS' table_name create_as_opt_col_list opt_table_with 'AS' select_stmt opt_create_table_on_commit
+	'CREATE' opt_persistence_temp_table 'TABLE' table_name create_as_opt_col_list opt_table_with 'AS' select_stmt opt_create_as_data opt_create_table_on_commit
+	| 'CREATE' opt_persistence_temp_table 'TABLE' 'IF' 'NOT' 'EXISTS' table_name create_as_opt_col_list opt_table_with 'AS' select_stmt opt_create_as_data opt_create_table_on_commit
 
 create_type_stmt ::=
 	'CREATE' 'TYPE' type_name 'AS' 'ENUM' '(' opt_enum_val_list ')'
@@ -2117,6 +2189,10 @@ drop_policy_stmt ::=
 	'DROP' 'POLICY' name 'ON' table_name opt_drop_behavior
 	| 'DROP' 'POLICY' 'IF' 'EXISTS' name 'ON' table_name opt_drop_behavior
 
+opt_with_drop_provisioned_roles_options ::=
+	'WITH' drop_provisioned_roles_options_list
+	| 
+
 explain_option_name ::=
 	non_reserved_word
 
@@ -2148,6 +2224,7 @@ typename ::=
 
 collation_name ::=
 	unrestricted_name
+	| unrestricted_name '.' unrestricted_name
 
 opt_asymmetric ::=
 	'ASYMMETRIC'
@@ -2415,9 +2492,8 @@ unrestricted_name ::=
 	| type_func_name_keyword
 	| reserved_keyword
 
-function_with_paramtypes ::=
-	db_object_name func_params
-	| db_object_name
+func_params_list ::=
+	( routine_param ) ( ( ',' routine_param ) )*
 
 transaction_mode ::=
 	transaction_iso_level
@@ -2629,6 +2705,10 @@ opt_add_val_placement ::=
 	| 'AFTER' 'SCONST'
 	| 
 
+opt_validate_behavior ::=
+	'NOT' 'VALID'
+	| 
+
 opt_in_schemas ::=
 	'IN' 'SCHEMA' schema_name_list
 	| 
@@ -2686,6 +2766,9 @@ opt_policy_exprs ::=
 	| 'WITH' 'CHECK' '(' a_expr ')'
 	| 'USING' '(' a_expr ')'
 	| 
+
+resource_group_option_list ::=
+	( resource_group_option ) ( ( ',' resource_group_option ) )*
 
 role_options ::=
 	( role_option ) ( ( role_option ) )*
@@ -2866,6 +2949,9 @@ create_as_opt_col_list ::=
 	'(' create_as_table_defs ')'
 	| 
 
+opt_create_as_data ::=
+	'WITH' 'NO' 'DATA'
+
 opt_enum_val_list ::=
 	enum_val_list
 	| 
@@ -2891,9 +2977,6 @@ opt_view_with ::=
 opt_with_data ::=
 	'WITH' 'DATA'
 	| 
-
-sequence_name ::=
-	db_object_name
 
 opt_sequence_option_list ::=
 	sequence_option_list
@@ -3071,6 +3154,9 @@ view_name_list ::=
 
 sequence_name_list ::=
 	db_object_name_list
+
+drop_provisioned_roles_options_list ::=
+	( drop_provisioned_roles_option ) ( ( ',' drop_provisioned_roles_option ) )*
 
 non_reserved_word ::=
 	'identifier'
@@ -3366,9 +3452,12 @@ reserved_keyword ::=
 	| 'WITH'
 	| cockroachdb_extra_reserved_keyword
 
-func_params ::=
-	'(' func_params_list ')'
-	| '(' ')'
+routine_param ::=
+	routine_param_class param_name routine_param_type
+	| param_name routine_param_class routine_param_type
+	| param_name routine_param_type
+	| routine_param_class routine_param_type
+	| routine_param_type
 
 transaction_iso_level ::=
 	'ISOLATION' 'LEVEL' iso_level
@@ -3489,6 +3578,9 @@ alter_backup_schedule_cmd ::=
 	| 'SET' 'SCHEDULE' 'OPTION' kv_option
 	| 'EXECUTE' 'IMMEDIATELY'
 	| 'EXECUTE' 'FULL' 'IMMEDIATELY'
+
+resource_group_option ::=
+	name '=' var_value
 
 role_option ::=
 	'CREATEROLE'
@@ -3742,6 +3834,10 @@ only_signed_fconst ::=
 db_object_name_list ::=
 	( db_object_name ) ( ( ',' db_object_name ) )*
 
+drop_provisioned_roles_option ::=
+	'SOURCE' '=' a_expr
+	| 'LAST' 'LOGIN' 'BEFORE' a_expr
+
 array_subscript ::=
 	'[' a_expr ']'
 	| '[' opt_slice_bound ':' opt_slice_bound ']'
@@ -3891,8 +3987,14 @@ type_func_name_no_crdb_extra_keyword ::=
 	| 'RIGHT'
 	| 'SIMILAR'
 
-func_params_list ::=
-	( routine_param ) ( ( ',' routine_param ) )*
+routine_param_class ::=
+	'IN'
+	| 'OUT'
+	| 'INOUT'
+	| 'IN' 'OUT'
+
+param_name ::=
+	type_function_name
 
 iso_level ::=
 	'READ' 'UNCOMMITTED'
@@ -4109,9 +4211,6 @@ routine_body_stmt ::=
 	stmt_without_legacy_transaction
 	| routine_return_stmt
 
-param_name ::=
-	type_function_name
-
 trigger_transition ::=
 	transition_is_new transition_is_row opt_as table_alias_name
 
@@ -4322,6 +4421,7 @@ bare_label_keywords ::=
 	| 'GREATEST'
 	| 'GROUPING'
 	| 'GROUPS'
+	| 'HANDLER'
 	| 'HASH'
 	| 'HEADER'
 	| 'HIGH'
@@ -4352,6 +4452,7 @@ bare_label_keywords ::=
 	| 'INHERITS'
 	| 'INITIALLY'
 	| 'INJECT'
+	| 'INLINE'
 	| 'INNER'
 	| 'INOUT'
 	| 'INPUT'
@@ -4524,8 +4625,10 @@ bare_label_keywords ::=
 	| 'PRIORITY'
 	| 'PRIVILEGES'
 	| 'PUSH'
+	| 'PROCEDURAL'
 	| 'PROCEDURE'
 	| 'PROCEDURES'
+	| 'PROVISIONED'
 	| 'PROVISIONSRC'
 	| 'PUBLIC'
 	| 'PUBLICATION'
@@ -4560,6 +4663,7 @@ bare_label_keywords ::=
 	| 'REPLICATION'
 	| 'RESET'
 	| 'RESOLVED'
+	| 'RESOURCE'
 	| 'RESTART'
 	| 'RESTORE'
 	| 'RESTRICT'
@@ -4577,6 +4681,7 @@ bare_label_keywords ::=
 	| 'ROLES'
 	| 'ROLLBACK'
 	| 'ROLLUP'
+	| 'ROUTINE'
 	| 'ROUTINES'
 	| 'ROW'
 	| 'ROWS'
@@ -4714,6 +4819,7 @@ bare_label_keywords ::=
 	| 'USING'
 	| 'VALID'
 	| 'VALIDATE'
+	| 'VALIDATOR'
 	| 'VALUE'
 	| 'VALUES'
 	| 'VARBIT'
@@ -4895,13 +5001,6 @@ opt_nowait_or_skip ::=
 wildcard_pattern ::=
 	name '.' '*'
 
-routine_param ::=
-	routine_param_class param_name routine_param_type
-	| param_name routine_param_class routine_param_type
-	| param_name routine_param_type
-	| routine_param_class routine_param_type
-	| routine_param_type
-
 opt_column ::=
 	'COLUMN'
 	| 
@@ -4951,10 +5050,6 @@ opt_alter_column_using ::=
 table_constraint ::=
 	'CONSTRAINT' constraint_name constraint_elem
 	| constraint_elem
-
-opt_validate_behavior ::=
-	'NOT' 'VALID'
-	| 
 
 constraint_elem ::=
 	'CHECK' '(' a_expr ')'
@@ -5150,12 +5245,6 @@ group_by_item ::=
 window_definition ::=
 	window_name 'AS' window_specification
 
-routine_param_class ::=
-	'IN'
-	| 'OUT'
-	| 'INOUT'
-	| 'IN' 'OUT'
-
 col_qual_list ::=
 	(  ) ( ( col_qualification ) )*
 
@@ -5316,8 +5405,7 @@ col_qualification_elem ::=
 	| 'DEFAULT' b_expr
 	| 'ON' 'UPDATE' b_expr
 	| 'REFERENCES' table_name opt_name_parens key_match reference_actions
-	| generated_as '(' a_expr ')' 'STORED'
-	| generated_as '(' a_expr ')' 'VIRTUAL'
+	| generated_as '(' a_expr ')' opt_virtual_or_stored
 	| generated_always_as 'IDENTITY' '(' opt_sequence_option_list ')'
 	| generated_by_default_as 'IDENTITY' '(' opt_sequence_option_list ')'
 	| generated_always_as 'IDENTITY'
@@ -5344,3 +5432,8 @@ opt_name_parens ::=
 generated_as ::=
 	'AS'
 	| generated_always_as
+
+opt_virtual_or_stored ::=
+	'STORED'
+	| 'VIRTUAL'
+	| 

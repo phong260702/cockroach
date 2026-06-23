@@ -1,6 +1,6 @@
 initial-keys tenant=system
 ----
-159 keys:
+166 keys:
  /Table/3/1/1/2/1
  /Table/3/1/3/2/1
  /Table/3/1/4/2/1
@@ -72,6 +72,9 @@ initial-keys tenant=system
  /Table/3/1/78/2/1
  /Table/3/1/79/2/1
  /Table/3/1/80/2/1
+ /Table/3/1/81/2/1
+ /Table/3/1/82/2/1
+ /Table/3/1/83/2/1
  /Table/5/1/0/2/1
  /Table/5/1/1/2/1
  /Table/5/1/11/2/1
@@ -119,6 +122,8 @@ initial-keys tenant=system
  /NamespaceTable/30/1/1/29/"replication_critical_localities"/4/1
  /NamespaceTable/30/1/1/29/"replication_stats"/4/1
  /NamespaceTable/30/1/1/29/"reports_meta"/4/1
+ /NamespaceTable/30/1/1/29/"resource_group_id_seq"/4/1
+ /NamespaceTable/30/1/1/29/"resource_groups"/4/1
  /NamespaceTable/30/1/1/29/"role_id_seq"/4/1
  /NamespaceTable/30/1/1/29/"role_members"/4/1
  /NamespaceTable/30/1/1/29/"role_options"/4/1
@@ -156,11 +161,13 @@ initial-keys tenant=system
  /NamespaceTable/30/1/1/29/"transaction_statistics"/4/1
  /NamespaceTable/30/1/1/29/"ui"/4/1
  /NamespaceTable/30/1/1/29/"users"/4/1
+ /NamespaceTable/30/1/1/29/"vcpu_usage"/4/1
  /NamespaceTable/30/1/1/29/"web_sessions"/4/1
  /NamespaceTable/30/1/1/29/"zones"/4/1
  /Table/48/1/0/0
  /Table/63/1/0/0
-76 splits:
+ /Table/82/1/0/0
+79 splits:
  /Table/3
  /Table/4
  /Table/5
@@ -237,10 +244,13 @@ initial-keys tenant=system
  /Table/78
  /Table/79
  /Table/80
+ /Table/81
+ /Table/82
+ /Table/83
 
 initial-keys tenant=5
 ----
-150 keys:
+157 keys:
  /Tenant/5/Table/3/1/1/2/1
  /Tenant/5/Table/3/1/3/2/1
  /Tenant/5/Table/3/1/4/2/1
@@ -312,6 +322,9 @@ initial-keys tenant=5
  /Tenant/5/Table/3/1/78/2/1
  /Tenant/5/Table/3/1/79/2/1
  /Tenant/5/Table/3/1/80/2/1
+ /Tenant/5/Table/3/1/81/2/1
+ /Tenant/5/Table/3/1/82/2/1
+ /Tenant/5/Table/3/1/83/2/1
  /Tenant/5/Table/5/1/0/2/1
  /Tenant/5/Table/7/1/0/0
  /Tenant/5/Table/8/1/1/0
@@ -350,6 +363,8 @@ initial-keys tenant=5
  /Tenant/5/NamespaceTable/30/1/1/29/"replication_critical_localities"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"replication_stats"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"reports_meta"/4/1
+ /Tenant/5/NamespaceTable/30/1/1/29/"resource_group_id_seq"/4/1
+ /Tenant/5/NamespaceTable/30/1/1/29/"resource_groups"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"role_id_seq"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"role_members"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"role_options"/4/1
@@ -387,17 +402,19 @@ initial-keys tenant=5
  /Tenant/5/NamespaceTable/30/1/1/29/"transaction_statistics"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"ui"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"users"/4/1
+ /Tenant/5/NamespaceTable/30/1/1/29/"vcpu_usage"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"web_sessions"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"zones"/4/1
  /Tenant/5/Table/48/1/0/0
  /Tenant/5/Table/63/1/0/0
+ /Tenant/5/Table/82/1/0/0
 2 splits:
  /Tenant/5
  /Tenant/6
 
 initial-keys tenant=5
 ----
-150 keys:
+157 keys:
  /Tenant/5/Table/3/1/1/2/1
  /Tenant/5/Table/3/1/3/2/1
  /Tenant/5/Table/3/1/4/2/1
@@ -469,6 +486,9 @@ initial-keys tenant=5
  /Tenant/5/Table/3/1/78/2/1
  /Tenant/5/Table/3/1/79/2/1
  /Tenant/5/Table/3/1/80/2/1
+ /Tenant/5/Table/3/1/81/2/1
+ /Tenant/5/Table/3/1/82/2/1
+ /Tenant/5/Table/3/1/83/2/1
  /Tenant/5/Table/5/1/0/2/1
  /Tenant/5/Table/7/1/0/0
  /Tenant/5/Table/8/1/1/0
@@ -507,6 +527,8 @@ initial-keys tenant=5
  /Tenant/5/NamespaceTable/30/1/1/29/"replication_critical_localities"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"replication_stats"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"reports_meta"/4/1
+ /Tenant/5/NamespaceTable/30/1/1/29/"resource_group_id_seq"/4/1
+ /Tenant/5/NamespaceTable/30/1/1/29/"resource_groups"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"role_id_seq"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"role_members"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"role_options"/4/1
@@ -544,17 +566,19 @@ initial-keys tenant=5
  /Tenant/5/NamespaceTable/30/1/1/29/"transaction_statistics"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"ui"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"users"/4/1
+ /Tenant/5/NamespaceTable/30/1/1/29/"vcpu_usage"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"web_sessions"/4/1
  /Tenant/5/NamespaceTable/30/1/1/29/"zones"/4/1
  /Tenant/5/Table/48/1/0/0
  /Tenant/5/Table/63/1/0/0
+ /Tenant/5/Table/82/1/0/0
 2 splits:
  /Tenant/5
  /Tenant/6
 
 initial-keys tenant=999
 ----
-150 keys:
+157 keys:
  /Tenant/999/Table/3/1/1/2/1
  /Tenant/999/Table/3/1/3/2/1
  /Tenant/999/Table/3/1/4/2/1
@@ -626,6 +650,9 @@ initial-keys tenant=999
  /Tenant/999/Table/3/1/78/2/1
  /Tenant/999/Table/3/1/79/2/1
  /Tenant/999/Table/3/1/80/2/1
+ /Tenant/999/Table/3/1/81/2/1
+ /Tenant/999/Table/3/1/82/2/1
+ /Tenant/999/Table/3/1/83/2/1
  /Tenant/999/Table/5/1/0/2/1
  /Tenant/999/Table/7/1/0/0
  /Tenant/999/Table/8/1/1/0
@@ -664,6 +691,8 @@ initial-keys tenant=999
  /Tenant/999/NamespaceTable/30/1/1/29/"replication_critical_localities"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"replication_stats"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"reports_meta"/4/1
+ /Tenant/999/NamespaceTable/30/1/1/29/"resource_group_id_seq"/4/1
+ /Tenant/999/NamespaceTable/30/1/1/29/"resource_groups"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"role_id_seq"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"role_members"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"role_options"/4/1
@@ -701,10 +730,12 @@ initial-keys tenant=999
  /Tenant/999/NamespaceTable/30/1/1/29/"transaction_statistics"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"ui"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"users"/4/1
+ /Tenant/999/NamespaceTable/30/1/1/29/"vcpu_usage"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"web_sessions"/4/1
  /Tenant/999/NamespaceTable/30/1/1/29/"zones"/4/1
  /Tenant/999/Table/48/1/0/0
  /Tenant/999/Table/63/1/0/0
+ /Tenant/999/Table/82/1/0/0
 2 splits:
  /Tenant/999
  /Tenant/1000

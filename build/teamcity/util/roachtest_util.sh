@@ -7,17 +7,7 @@
 
 # Set up Google credentials. Note that we need this for all clouds since we upload
 # perf artifacts to Google Storage at the end.
-if [[ "$GOOGLE_EPHEMERAL_CREDENTIALS" ]]; then
-  echo "$GOOGLE_EPHEMERAL_CREDENTIALS" > creds.json
-  gcloud auth activate-service-account --key-file=creds.json
-  export ROACHPROD_USER=teamcity
-
-  # Set GOOGLE_APPLICATION_CREDENTIALS so that gcp go libraries can find it.
-  export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/creds.json"
-else
-  echo 'warning: GOOGLE_EPHEMERAL_CREDENTIALS not set' >&2
-  echo "Assuming that you've run \`gcloud auth login\` from inside the builder." >&2
-fi
+gcs_setup_credentials
 
 # defines get_host_arch
 source  $root/build/teamcity/util/roachtest_arch_util.sh
@@ -26,14 +16,15 @@ source  $root/build/teamcity/util/roachtest_arch_util.sh
 # date at the time of the start of the run (which identifies the version of the
 # code run best).
 stats_dir="$(date +"%Y%m%d")-${TC_BUILD_ID}"
-stats_file_name="stats.json"
+# NOTE: when adding entries here, also extend the `find` invocation in
+# upload_stats below; it indexes this array explicitly.
+stats_file_names=("stats.json" "summary_stats.json" "aggregated_stats.json" "phases.json")
 
 # Provide a default value for EXPORT_OPENMETRICS if it is not set
 EXPORT_OPENMETRICS="${EXPORT_OPENMETRICS:-false}"
 
 if [[ "${EXPORT_OPENMETRICS}" == "true" ]]; then
-  # Use * to upload aggregated and other stats file
-  stats_file_name="*stats.om"
+  stats_file_names=("stats.om" "summary_stats.om" "aggregated_stats.om" "phases.om")
 fi
 
 COMMIT_SHA=$(git rev-parse --short HEAD)
@@ -64,12 +55,12 @@ function upload_stats {
       remote_artifacts_dir="${remote_artifacts_dir}-fips"
     fi
 
-    # The ${stats_file_name} files need some path translation:
-    #     ${artifacts}/path/to/test/${stats_file_name}
+    # The ${stats_file_names} files need some path translation:
+    #     ${artifacts}/path/to/test/${stats_file_names}
     # to
-    #     gs://${bucket}/artifacts/${stats_dir}/path/to/test/${stats_file_name}
+    #     gs://${bucket}/artifacts/${stats_dir}/path/to/test/${stats_file_names}
     #
-    # `find` below will expand "{}" as ./path/to/test/${stats_file_name}. We need
+    # `find` below will expand "{}" as ./path/to/test/${stats_file_names}. We need
     # to bend over backwards to remove the `./` prefix or gsutil will have
     # a `.` folder in ${stats_dir}, which we don't want.
     (cd "${artifacts}" && \
@@ -86,7 +77,7 @@ function upload_stats {
           fi
           gsutil cp "${f}" "gs://${bucket}/${artifacts_dir}/${stats_dir}/${f}"
         fi
-      done <<< "$(find . -name "${stats_file_name}" | sed 's/^\.\///')")
+      done <<< "$(find . \( -name "${stats_file_names[0]}" -o -name "${stats_file_names[1]}" -o -name "${stats_file_names[2]}" -o -name "${stats_file_names[3]}" \) | sed 's/^\.\///')")
   fi
 }
 
@@ -112,7 +103,7 @@ function upload_all {
   upload_stats
 }
 
-# Upload any ${stats_file_name} we can find, and some binaries, no matter what happens.
+# Upload any ${stats_file_names} we can find, and some binaries, no matter what happens.
 trap upload_all EXIT
 
 # Set up the parameters for the roachtest invocation.

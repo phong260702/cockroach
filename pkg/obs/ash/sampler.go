@@ -228,7 +228,6 @@ func (s *Sampler) run(ctx context.Context) {
 	for {
 		select {
 		case <-timer.C:
-			timer.Read = true
 			timer.Reset(time.Duration(s.interval.Load()))
 			if Enabled.Get(&s.st.SV) {
 				s.takeSample(ctx)
@@ -540,7 +539,7 @@ func encodeWorkloadID(id uint64, typ workloadid.WorkloadType) string {
 		return strconv.FormatUint(id, 10)
 	case workloadid.WorkloadTypeSystem:
 		return workloadid.WorkloadID(id).Name()
-	default: // WorkloadTypeUnknown + WorkloadTypeStatement
+	default: // WorkloadTypeUnknown, WorkloadTypeStatement, WorkloadTypeCommit
 		return encodeStmtFingerprintIDToString(id)
 	}
 }

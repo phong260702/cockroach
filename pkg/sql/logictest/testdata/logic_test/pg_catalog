@@ -363,7 +363,8 @@ table_name  index_name  non_unique  seq_in_index  column_name  definition  direc
 query TTTTB colnames
 SHOW CONSTRAINTS FROM pg_catalog.pg_namespace
 ----
-table_name  constraint_name  constraint_type  details  validated
+table_name    constraint_name                constraint_type  details   validated
+pg_namespace  pg_namespace_nspname_not_null  NOT NULL         NOT NULL  true
 
 query TTTTTB colnames
 SHOW GRANTS ON pg_catalog.pg_namespace
@@ -636,7 +637,6 @@ t6_expr_expr1_idx  public   false        0          1546506610  2631952481  0
 t6_expr_key        public   false        0          1546506610  2631952481  0
 t6_expr_idx1       public   false        0          1546506610  2631952481  0
 mv1                public   true         0          1546506610  0           0
-mv1_pkey           public   false        0          1546506610  2631952481  0
 
 query TIRIOBBT colnames,rowsort
 SELECT relname, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence
@@ -669,7 +669,6 @@ t6_expr_expr1_idx  NULL      NULL       0              0              false     
 t6_expr_key        NULL      NULL       0              0              false        false        p
 t6_expr_idx1       NULL      NULL       0              0              false        false        p
 mv1                NULL      NULL       0              0              true         false        p
-mv1_pkey           NULL      NULL       0              0              false        false        p
 
 query TBTIIBB colnames,rowsort
 SELECT relname, relistemp, relkind, relnatts, relchecks, relhasoids, relhaspkey
@@ -702,7 +701,6 @@ t6_expr_expr1_idx  false      i        2         0          false       false
 t6_expr_key        false      i        1         0          false       false
 t6_expr_idx1       false      i        1         0          false       false
 mv1                false      m        2         0          false       true
-mv1_pkey           false      i        1         0          false       false
 
 query TBBBITTT colnames,rowsort
 SELECT relname, relhasrules, relhastriggers, relhassubclass, relfrozenxid, relacl, reloptions, relreplident
@@ -735,7 +733,6 @@ t6_expr_expr1_idx  false        false           false           0             NU
 t6_expr_key        false        false           false           0             NULL    NULL                  n
 t6_expr_idx1       false        false           false           0             NULL    NULL                  n
 mv1                false        false           false           0             NULL    NULL                  d
-mv1_pkey           false        false           false           0             NULL    NULL                  n
 
 ## pg_catalog.pg_attribute
 
@@ -810,7 +807,6 @@ t6_expr_key        crdb_internal_idx_expr_1      25        NULL           -1    
 t6_expr_idx1       crdb_internal_idx_expr_2      16        NULL           1       1       0         -1
 mv1                ?column?                      20        NULL           8       1       0         -1
 mv1                rowid                         20        NULL           8       2       0         -1
-mv1_pkey           rowid                         20        NULL           8       1       0         -1
 
 query TTIBTTBBTT colnames,rowsort
 SELECT c.relname, attname, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attidentity, attgenerated
@@ -883,7 +879,6 @@ t6_expr_key        crdb_internal_idx_expr_1      -1         NULL      NULL      
 t6_expr_idx1       crdb_internal_idx_expr_2      -1         NULL      NULL        NULL      false       true       ·            v
 mv1                ?column?                      -1         NULL      NULL        NULL      false       false      ·            ·
 mv1                rowid                         -1         NULL      NULL        NULL      true        true       ·            ·
-mv1_pkey           rowid                         -1         NULL      NULL        NULL      true        true       ·            ·
 
 query TTBBITTT colnames,rowsort
 SELECT c.relname, attname, attisdropped, attislocal, attinhcount, attacl, attoptions, attfdwoptions
@@ -956,7 +951,6 @@ t6_expr_key        crdb_internal_idx_expr_1      false         true        0    
 t6_expr_idx1       crdb_internal_idx_expr_2      false         true        0            NULL    NULL        NULL
 mv1                ?column?                      false         true        0            NULL    NULL        NULL
 mv1                rowid                         false         true        0            NULL    NULL        NULL
-mv1_pkey           rowid                         false         true        0            NULL    NULL        NULL
 
 # Regression test for #163948: dropped columns should have atttypid=0, so they
 # are filtered out by joins with pg_type (matching PostgreSQL behavior).
@@ -1009,7 +1003,6 @@ WHERE n.nspname = 'public'
 ORDER BY relname
 ----
 mv_test         m  d
-mv_test_pkey    i  n
 seq_test        S  n
 tbl_test        r  d
 tbl_test_pkey   i  n
@@ -1118,7 +1111,6 @@ crdb_oid    schemaname  tablename  indexname          tablespace
 2129466854  public      t6         t6_expr_expr1_idx  NULL
 2129466848  public      t6         t6_expr_key        NULL
 2129466850  public      t6         t6_expr_idx1       NULL
-784389845   public      mv1        mv1_pkey           NULL
 
 query OTTT colnames
 SELECT crdb_oid, tablename, indexname, indexdef
@@ -1127,7 +1119,6 @@ WHERE schemaname = 'public'
 ORDER BY tablename, indexname
 ----
 crdb_oid    tablename  indexname          indexdef
-784389845   mv1        mv1_pkey           CREATE UNIQUE INDEX mv1_pkey ON public.mv1 USING btree (rowid ASC)
 3687884464  t1         index_key          CREATE UNIQUE INDEX index_key ON public.t1 USING btree (b ASC, c ASC)
 3687884465  t1         t1_a_key           CREATE UNIQUE INDEX t1_a_key ON public.t1 USING btree (a ASC)
 3687884466  t1         t1_pkey            CREATE UNIQUE INDEX t1_pkey ON public.t1 USING btree (p ASC)
@@ -1354,6 +1345,7 @@ indexrelid  indrelid  indnatts  indisunique  indnullsnotdistinct  indisprimary  
 1396653708  67        2         false        false                false         false           false         false           true        false         true        true       false           9 2                                                          0 0                        0 0            1 2            NULL      NULL                                                                                                                2
 1396653709  67        2         false        false                false         false           false         false           true        false         true        true       false           10 2                                                         0 0                        0 0            1 2            NULL      NULL                                                                                                                2
 1396653711  67        2         true         false                true          false           true          false           true        false         true        true       false           1 2                                                          0 0                        0 0            2 2            NULL      NULL                                                                                                                2
+1443049375  83        3         true         false                true          false           true          false           true        false         true        true       false           1 2 3                                                        0 3403232968 0             0 0 0          2 2 2          NULL      NULL                                                                                                                3
 1489445036  35        11        false        false                false         false           false         false           true        false         true        true       false           2 1 3 6 7 8 9 10 11 12 13                                    0 0                        0 0            2 2            NULL      NULL                                                                                                                2
 1489445039  35        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 1535840703  51        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
@@ -1380,8 +1372,7 @@ indexrelid  indrelid  indnatts  indisunique  indnullsnotdistinct  indisprimary  
 2361445174  8         1         false        false                false         false           false         false           true        false         true        true       false           6                                                            0                          0              2              NULL      NULL                                                                                                                1
 2361445175  8         1         true         false                false         false           true          false           true        false         true        true       false           4                                                            3403232968                 0              2              NULL      NULL                                                                                                                1
 2407840836  24        3         true         false                true          false           true          false           true        false         true        true       false           1 2 3                                                        0 0 0                      0 0 0          2 2 2          NULL      NULL                                                                                                                3
-2435598784  79        4         true         false                false         false           true          false           true        false         true        true       false           2 3 4 5                                                      0                          0              2              NULL      NULL                                                                                                                1
-2435598785  79        1         false        false                false         false           false         false           true        false         true        true       false           3                                                            3403232968                 0              2              NULL      NULL                                                                                                                1
+2435598784  79        1         false        false                false         false           false         false           true        false         true        true       false           2                                                            3403232968                 0              2              NULL      NULL                                                                                                                1
 2435598787  79        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 2528390115  47        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 2574785779  63        1         false        false                true          false           false         false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
@@ -1396,11 +1387,14 @@ indexrelid  indrelid  indnatts  indisunique  indnullsnotdistinct  indisprimary  
 2741730716  66        3         false        false                false         false           false         false           true        false         true        true       false           3 10 11                                                      0 0 0                      0 0 0          2 1 1          NULL      NULL                                                                                                                3
 2741730717  66        1         false        false                false         false           false         false           true        false         true        true       false           2                                                            0                          0              2              NULL      NULL                                                                                                                1
 2741730718  66        2         true         false                true          false           true          false           true        false         true        true       false           4 2                                                          3403232968 0               0 0            2 2            NULL      NULL                                                                                                                2
+2788126382  82        1         false        false                true          false           false         false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 2834522046  34        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 2880917710  50        2         true         false                true          false           true          false           true        false         true        true       false           1 2                                                          0 3403232968               0 0            2 2            NULL      NULL                                                                                                                2
 3001466989  65        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 3001466990  65        1         false        false                false         false           false         false           true        false         true        true       false           2                                                            0                          0              2              NULL      NULL                                                                                                                1
 3001466991  65        3         false        false                false         false           false         false           true        false         true        true       false           23 6 7                                                       0 0 0                      0 0 0          2 1 1          NULL      NULL                                                                                                                3
+3047862653  81        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
+3047862654  81        1         true         false                false         false           true          false           true        false         true        true       false           2                                                            3403232968                 0              2              NULL      NULL                                                                                                                1
 3094258317  33        2         true         false                true          false           true          false           true        false         true        true       false           1 2                                                          3403232968 3403232968      0 0            2 2            NULL      NULL                                                                                                                2
 3094258318  33        1         false        false                false         false           false         false           true        false         true        true       false           4                                                            0                          0              2              NULL      NULL                                                                                                                1
 3261203256  68        2         true         false                true          false           true          false           true        false         true        true       false           1 2                                                          0 0                        0 0            2 1            NULL      NULL                                                                                                                2
@@ -1544,6 +1538,9 @@ indexrelid  operator_argument_type_oid  operator_argument_position
 1396653709  0                           2
 1396653711  0                           1
 1396653711  0                           2
+1443049375  0                           1
+1443049375  0                           2
+1443049375  0                           3
 1489445036  0                           1
 1489445036  0                           2
 1489445039  0                           1
@@ -1582,7 +1579,6 @@ indexrelid  operator_argument_type_oid  operator_argument_position
 2407840836  0                           2
 2407840836  0                           3
 2435598784  0                           1
-2435598785  0                           1
 2435598787  0                           1
 2528390115  0                           1
 2574785779  0                           1
@@ -1608,6 +1604,7 @@ indexrelid  operator_argument_type_oid  operator_argument_position
 2741730717  0                           1
 2741730718  0                           1
 2741730718  0                           2
+2788126382  0                           1
 2834522046  0                           1
 2880917710  0                           1
 2880917710  0                           2
@@ -1616,6 +1613,8 @@ indexrelid  operator_argument_type_oid  operator_argument_position
 3001466991  0                           1
 3001466991  0                           2
 3001466991  0                           3
+3047862653  0                           1
+3047862654  0                           1
 3094258317  0                           1
 3094258317  0                           2
 3094258318  0                           1
@@ -1738,28 +1737,37 @@ FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-conname        connamespace  contype  condef
-t1_pkey        109           p        PRIMARY_KEY_(p_ASC)
-t1_a_key       109           u        UNIQUE_(a_ASC)
-index_key      109           u        UNIQUE_(b_ASC,_c_ASC)
-primary        109           p        PRIMARY_KEY_(value_ASC)
-primary        109           p        PRIMARY_KEY_(value_ASC)
-t2_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-fk             109           f        FOREIGN_KEY_(t1_id)_REFERENCES_t1(a)
-t3_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-check_b        109           c        CHECK_((b_>_11))
-check_c        109           c        CHECK_((c_!=_''::text))
-fk             109           f        FOREIGN_KEY_(a,_b)_REFERENCES_t1(b,_c)
-t4_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-unique_a       109           u        UNIQUE_WITHOUT_INDEX_(a)
-uwi_b_c        109           u        UNIQUE_WITHOUT_INDEX_(b,_c)
-uwi_b_partial  109           u        UNIQUE_WITHOUT_INDEX_(b)_WHERE_(c_=_'foo'::text)
-t5_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-fk_b_c         109           f        FOREIGN_KEY_(b,_c)_REFERENCES_t4(b,_c)_MATCH_FULL_ON_UPDATE_RESTRICT
-t5_a_fkey      109           f        FOREIGN_KEY_(a)_REFERENCES_t4(a)_ON_DELETE_CASCADE
-t6_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-t6_expr_key    109           u        UNIQUE_(lower(c)_ASC)
-mv1_pkey       109           p        PRIMARY_KEY_(rowid_ASC)
+conname                  connamespace  contype  condef
+t1_pkey                  109           p        PRIMARY_KEY_(p_ASC)
+t1_a_key                 109           u        UNIQUE_(a_ASC)
+index_key                109           u        UNIQUE_(b_ASC,_c_ASC)
+t1_p_not_null            109           n        NOT_NULL
+t1_m_not_null            109           n        NOT_NULL
+t1_n_not_null            109           n        NOT_NULL
+primary                  109           p        PRIMARY_KEY_(value_ASC)
+t1_m_seq_value_not_null  109           n        NOT_NULL
+primary                  109           p        PRIMARY_KEY_(value_ASC)
+t1_n_seq_value_not_null  109           n        NOT_NULL
+t2_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+fk                       109           f        FOREIGN_KEY_(t1_id)_REFERENCES_t1(a)
+t2_rowid_not_null        109           n        NOT_NULL
+t3_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+check_b                  109           c        CHECK_((b_>_11))
+check_c                  109           c        CHECK_((c_!=_''::text))
+fk                       109           f        FOREIGN_KEY_(a,_b)_REFERENCES_t1(b,_c)
+t3_rowid_not_null        109           n        NOT_NULL
+t4_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+unique_a                 109           u        UNIQUE_WITHOUT_INDEX_(a)
+uwi_b_c                  109           u        UNIQUE_WITHOUT_INDEX_(b,_c)
+uwi_b_partial            109           u        UNIQUE_WITHOUT_INDEX_(b)_WHERE_(c_=_'foo'::text)
+t4_rowid_not_null        109           n        NOT_NULL
+t5_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+fk_b_c                   109           f        FOREIGN_KEY_(b,_c)_REFERENCES_t4(b,_c)_MATCH_FULL_ON_UPDATE_RESTRICT
+t5_a_fkey                109           f        FOREIGN_KEY_(a)_REFERENCES_t4(a)_ON_DELETE_CASCADE
+t5_rowid_not_null        109           n        NOT_NULL
+t6_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+t6_expr_key              109           u        UNIQUE_(lower(c)_ASC)
+t6_rowid_not_null        109           n        NOT_NULL
 
 query TTBBBOOOB colnames,rowsort
 SELECT conname, contype, condeferrable, condeferred, convalidated, conrelid, contypid, conindid, conenforced
@@ -1767,34 +1775,43 @@ FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-conname        contype  condeferrable  condeferred  convalidated  conrelid  contypid  conindid    conenforced
-t1_pkey        p        false          false        true          110       0         3687884466  true
-t1_a_key       u        false          false        true          110       0         3687884465  true
-index_key      u        false          false        true          110       0         3687884464  true
-primary        p        false          false        true          111       0         2342807459  true
-primary        p        false          false        true          112       0         5181036     true
-t2_pkey        p        false          false        true          113       0         2955071325  true
-fk             f        false          false        true          113       0         3687884465  true
-t3_pkey        p        false          false        true          114       0         2695335054  true
-check_b        c        false          false        true          114       0         0           true
-check_c        c        false          false        true          114       0         0           true
-fk             f        false          false        true          114       0         3687884464  true
-t4_pkey        p        false          false        true          116       0         3214807592  true
-unique_a       u        false          false        true          116       0         0           true
-uwi_b_c        u        false          false        true          116       0         0           true
-uwi_b_partial  u        false          false        true          116       0         0           true
-t5_pkey        p        false          false        true          117       0         1869730585  true
-fk_b_c         f        false          false        true          117       0         0           true
-t5_a_fkey      f        false          false        true          117       0         0           true
-t6_pkey        p        false          false        true          120       0         2129466852  true
-t6_expr_key    u        false          false        true          120       0         2129466848  true
-mv1_pkey       p        false          false        true          121       0         784389845   true
+conname                  contype  condeferrable  condeferred  convalidated  conrelid  contypid  conindid    conenforced
+t1_pkey                  p        false          false        true          110       0         3687884466  true
+t1_a_key                 u        false          false        true          110       0         3687884465  true
+index_key                u        false          false        true          110       0         3687884464  true
+t1_p_not_null            n        false          false        true          110       0         0           true
+t1_m_not_null            n        false          false        true          110       0         0           true
+t1_n_not_null            n        false          false        true          110       0         0           true
+primary                  p        false          false        true          111       0         2342807459  true
+t1_m_seq_value_not_null  n        false          false        true          111       0         0           true
+primary                  p        false          false        true          112       0         5181036     true
+t1_n_seq_value_not_null  n        false          false        true          112       0         0           true
+t2_pkey                  p        false          false        true          113       0         2955071325  true
+fk                       f        false          false        true          113       0         3687884465  true
+t2_rowid_not_null        n        false          false        true          113       0         0           true
+t3_pkey                  p        false          false        true          114       0         2695335054  true
+check_b                  c        false          false        true          114       0         0           true
+check_c                  c        false          false        true          114       0         0           true
+fk                       f        false          false        true          114       0         3687884464  true
+t3_rowid_not_null        n        false          false        true          114       0         0           true
+t4_pkey                  p        false          false        true          116       0         3214807592  true
+unique_a                 u        false          false        true          116       0         0           true
+uwi_b_c                  u        false          false        true          116       0         0           true
+uwi_b_partial            u        false          false        true          116       0         0           true
+t4_rowid_not_null        n        false          false        true          116       0         0           true
+t5_pkey                  p        false          false        true          117       0         1869730585  true
+fk_b_c                   f        false          false        true          117       0         0           true
+t5_a_fkey                f        false          false        true          117       0         0           true
+t5_rowid_not_null        n        false          false        true          117       0         0           true
+t6_pkey                  p        false          false        true          120       0         2129466852  true
+t6_expr_key              u        false          false        true          120       0         2129466848  true
+t6_rowid_not_null        n        false          false        true          120       0         0           true
 
 query T
 SELECT conname
 FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
-WHERE n.nspname = 'public' AND contype NOT IN ('c', 'f', 'p', 'u')
+WHERE n.nspname = 'public' AND contype NOT IN ('c', 'f', 'n', 'p', 'u')
 ORDER BY con.oid
 ----
 
@@ -1821,7 +1838,6 @@ uwi_b_partial  0          NULL         NULL         NULL
 t5_pkey        0          NULL         NULL         NULL
 t6_pkey        0          NULL         NULL         NULL
 t6_expr_key    0          NULL         NULL         NULL
-mv1_pkey       0          NULL         NULL         NULL
 
 query TOTTT colnames,rowsort
 SELECT conname, confrelid, confupdtype, confdeltype, confmatchtype
@@ -1842,28 +1858,37 @@ FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-conname        conislocal  coninhcount  connoinherit  conkey
-t1_pkey        true        0            true          {1}
-t1_a_key       true        0            true          {2}
-index_key      true        0            true          {3,4}
-primary        true        0            true          {1}
-primary        true        0            true          {1}
-t2_pkey        true        0            true          {2}
-fk             true        0            true          {1}
-t3_pkey        true        0            true          {4}
-check_b        true        0            true          {2}
-check_c        true        0            true          {3}
-fk             true        0            true          {1,2}
-t4_pkey        true        0            true          {4}
-unique_a       true        0            true          NULL
-uwi_b_c        true        0            true          NULL
-uwi_b_partial  true        0            true          NULL
-t5_pkey        true        0            true          {4}
-fk_b_c         true        0            true          {2,3}
-t5_a_fkey      true        0            true          {1}
-t6_pkey        true        0            true          {6}
-t6_expr_key    true        0            true          {7}
-mv1_pkey       true        0            true          {2}
+conname                  conislocal  coninhcount  connoinherit  conkey
+t1_pkey                  true        0            true          {1}
+t1_a_key                 true        0            true          {2}
+index_key                true        0            true          {3,4}
+t1_p_not_null            true        0            false         {1}
+t1_m_not_null            true        0            false         {14}
+t1_n_not_null            true        0            false         {15}
+primary                  true        0            true          {1}
+t1_m_seq_value_not_null  true        0            false         {1}
+primary                  true        0            true          {1}
+t1_n_seq_value_not_null  true        0            false         {1}
+t2_pkey                  true        0            true          {2}
+fk                       true        0            true          {1}
+t2_rowid_not_null        true        0            false         {2}
+t3_pkey                  true        0            true          {4}
+check_b                  true        0            true          {2}
+check_c                  true        0            true          {3}
+fk                       true        0            true          {1,2}
+t3_rowid_not_null        true        0            false         {4}
+t4_pkey                  true        0            true          {4}
+unique_a                 true        0            true          NULL
+uwi_b_c                  true        0            true          NULL
+uwi_b_partial            true        0            true          NULL
+t4_rowid_not_null        true        0            false         {4}
+t5_pkey                  true        0            true          {4}
+fk_b_c                   true        0            true          {2,3}
+t5_a_fkey                true        0            true          {1}
+t5_rowid_not_null        true        0            false         {4}
+t6_pkey                  true        0            true          {6}
+t6_expr_key              true        0            true          {7}
+t6_rowid_not_null        true        0            false         {6}
 
 query TTTTTTTTT colnames
 SELECT conname, confkey, conpfeqop, conppeqop, conffeqop, conexclop, conbin, consrc, pg_get_constraintdef(con.oid) as condef
@@ -1876,7 +1901,6 @@ conname        confkey  conpfeqop  conppeqop  conffeqop  conexclop  conbin      
 check_b        NULL     NULL       NULL       NULL       NULL       (b > 11)         (b > 11)         CHECK ((b > 11))
 check_c        NULL     NULL       NULL       NULL       NULL       (c != ''::text)  (c != ''::text)  CHECK ((c != ''::text))
 index_key      NULL     NULL       NULL       NULL       NULL       NULL             NULL             UNIQUE (b ASC, c ASC)
-mv1_pkey       NULL     NULL       NULL       NULL       NULL       NULL             NULL             PRIMARY KEY (rowid ASC)
 primary        NULL     NULL       NULL       NULL       NULL       NULL             NULL             PRIMARY KEY (value ASC)
 primary        NULL     NULL       NULL       NULL       NULL       NULL             NULL             PRIMARY KEY (value ASC)
 t1_a_key       NULL     NULL       NULL       NULL       NULL       NULL             NULL             UNIQUE (a ASC)
@@ -2854,21 +2878,21 @@ __OID__  pg_proc  __OID__       __OID__   -1      false     c
 
 ## pg_catalog.pg_proc
 
-query TOTOOTTO colnames,rowsort
+query TOTOORRO colnames,rowsort
 SELECT proname, pronamespace, nspname, proowner, prolang, procost, prorows, provariadic
 FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 WHERE proname='substring'
 ----
 proname    pronamespace  nspname     proowner    prolang  procost  prorows  provariadic
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
-substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
+substring  4294967089    pg_catalog  3233629770  12       1        0        0
 
 query TTBB colnames,rowsort
 SELECT proname, prokind, prosecdef, proleakproof
@@ -2891,14 +2915,14 @@ FROM pg_catalog.pg_proc
 WHERE proname='substring'
 ----
 proname    proisstrict  proretset  provolatile  proparallel
-substring  true         false      i            NULL
-substring  true         false      i            NULL
-substring  true         false      i            NULL
-substring  true         false      i            NULL
-substring  true         false      i            NULL
-substring  true         false      i            NULL
-substring  true         false      i            NULL
-substring  true         false      i            NULL
+substring  true         false      i            u
+substring  true         false      i            u
+substring  true         false      i            u
+substring  true         false      i            u
+substring  true         false      i            u
+substring  true         false      i            u
+substring  true         false      i            u
+substring  true         false      i            u
 
 # Verify that proretset is true for set-returning functions.
 query OTBT
@@ -3129,8 +3153,8 @@ query OOOOBBB colnames
 SELECT oid, roleid, member, grantor, admin_option, inherit_option, set_option
 FROM pg_catalog.pg_auth_members
 ----
-oid         roleid      member      grantor  admin_option  inherit_option  set_option
-3818609862  2310524507  1546506610  NULL     true          true            true
+oid         roleid      member      grantor     admin_option  inherit_option  set_option
+3818609862  2310524507  1546506610  2310524507  true          true            true
 
 ## pg_catalog.pg_user
 
@@ -3316,6 +3340,8 @@ distribute_scan_row_count_threshold                              10000          
 distribute_sort_row_count_threshold                              1000                NULL      NULL        NULL        string
 distsql                                                          off                 NULL      NULL        NULL        string
 distsql_plan_gateway_bias                                        2                   NULL      NULL        NULL        string
+distsql_plan_locality_filter                                     ·                   NULL      NULL        NULL        string
+distsql_plan_locality_filter_strict                              off                 NULL      NULL        NULL        string
 distsql_prevent_partitioning_soft_limited_scans                  on                  NULL      NULL        NULL        string
 distsql_use_reduced_leaf_write_sets                              on                  NULL      NULL        NULL        string
 enable_auto_rehoming                                             off                 NULL      NULL        NULL        string
@@ -3344,6 +3370,7 @@ force_savepoint_restart                                          off            
 foreign_key_cascades_limit                                       10000               NULL      NULL        NULL        string
 idle_in_transaction_session_timeout                              0                   NULL      NULL        NULL        string
 idle_session_timeout                                             0                   NULL      NULL        NULL        string
+in_hot_standby                                                   off                 NULL      NULL        NULL        string
 index_join_streamer_batch_size                                   8.0 MiB             NULL      NULL        NULL        string
 index_recommendations_enabled                                    off                 NULL      NULL        NULL        string
 initial_retry_backoff_for_read_committed                         2                   NULL      NULL        NULL        string
@@ -3384,6 +3411,7 @@ optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables  on             
 optimizer_enable_lock_elision                                    on                  NULL      NULL        NULL        string
 optimizer_hoist_uncorrelated_equality_subqueries                 on                  NULL      NULL        NULL        string
 optimizer_inline_any_unnest_subquery                             on                  NULL      NULL        NULL        string
+optimizer_inline_placeholder_equalities                          on                  NULL      NULL        NULL        string
 optimizer_merge_joins_enabled                                    on                  NULL      NULL        NULL        string
 optimizer_min_row_count                                          1                   NULL      NULL        NULL        string
 optimizer_plan_lookup_joins_with_reverse_scans                   on                  NULL      NULL        NULL        string
@@ -3423,7 +3451,7 @@ parallelize_multi_key_lookup_joins_avg_lookup_ratio              10             
 parallelize_multi_key_lookup_joins_avg_lookup_row_size           100 KiB             NULL      NULL        NULL        string
 parallelize_multi_key_lookup_joins_enabled                       off                 NULL      NULL        NULL        string
 parallelize_multi_key_lookup_joins_max_lookup_ratio              10000               NULL      NULL        NULL        string
-parallelize_multi_key_lookup_joins_only_on_mr_mutations          on                  NULL      NULL        NULL        string
+parallelize_multi_key_lookup_joins_only_on_mr_mutations          off                 NULL      NULL        NULL        string
 password_encryption                                              scram-sha-256       NULL      NULL        NULL        string
 pg_dump_compatibility                                            off                 NULL      NULL        NULL        string
 pg_trgm.similarity_threshold                                     0.3                 NULL      NULL        NULL        string
@@ -3438,9 +3466,11 @@ recursion_depth_limit                                            1000           
 register_latch_wait_contention_events                            off                 NULL      NULL        NULL        string
 reorder_joins_limit                                              8                   NULL      NULL        NULL        string
 require_explicit_primary_keys                                    off                 NULL      NULL        NULL        string
+resource_group                                                   ·                   NULL      NULL        NULL        string
 results_buffer_size                                              524288              NULL      NULL        NULL        string
 role                                                             none                NULL      NULL        NULL        string
 row_security                                                     on                  NULL      NULL        NULL        string
+scram_iterations                                                 10610               NULL      NULL        NULL        string
 search_path                                                      "$user", public     NULL      NULL        NULL        string
 serial_normalization                                             rowid               NULL      NULL        NULL        string
 server_encoding                                                  UTF8                NULL      NULL        NULL        string
@@ -3576,6 +3606,8 @@ distribute_scan_row_count_threshold                              10000          
 distribute_sort_row_count_threshold                              1000                NULL  user     NULL      1000                1000
 distsql                                                          off                 NULL  user     NULL      off                 off
 distsql_plan_gateway_bias                                        2                   NULL  user     NULL      2                   2
+distsql_plan_locality_filter                                     ·                   NULL  user     NULL      ·                   ·
+distsql_plan_locality_filter_strict                              off                 NULL  user     NULL      off                 off
 distsql_prevent_partitioning_soft_limited_scans                  on                  NULL  user     NULL      on                  on
 distsql_use_reduced_leaf_write_sets                              on                  NULL  user     NULL      on                  on
 enable_auto_rehoming                                             off                 NULL  user     NULL      off                 off
@@ -3604,6 +3636,7 @@ force_savepoint_restart                                          off            
 foreign_key_cascades_limit                                       10000               NULL  user     NULL      10000               10000
 idle_in_transaction_session_timeout                              0                   ms    user     NULL      0s                  0s
 idle_session_timeout                                             0                   ms    user     NULL      0s                  0s
+in_hot_standby                                                   off                 NULL  user     NULL      off                 off
 index_join_streamer_batch_size                                   8.0 MiB             B     user     NULL      8.0 MiB             8.0 MiB
 index_recommendations_enabled                                    off                 NULL  user     NULL      on                  false
 initial_retry_backoff_for_read_committed                         2                   NULL  user     NULL      2ms                 2ms
@@ -3644,6 +3677,7 @@ optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables  on             
 optimizer_enable_lock_elision                                    on                  NULL  user     NULL      on                  on
 optimizer_hoist_uncorrelated_equality_subqueries                 on                  NULL  user     NULL      on                  on
 optimizer_inline_any_unnest_subquery                             on                  NULL  user     NULL      on                  on
+optimizer_inline_placeholder_equalities                          on                  NULL  user     NULL      on                  on
 optimizer_merge_joins_enabled                                    on                  NULL  user     NULL      on                  on
 optimizer_min_row_count                                          1                   NULL  user     NULL      1                   1
 optimizer_plan_lookup_joins_with_reverse_scans                   on                  NULL  user     NULL      on                  on
@@ -3683,7 +3717,7 @@ parallelize_multi_key_lookup_joins_avg_lookup_ratio              10             
 parallelize_multi_key_lookup_joins_avg_lookup_row_size           100 KiB             B     user     NULL      100 KiB             100 KiB
 parallelize_multi_key_lookup_joins_enabled                       off                 NULL  user     NULL      off                 off
 parallelize_multi_key_lookup_joins_max_lookup_ratio              10000               NULL  user     NULL      10000               10000
-parallelize_multi_key_lookup_joins_only_on_mr_mutations          on                  NULL  user     NULL      on                  on
+parallelize_multi_key_lookup_joins_only_on_mr_mutations          off                 NULL  user     NULL      off                 off
 password_encryption                                              scram-sha-256       NULL  user     NULL      scram-sha-256       scram-sha-256
 pg_dump_compatibility                                            off                 NULL  user     NULL      off                 off
 pg_trgm.similarity_threshold                                     0.3                 NULL  user     NULL      0.3                 0.3
@@ -3698,9 +3732,11 @@ recursion_depth_limit                                            1000           
 register_latch_wait_contention_events                            off                 NULL  user     NULL      off                 off
 reorder_joins_limit                                              8                   NULL  user     NULL      8                   8
 require_explicit_primary_keys                                    off                 NULL  user     NULL      off                 off
+resource_group                                                   ·                   NULL  user     NULL      ·                   ·
 results_buffer_size                                              524288              NULL  user     NULL      524288              524288
 role                                                             none                NULL  user     NULL      none                none
 row_security                                                     on                  NULL  user     NULL      on                  on
+scram_iterations                                                 10610               NULL  user     NULL      10610               10610
 search_path                                                      "$user", public     NULL  user     NULL      "$user", public     "$user", public
 serial_normalization                                             rowid               NULL  user     NULL      rowid               rowid
 server_encoding                                                  UTF8                NULL  user     NULL      UTF8                UTF8
@@ -3823,6 +3859,8 @@ distribute_scan_row_count_threshold                              NULL    NULL   
 distribute_sort_row_count_threshold                              NULL    NULL     NULL     NULL        NULL
 distsql                                                          NULL    NULL     NULL     NULL        NULL
 distsql_plan_gateway_bias                                        NULL    NULL     NULL     NULL        NULL
+distsql_plan_locality_filter                                     NULL    NULL     NULL     NULL        NULL
+distsql_plan_locality_filter_strict                              NULL    NULL     NULL     NULL        NULL
 distsql_prevent_partitioning_soft_limited_scans                  NULL    NULL     NULL     NULL        NULL
 distsql_use_reduced_leaf_write_sets                              NULL    NULL     NULL     NULL        NULL
 distsql_workmem                                                  NULL    NULL     NULL     NULL        NULL
@@ -3852,6 +3890,7 @@ force_savepoint_restart                                          NULL    NULL   
 foreign_key_cascades_limit                                       NULL    NULL     NULL     NULL        NULL
 idle_in_transaction_session_timeout                              NULL    NULL     NULL     NULL        NULL
 idle_session_timeout                                             NULL    NULL     NULL     NULL        NULL
+in_hot_standby                                                   NULL    NULL     NULL     NULL        NULL
 index_join_streamer_batch_size                                   NULL    NULL     NULL     NULL        NULL
 index_recommendations_enabled                                    NULL    NULL     NULL     NULL        NULL
 initial_retry_backoff_for_read_committed                         NULL    NULL     NULL     NULL        NULL
@@ -3895,6 +3934,7 @@ optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables  NULL    NULL   
 optimizer_enable_lock_elision                                    NULL    NULL     NULL     NULL        NULL
 optimizer_hoist_uncorrelated_equality_subqueries                 NULL    NULL     NULL     NULL        NULL
 optimizer_inline_any_unnest_subquery                             NULL    NULL     NULL     NULL        NULL
+optimizer_inline_placeholder_equalities                          NULL    NULL     NULL     NULL        NULL
 optimizer_merge_joins_enabled                                    NULL    NULL     NULL     NULL        NULL
 optimizer_min_row_count                                          NULL    NULL     NULL     NULL        NULL
 optimizer_plan_lookup_joins_with_reverse_scans                   NULL    NULL     NULL     NULL        NULL
@@ -3949,9 +3989,11 @@ recursion_depth_limit                                            NULL    NULL   
 register_latch_wait_contention_events                            NULL    NULL     NULL     NULL        NULL
 reorder_joins_limit                                              NULL    NULL     NULL     NULL        NULL
 require_explicit_primary_keys                                    NULL    NULL     NULL     NULL        NULL
+resource_group                                                   NULL    NULL     NULL     NULL        NULL
 results_buffer_size                                              NULL    NULL     NULL     NULL        NULL
 role                                                             NULL    NULL     NULL     NULL        NULL
 row_security                                                     NULL    NULL     NULL     NULL        NULL
+scram_iterations                                                 NULL    NULL     NULL     NULL        NULL
 search_path                                                      NULL    NULL     NULL     NULL        NULL
 serial_normalization                                             NULL    NULL     NULL     NULL        NULL
 server_encoding                                                  NULL    NULL     NULL     NULL        NULL
@@ -4078,20 +4120,20 @@ JOIN pg_catalog.pg_class c ON def.adrelid = c.oid
 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public' ORDER BY def.oid DESC
 ----
-4171354239  t2             unique_rowid()
-3633243986  testtable      unique_rowid()
-3086013501  t5             unique_rowid()
-2306804703  t1             a * b
-2306804698  t1             a * b
-2306804694  t1             12
-2000672759  mv1            unique_rowid()
-1740936492  t4             unique_rowid()
-1221463949  t3             'FOO'::text
-1221463946  t3             unique_rowid()
-655595756   t6             m = 'foo'::public.mytype
-655595747   t6             lower(c)
-655595746   t6             unique_rowid()
-655595745   t6             a + b
+4171354239  t2         unique_rowid()
+3633243986  testtable  unique_rowid()
+3086013501  t5         unique_rowid()
+2306804703  t1         a * b
+2306804698  t1         a * b
+2306804694  t1         12
+2000672759  mv1        unique_rowid()
+1740936492  t4         unique_rowid()
+1221463949  t3         'FOO'::text
+1221463946  t3         unique_rowid()
+655595756   t6         m = 'foo'::public.mytype
+655595747   t6         lower(c)
+655595746   t6         unique_rowid()
+655595745   t6         a + b
 
 # Verify that a set database shows tables from that database for a non-root
 # user, when that user has permissions.
@@ -4196,8 +4238,8 @@ PREPARE test_select_statement AS SELECT * FROM types
 query TTTTB
 select name, statement, parameter_types, result_types, from_sql from pg_prepared_statements ORDER BY 1, 2
 ----
-test_insert_statement  PREPARE test_insert_statement (int, timestamptz) AS INSERT INTO types VALUES ($2, $1)  {bigint,"'timestamp with time zone'"}  {}                                              true
-test_select_statement  PREPARE test_select_statement AS SELECT * FROM types  {}  {"'timestamp with time zone'",bigint}  true
+test_insert_statement  PREPARE test_insert_statement (int, timestamptz) AS INSERT INTO types VALUES ($2, $1)  {bigint,"timestamp with time zone"}  {}                                            true
+test_select_statement  PREPARE test_select_statement AS SELECT * FROM types  {}  {"timestamp with time zone",bigint}  true
 
 # INSERT ... RETURNING populates result_types with the returned columns.
 statement ok
@@ -4234,10 +4276,10 @@ PREPARE args_deduce_type_1(int) AS SELECT $1::int, $2::varchar(10), $3::varchar(
 query TTTB
 SELECT name, statement, parameter_types, from_sql FROM pg_prepared_statements WHERE name LIKE 'args_%' ORDER BY 1,2
 ----
-args_deduce_type    PREPARE args_deduce_type (int, varchar, int, int) AS INSERT INTO t_prepare VALUES ($1, $2, $3)           {bigint,"'character varying'",bigint,bigint}          true
-args_deduce_type_1  PREPARE args_deduce_type_1 (int, varchar, varchar) AS SELECT $1::INT8, $2::VARCHAR(10), $3::VARCHAR(20)  {bigint,"'character varying'","'character varying'"}  true
-args_test_few       PREPARE args_test_few (int, int) AS SELECT $1, $2::INT8                                                  {bigint,bigint}                                       true
-args_test_many      PREPARE args_test_many (int, int) AS SELECT $1                                                           {bigint,bigint}                                       true
+args_deduce_type    PREPARE args_deduce_type (int, varchar, int, int) AS INSERT INTO t_prepare VALUES ($1, $2, $3)           {bigint,"character varying",bigint,bigint}        true
+args_deduce_type_1  PREPARE args_deduce_type_1 (int, varchar, varchar) AS SELECT $1::INT8, $2::VARCHAR(10), $3::VARCHAR(20)  {bigint,"character varying","character varying"}  true
+args_test_few       PREPARE args_test_few (int, int) AS SELECT $1, $2::INT8                                                  {bigint,bigint}                                   true
+args_test_many      PREPARE args_test_many (int, int) AS SELECT $1                                                           {bigint,bigint}                                   true
 
 statement ok
 DROP TABLE types
@@ -4461,20 +4503,22 @@ CREATE TABLE t(x INT UNIQUE);
 query TTT
 SELECT conname, confupdtype, confdeltype FROM pg_constraint ORDER BY conname
 ----
-t_pkey    NULL  NULL
-t_x_key   NULL  NULL
-u_a_fkey  a     a
-u_b_fkey  a     r
-u_c_fkey  a     n
-u_d_fkey  a     d
-u_e_fkey  a     c
-u_f_fkey  a     a
-u_g_fkey  r     a
-u_h_fkey  n     a
-u_i_fkey  d     a
-u_j_fkey  c     a
-u_k_fkey  n     r
-u_pkey    NULL  NULL
+t_pkey            NULL  NULL
+t_rowid_not_null  NULL  NULL
+t_x_key           NULL  NULL
+u_a_fkey          a     a
+u_b_fkey          a     r
+u_c_fkey          a     n
+u_d_fkey          a     d
+u_e_fkey          a     c
+u_f_fkey          a     a
+u_g_fkey          r     a
+u_h_fkey          n     a
+u_i_fkey          d     a
+u_j_fkey          c     a
+u_k_fkey          n     r
+u_pkey            NULL  NULL
+u_rowid_not_null  NULL  NULL
 
 statement ok
 DROP TABLE u; DROP TABLE t
@@ -4492,11 +4536,13 @@ CREATE TABLE w(
 query TT
 SELECT conname, confmatchtype FROM pg_constraint ORDER BY conname
 ----
-v_pkey      NULL
-v_x_y_key   NULL
-w_a_b_fkey  f
-w_c_d_fkey  s
-w_pkey      NULL
+v_pkey            NULL
+v_rowid_not_null  NULL
+v_x_y_key         NULL
+w_a_b_fkey        f
+w_c_d_fkey        s
+w_pkey            NULL
+w_rowid_not_null  NULL
 
 statement ok
 DROP DATABASE d34862 CASCADE; SET database=test
@@ -4638,10 +4684,11 @@ ON c.conrelid = t.oid
 WHERE t.relname = 'partial_index_table'
 ORDER BY conname
 ----
-conname                     condef
-partial_index_table_a_key   UNIQUE (a ASC) WHERE (a > 0)
-partial_index_table_a_key1  UNIQUE (a ASC) WHERE (b IN ('foo'::public.testenum, 'bar'::public.testenum))
-partial_index_table_pkey    PRIMARY KEY (rowid ASC)
+conname                             condef
+partial_index_table_a_key           UNIQUE (a ASC) WHERE (a > 0)
+partial_index_table_a_key1          UNIQUE (a ASC) WHERE (b IN ('foo'::public.testenum, 'bar'::public.testenum))
+partial_index_table_pkey            PRIMARY KEY (rowid ASC)
+partial_index_table_rowid_not_null  NOT NULL
 
 subtest regression_46799
 statement ok
@@ -5746,6 +5793,24 @@ query TTTB
 SELECT * from pg_timezone_names WHERE name = 'DoesNotExist'
 ----
 
+# pg_timezone_abbrevs
+
+query TTB rowsort
+SELECT abbrev, utc_offset, is_dst
+FROM pg_catalog.pg_timezone_abbrevs
+WHERE abbrev IN ('EST', 'EDT', 'CST', 'CDT', 'PST', 'PDT', 'MST', 'MDT', 'UTC', 'EAT')
+----
+CDT  -05:00:00  true
+CST  -06:00:00  false
+EAT  03:00:00   false
+EDT  -04:00:00  true
+EST  -05:00:00  false
+MDT  -06:00:00  true
+MST  -07:00:00  false
+PDT  -07:00:00  true
+PST  -08:00:00  false
+UTC  00:00:00   false
+
 # Regression test for incorrectly handling left anti virtual lookup joins
 # (#88096).
 statement ok
@@ -5960,7 +6025,7 @@ GRANT SELECT ON t1 TO testuser WITH GRANT OPTION
 query T
 SELECT relacl FROM pg_class WHERE relname = 't1'
 ----
-{admin=C*r*a*d*w*D*t*m*/root,root=C*r*a*d*w*D*t*m*/root,testuser=r*/root}
+{admin=C*r*a*d*w*D*t*m*x*/root,root=C*r*a*d*w*D*t*m*x*/root,testuser=r*/root}
 
 # relacl: returns to NULL after revoking back to defaults.
 statement ok
@@ -6125,7 +6190,7 @@ GRANT SELECT ON testowner_table TO testuser
 query T
 SELECT relacl FROM pg_class WHERE relname = 'testowner_table'
 ----
-{admin=C*r*a*d*w*D*t*m*/testowner,root=C*r*a*d*w*D*t*m*/testowner,testuser=r/testowner,testowner=CradwDtm/testowner}
+{admin=C*r*a*d*w*D*t*m*x*/testowner,root=C*r*a*d*w*D*t*m*x*/testowner,testuser=r/testowner,testowner=CradwDtmx/testowner}
 
 # relacl: returns to NULL after revoking back to defaults.
 statement ok
@@ -6240,7 +6305,7 @@ DROP TABLE pg_attrdef_identity
 # ALTER TABLE ... ADD GENERATED on a plain column must not introduce a
 # pg_attrdef entry; ALTER ... DROP IDENTITY must not leave one behind.
 statement ok
-CREATE TABLE pg_attrdef_alter_identity (a INT PRIMARY KEY, b INT DEFAULT 7) WITH (schema_locked = false)
+CREATE TABLE pg_attrdef_alter_identity (a INT PRIMARY KEY, b INT DEFAULT 7)
 
 statement ok
 ALTER TABLE pg_attrdef_alter_identity ALTER COLUMN a ADD GENERATED ALWAYS AS IDENTITY
@@ -6280,5 +6345,62 @@ statement ok
 DROP TABLE pg_attrdef_alter_identity
 
 subtest end
+
+subtest pg_constraint_not_null
+
+# Match PostgreSQL: every NOT NULL column gets a synthetic pg_constraint row of
+# type 'n', regardless of whether the column became non-nullable via an explicit
+# modifier, a primary key, or ALTER TABLE ... SET NOT NULL. The constraint
+# name must follow PG's default ("<table>_<column>_not_null") so pg_dump
+# suppresses the explicit CONSTRAINT clause and emits a bare NOT NULL.
+
+statement ok
+CREATE TABLE notnull_test (
+  id INT PRIMARY KEY,
+  explicit_nn TEXT NOT NULL,
+  nullable TEXT,
+  later_nn TEXT,
+  pk_explicit_nn INT NOT NULL
+);
+ALTER TABLE notnull_test ALTER COLUMN later_nn SET NOT NULL;
+
+query TTT rowsort
+SELECT conname, contype::text, conkey::text
+FROM pg_catalog.pg_constraint
+WHERE conrelid = 'notnull_test'::regclass AND contype = 'n'
+----
+notnull_test_id_not_null              n  {1}
+notnull_test_explicit_nn_not_null     n  {2}
+notnull_test_later_nn_not_null        n  {4}
+notnull_test_pk_explicit_nn_not_null  n  {5}
+
+# The PK column also has its dedicated pg_constraint row of type 'p' — both
+# rows coexist, matching PG.
+query TTT rowsort
+SELECT conname, contype::text, conkey::text
+FROM pg_catalog.pg_constraint
+WHERE conrelid = 'notnull_test'::regclass AND contype IN ('p', 'n') AND conkey = '{1}'
+----
+notnull_test_pkey         p  {1}
+notnull_test_id_not_null  n  {1}
+
+# pg_dump 18 joins on (a.attrelid = co.conrelid AND co.contype = 'n'
+# AND co.conkey = array[a.attnum]). Confirm that join finds exactly the
+# non-nullable columns and nothing else.
+query TT rowsort
+SELECT a.attname, co.conname
+FROM pg_catalog.pg_attribute a
+LEFT JOIN pg_catalog.pg_constraint co
+  ON a.attrelid = co.conrelid AND co.contype = 'n' AND co.conkey = array[a.attnum]
+WHERE a.attrelid = 'notnull_test'::regclass AND a.attnum > 0
+----
+id              notnull_test_id_not_null
+explicit_nn     notnull_test_explicit_nn_not_null
+nullable        NULL
+later_nn        notnull_test_later_nn_not_null
+pk_explicit_nn  notnull_test_pk_explicit_nn_not_null
+
+statement ok
+DROP TABLE notnull_test
 
 subtest end

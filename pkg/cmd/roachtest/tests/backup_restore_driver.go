@@ -160,11 +160,13 @@ func (d *BackupRestoreTestDriver) createBackupCollection(
 	backupNamePrefix string,
 	internalSystemJobs bool,
 	isMultitenant bool,
+	cfgs ...CollectionConfig,
 ) (*backupCollection, error) {
 	builder := d.NewCollectionBuilder(
 		l, tasker, rng, backupNamePrefix,
 		fullBackupSpec, incBackupSpec,
 		internalSystemJobs, isMultitenant,
+		cfgs...,
 	)
 
 	// Create full backup.
@@ -1072,6 +1074,21 @@ func (cb *CollectionBuilder) BackupCount() int {
 	return len(cb.backupEndTimes)
 }
 
+// SetFingerprintTime overrides the fingerprint AOST and restore AOST
+// that will be used by Finalize. This must be called before Finalize.
+func (cb *CollectionBuilder) SetFingerprintTime(t string) {
+	cb.cfg.fingerprintTime = t
+}
+
+// CollectionURI returns the backup collection URI. Returns an error
+// if no full backup has been taken yet.
+func (cb *CollectionBuilder) CollectionURI() (string, error) {
+	if !cb.fullStarted {
+		return "", errors.New("CollectionURI called before full backup")
+	}
+	return cb.collection.uri(), nil
+}
+
 // Finalize completes the backup collection by:
 //  1. Optionally selecting a restore AOST
 //  2. Computing and saving table fingerprints
@@ -1098,18 +1115,26 @@ func (cb *CollectionBuilder) Finalize(ctx context.Context) (*backupCollection, e
 		latestIncBackupEndTime = cb.backupEndTimes[len(cb.backupEndTimes)-1]
 	}
 
-	if err := collection.maybeUseRestoreAOST(
-		cb.l, cb.rng, fullBackupEndTime, latestIncBackupEndTime,
-	); err != nil {
-		return nil, err
-	}
+	var fingerprintAOST string
+	if cb.cfg.fingerprintTime != "" {
+		// Caller explicitly set the fingerprint time (e.g. for continuous
+		// backup restore). Use it for both the restore AOST and fingerprint.
+		collection.restoreAOST = cb.cfg.fingerprintTime
+		fingerprintAOST = cb.cfg.fingerprintTime
+	} else {
+		if err := collection.maybeUseRestoreAOST(
+			cb.l, cb.rng, fullBackupEndTime, latestIncBackupEndTime,
+		); err != nil {
+			return nil, err
+		}
 
-	fingerprintAOST := latestIncBackupEndTime
-	if fingerprintAOST == "" {
-		fingerprintAOST = fullBackupEndTime
-	}
-	if collection.restoreAOST != "" {
-		fingerprintAOST = collection.restoreAOST
+		fingerprintAOST = latestIncBackupEndTime
+		if fingerprintAOST == "" {
+			fingerprintAOST = fullBackupEndTime
+		}
+		if collection.restoreAOST != "" {
+			fingerprintAOST = collection.restoreAOST
+		}
 	}
 
 	return cb.driver.saveContents(ctx, cb.l, cb.rng, &collection, fingerprintAOST)
@@ -1310,15 +1335,20 @@ func (cb *CollectionBuilder) initCollCfg(cfgs ...CollectionConfig) {
 	}
 
 	if cb.cfg.options == nil {
-		cb.cfg.options = newBackupOptions(cb.rng, cb.driver.testUtils.onlineRestore)
+		cb.cfg.options = newBackupOptions(cb.rng, cb.driver.testUtils.onlineRestore, cb.cfg.skipRevisionHistory)
 	}
 }
 
 // collCfg holds the backup configuration for the backup collection and is used
 // to build the BACKUP statement when taking backups.
 type collCfg struct {
-	scope   backupScope
-	options []backupOption
+	scope               backupScope
+	options             []backupOption
+	skipRevisionHistory bool
+
+	// fingerprintTime, when set, overrides the fingerprint AOST and
+	// restore AOST in Finalize.
+	fingerprintTime string
 }
 
 type CollectionConfig func(*CollectionBuilder)
@@ -1326,6 +1356,35 @@ type CollectionConfig func(*CollectionBuilder)
 func WithClusterScope() CollectionConfig {
 	return func(cb *CollectionBuilder) {
 		cb.cfg.scope = newClusterBackup(cb.rng, cb.driver.dbs, cb.driver.tables)
+	}
+}
+
+func WithTableScope() CollectionConfig {
+	return func(cb *CollectionBuilder) {
+		cb.cfg.scope = newTableBackup(cb.rng, cb.driver.dbs, cb.driver.tables)
+	}
+}
+
+func WithDatabaseScope() CollectionConfig {
+	return func(cb *CollectionBuilder) {
+		cb.cfg.scope = newDatabaseBackup(cb.rng, cb.driver.dbs, cb.driver.tables)
+	}
+}
+
+// WithRevisionStream adds the `revision stream` backup option to the
+// collection, which establishes a continuous backup (revlog) sibling job.
+func WithRevisionStream() CollectionConfig {
+	return func(cb *CollectionBuilder) {
+		cb.cfg.options = append(cb.cfg.options, revisionStream{})
+	}
+}
+
+// WithSkipRevisionHistory excludes the revision_history option from the
+// randomized set of backup options. Used when the cluster version does not
+// support revision_history backups on the relevant tenant.
+func WithSkipRevisionHistory() CollectionConfig {
+	return func(cb *CollectionBuilder) {
+		cb.cfg.skipRevisionHistory = true
 	}
 }
 
@@ -1338,6 +1397,10 @@ type (
 
 	// revisionHistory wraps the `revision_history` backup option.
 	revisionHistory struct{}
+
+	// revisionStream wraps the `revision stream` backup option,
+	// which establishes a continuous backup (revlog) sibling job.
+	revisionStream struct{}
 
 	// encryptionPassphrase is the `encryption_passphrase` backup
 	// option. If passed when a backup is created, the same passphrase
@@ -1648,11 +1711,20 @@ func (rh revisionHistory) String() string {
 	return "revision_history"
 }
 
+func (rs revisionStream) String() string {
+	return "revision stream"
+}
+
 // newBackupOptions returns a list of backup options to be used when
 // creating a new backup. Each backup option has a 50% chance of being
 // included.
-func newBackupOptions(rng *rand.Rand, onlineRestoreExpected bool) []backupOption {
-	possibleOpts := []backupOption{revisionHistory{}}
+func newBackupOptions(
+	rng *rand.Rand, onlineRestoreExpected, skipRevisionHistory bool,
+) []backupOption {
+	var possibleOpts []backupOption
+	if !skipRevisionHistory {
+		possibleOpts = append(possibleOpts, revisionHistory{})
+	}
 	if !onlineRestoreExpected {
 		possibleOpts = append(possibleOpts, newEncryptionPassphrase(rng))
 	}

@@ -127,6 +127,7 @@ func (req runnerRequest) run() error {
 
 	client, err := execinfrapb.DialDistSQLClient(req.sqlInstanceDialer, req.ctx, roachpb.NodeID(req.sqlInstanceID), rpcbase.DefaultClass)
 	if err != nil {
+		err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "dial error")
 		// Mark this error as special runnerDialErr so that we could retry this
 		// distributed query as local.
 		err = &runnerDialErr{err: err}
@@ -136,7 +137,7 @@ func (req runnerRequest) run() error {
 	// TODO(radu): do we want a timeout here?
 	resp, err := client.SetupFlow(req.ctx, req.flowReq)
 	if err != nil {
-		res.err = err
+		res.err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "SetupFlow RPC error")
 	} else {
 		res.err = resp.Error.ErrorDetail(req.ctx)
 	}
@@ -1643,6 +1644,11 @@ func forwardInnerQueryStats(f metadataForwarder, stats topLevelQueryStats) {
 	meta.Metrics.IndexRowsWritten = stats.indexRowsWritten
 	meta.Metrics.IndexBytesWritten = stats.indexBytesWritten
 	meta.Metrics.KVCPUTime = int64(stats.kvCPUTimeNanos)
+	meta.Metrics.LocalKVCPUTime = int64(stats.localKVCPUTime)
+	// Do not forward rawSQLCPUTime: the outer query's gateway grunning
+	// already includes the inner query's CPU (same goroutine), so
+	// forwarding it would double-count.
+	//
 	// stats.networkEgressEstimate and stats.clientTime are ignored since they
 	// only matter at the "true" top-level query (and actually should be zero
 	// here anyway).
@@ -1701,6 +1707,8 @@ func (r *DistSQLReceiver) pushMeta(meta *execinfrapb.ProducerMetadata) execinfra
 		r.stats.indexRowsWritten += meta.Metrics.IndexRowsWritten
 		r.stats.indexBytesWritten += meta.Metrics.IndexBytesWritten
 		r.stats.kvCPUTimeNanos += time.Duration(meta.Metrics.KVCPUTime)
+		r.stats.localKVCPUTime += time.Duration(meta.Metrics.LocalKVCPUTime)
+		r.stats.rawSQLCPUTime += time.Duration(meta.Metrics.RawSQLCPUTime)
 
 		if sm, ok := r.scanStageEstimateMap[meta.Metrics.StageID]; ok {
 			sm.rowsRead += uint64(meta.Metrics.RowsRead)
@@ -2478,18 +2486,26 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 // Because cascades and triggers can themselves generate more cascades, check,
 // or trigger queries, this method can append to plan.cascades, plan.checkPlans,
 // and plan.triggers (and all these plans must be closed later).
-//
-// Returns false if an error was encountered and sets that error in the provided
-// receiver.
 func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 	ctx context.Context,
 	planner *planner,
 	evalCtxFactory func(usedConcurrently bool) *extendedEvalContext,
 	plan *planComponents,
 	recv *DistSQLReceiver,
-) bool {
-	if len(plan.cascades) == 0 && len(plan.checkPlans) == 0 && len(plan.triggers) == 0 {
-		return false
+) {
+	if len(plan.checkPlans) == 0 {
+		if len(plan.cascades) == 0 && len(plan.triggers) == 0 {
+			// We have no postqueries to run.
+			return
+		}
+		if rcr, ok := recv.resultWriter.(RestrictedCommandResult); ok && rcr.RowsAffected() == 0 {
+			// We have some cascades and / or row-level triggers, but the main
+			// query didn't modify any rows, meaning that cascades / row-level
+			// triggers would no-op, so we simply short-circuit their execution.
+			// TODO(#126362): once we support statement-level triggers, this
+			// might need to be adjusted.
+			return
+		}
 	}
 
 	prevSteppingMode := planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
@@ -2525,7 +2541,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 			// run as part of the same statement as the corresponding mutations.
 			if err := planner.Txn().Step(ctx, false /* allowReadTimestampStep */); err != nil {
 				recv.SetError(err)
-				return false
+				return
 			}
 
 			// The cascading query is allowed to autocommit only if it is the last
@@ -2547,7 +2563,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 				&plan.cascades[cascadesIdx], defaultGetSaveFlowsFunc,
 			)
 			if !ok {
-				return false
+				return
 			}
 			checksContainLocking = checksContainLocking || newChecksContainLocking
 		}
@@ -2570,7 +2586,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 			// part of the same statement as the corresponding mutations.
 			if err := planner.Txn().Step(ctx, false /* allowReadTimestampStep */); err != nil {
 				recv.SetError(err)
-				return false
+				return
 			}
 
 			// We'll run the checks in parallel if the parallelization is enabled, we have
@@ -2596,7 +2612,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 				checksToRun := plan.checkPlans[checksIdx:]
 				if err := dsp.planAndRunChecksInParallel(ctx, checksToRun, planner, evalCtxFactory, recv); err != nil {
 					recv.SetError(err)
-					return false
+					return
 				}
 			} else {
 				if (len(plan.checkPlans) - checksIdx) > 1 {
@@ -2616,7 +2632,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 						recv.stats.add,
 					); err != nil {
 						recv.SetError(err)
-						return false
+						return
 					}
 				}
 			}
@@ -2650,12 +2666,11 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 				&plan.triggers[triggersIdx], defaultGetSaveFlowsFunc,
 			)
 			if !ok {
-				return false
+				return
 			}
 			checksContainLocking = checksContainLocking || newChecksContainLocking
 		}
 	}
-	return true
 }
 
 // checkPostQueryBuffer checks whether the given post-query has an input buffer
@@ -2996,7 +3011,20 @@ func (dsp *DistSQLPlanner) planAndRunChecksInParallel(
 			},
 			func(ctx context.Context) {
 				defer wg.Done()
+				// Measure this worker goroutine's CPU time. It is not
+				// captured by the main cpuStopWatch in
+				// dispatchToExecutionEngine since it runs on a separate
+				// goroutine. We add raw grunning here; the gateway's
+				// sqlCPUTime() helper will subtract localKVCPUTime (which
+				// is propagated via addTopLevelQueryStats).
+				var cpuStopWatch timeutil.CPUStopWatch
+				cpuStopWatch.Start()
 				runCheck(ctx, checkPlanIdx, parallelCheckWorkerGoroutine)
+				if workerGrunning := cpuStopWatch.Stop(); workerGrunning > 0 {
+					mu.Lock()
+					recv.stats.rawSQLCPUTime += workerGrunning
+					mu.Unlock()
+				}
 			}); err != nil {
 			// The server is quiescing, so we just make sure to wait for all
 			// already started checks to complete after canceling them.

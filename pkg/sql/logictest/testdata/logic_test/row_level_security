@@ -1104,6 +1104,12 @@ select relname, relrowsecurity, relforcerowsecurity from pg_class where relname 
 ----
 roaches  true  true
 
+# pg_tables.rowsecurity should agree with pg_class.relrowsecurity.
+query TB
+select tablename, rowsecurity from pg_tables where tablename = 'roaches';
+----
+roaches  true
+
 skipif config schema-locked-disabled
 query T
 select create_statement from crdb_internal.create_statements where descriptor_name='roaches'
@@ -6432,6 +6438,9 @@ statement ok
 CREATE POLICY p_rls_dep ON t_rls_dep USING (public.rls_dep_fn(v));
 
 # Renaming the function referenced by the policy should be blocked.
+# In mixed-version clusters (before V26_3_Start), the policy dependency
+# check is skipped, so the rename succeeds.
+skipif config local-mixed-25.4 local-mixed-26.1 local-mixed-26.2
 statement error cannot rename function "rls_dep_fn" because other objects \(\[policy "p_rls_dep" on .*t_rls_dep\]\) still depend on it
 ALTER FUNCTION rls_dep_fn(INT) RENAME TO rls_dep_fn_renamed;
 
@@ -6439,6 +6448,7 @@ ALTER FUNCTION rls_dep_fn(INT) RENAME TO rls_dep_fn_renamed;
 statement ok
 CREATE SCHEMA sc_rls_dep;
 
+skipif config local-mixed-25.4 local-mixed-26.1 local-mixed-26.2
 statement error cannot set schema for function "rls_dep_fn" because other objects \(\[policy "p_rls_dep" on .*t_rls_dep\]\) still depend on it
 ALTER FUNCTION rls_dep_fn(INT) SET SCHEMA sc_rls_dep;
 

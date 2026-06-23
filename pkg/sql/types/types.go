@@ -349,6 +349,12 @@ type DomainMetadata struct {
 	BaseType *T
 	// NotNull is true if the domain has a NOT NULL constraint.
 	NotNull bool
+	// NotNullConstraintName is the name of the NOT NULL constraint.
+	// Empty if the domain has no NOT NULL constraint.
+	NotNullConstraintName string
+	// NotNullConstraintID uniquely identifies the NOT NULL constraint.
+	// Zero if the domain has no NOT NULL constraint.
+	NotNullConstraintID catid.ConstraintID
 	// DefaultExpr is the default expression for the domain, serialized as
 	// a string. Empty if no default is specified.
 	DefaultExpr string
@@ -362,12 +368,11 @@ type DomainCheckConstraint struct {
 	Name string
 	// Expr is the CHECK expression, serialized as a string.
 	Expr string
-	// ParsedExpr is the cached parsed expression tree from hydration.
-	// Typed as any to avoid an import cycle with tree. At runtime this
-	// holds a tree.Expr obtained via parserutils.ParseExpr. It may be nil
-	// if hydration has not occurred or if the expression failed to parse;
-	// callers must handle the nil case by re-parsing from Expr.
-	ParsedExpr any
+	// ConstraintID uniquely identifies this constraint within the domain.
+	ConstraintID catid.ConstraintID
+	// Validated indicates whether this constraint has been validated against
+	// all existing data. False for constraints added with NOT VALID.
+	Validated bool
 }
 
 func (e *EnumMetadata) debugString() string {
@@ -1614,6 +1619,13 @@ func (t *T) WithoutTypeModifiers() *T {
 		// Enums have no type modifiers.
 		return t
 	}
+	// Domain types share their base type's Family, so check for them before
+	// looking up the OID in OidToType. Domain OIDs are user defined and do not
+	// exist in OidToType, and domains do not have independent type modifiers to
+	// strip beyond the base type information already baked into the type.
+	if t.UserDefined() && t.TypeMeta.DomainData != nil {
+		return t
+	}
 
 	// For types that can be a collated string, we copy the type and set the width
 	// to 0 rather than returning the default OidToType type so that we retain the
@@ -2042,7 +2054,13 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int, useFQName boo
 	case PGLSNFamily:
 		return "pg_lsn"
 	case PGVectorFamily:
-		return "vector"
+		// pgvector stores the dimension directly in the typmod (no -4 header
+		// offset like varchar). A typmod of -1 means the dimension was not
+		// specified.
+		if !haveTypmod || typmod <= 0 {
+			return "vector"
+		}
+		return fmt.Sprintf("vector(%d)", typmod)
 	case RefCursorFamily:
 		return "refcursor"
 	case StringFamily, CollatedStringFamily:

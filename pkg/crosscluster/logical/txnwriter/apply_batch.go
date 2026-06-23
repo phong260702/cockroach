@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/ldrdecoder"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/sqlwriter"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/errors"
 )
 
@@ -96,12 +97,31 @@ func (tw *transactionWriter) tryApplyTransaction(
 		switch {
 		case row.IsDeleteRow():
 			err := tableWriter.DeleteRow(ctx, transaction.TxnID.Timestamp, row.PrevRow)
+			if sqlwriter.IsLwwLoser(err) {
+				lwwLosers++
+				continue
+			}
 			if err != nil {
 				return ApplyResult{}, err
 			}
 		case row.IsTombstoneUpdate():
-			// TODO(jeffswenson): handle the tombstone update case. For ordered mode,
-			// this case is only needed for racing updates.
+			// Use a KV savepoint so that a ConditionFailedError on one
+			// tombstone does not abort the surrounding transaction.
+			var lwwLoss bool
+			err := tw.session.KVSavepoint(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				var err error
+				lwwLoss, err = tw.tombstoneUpdaters[row.TableID].UpdateTombstone(
+					ctx, txn, transaction.TxnID.Timestamp, row.Row,
+				)
+				return err
+			})
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if lwwLoss {
+				lwwLosers++
+				continue
+			}
 		case row.IsInsertRow():
 			err := tableWriter.InsertRow(ctx, transaction.TxnID.Timestamp, row.Row)
 			if sqlwriter.IsLwwLoser(err) {
@@ -118,6 +138,10 @@ func (tw *transactionWriter) tryApplyTransaction(
 				row.PrevRow,
 				row.Row,
 			)
+			if sqlwriter.IsLwwLoser(err) {
+				lwwLosers++
+				continue
+			}
 			if err != nil {
 				return ApplyResult{}, err
 			}

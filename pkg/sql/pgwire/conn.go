@@ -322,10 +322,18 @@ func (c *conn) sendInitialConnData(
 			return sql.ConnectionHandler{}, err
 		}
 	}
-	// The two following status parameters have no equivalent session
-	// variable.
+	// session_authorization has no equivalent session variable.
 	if err := c.bufferParamStatus("session_authorization", c.sessionArgs.User.Normalized()); err != nil {
 		return sql.ConnectionHandler{}, err
+	}
+
+	// Deliver any notices accumulated during connection setup (e.g. defaulting
+	// pg_dump_compatibility for a dump/restore client) before signaling that the
+	// connection is ready for queries.
+	for _, notice := range connHandler.GetStartupNotices() {
+		if err := c.bufferNotice(ctx, notice); err != nil {
+			return sql.ConnectionHandler{}, err
+		}
 	}
 
 	if err := c.bufferInitialReadyForQuery(connHandler.GetQueryCancelKey()); err != nil {
@@ -1485,19 +1493,23 @@ func (r *pgwireReader) ReadByte() (byte, error) {
 // initialization.
 //
 // The standard PostgreSQL status vars are listed here:
-// https://www.postgresql.org/docs/10/static/libpq-status.html
+// https://www.postgresql.org/docs/18/libpq-status.html
 var statusReportParams = []string{
 	"server_version",
 	"server_encoding",
 	"client_encoding",
 	"application_name",
-	// Note: session_authorization is handled specially in serveImpl().
+	// Note: session_authorization is handled specially in sendInitialConnData().
 	"DateStyle",
 	"IntervalStyle",
 	"is_superuser",
 	"TimeZone",
 	"integer_datetimes",
 	"standard_conforming_strings",
+	"default_transaction_read_only",
+	"search_path",
+	"scram_iterations",
+	"in_hot_standby",
 	"crdb_version", // CockroachDB extension.
 }
 

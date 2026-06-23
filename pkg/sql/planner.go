@@ -123,7 +123,7 @@ type extendedEvalContext struct {
 	validateDbZoneConfig *bool
 
 	// advisoryLockManager is the manager for advisory locks.
-	advisoryLockManager *advisorylock.Manager
+	advisoryLockManager *atomic.Pointer[advisorylock.Manager]
 }
 
 // copyFromExecCfg copies relevant fields from an ExecutorConfig.
@@ -297,6 +297,13 @@ type planner struct {
 	// Do not use this object directly; use the BufferClientNotice() method
 	// instead.
 	noticeSender noticeSender
+
+	// stmtResultBuffering exposes the current statement's result writer so a
+	// side-effecting builtin can flush its results immediately and prevent
+	// transparent connExecutor rewind across the side effect. Set in
+	// execStmtInOpenState after resetPlanner; nil between statements and for
+	// the internal executor.
+	stmtResultBuffering resultBufferingDisabler
 
 	queryCacheSession querycache.Session
 
@@ -738,10 +745,11 @@ func (p *planner) InternalSQLTxn() descs.Txn {
 		ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
 		ie.SetSessionData(p.SessionData())
 		ie.extraTxnState = &extraTxnState{
-			txn:                p.Txn(),
-			descCollection:     p.Descriptors(),
-			jobs:               p.extendedEvalCtx.jobs,
-			schemaChangerState: p.extendedEvalCtx.SchemaChangerState,
+			txn:                 p.Txn(),
+			descCollection:      p.Descriptors(),
+			jobs:                p.extendedEvalCtx.jobs,
+			schemaChangerState:  p.extendedEvalCtx.SchemaChangerState,
+			advisoryLockManager: p.extendedEvalCtx.advisoryLockManager,
 		}
 		p.internalSQLTxn.init(p.txn, ie)
 	}
@@ -770,7 +778,7 @@ func (p *planner) regionsProvider() *regions.Provider {
 }
 
 func (p *planner) User() username.SQLUsername {
-	return p.SessionData().User()
+	return p.EvalContext().EffectiveUser()
 }
 
 // TemporarySchemaName implements scbuildstmt.TemporarySchemaProvider.
@@ -908,6 +916,11 @@ func (p *planner) Ann() *tree.Annotations {
 // ExecutorConfig implements Planner interface.
 func (p *planner) ExecutorConfig() interface{} {
 	return p.execCfg
+}
+
+// TimeSeriesQuerier implements the eval.Planner interface.
+func (p *planner) TimeSeriesQuerier() eval.TimeSeriesQuerier {
+	return p.execCfg.TimeSeriesQuerier
 }
 
 // statementPreparer is an interface used when deserializing a session in order
@@ -1218,10 +1231,21 @@ func (p *planner) InsertStatementHint(
 	statementFingerprint string,
 	hint hintpb.StatementHintUnion,
 	optDatabase string,
-) (int64, error) {
-	return hints.InsertHintIntoDB(
-		ctx, p.execCfg.Settings, p.InternalSQLTxn(), statementFingerprint, hint, optDatabase,
+) (int64, int64, error) {
+	txn := p.InternalSQLTxn()
+	hintID, err := hints.InsertHintIntoDB(
+		ctx, p.execCfg.Settings, txn, statementFingerprint, hint, optDatabase,
 	)
+	if err != nil {
+		return 0, 0, err
+	}
+	numOverridden, err := hints.CountConflictingHintsInDB(
+		ctx, p.execCfg.Settings, txn, statementFingerprint, hint, hintID,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	return hintID, numOverridden, nil
 }
 
 // DeleteStatementHint is part of the eval.Planner interface.
@@ -1327,7 +1351,7 @@ func (p *planner) advisoryXactLockImpl(
 		return false, pgerror.New(pgcode.NoActiveSQLTransaction,
 			"advisory locks are only available in a transaction")
 	}
-	mgr := p.extendedEvalCtx.advisoryLockManager
+	mgr := p.extendedEvalCtx.advisoryLockManager.Load()
 	if mgr == nil {
 		return false, errors.AssertionFailedf("advisory lock manager not initialized")
 	}
@@ -1344,12 +1368,23 @@ func (p *planner) advisoryXactLockImpl(
 		mode = advisorylock.LockModeShare
 	}
 	lockKey := mk(db.GetID())
-	err = mgr.AcquireInTxn(ctx, p.txn, lockKey, mode, wait /* wait */)
+	// When wait is true, honor the session's lock_timeout (if set). The non-
+	// waiting (try_*) variants ignore lockTimeout entirely on the KV side
+	// because WaitPolicy_Error short-circuits before any waiting happens.
+	lockTimeout := p.SessionData().LockTimeout
+	err = mgr.AcquireInTxn(ctx, p.txn, lockKey, mode, wait /* wait */, lockTimeout /* lockTimeout */)
 	if err != nil {
 		if !wait && errors.Is(err, advisorylock.LockIsNotAvailableErr) {
 			return false, nil
 		}
 		return false, err
+	}
+	// The acquire is a visible side effect; flush the statement's result so
+	// the connExecutor cannot transparently rewind past it on a subsequent
+	// serializable push (e.g. a deadlock break would otherwise be masked by
+	// auto-retry and the losing client would see no error).
+	if w := p.stmtResultBuffering; w != nil {
+		w.DisableBuffering()
 	}
 	return true, nil
 }

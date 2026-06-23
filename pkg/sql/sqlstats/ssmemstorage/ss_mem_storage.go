@@ -16,6 +16,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/obs/statementstore"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
@@ -49,7 +51,6 @@ type txnKey struct {
 // sampledPlanKey is used by the Optimizer to determine if we should build a full EXPLAIN plan.
 type sampledPlanKey struct {
 	stmtNoConstants string
-	implicitTxn     bool
 	database        string
 }
 
@@ -225,7 +226,6 @@ func NewTempContainerFromExistingStmtStats(
 		stmtStats, _, throttled :=
 			container.tryCreateStatsForStmtWithKeyLocked(key, sampledPlanKey{
 				stmtNoConstants: statistics[i].Key.KeyData.Query,
-				implicitTxn:     statistics[i].Key.KeyData.ImplicitTxn,
 				database:        statistics[i].Key.KeyData.Database,
 			})
 		if throttled {
@@ -537,6 +537,17 @@ func (s *Container) DrainStats(
 	var distSQLUsed, vectorized, fullScan bool
 	var querySummary string
 
+	// Once V26_3 is active, query, query summary, and database are sourced
+	// from system.statements; omit them from the persisted metadata JSONB to
+	// avoid duplication. Mixed-version clusters keep populating them so
+	// older binaries reading metadata->>'query' continue to work. If the
+	// statement store is disabled, system.statements will not be populated,
+	// so we must keep writing the fields into the metadata JSONB to avoid
+	// losing the query metadata entirely.
+	omitDeprecatedKeyFields := s.st != nil &&
+		s.st.Version.IsActive(ctx, clusterversion.V26_3) &&
+		statementstore.StatementStoreEnabled.Get(&s.st.SV)
+
 	for key, stmt := range stmts {
 		func() {
 			stmt.mu.Lock()
@@ -548,19 +559,25 @@ func (s *Container) DrainStats(
 			querySummary = stmt.mu.querySummary
 		}()
 
+		stmtKey := appstatspb.StatementStatisticsKey{
+			Query:                    stmt.meta.stmtNoConstants,
+			QuerySummary:             querySummary,
+			DistSQL:                  distSQLUsed,
+			Vec:                      vectorized,
+			FullScan:                 fullScan,
+			App:                      s.appName,
+			Database:                 stmt.meta.database,
+			PlanHash:                 key.planHash,
+			TransactionFingerprintID: key.transactionFingerprintID,
+		}
+		if omitDeprecatedKeyFields {
+			stmtKey.Query = ""
+			stmtKey.QuerySummary = ""
+			stmtKey.Database = ""
+		}
+
 		statementStats = append(statementStats, &appstatspb.CollectedStatementStatistics{
-			Key: appstatspb.StatementStatisticsKey{
-				Query:                    stmt.meta.stmtNoConstants,
-				QuerySummary:             querySummary,
-				DistSQL:                  distSQLUsed,
-				Vec:                      vectorized,
-				ImplicitTxn:              stmt.meta.implicitTxn,
-				FullScan:                 fullScan,
-				App:                      s.appName,
-				Database:                 stmt.meta.database,
-				PlanHash:                 key.planHash,
-				TransactionFingerprintID: key.transactionFingerprintID,
-			},
+			Key:                 stmtKey,
 			ID:                  stmt.ID,
 			Stats:               data,
 			AggregatedTs:        key.aggregatedTs,

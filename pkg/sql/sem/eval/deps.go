@@ -345,6 +345,11 @@ type Planner interface {
 	// DecodeGist exposes gist functionality to the builtin functions.
 	DecodeGist(ctx context.Context, gist string, external bool) ([]string, error)
 
+	// TimeSeriesQuerier returns the TSDB bridge wired into ExecutorConfig
+	// at server startup, or nil in test configurations that do not bring
+	// up a TSDB server.
+	TimeSeriesQuerier() TimeSeriesQuerier
+
 	// SerializeSessionState serializes the variables in the current session
 	// and returns a state, in bytes form.
 	SerializeSessionState() (*tree.DBytes, error)
@@ -506,9 +511,10 @@ type Planner interface {
 
 	// InsertStatementHint adds a new hint for the given statement fingerprint to
 	// the system.statement_hints table. It returns the hint ID of the newly
-	// created hint. If optDatabase is non-empty, the hint is scoped to the
+	// created hint and a count of existing enabled hints that the new hint
+	// conflicts with. If optDatabase is non-empty, the hint is scoped to the
 	// given database.
-	InsertStatementHint(ctx context.Context, statementFingerprint string, hint hintpb.StatementHintUnion, optDatabase string) (int64, error)
+	InsertStatementHint(ctx context.Context, statementFingerprint string, hint hintpb.StatementHintUnion, optDatabase string) (hintID int64, numOverridden int64, retErr error)
 
 	// DeleteStatementHint deletes statement hints from
 	// system.statement_hints, filtered by the row ID, fingerprint, and/or

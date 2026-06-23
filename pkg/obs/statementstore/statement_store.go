@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
@@ -55,8 +56,10 @@ var flushInterval = settings.RegisterDurationSetting(settings.ApplicationLevel,
 	settings.PositiveDuration)
 
 const (
-	metadataImplicitTrue  = `{"implicit_txn": true}`
-	metadataImplicitFalse = `{"implicit_txn": false}`
+	// emptyMetadata is the placeholder JSON written to the system.statements
+	// metadata column. The column is currently unused but is NOT NULL in the
+	// schema, so we always write an empty object.
+	emptyMetadata = `{}`
 
 	// cacheEntrySize is a rough estimate of the memory overhead per
 	// cache entry (fingerprint ID key + map/list node overhead).
@@ -148,6 +151,14 @@ func (ss *StatementStore) PutStatement(ctx context.Context, info StatementInfo) 
 	if !StatementStoreEnabled.Get(&ss.settings.SV) {
 		return
 	}
+	// Stay dormant until the V26_3_AlterStatementsTablePK migration has run on
+	// the whole cluster. Writing during the ALTER PRIMARY KEY window can race
+	// with the schema change and produce transient INSERT errors that the
+	// writer handles by evicting from cache (and logging at ERROR level), but
+	// the data is non-essential, so it is cleaner to simply not write.
+	if !ss.settings.Version.IsActive(ctx, clusterversion.V26_3_AlterStatementsTablePK) {
+		return
+	}
 	if !ss.addToCacheIfAbsent(ctx, info.FingerprintID) {
 		return
 	}
@@ -162,14 +173,14 @@ func (ss *StatementStore) addToCacheIfAbsent(
 	if _, ok := ss.cacheMu.cache.Get(id); ok {
 		return false
 	}
-	// Add may trigger eviction, which shrinks the account via OnEvicted.
-	ss.cacheMu.cache.Add(id, struct{}{})
 	if ss.memAcc != nil {
 		if err := ss.memAcc.Grow(ctx, cacheEntrySize); err != nil {
 			log.Ops.Warningf(ctx,
 				"statement store cache memory accounting error: %s", err)
+			return false
 		}
 	}
+	ss.cacheMu.cache.Add(id, struct{}{})
 	return true
 }
 
@@ -179,19 +190,29 @@ func (ss *StatementStore) evictFromCacheByID(id appstatspb.StmtFingerprintID) {
 	ss.cacheMu.cache.Del(id)
 }
 
+var logEveryAppend = log.Every(10 * time.Second)
+
 func (ss *StatementStore) appendPending(ctx context.Context, info StatementInfo) {
 	ss.flushMu.Lock()
 	defer ss.flushMu.Unlock()
 	if len(ss.flushMu.pending) >= maxPendingSize {
 		// Buffer full — evict from cache so we retry on the next
 		// occurrence rather than silently dropping the fingerprint.
+		if logEveryAppend.ShouldLog() {
+			log.Ops.Warningf(ctx, "statement store pending buffer full, skipping fingerprint. ID: %d", info.FingerprintID)
+		}
 		ss.evictFromCacheByID(info.FingerprintID)
 		return
 	}
-	ss.flushMu.pending = append(ss.flushMu.pending, info)
 	if ss.memAcc != nil {
-		_ = ss.memAcc.Grow(ctx, statementInfoSize(info))
+		if err := ss.memAcc.Grow(ctx, statementInfoSize(info)); err != nil {
+			log.Ops.Warningf(ctx,
+				"statement store cache memory accounting error: %s", err)
+			ss.evictFromCacheByID(info.FingerprintID)
+			return
+		}
 	}
+	ss.flushMu.pending = append(ss.flushMu.pending, info)
 }
 
 var logEvery = log.Every(10 * time.Second)
@@ -203,7 +224,7 @@ func (ss *StatementStore) Start(ctx context.Context, stopper *stop.Stopper) {
 			panic(errors.AssertionFailedf(
 				"StatementStore.Start called before SetInternalExecutor"))
 		}
-		log.Dev.Error(ctx,
+		log.Ops.Errorf(ctx,
 			"StatementStore.Start called before SetInternalExecutor")
 		return
 	}
@@ -223,6 +244,12 @@ func (ss *StatementStore) Start(ctx context.Context, stopper *stop.Stopper) {
 
 	if err := stopper.RunAsyncTask(ctx,
 		"statement-store-writer", func(ctx context.Context) {
+			// Tie ctx to the stopper's quiesce signal so that an in-flight
+			// flush is interrupted at shutdown. Without this, drainAndFlush
+			// can block indefinitely inside the internal executor (e.g. on
+			// RAC2 flow control) and prevent the stopper from quiescing.
+			ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+			defer cancel()
 			ticker := time.NewTicker(flushInterval.Get(&ss.settings.SV))
 			defer ticker.Stop()
 			for {
@@ -333,16 +360,12 @@ func (ss *StatementStore) batchInsertStatements(
 		p := i*colsPerRow + 1
 		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d)",
 			p, p+1, p+2, p+3, p+4)
-		metadataStr := metadataImplicitFalse
-		if info.ImplicitTxn {
-			metadataStr = metadataImplicitTrue
-		}
 		args = append(args,
 			sqlstatsutil.EncodeUint64ToBytes(uint64(info.FingerprintID)),
 			info.Fingerprint,
 			info.Summary,
 			info.Database,
-			metadataStr,
+			emptyMetadata,
 		)
 	}
 	sb.WriteString(" ON CONFLICT (fingerprint_id) DO UPDATE SET last_upserted = now()")
@@ -391,5 +414,4 @@ type StatementInfo struct {
 	Fingerprint   string
 	Database      string
 	Summary       string
-	ImplicitTxn   bool
 }

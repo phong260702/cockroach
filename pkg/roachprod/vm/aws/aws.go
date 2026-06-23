@@ -11,6 +11,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -564,6 +565,13 @@ var DefaultConfig = func() (cfg *awsConfig) {
 // https://github.com/cockroachdb/cockroach/issues/105968.
 var defaultZones = []string{
 	"us-east-2a",
+	"us-east-2b",
+	"us-east-2c",
+}
+
+// defaultGeoExtraZones are the additional zones used for geo-distributed
+// clusters, appended to a randomly selected zone from defaultZones.
+var defaultGeoExtraZones = []string{
 	"us-west-2b",
 	"eu-west-2b",
 }
@@ -875,10 +883,19 @@ func (p *Provider) Create(
 }
 
 func DefaultZones(geoDistributed bool) []string {
+	zones := DefaultRetryZoneCandidates()
+	zone := zones[rand.Intn(len(zones))]
 	if geoDistributed {
-		return defaultZones
+		return append([]string{zone}, defaultGeoExtraZones...)
 	}
-	return []string{defaultZones[0]}
+	return []string{zone}
+}
+
+// DefaultRetryZoneCandidates returns the default non-geo AWS zone pool.
+// DefaultZones chooses from this pool for ordinary creates, and roachtest uses
+// it to choose a different zone after provider capacity failures.
+func DefaultRetryZoneCandidates() []string {
+	return append([]string(nil), defaultZones...)
 }
 
 // createInstances creates EC2 instances in parallel with rate limiting.
@@ -1734,11 +1751,16 @@ func (p *Provider) listRegionsFiltered(
 		namesFilter = fmt.Sprintf("Name=tag:Name,Values=%s", strings.Join(names, ","))
 	}
 
+	failedRegions := make(map[string]bool)
+	var failedRegionsMux syncutil.Mutex
 	for _, r := range regions {
 		g.GoCtx(func(ctx context.Context) error {
 			vms, err := p.describeInstances(ctx, l, r, opts, listOpts, namesFilter)
 			if err != nil {
 				l.Printf("Failed to list AWS VMs in region: %s\n%v\n", r, err)
+				failedRegionsMux.Lock()
+				failedRegions[r] = true
+				failedRegionsMux.Unlock()
 				return nil
 			}
 			mux.Lock()
@@ -1766,6 +1788,10 @@ func (p *Provider) listRegionsFiltered(
 		}
 
 		for _, r := range regions {
+			if failedRegions[r] {
+				l.Printf("Skipping empty cluster detection in region %s: instance listing failed", r)
+				continue
+			}
 			clusterNames, err := p.listManagedLaunchTemplates(l, r)
 			if err != nil {
 				l.Printf("Failed to list managed launch templates in region %s: %v", r, err)
@@ -2218,13 +2244,13 @@ func (p *Provider) runInstance(
 
 	if providerOpts.UseSpot {
 		//todo(babusrithar): Add fallback to on-demand instances if spot instances are not available.
-		return runSpotInstance(l, p, args, az.Region.Name, providerOpts)
+		return runSpotInstance(l, p, args, az.Name, az.Region.Name, cfg.machineType, providerOpts)
 	}
 
 	runInstancesOutput := RunInstancesOutput{}
 	err = p.runJSONCommand(l, args, &runInstancesOutput)
 	if err != nil {
-		return nil, err
+		return nil, annotateAWSCapacityError(err, az.Name, cfg.machineType)
 	}
 
 	if len(runInstancesOutput.Instances) == 0 {
@@ -2250,7 +2276,13 @@ func isArmMachineType(machineType string) bool {
 // It returns an error if the spot request is not fulfilled within 2 minutes.
 // It uses describe-spot-instance-requests command to get the status of the spot request.
 func runSpotInstance(
-	l *logger.Logger, p *Provider, args []string, regionName string, providerOpts *ProviderOpts,
+	l *logger.Logger,
+	p *Provider,
+	args []string,
+	zoneName string,
+	regionName string,
+	machineType string,
+	providerOpts *ProviderOpts,
 ) (*vm.VM, error) {
 	waitForSpotDuration := 2 * time.Minute
 
@@ -2261,7 +2293,7 @@ func runSpotInstance(
 	runInstancesOutput := RunInstancesOutput{}
 	err := p.runJSONCommand(l, spotArgs, &runInstancesOutput)
 	if err != nil {
-		return nil, err
+		return nil, annotateAWSCapacityError(err, zoneName, machineType)
 	}
 	// If the spot request is accepted, the run-instances command will return an instance-id.
 	if len(runInstancesOutput.Instances) == 0 {
@@ -2284,7 +2316,9 @@ func runSpotInstance(
 		if err != nil {
 			return nil, err
 		}
-		spotRequestFulfilled, err := processSpotInstanceRequestStatus(l, describeSpotInstanceRequestsOutput, spotInstanceRequestId, instanceId)
+		spotRequestFulfilled, err := processSpotInstanceRequestStatus(
+			l, describeSpotInstanceRequestsOutput, spotInstanceRequestId, instanceId, zoneName, machineType,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -2299,7 +2333,9 @@ func runSpotInstance(
 			if err != nil {
 				return nil, err
 			}
-			return nil, errors.New("waitForSpotDuration over")
+			return nil, newAWSSpotCapacityTimeoutError(
+				zoneName, machineType, spotInstanceRequestId, waitForSpotDuration,
+			)
 		}
 		l.Printf("Sleeping for 10 seconds before checking the status of the spot instance request again")
 		time.Sleep(10 * time.Second)
@@ -2346,15 +2382,24 @@ func processSpotInstanceRequestStatus(
 	describeSpotInstanceRequestsOutput DescribeSpotInstanceRequestsOutput,
 	spotInstanceRequestId string,
 	instanceId string,
+	zoneName string,
+	machineType string,
 ) (fullFilled bool, err error) {
 	if len(describeSpotInstanceRequestsOutput.SpotInstanceRequests) == 0 {
 		return false, errors.Errorf("No Spot Instance Request found for instance-id: %s", instanceId)
 	}
 	requestState := describeSpotInstanceRequestsOutput.SpotInstanceRequests[0].State
 	requestStatusCode := describeSpotInstanceRequestsOutput.SpotInstanceRequests[0].Status.Code
+	requestStatusMessage := describeSpotInstanceRequestsOutput.SpotInstanceRequests[0].Status.Message
 	if requestState == "closed" || requestState == "cancelled" || requestState == "failed" {
-		return false, errors.Errorf("Spot request %s for instance %s not active with state: %s",
-			spotInstanceRequestId, instanceId, requestState)
+		if err := newAWSSpotTerminalCapacityError(
+			zoneName, machineType, spotInstanceRequestId, instanceId,
+			requestState, requestStatusCode, requestStatusMessage,
+		); err != nil {
+			return false, err
+		}
+		return false, errors.Errorf("Spot request %s for instance %s not active with state: %s and status: %s",
+			spotInstanceRequestId, instanceId, requestState, requestStatusCode)
 	}
 	if requestStatusCode == "fulfilled" {
 		l.Printf("Spot request %s for instance %s fulfilled.", spotInstanceRequestId, instanceId)
@@ -2622,6 +2667,7 @@ func (p *Provider) CreateVolume(
 		args = append(args, "--volume-type", vco.Type)
 	case "":
 		// Use the default.
+		args = append(args, "--volume-type", defaultEBSVolumeType)
 	default:
 		return vol, errors.Newf("Invalid volume type %q", vco.Type)
 	}
@@ -2718,8 +2764,73 @@ func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, v *vm.VM) er
 	return nil
 }
 
-func (p *Provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
-	return vm.NonBootAttachedVolumes, nil
+func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) {
+	if v.ProviderID == "" {
+		return nil, nil
+	}
+	region := v.Zone[:len(v.Zone)-1]
+
+	// Describe this instance to get block device mappings and the root device
+	// name, which we need to identify (and exclude) the boot volume.
+	var descResp DescribeInstancesOutput
+	descArgs := []string{
+		"ec2", "describe-instances",
+		"--region", region,
+		"--instance-ids", v.ProviderID,
+	}
+	if err := p.runJSONCommand(l, descArgs, &descResp); err != nil {
+		return nil, err
+	}
+	var instance *DescribeInstancesOutputInstance
+	for _, res := range descResp.Reservations {
+		for i := range res.Instances {
+			if res.Instances[i].InstanceID == v.ProviderID {
+				instance = &res.Instances[i]
+				break
+			}
+		}
+	}
+	if instance == nil {
+		l.Printf("WARNING: instance %s not found in describe-instances response for region %s", v.ProviderID, region)
+		return nil, nil
+	}
+
+	// Collect non-boot volume device names from the block device
+	// mappings. The root device is excluded so we only return data volumes.
+	deviceByVolumeID := make(map[string]string)
+	for _, bdm := range instance.BlockDeviceMappings {
+		if bdm.DeviceName != instance.RootDeviceName {
+			deviceByVolumeID[bdm.Disk.VolumeID] = bdm.DeviceName
+		}
+	}
+	if len(deviceByVolumeID) == 0 {
+		return nil, nil
+	}
+
+	// Describe the non-boot volumes to get their full metadata.
+	volsByInstance, err := p.getVolumesForInstances(
+		context.Background(), l, region, []string{v.ProviderID},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var volumes []vm.Volume
+	for _, vol := range volsByInstance[v.ProviderID] {
+		if _, ok := deviceByVolumeID[vol.ProviderResourceID]; ok {
+			volumes = append(volumes, vol)
+		}
+	}
+
+	// Sort by device name to ensure deterministic ordering that matches
+	// the mount point assignment (/mnt/data1, /mnt/data2, etc.).
+	slices.SortFunc(volumes, func(a, b vm.Volume) int {
+		return strings.Compare(
+			deviceByVolumeID[a.ProviderResourceID],
+			deviceByVolumeID[b.ProviderResourceID],
+		)
+	})
+	return volumes, nil
 }
 
 type snapshotOutput struct {
@@ -2761,21 +2872,11 @@ func (p *Provider) CreateVolumeSnapshot(
 		return vm.VolumeSnapshot{}, err
 	}
 
-	// Wait for the snapshot to complete before returning. AWS snapshots
-	// are asynchronous and cannot be used to create volumes while pending.
-	waitArgs := []string{
-		"ec2", "wait", "snapshot-completed",
-		"--region", region,
-		"--snapshot-ids", so.SnapshotID,
-	}
-	if _, err := p.runCommand(l, waitArgs); err != nil {
-		return vm.VolumeSnapshot{}, errors.Wrapf(err, "waiting for snapshot %s to complete", so.SnapshotID)
-	}
-
 	return vm.VolumeSnapshot{
 		ID:     so.SnapshotID,
 		Name:   vsco.Name,
 		Region: region,
+		Status: so.State,
 	}, nil
 }
 
@@ -2839,6 +2940,7 @@ func (p *Provider) ListVolumeSnapshots(
 					ID:     so.SnapshotID,
 					Name:   name,
 					Region: r,
+					Status: so.State,
 				})
 			}
 			mu.Lock()

@@ -1335,7 +1335,7 @@ func applyColumnMutation(
 
 		// Verify sequence is not depended on by another column.
 		// Use tree.DropDefault behavior to verify without the need to alter other dependencies via tree.DropCascade.
-		if err := params.p.canRemoveAllColumnOwnedSequences(params.ctx, tableDesc, col, tree.DropDefault); err != nil {
+		if err := params.p.canRemoveAllIdentityOwnedSequences(params.ctx, tableDesc, col, tree.DropDefault); err != nil {
 			return err
 		}
 		// Drop the identity flag first, so that it is treated like a normal column.
@@ -2223,6 +2223,36 @@ func dropColumnImpl(
 	}
 	tableDesc.OutboundFKs = tableDesc.OutboundFKs[:sliceIdx]
 
+	// Drop inbound FKs that reference the column being dropped. Inbound FKs
+	// backed by a unique constraint covering this column were already handled
+	// when that constraint was dropped above; what remains here are subset
+	// FKs, which can reference a column with no backing unique constraint
+	// covering it.
+	sliceIdx = 0
+	for i, fk := range tableDesc.InboundForeignKeys() {
+		tableDesc.InboundFKs[sliceIdx] = tableDesc.InboundFKs[i]
+		sliceIdx++
+		if !fk.CollectReferencedColumnIDs().Contains(colToDrop.GetID()) {
+			continue
+		}
+		if t.DropBehavior != tree.DropCascade {
+			originDesc, err := params.p.Descriptors().MutableByID(params.p.txn).
+				Table(params.ctx, fk.GetOriginTableID())
+			if err != nil {
+				return nil, err
+			}
+			return nil, sqlerrors.NewDependentBlocksOpError(
+				"drop", "column", colToDrop.GetName(),
+				"constraint",
+				fmt.Sprintf("%s on relation %s", fk.GetName(), originDesc.GetName()))
+		}
+		sliceIdx--
+		if err := params.p.removeFKForBackReference(params.ctx, tableDesc, fk); err != nil {
+			return nil, err
+		}
+	}
+	tableDesc.InboundFKs = tableDesc.InboundFKs[:sliceIdx]
+
 	found := false
 	for i := range tableDesc.Columns {
 		if tableDesc.Columns[i].ID == colToDrop.GetID() {
@@ -2437,9 +2467,10 @@ func (p *planner) tryRemoveFKBackReferences(
 	behavior tree.DropBehavior,
 	withSearchForReplacement bool,
 ) error {
+	canUseSubset := p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V26_3)
 	isSuitable := func(fk catalog.ForeignKeyConstraint, u catalog.UniqueConstraint) bool {
 		return u.GetConstraintID() != uniqueConstraint.GetConstraintID() && !u.Dropped() &&
-			u.IsValidReferencedUniqueConstraint(fk)
+			u.IsValidReferencedUniqueConstraint(fk, canUseSubset)
 	}
 	uwis := tableDesc.UniqueConstraintsWithIndex()
 	uwois := tableDesc.UniqueConstraintsWithoutIndex()
@@ -2470,7 +2501,7 @@ func (p *planner) tryRemoveFKBackReferences(
 		// The constraint being deleted could potentially be required by a
 		// referencing foreign key. Find alternatives if that's the case,
 		// otherwise remove the foreign key.
-		if uniqueConstraint.IsValidReferencedUniqueConstraint(fk) &&
+		if uniqueConstraint.IsValidReferencedUniqueConstraint(fk, canUseSubset) &&
 			!uniqueConstraintHasReplacementCandidate(fk) {
 			// If we haven't found a replacement, then we check that the drop
 			// behavior is cascade.

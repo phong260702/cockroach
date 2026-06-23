@@ -115,6 +115,9 @@ const (
 	StatementsTableName                     SystemTableName = "statements"
 	TableStatisticsLocksTableName           SystemTableName = "table_statistics_locks"
 	AdvisoryLocksTableName                  SystemTableName = "advisory_locks"
+	ResourceGroupsTableName                 SystemTableName = "resource_groups"
+	ResourceGroupIDSequenceName             SystemTableName = "resource_group_id_seq"
+	VcpuUsageTableName                      SystemTableName = "vcpu_usage"
 )
 
 // Oid for virtual database and table.
@@ -478,7 +481,8 @@ const (
 	PgExtensionSpatialRefSysTableID
 	InformationSchemaCrdbNodeActiveSessionHistoryTableID
 	InformationSchemaCrdbClusterActiveSessionHistoryTableID
-	MinVirtualID = InformationSchemaCrdbClusterActiveSessionHistoryTableID
+	CrdbInternalClusterHeldAdvisoryLocksTableID
+	MinVirtualID = CrdbInternalClusterHeldAdvisoryLocksTableID
 )
 
 // ConstraintType is used to identify the type of a constraint.

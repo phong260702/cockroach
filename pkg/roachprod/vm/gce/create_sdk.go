@@ -59,8 +59,12 @@ func (p *Provider) buildInstanceProperties(
 	// Add additional disks (SSDs or persistent disks).
 	if !providerOpts.BootDiskOnly {
 		if opts.SSDOpts.UseLocalSSD {
+			attachCount, err := localSSDAttachCount(l, providerOpts)
+			if err != nil {
+				return nil, err
+			}
 			// Local SSDs are physically attached to the host machine.
-			for i := 0; i < providerOpts.SSDCount; i++ {
+			for i := 0; i < attachCount; i++ {
 				disks = append(disks, &computepb.AttachedDisk{
 					AutoDelete: proto.Bool(true),
 					Type:       proto.String(computepb.AttachedDisk_SCRATCH.String()),
@@ -224,6 +228,7 @@ func (p *Provider) bulkInsertInstances(
 	// Execute the BulkInsert request (async operation).
 	op, err := client.BulkInsert(ctx, req)
 	if err != nil {
+		err = maybeGCECapacityError(err, []byte(err.Error()))
 		return errors.Wrapf(err, "BulkInsert request failed for zone %s", zone)
 	}
 
@@ -233,6 +238,7 @@ func (p *Provider) bulkInsertInstances(
 		return op.Wait(ctx)
 	}()
 	if err != nil {
+		err = maybeGCECapacityError(err, []byte(err.Error()))
 		return errors.Wrapf(err, "BulkInsert operation failed for zone %s", zone)
 	}
 	l.Printf("BulkInsert: successfully created %d instances in zone %s", len(hostNames), zone)

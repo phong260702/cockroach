@@ -7,19 +7,24 @@ and write your findings to `artifacts/findings.md` (a later workflow
 step posts it as a comment on the issue). Create the directory first
 with `mkdir -p artifacts`.
 
-You are inside a blobless clone of the CockroachDB repository with
-full commit history. `git log`, `git blame`, `git diff`, etc. work
-normally — no need to deepen or unshallow. File contents (blobs) are
-fetched transparently on demand when you check out a commit or read
-a file at a specific revision.
+The issue and your findings comment live in `ISSUE_REPO` (passed in the
+prompt); `gh` defaults to it, so use plain `gh issue`/`gh pr`/`gh search`
+commands. The working tree is checked out from `CODE_REPO`; use that
+when building source links (blob/permalink URLs).
 
-To inspect a specific commit, just check it out:
+You are inside a blobless clone of the `CODE_REPO` repository with
+full commit history. `git log`, `git diff`, etc. work normally — no
+need to deepen or unshallow.
+
+To inspect a specific commit, check it out with the `checkout-sha`
+helper (do not use a plain `git checkout <sha>` — it cannot reliably
+fetch file contents for commits on non-default branches):
 
 ```bash
-git checkout <sha>
+checkout-sha <sha>
 ```
 
-If the checkout fails (SHA not reachable from this remote — rare,
+If `checkout-sha` fails (SHA not reachable from this remote — rare,
 only happens for commits exclusive to a fork), proceed with the
 currently checked-out code instead, but add a prominent warning at
 the very top of `artifacts/findings.md`:
@@ -42,7 +47,8 @@ to check what's available.
 Key tools at your disposal:
 
 - **Code reading**: Read, Grep, Glob, and common shell text tools
-- **Git**: all git commands (log, blame, diff, show, fetch, etc.)
+- **Git**: all git commands (log, diff, show, etc.); use
+  `checkout-sha <sha>` to check out a specific commit
 - **GitHub CLI**: gh issue view/list, gh pr view/list/diff, gh search
 - **Web browsing**: WebFetch tool for reading web pages and JSON APIs
 - **File download**: `fetch-url <url> [output-file]` (GET-only HTTP
@@ -123,10 +129,10 @@ fix is present in the failure SHA's history using `git log`.
 After determining the failure SHA from Step 1, check it out:
 
 ```bash
-git checkout <failure-sha>
+checkout-sha <failure-sha>
 ```
 
-If the checkout fails, fall back to the default branch tip (see the
+If `checkout-sha` fails, fall back to the default branch tip (see the
 warning note in the checkout instructions above).
 
 Then explore the relevant source code:
@@ -193,8 +199,12 @@ artifact is `failure-logs.tbz` — a bzip2-compressed tar archive bundled
 
 ```bash
 unzip -j "$DEST/artifacts.zip" "failure-logs.tbz" -d "$DEST"
-tar -xjf "$DEST/failure-logs.tbz" -C "$DEST"
+tar --extract -f "$DEST/failure-logs.tbz" -C "$DEST"
 ```
+
+(GNU tar auto-detects bzip2 compression on extract, so no `-j` flag
+is needed. Use the long-form `--extract` because that's the form
+allowed by the workflow's tool permissions; `tar -xjf` is sandboxed.)
 
 The archive contains:
 
@@ -335,10 +345,10 @@ top-level error is just "command failed" or similarly uninformative,
 dig into the artifact logs to find the actual underlying failure
 from the command's output.>
 
-<When referencing file:line(s) in code, make it a link specific to this repo and
-SHA. Example:
-[server.go:251](https://github.com/cockroachdb/cockroach/blob/<sha>/pkg/server/server.go#L251).
-For multi-line sections, e.g. [server.go:251-300], use suffix like #L251-L300>
+<When referencing file:line(s) in code, make it a link specific to the
+CODE_REPO repo and SHA. Example (substitute CODE_REPO for the owner/repo):
+[server.go:251](https://github.com/<CODE_REPO>/blob/<sha>/pkg/server/server.go#L251).
+For multi-line sections, e.g. [server.go:251-300], use suffix like #L251-L300.>
 
 ### Analysis
 

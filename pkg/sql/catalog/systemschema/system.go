@@ -1390,8 +1390,7 @@ CREATE TABLE system.advisory_locks (
 	// StatementsTableSchema defines the schema for the system.statements table
 	// which stores information about executed statements.
 	//
-	// * id: a unique ID used as the primary key.
-	// * fingerprint_id: the fingerprint ID of the statement (as bytes).
+	// * fingerprint_id: the fingerprint ID of the statement (as bytes); primary key.
 	// * fingerprint: the statement fingerprint text.
 	// * summary: a summary of the statement.
 	// * db: the database where the statement was executed.
@@ -1400,7 +1399,6 @@ CREATE TABLE system.advisory_locks (
 	// * last_upserted: the timestamp when the record was last updated.
 	StatementsTableSchema = `
 CREATE TABLE system.statements (
-    id             INT8 NOT NULL DEFAULT unique_rowid(),
     fingerprint_id BYTES NOT NULL,
     fingerprint    STRING NOT NULL,
     summary        STRING NOT NULL,
@@ -1408,10 +1406,57 @@ CREATE TABLE system.statements (
     metadata       JSONB NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_upserted  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT "primary" PRIMARY KEY (id ASC),
-    UNIQUE INDEX statements_fingerprint_id_key (fingerprint_id ASC) STORING (fingerprint, summary, db),
+    CONSTRAINT "primary" PRIMARY KEY (fingerprint_id ASC),
     INDEX statements_fingerprint_idx (fingerprint ASC),
-    FAMILY "primary" (id, fingerprint_id, fingerprint, summary, db, metadata, created_at, last_upserted)
+    FAMILY "primary" (fingerprint_id, fingerprint, summary, db, metadata, created_at, last_upserted)
+);`
+
+	// ResourceGroupsTableSchema defines the schema for the
+	// system.resource_groups table, which stores the user-defined resource
+	// group configurations used by the resource manager. The table holds
+	// the configurations for the tenant it lives on; a future host-side
+	// table will hold the host's reconciled view of every tenant's groups.
+	//
+	// IDs < 16 are reserved for built-in groups that are hardcoded in code
+	// rather than stored in this table. The CHECK on this table and the
+	// MINVALUE on system.resource_group_id_seq are both set to 16 so neither
+	// path can produce an id in the reserved range.
+	ResourceGroupsTableSchema = `
+CREATE TABLE system.resource_groups (
+    id     INT8   NOT NULL,
+    name   STRING NOT NULL,
+    config BYTES  NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (id ASC),
+    CONSTRAINT check_id_reserved_range CHECK (id >= 16),
+    UNIQUE INDEX resource_groups_name_idx (name ASC),
+    FAMILY "primary" (id, name, config)
+);`
+
+	// ResourceGroupIDSequenceSchema defines the schema for the
+	// system.resource_group_id_seq sequence used to allocate new resource
+	// group ids. MINVALUE matches the table's CHECK so allocated ids never
+	// fall in the reserved range.
+	ResourceGroupIDSequenceSchema = `
+CREATE SEQUENCE system.resource_group_id_seq START 16 MINVALUE 16 MAXVALUE 9223372036854775807;`
+
+	// VcpuUsageTableSchema defines the schema for the system.vcpu_usage table,
+	// which stores per-node vCPU consumption data for license auditing.
+	//
+	// * node_id: the ID of the node reporting vCPU usage.
+	// * license_id: the license ID under which vCPUs are consumed. Use an empty
+	//   string as a sentinel when no license is installed.
+	// * period_start: the truncated start of the audit interval this measurement
+	//   is attributed to. The interval length is determined by the audit job.
+	// * vcpus: the number of vCPUs observed on the node during the interval.
+	//   Stored as FLOAT to accommodate fractional values from cgroup CPU quotas.
+	VcpuUsageTableSchema = `
+CREATE TABLE system.vcpu_usage (
+    node_id        INT8 NOT NULL,
+    license_id     STRING NOT NULL,
+    period_start   TIMESTAMPTZ NOT NULL,
+    vcpus          FLOAT NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (node_id, license_id, period_start),
+    FAMILY "primary" (node_id, license_id, period_start, vcpus)
 );`
 )
 
@@ -1457,7 +1502,7 @@ const SystemDatabaseName = catconstants.SystemDatabaseName
 // release version).
 //
 // NB: Don't set this to clusterversion.Latest; use a specific version instead.
-var SystemDatabaseSchemaBootstrapVersion = clusterversion.V26_3_AddAdvisoryLocksTable.Version()
+var SystemDatabaseSchemaBootstrapVersion = clusterversion.V26_3_AddVcpuUsageTable.Version()
 
 // MakeSystemDatabaseDesc constructs a copy of the system database
 // descriptor.
@@ -1661,6 +1706,9 @@ func MakeSystemTables() []SystemTable {
 		TableStatisticsLocksTable,
 		AdvisoryLocksTable,
 		StatementsTable,
+		ResourceGroupsTable,
+		ResourceGroupIDSequence,
+		VcpuUsageTable,
 	}
 }
 
@@ -5521,21 +5569,59 @@ var (
 			catconstants.StatementsTableName,
 			descpb.InvalidID, // dynamically assigned
 			[]descpb.ColumnDescriptor{
-				{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString},
-				{Name: "fingerprint_id", ID: 2, Type: types.Bytes},
-				{Name: "fingerprint", ID: 3, Type: types.String},
-				{Name: "summary", ID: 4, Type: types.String},
-				{Name: "db", ID: 5, Type: types.String},
-				{Name: "metadata", ID: 6, Type: types.Jsonb},
-				{Name: "created_at", ID: 7, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
-				{Name: "last_upserted", ID: 8, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
+				{Name: "fingerprint_id", ID: 1, Type: types.Bytes},
+				{Name: "fingerprint", ID: 2, Type: types.String},
+				{Name: "summary", ID: 3, Type: types.String},
+				{Name: "db", ID: 4, Type: types.String},
+				{Name: "metadata", ID: 5, Type: types.Jsonb},
+				{Name: "created_at", ID: 6, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
+				{Name: "last_upserted", ID: 7, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name:        "primary",
 					ID:          0,
-					ColumnNames: []string{"id", "fingerprint_id", "fingerprint", "summary", "db", "metadata", "created_at", "last_upserted"},
-					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8},
+					ColumnNames: []string{"fingerprint_id", "fingerprint", "summary", "db", "metadata", "created_at", "last_upserted"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7},
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:                "primary",
+				ID:                  1,
+				Unique:              true,
+				KeyColumnNames:      []string{"fingerprint_id"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        []descpb.ColumnID{1},
+			},
+			descpb.IndexDescriptor{
+				Name:                "statements_fingerprint_idx",
+				ID:                  2,
+				Unique:              false,
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+				KeyColumnNames:      []string{"fingerprint"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        []descpb.ColumnID{2},
+				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+			},
+		),
+	)
+
+	ResourceGroupsTable = makeSystemTable(
+		ResourceGroupsTableSchema,
+		systemTable(
+			catconstants.ResourceGroupsTableName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "id", ID: 1, Type: types.Int},
+				{Name: "name", ID: 2, Type: types.String},
+				{Name: "config", ID: 3, Type: types.Bytes},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:        "primary",
+					ID:          0,
+					ColumnNames: []string{"id", "name", "config"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3},
 				},
 			},
 			descpb.IndexDescriptor{
@@ -5547,26 +5633,100 @@ var (
 				KeyColumnIDs:        []descpb.ColumnID{1},
 			},
 			descpb.IndexDescriptor{
-				Name:                "statements_fingerprint_id_key",
+				Name:                "resource_groups_name_idx",
 				ID:                  2,
 				Unique:              true,
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-				KeyColumnNames:      []string{"fingerprint_id"},
+				KeyColumnNames:      []string{"name"},
 				KeyColumnDirections: singleASC,
 				KeyColumnIDs:        []descpb.ColumnID{2},
 				KeySuffixColumnIDs:  []descpb.ColumnID{1},
-				StoreColumnNames:    []string{"fingerprint", "summary", "db"},
-				StoreColumnIDs:      []descpb.ColumnID{3, 4, 5},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+		),
+		func(tbl *descpb.TableDescriptor) {
+			tbl.Checks = []*descpb.TableDescriptor_CheckConstraint{{
+				Name:         "check_id_reserved_range",
+				Expr:         descpb.Expression("id >= 16:::INT8"),
+				ColumnIDs:    []descpb.ColumnID{1},
+				ConstraintID: tbl.NextConstraintID,
+			}}
+			tbl.NextConstraintID++
+		},
+	)
+
+	// ResourceGroupIDSequence is the descriptor for the resource group id
+	// sequence. It starts at 16 to keep allocated IDs out of the reserved
+	// range used by built-in groups (see ResourceGroupsTableSchema).
+	ResourceGroupIDSequence = makeSystemTable(
+		ResourceGroupIDSequenceSchema,
+		systemTable(
+			catconstants.ResourceGroupIDSequenceName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: tabledesc.SequenceColumnName, ID: tabledesc.SequenceColumnID, Type: types.Int},
+			},
+			[]descpb.ColumnFamilyDescriptor{{
+				Name:            "primary",
+				ID:              keys.SequenceColumnFamilyID,
+				ColumnNames:     []string{tabledesc.SequenceColumnName},
+				ColumnIDs:       []descpb.ColumnID{tabledesc.SequenceColumnID},
+				DefaultColumnID: tabledesc.SequenceColumnID,
+			}},
+			descpb.IndexDescriptor{
+				ID:                  keys.SequenceIndexID,
+				Name:                tabledesc.LegacyPrimaryKeyIndexName,
+				KeyColumnIDs:        []descpb.ColumnID{tabledesc.SequenceColumnID},
+				KeyColumnNames:      []string{tabledesc.SequenceColumnName},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+			},
+		),
+		func(tbl *descpb.TableDescriptor) {
+			tbl.SequenceOpts = &descpb.TableDescriptor_SequenceOpts{
+				Increment:        1,
+				MinValue:         16,
+				MaxValue:         math.MaxInt64,
+				Start:            16,
+				SessionCacheSize: 1,
+			}
+			tbl.NextColumnID = 0
+			tbl.NextFamilyID = 0
+			tbl.NextIndexID = 0
+			tbl.NextMutationID = 0
+			// Sequences never exposed their internal constraints, so all
+			// IDs will be left at zero. CREATE SEQUENCE has the same
+			// behaviour.
+			tbl.NextConstraintID = 0
+			tbl.PrimaryIndex.ConstraintID = 0
+		},
+	)
+
+	VcpuUsageTable = makeSystemTable(
+		VcpuUsageTableSchema,
+		systemTable(
+			catconstants.VcpuUsageTableName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "node_id", ID: 1, Type: types.Int},
+				{Name: "license_id", ID: 2, Type: types.String},
+				{Name: "period_start", ID: 3, Type: types.TimestampTZ},
+				{Name: "vcpus", ID: 4, Type: types.Float},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:            "primary",
+					ID:              0,
+					ColumnNames:     []string{"node_id", "license_id", "period_start", "vcpus"},
+					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4},
+					DefaultColumnID: 4,
+				},
 			},
 			descpb.IndexDescriptor{
-				Name:                "statements_fingerprint_idx",
-				ID:                  3,
-				Unique:              false,
-				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
-				KeyColumnNames:      []string{"fingerprint"},
-				KeyColumnDirections: singleASC,
-				KeyColumnIDs:        []descpb.ColumnID{3},
-				KeySuffixColumnIDs:  []descpb.ColumnID{1},
+				Name:                "primary",
+				ID:                  1,
+				Unique:              true,
+				KeyColumnNames:      []string{"node_id", "license_id", "period_start"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{1, 2, 3},
 			},
 		),
 	)

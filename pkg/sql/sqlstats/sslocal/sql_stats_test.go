@@ -377,7 +377,6 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		statements          []string
 		fingerprints        []string
 		curFingerprintCount int64
-		implicit            bool
 	}
 
 	testCases := []tc{
@@ -389,7 +388,6 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 				"SELECT _",
 			},
 			curFingerprintCount: 2, /* 1 stmt + 1 txn */
-			implicit:            true,
 		},
 		{
 			statements: []string{
@@ -405,7 +403,6 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 				"COMMIT",
 			},
 			curFingerprintCount: 7, /* 4 stmt + 1 txn + prev count */
-			implicit:            false,
 		},
 		{
 			statements: []string{
@@ -421,7 +418,6 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 				"COMMIT",
 			},
 			curFingerprintCount: 7, /* prev count */
-			implicit:            false,
 		},
 		{
 			statements: []string{
@@ -439,7 +435,6 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 				"COMMIT",
 			},
 			curFingerprintCount: 13, /* 5 stmt + 1 txn + prev count */
-			implicit:            false,
 		},
 	}
 
@@ -449,6 +444,11 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		Settings: st,
 	})
 
+	// Stub the time so all events fall in the same aggregation window.
+	// Without this, a test run that crosses an aggregation boundary
+	// produces duplicate (fingerprint, aggregatedTs) keys and inflates
+	// the fingerprint count. See #169386.
+	stubNow := time.Date(2026, 3, 15, 10, 30, 45, 0, time.UTC)
 	sqlStats := sslocal.NewSQLStats(
 		st,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -458,12 +458,14 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		nil, /* discardedStatsCount */
 		monitor,
 		nil, /* reportingSink */
-		nil, /* knobs */
+		&sqlstats.TestingKnobs{
+			StubTimeNow: func() time.Time { return stubNow },
+		},
 	)
 
 	ingester := sslocal.NewSQLStatsIngester(
 		st, nil /* knobs */, sslocal.NewIngesterMetrics(),
-		nil /* parentMon */, nil /* statementStore */, sqlStats)
+		nil /* discardedStatsCount */, nil /* parentMon */, nil /* statementStore */, sqlStats)
 	ingester.Start(ctx, stopper)
 
 	appStats := sqlStats.GetApplicationStats("" /* appName */)
@@ -480,11 +482,10 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		txnFingerprintIDHash := util.MakeFNV64()
 		statsCollector.StartTransaction()
 		for _, fingerprint := range testCase.fingerprints {
-			stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, testCase.implicit, "defaultdb")
+			stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, "defaultdb")
 			statsCollector.RecordStatement(ctx, &sqlstats.RecordedStmtStats{
 				FingerprintID: stmtFingerprintID,
 				Query:         fingerprint,
-				ImplicitTxn:   testCase.implicit,
 			})
 			txnFingerprintIDHash.Add(uint64(stmtFingerprintID))
 		}
@@ -590,7 +591,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 		)
 		ingester := sslocal.NewSQLStatsIngester(
 			st, nil /* knobs */, sslocal.NewIngesterMetrics(),
-			nil /* parentMon */, nil /* statementStore */, sqlStats)
+			nil /* discardedStatsCount */, nil /* parentMon */, nil /* statementStore */, sqlStats)
 		appStats := sqlStats.GetApplicationStats("" /* appName */)
 		statsCollector := sslocal.NewStatsCollector(
 			st,
@@ -606,7 +607,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			// Collect stats for the simulated transaction.
 			txnFingerprintIDHash := util.MakeFNV64()
 			for _, fingerprint := range txn.stmtFingerprints {
-				stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, false, "defaultdb")
+				stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(fingerprint, "defaultdb")
 				statsCollector.RecordStatement(ctx, &sqlstats.RecordedStmtStats{
 					FingerprintID: stmtFingerprintID,
 					Query:         fingerprint,
