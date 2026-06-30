@@ -9,7 +9,6 @@ import (
 	"context"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -41,7 +40,7 @@ var readerTenantSystemTableIDOffset = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
 	"physical_cluster_replication.reader_system_table_id_offset",
 	"the offset added to dynamically allocated system table IDs in the reader tenant",
-	0,
+	1_000_000_000,
 	// Max offset is 1000 less than MaxUint32 to leave room 1000 dynamically
 	// allocated system table ids. Hope that never happens.
 	settings.NonNegativeIntWithMaximum(math.MaxUint32-1000),
@@ -132,13 +131,6 @@ func ingestionPlanHook(
 		}()
 		ctx, span := tracing.ChildSpan(ctx, stmt.StatementTag())
 		defer span.Finish()
-
-		if err := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings,
-			"CREATE VIRTUAL CLUSTER FROM REPLICATION",
-		); err != nil {
-			return err
-		}
 
 		if err := sql.CanManageTenant(ctx, p); err != nil {
 			return err
@@ -349,6 +341,7 @@ func createReaderTenant(
 		if err != nil {
 			return readerID, err
 		}
+		telemetry.Count("physical_replication.reader_tenant.created")
 	}
 	return readerID, nil
 }

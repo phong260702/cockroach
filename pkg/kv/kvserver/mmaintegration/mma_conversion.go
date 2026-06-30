@@ -6,8 +6,6 @@
 package mmaintegration
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/mmaprototype"
@@ -20,6 +18,7 @@ import (
 func convertLeaseTransferToMMA(
 	desc *roachpb.RangeDescriptor,
 	usage allocator.RangeUsageInfo,
+	amp mmaprototype.AmpVector,
 	transferFrom, transferTo roachpb.ReplicationTarget,
 ) mmaprototype.PendingRangeChange {
 	// TODO(wenyihu6): we are passing existing replicas to
@@ -43,7 +42,7 @@ func convertLeaseTransferToMMA(
 	}
 	replicaChanges := mmaprototype.MakeLeaseTransferChanges(desc.RangeID,
 		existingReplicas,
-		mmaRangeLoad(usage),
+		mmaRangeLoad(usage, amp),
 		transferTo,
 		transferFrom,
 	)
@@ -62,10 +61,11 @@ func convertLeaseTransferToMMA(
 func convertReplicaChangeToMMA(
 	desc *roachpb.RangeDescriptor,
 	usage allocator.RangeUsageInfo,
+	amp mmaprototype.AmpVector,
 	changes kvpb.ReplicationChanges,
 	leaseholderStoreID roachpb.StoreID,
 ) (mmaprototype.PendingRangeChange, error) {
-	rLoad := mmaRangeLoad(usage)
+	rLoad := mmaRangeLoad(usage, amp)
 	replicaChanges := make([]mmaprototype.ReplicaChange, 0, len(changes))
 	replicaSet := desc.Replicas()
 
@@ -91,9 +91,15 @@ func convertReplicaChangeToMMA(
 			})
 			replDescriptors := filteredSet.Descriptors()
 			if len(replDescriptors) != 1 {
-				panic(fmt.Sprintf(
+				// This is reachable when the replicate queue plans changes against
+				// one descriptor and applyChange then re-reads a fresher descriptor
+				// before passing both into NonMMAPreChangeReplicas: a concurrent
+				// replication change can remove the target store in between. The
+				// caller logs and skips MMA registration; the underlying
+				// changeReplicasImpl will detect the stale descriptor via its CPut.
+				return mmaprototype.PendingRangeChange{}, errors.Errorf(
 					"no replica found for removal target=%v post-filter=%v pre-filter=%v",
-					chg.Target.StoreID, replDescriptors, desc))
+					chg.Target.StoreID, replDescriptors, desc)
 			}
 			replDesc := replDescriptors[0]
 			isLeaseholder := replDesc.StoreID == leaseholderStoreID

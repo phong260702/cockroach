@@ -137,41 +137,44 @@ func (f *MultiFrontier[P]) PeekFrontierSpan() roachpb.Span {
 }
 
 // Forward implements Frontier.
-func (f *MultiFrontier[P]) Forward(span roachpb.Span, ts hlc.Timestamp) (bool, error) {
+func (f *MultiFrontier[P]) Forward(span roachpb.Span, ts hlc.Timestamp) (ForwardResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	partition, err := f.partitioner(span)
 	if err != nil {
-		return false, errors.Wrapf(err, "got partitioner error when attempting to forward")
+		return ForwardNoChange, errors.Wrapf(err, "got partitioner error when attempting to forward")
 	}
 
 	frontier := f.mu.frontiers.get(partition)
 	if frontier == nil {
-		return false, nil
+		return ForwardNoChange, nil
 	}
 
 	prevMinFrontier := f.mu.frontiers.min().Frontier()
-	forwarded, err := frontier.Forward(span, ts)
+	result, err := frontier.Forward(span, ts)
 	if err != nil {
-		return false, err
+		return ForwardNoChange, err
 	}
-	if forwarded {
+	if result.FrontierForwarded() {
 		if err := f.mu.frontiers.fixup(partition); err != nil {
-			return false, err
+			return ForwardNoChange, err
 		}
 	}
 
 	if buildutil.CrdbTestBuild && !f.mu.frontiers.valid() {
-		return false, errors.AssertionFailedf(
+		return ForwardNoChange, errors.AssertionFailedf(
 			"Forward: heap invariant violated after forwarding span: %v", span)
 	}
 
 	newMinFrontier := f.mu.frontiers.min().Frontier()
 	if prevMinFrontier.Less(newMinFrontier) {
-		return true, nil
+		return ForwardResolvedTime, nil
 	}
-	return false, nil
+	if result.SpanForwarded() {
+		return ForwardSpan, nil
+	}
+	return ForwardNoChange, nil
 }
 
 // Release implements Frontier.
@@ -212,6 +215,20 @@ func (f *MultiFrontier[P]) SpanEntries(span roachpb.Span) iter.Seq2[roachpb.Span
 			}
 		}
 	}
+}
+
+// Copy implements Frontier.
+func (f *MultiFrontier[P]) Copy() Frontier {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	copy := newFrontier()
+	for _, frontier := range f.mu.frontiers.all() {
+		for sp, ts := range frontier.Entries() {
+			_ = copy.AddSpansAt(ts, sp)
+		}
+	}
+	return copy
 }
 
 // Len implements Frontier.

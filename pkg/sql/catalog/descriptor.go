@@ -372,6 +372,9 @@ type TableDescriptor interface {
 	IsPhysicalTable() bool
 	// MaterializedView returns whether this TableDescriptor is a MaterializedView.
 	MaterializedView() bool
+	// IsSecurityInvoker returns true if security_invoker option is set to true.
+	// The function should only be called on a view descriptor.
+	IsSecurityInvoker() bool
 	// IsReadOnly returns if this table descriptor has external data, and cannot
 	// be written to.
 	IsReadOnly() bool
@@ -385,7 +388,7 @@ type TableDescriptor interface {
 
 	// GetCreateQuery returns the full CREATE TABLE AS query that was used for
 	// table's creation. Only valid if IsAs is true.
-	GetCreateQuery() string
+	GetCreateQuery() catpb.Statement
 	// GetCreateAsOfTime returns the transaction timestamp that this table was
 	// created at, for materialized views and CREATE TABLE AS. Only valid if
 	// IsAs or MaterializedView returns true.
@@ -393,7 +396,7 @@ type TableDescriptor interface {
 
 	// GetViewQuery returns this view's CREATE VIEW declaration. Only valid if
 	// IsView is true.
-	GetViewQuery() string
+	GetViewQuery() catpb.Statement
 
 	// GetDropTime returns the timestamp at which the table is truncated or
 	// dropped. It's represented as the current time in nanoseconds since the
@@ -655,9 +658,16 @@ type TableDescriptor interface {
 	GetReplacementOf() descpb.TableDescriptor_Replacement
 
 	// GetAllReferencedRelationIDsExceptFKs returns the IDs of all relations
-	// this table depends on, excluding foreign key dependencies. Dependencies can
-	// originate from triggers, policies, or direct references in views.
-	GetAllReferencedRelationIDsExceptFKs() descpb.IDs
+	// this table depends on, excluding foreign key dependencies. Dependencies are
+	// returned separately by source:
+	//   - byTriggerID: maps each trigger ID to the set of relation IDs it references
+	//   - byPolicyID: maps each policy ID to the set of relation IDs it references
+	//   - fromView: relation IDs referenced directly by the view's DependsOn
+	GetAllReferencedRelationIDsExceptFKs() (
+		byTriggerID map[descpb.TriggerID]DescriptorIDSet,
+		byPolicyID map[descpb.PolicyID]DescriptorIDSet,
+		fromView DescriptorIDSet,
+	)
 
 	// GetAllReferencedTypeIDs returns all user defined type descriptor IDs that
 	// this table references. It takes in a function that returns the TypeDescriptor
@@ -811,6 +821,8 @@ type TableDescriptor interface {
 	GetExcludeDataFromBackup() bool
 	// GetStorageParams returns a list of storage parameters for the table.
 	GetStorageParams(spaceBetweenEqual bool) ([]string, error)
+	// GetViewOptions returns a list of options for the view.
+	GetViewOptions(spaceBetweenEqual bool) ([]string, error)
 	// NoAutoStatsSettingsOverrides is true if no auto stats related settings are
 	// set at the table level for the given table.
 	NoAutoStatsSettingsOverrides() bool
@@ -943,6 +955,10 @@ type TypeDescriptor interface {
 	// TableImplicitRecordTypeDescriptor if this type is an implicit table record
 	// type, nil otherwise.
 	AsTableImplicitRecordTypeDescriptor() TableImplicitRecordTypeDescriptor
+
+	// AsDomainTypeDescriptor returns this instance cast to
+	// DomainTypeDescriptor if this type is a domain type, nil otherwise.
+	AsDomainTypeDescriptor() DomainTypeDescriptor
 }
 
 // NonAliasTypeDescriptor is the TypeDescriptor subtype for concrete user-defined
@@ -998,6 +1014,12 @@ type RegionEnumTypeDescriptor interface {
 		superRegion string,
 		f func(region catpb.RegionName) error,
 	) error
+
+	// GetSuperRegionSurvivalGoal returns the survival goal string ("zone" or
+	// "region") for the named super region if it has an explicit goal, along
+	// with a boolean indicating whether an explicit goal was set. If the super
+	// region inherits the database-level goal, the bool is false.
+	GetSuperRegionSurvivalGoal(superRegion string) (string, bool, error)
 }
 
 // AliasTypeDescriptor is the TypeDescriptor subtype for alias types.
@@ -1034,6 +1056,48 @@ type TableImplicitRecordTypeDescriptor interface {
 	// UnderlyingTableDescriptor returns the table descriptor underlying this
 	// implicit type.
 	UnderlyingTableDescriptor() TableDescriptor
+}
+
+// DomainTypeDescriptor is the TypeDescriptor subtype for domain types, which
+// are user-defined types based on an existing type with optional constraints.
+type DomainTypeDescriptor interface {
+	NonAliasTypeDescriptor
+
+	// GetBaseType returns the underlying base type of the domain.
+	GetBaseType() *types.T
+	// IsNotNull returns true if the domain has a NOT NULL constraint in any
+	// state of enforcement.
+	IsNotNull() bool
+	// IsNotNullValidated returns true only if the domain's NOT NULL constraint
+	// is fully validated against all existing rows (i.e. state ENFORCING).
+	IsNotNullValidated() bool
+	// GetNotNullConstraintName returns the name of the NOT NULL constraint, or
+	// an empty string if there is no NOT NULL constraint.
+	GetNotNullConstraintName() string
+	// GetNotNullConstraintID returns the ID of the NOT NULL constraint, or zero
+	// if there is no NOT NULL constraint.
+	GetNotNullConstraintID() descpb.ConstraintID
+	// GetDefaultExpr returns the default expression for the domain, or an
+	// empty string if no default is specified.
+	GetDefaultExpr() string
+	// NumCheckConstraints returns the number of CHECK constraints on the domain.
+	NumCheckConstraints() int
+	// GetCheckConstraintName returns the name of the CHECK constraint at the
+	// given ordinal.
+	GetCheckConstraintName(idx int) string
+	// GetCheckConstraintExpr returns the expression of the CHECK constraint at
+	// the given ordinal.
+	GetCheckConstraintExpr(idx int) string
+	// GetCheckConstraintID returns the ID of the CHECK constraint at the given
+	// ordinal.
+	GetCheckConstraintID(idx int) descpb.ConstraintID
+	// GetCheckConstraintValidity returns the validity of the CHECK constraint
+	// at the given ordinal.
+	GetCheckConstraintValidity(idx int) descpb.ConstraintValidity
+	// GetNextConstraintID returns the next constraint ID to assign when adding
+	// a NOT NULL or CHECK constraint to this domain. It is monotonically
+	// increasing across the lifetime of the descriptor.
+	GetNextConstraintID() descpb.ConstraintID
 }
 
 // TypeDescriptorResolver is an interface used during hydration of type
@@ -1074,7 +1138,7 @@ type FunctionDescriptor interface {
 	GetNullInputBehavior() catpb.Function_NullInputBehavior
 
 	// GetFunctionBody returns the function body string.
-	GetFunctionBody() string
+	GetFunctionBody() catpb.RoutineBody
 
 	// GetParams returns a list of all parameters of the function.
 	GetParams() []descpb.FunctionDescriptor_Parameter
@@ -1119,9 +1183,8 @@ type FunctionDescriptor interface {
 func FilterDroppedDescriptor(desc Descriptor) error {
 	if !desc.Dropped() {
 		return nil
-
 	}
-	return NewInactiveDescriptorError(ErrDescriptorDropped)
+	return NewInactiveDescriptorError(NewDescriptorDroppedError(desc))
 }
 
 // FilterOfflineDescriptor returns an error if the descriptor state is OFFLINE.

@@ -268,7 +268,7 @@ CREATE INDEX foo ON t.test (v)
 	}
 
 	// Ensure that the indexes have been created.
-	mTest := makeMutationTest(t, kvDB, sqlDB, s.Codec(), tableDesc)
+	mTest := makeMutationTest(t, s, kvDB, sqlDB, s.Codec(), tableDesc)
 	indexQuery := `SELECT v FROM t.test@foo`
 	mTest.CheckQueryResults(t, indexQuery, [][]string{{"b"}, {"d"}})
 
@@ -1351,7 +1351,7 @@ CREATE TABLE t.test (
 	if len(tableDesc.EnforcedCheckConstraints()) != 1 {
 		checkExprs := make([]string, 0)
 		for i := range tableDesc.EnforcedCheckConstraints() {
-			checkExprs = append(checkExprs, tableDesc.EnforcedCheckConstraints()[i].GetExpr())
+			checkExprs = append(checkExprs, string(tableDesc.EnforcedCheckConstraints()[i].GetExpr()))
 		}
 		t.Fatalf("Expected 1 check but got %d with CHECK expr %s ", len(tableDesc.EnforcedCheckConstraints()), strings.Join(checkExprs, ", "))
 	}
@@ -3693,24 +3693,32 @@ CREATE TABLE d.t (
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, server.Codec(), "d", "t")
 	// Verify that this descriptor uses the new STORING encoding. Overwrite it
-	// with one that uses the old encoding.
-	for _, index := range tableDesc.PublicNonPrimaryIndexes() {
-		if index.NumKeySuffixColumns() != 1 {
-			t.Fatalf("KeySuffixColumnIDs not set properly: %s", tableDesc)
+	// with one that uses the old encoding. Use TestingDescsTxn so that the
+	// descriptor version is properly incremented and the lease manager waits
+	// for all old leases to drain before proceeding.
+	if err := sqltestutils.TestingDescsTxn(context.Background(), server, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		tbl, err := col.MutableByID(txn.KV()).Table(ctx, tableDesc.GetID())
+		if err != nil {
+			return err
 		}
-		if index.NumSecondaryStoredColumns() != 1 {
-			t.Fatalf("StoreColumnIDs not set properly: %s", tableDesc)
+		for _, index := range tbl.PublicNonPrimaryIndexes() {
+			if index.NumKeySuffixColumns() != 1 {
+				t.Fatalf("KeySuffixColumnIDs not set properly: %s", tbl)
+			}
+			if index.NumSecondaryStoredColumns() != 1 {
+				t.Fatalf("StoreColumnIDs not set properly: %s", tbl)
+			}
+			newIndexDesc := index.IndexDescDeepCopy()
+			newIndexDesc.KeySuffixColumnIDs = append(newIndexDesc.KeySuffixColumnIDs, newIndexDesc.StoreColumnIDs...)
+			newIndexDesc.StoreColumnIDs = nil
+			tbl.SetPublicNonPrimaryIndex(index.Ordinal(), newIndexDesc)
 		}
-		newIndexDesc := index.IndexDescDeepCopy()
-		newIndexDesc.KeySuffixColumnIDs = append(newIndexDesc.KeySuffixColumnIDs, newIndexDesc.StoreColumnIDs...)
-		newIndexDesc.StoreColumnIDs = nil
-		tableDesc.SetPublicNonPrimaryIndex(index.Ordinal(), newIndexDesc)
-	}
-	if err := kvDB.Put(
-		context.Background(),
-		catalogkeys.MakeDescMetadataKey(server.Codec(), tableDesc.GetID()),
-		tableDesc.DescriptorProto(),
-	); err != nil {
+		ba := txn.KV().NewBatch()
+		if err := col.WriteDescToBatch(ctx, false /* kvTrace */, tbl, ba); err != nil {
+			return err
+		}
+		return txn.KV().Run(ctx, ba)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`INSERT INTO d.t VALUES (11, 1, 2);`); err != nil {
@@ -4141,6 +4149,7 @@ func TestSchemaChangeErrorOnCommit(t *testing.T) {
 func TestIndexBackfillAfterGC(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "flaky under race")
 
 	var tc serverutils.TestClusterInterface
 	ctx := context.Background()
@@ -4202,6 +4211,17 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 		sqlDB.Exec(t, "DROP TABLE IF EXISTS t.test")
 		sqlDB.Exec(t, `CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'))`)
 		sqlDB.Exec(t, `INSERT INTO t.test VALUES (1, 1)`)
+
+		// Split t.test off into its own range. Without this, t.test shares a
+		// range with system tables (notably system.jobs), and the GCRequest
+		// injected below would advance the GC threshold on that shared range.
+		// The schema changer recovers from BatchTimestampBeforeGCError on the
+		// backfill, but the parallel poll-show-jobs query in jobs.WaitForJobs
+		// would race with the threshold bump and fail the CREATE INDEX.
+		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "test")
+		if err := kvDB.AdminSplit(ctx, codec.TablePrefix(uint32(tableDesc.GetID())), hlc.MaxTimestamp); err != nil {
+			t.Fatal(err)
+		}
 
 		shouldRunGC.Store(true)
 		if _, err := db.Exec(
@@ -5048,8 +5068,8 @@ func TestCreateStatsAfterSchemaChange(t *testing.T) {
 		stats.DefaultRefreshInterval = oldRefreshInterval
 		stats.DefaultAsOfTime = oldAsOf
 	}(stats.DefaultRefreshInterval, stats.DefaultAsOfTime)
-	stats.DefaultRefreshInterval = time.Millisecond
-	stats.DefaultAsOfTime = time.Microsecond
+	stats.DefaultRefreshInterval = time.Second
+	stats.DefaultAsOfTime = 100 * time.Millisecond
 
 	server, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer server.Stopper().Stop(context.Background())
@@ -6153,7 +6173,7 @@ func TestFailureToMarkCanceledReversalLeadsToCanceledStatus(t *testing.T) {
 		f(jobCancellationsToFail.jobs)
 	}
 	jobKnobs := jobs.NewTestingKnobsWithShortIntervals()
-	jobKnobs.BeforeUpdate = func(orig, updated jobs.JobMetadata) (err error) {
+	jobKnobs.BeforeUpdate = func(orig, updated jobs.DeprecatedJobMetadata) (err error) {
 		withJobsToFail(func(m map[jobspb.JobID]struct{}) {
 			if _, ok := m[orig.ID]; ok && updated.State == jobs.StateCanceled {
 				delete(m, orig.ID)

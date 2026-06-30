@@ -168,7 +168,9 @@ SELECT
 	getIndexesQuery += `
 FROM
     %[4]s.information_schema.statistics AS s
-    JOIN %[4]s.pg_catalog.pg_class c ON c.relname = s.index_name
+    -- Use an index hint to avoid an incomplete virtual index lookup join that
+    -- degrades to a full scan.
+    JOIN %[4]s.pg_catalog.pg_class@primary AS c ON c.relname = s.index_name
     JOIN %[4]s.pg_catalog.pg_class c_table ON c_table.relname = s.table_name
     JOIN %[4]s.pg_catalog.pg_namespace n ON c.relnamespace = n.oid AND c_table.relnamespace = n.oid AND n.nspname = s.index_schema
     JOIN %[4]s.pg_catalog.pg_index i ON i.indexrelid = c.oid AND i.indrelid = c_table.oid
@@ -249,6 +251,7 @@ func (d *delegator) delegateShowConstraints(n *tree.ShowConstraints) (tree.State
            WHEN 'u' THEN 'UNIQUE'
            WHEN 'c' THEN 'CHECK'
            WHEN 'f' THEN 'FOREIGN KEY'
+           WHEN 'n' THEN 'NOT NULL'
            ELSE c.contype::TEXT
         END AS constraint_type,
         c.condef AS details,

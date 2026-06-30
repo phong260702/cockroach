@@ -38,11 +38,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/mmaprototype/mmasnappb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
 	raft "github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -59,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -126,9 +129,44 @@ const (
 	updateTableMetadataCachePermissionErrMsg = "only admin users can trigger table metadata cache updates"
 )
 
+// metricsVisibilityInternalAlias is a separate enum key that lets the cluster
+// setting accept "internal" as a synonym for "all" (no filtering). It maps to
+// a sentinel value that resolveVisibility converts back to Metadata_INTERNAL.
+const metricsVisibilityInternalAlias int64 = -1
+
+var defaultMetricsVisibility = settings.RegisterEnumSetting(
+	settings.ApplicationLevel,
+	"obs.metrics_scrape.default_visibility",
+	"controls the default metric visibility level for the metrics scrape endpoints",
+	"all",
+	map[int64]string{
+		int64(metric.Metadata_INTERNAL):  "all",
+		metricsVisibilityInternalAlias:   "internal",
+		int64(metric.Metadata_SUPPORT):   "support",
+		int64(metric.Metadata_ESSENTIAL): "essential",
+	},
+	settings.WithPublic,
+)
+
+// parseMetricsVisibility maps a ?visibility= query parameter value to the
+// corresponding Metadata_MetricVisibility threshold. Returns the level and
+// true on success, or (0, false) if the value is not recognized.
+func parseMetricsVisibility(s string) (metric.Metadata_MetricVisibility, bool) {
+	switch strings.ToLower(s) {
+	case "all", "internal":
+		return metric.Metadata_INTERNAL, true
+	case "support":
+		return metric.Metadata_SUPPORT, true
+	case "essential":
+		return metric.Metadata_ESSENTIAL, true
+	default:
+		return 0, false
+	}
+}
+
 type metricMarshaler interface {
 	json.Marshaler
-	PrintAsText(io.Writer, expfmt.Format, bool) error
+	PrintAsText(io.Writer, expfmt.Format, bool, metric.Metadata_MetricVisibility) error
 	ScrapeIntoPrometheus(pm *metric.PrometheusExporter)
 }
 
@@ -407,12 +445,15 @@ func (b *baseStatusServer) localExecutionInsights(
 		insightsCopy := *insight
 		insightsCopy.Statements = make([]*insightspb.Statement, len(insight.Statements))
 		copy(insightsCopy.Statements, insight.Statements)
-		if insight.Transaction != nil && slices.Contains(insight.Transaction.Causes, insightspb.Cause_HighContention) {
-			// Collect high contention insights seperately, they need additional validation / filtering.
-			// If it is valid we will add it to the response later.
+		if insight.Transaction != nil &&
+			slices.Contains(insight.Transaction.Causes, insightspb.Cause_HighContention) &&
+			!slices.Contains(insight.Transaction.Problems, insightspb.Problem_FailedExecution) {
+			// Collect high-contention-only insights separately for
+			// validation against resolved contention events. Insights
+			// that also have FailedExecution are independently valid
+			// and should not be gated on contention resolution.
 			highContentionInsights[insightsCopy.Transaction.ID] = insightsCopy
 		} else {
-			// All other insights are included in the response.
 			response.Insights = append(response.Insights, insightsCopy)
 		}
 	})
@@ -595,6 +636,11 @@ type StmtDiagnosticsRequester interface {
 	//   latency of a query that satisfies the request. In other words, queries
 	//   that ran faster than minExecutionLatency do not satisfy the condition
 	//   and the bundle is not generated for them.
+	// - maxExecutionLatency, if non-zero, determines the maximum execution
+	//   latency of a query that satisfies the request. In other words, queries
+	//   that ran slower than maxExecutionLatency do not satisfy the condition
+	//   and the bundle is not generated for them. If zero, there is no upper
+	//   bound.
 	// - expiresAfter, if non-zero, indicates for how long the request should
 	//   stay active.
 	// - redacted, if true, indicates that the redacted bundle is requested.
@@ -607,6 +653,7 @@ type StmtDiagnosticsRequester interface {
 		antiPlanGist bool,
 		samplingProbability float64,
 		minExecutionLatency time.Duration,
+		maxExecutionLatency time.Duration,
 		expiresAfter time.Duration,
 		redacted bool,
 		username string,
@@ -651,7 +698,7 @@ func newStatusServer(
 			rpcCtx:             rpcCtx,
 			stopper:            stopper,
 			serverIterator:     serverIterator,
-			nd:                 &nodeDialer{cs: st, si: serverIterator},
+			nd:                 &nodeDialer{useDRPC: rpcCtx.UseDRPC, si: serverIterator},
 			clock:              clock,
 		},
 		cfg:              cfg,
@@ -785,7 +832,7 @@ func (s *statusServer) dialNode(
 			return nil, err
 		}
 	}
-	return serverpb.DialStatusClient(s.nd, ctx, nodeID, s.nd.cs)
+	return serverpb.DialStatusClient(s.nd, ctx, nodeID, s.nd.useDRPC)
 }
 
 // Gossip returns current state of gossip information on the given node
@@ -980,6 +1027,55 @@ func (s *systemStatusServer) Allocator(
 		return nil, srverrors.ServerError(ctx, err)
 	}
 	return output, nil
+}
+
+// MMAState returns a snapshot of the multi-metric allocator's
+// view of the cluster from the given node. It is intended for diagnostics
+// (e.g. cockroach debug zip) and offline analysis.
+func (s *systemStatusServer) MMAState(
+	ctx context.Context, req *serverpb.MMAStateRequest,
+) (*serverpb.MMAStateResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	if err := s.privilegeChecker.RequireViewClusterMetadataPermission(ctx); err != nil {
+		// NB: not using srverrors.ServerError() here since the priv checker
+		// already returns a proper gRPC error status.
+		return nil, err
+	}
+
+	nodeID, local, err := s.parseNodeID(req.NodeId)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	if !local {
+		client, err := s.dialNode(ctx, nodeID)
+		if err != nil {
+			return nil, srverrors.ServerError(ctx, err)
+		}
+		return client.MMAState(ctx, req)
+	}
+
+	// The mma allocator is one-per-node, shared across this node's stores.
+	// Pick any store and snapshot through Store.MMAllocator.
+	var snap *mmasnappb.ClusterStateSnapshot
+	var snapErr error
+	if err := s.stores.VisitStores(func(store *kvserver.Store) error {
+		if snap == nil && snapErr == nil {
+			snap, snapErr = store.GetStoreConfig().MMAllocator.ClusterStateSnapshot()
+		}
+		return nil
+	}); err != nil {
+		return nil, srverrors.ServerError(ctx, err)
+	}
+	if snapErr != nil {
+		return nil, srverrors.ServerError(ctx, snapErr)
+	}
+	if snap == nil {
+		return nil, status.Error(codes.Unavailable, "no stores on this node")
+	}
+	return &serverpb.MMAStateResponse{Snapshot: snap}, nil
 }
 
 func recordedSpansToTraceEvents(spans []tracingpb.RecordedSpan) []*serverpb.TraceEvent {
@@ -1462,11 +1558,28 @@ func (s *statusServer) LogFile(
 	if s.rpcCtx.TenantID != roachpb.SystemTenantID {
 		tenantIDFilter = s.rpcCtx.TenantID.String()
 	}
+
+	// Build an exclusion set for severity-based filtering.
+	excludeSev := make(map[logpb.Severity]struct{}, len(req.ExcludeSeverities))
+	for _, sev := range req.ExcludeSeverities {
+		excludeSev[sev] = struct{}{}
+	}
+
 	for {
 		var entry logpb.Entry
 		if err := decoder.Decode(&entry); err != nil {
 			if err == io.EOF {
 				break
+			}
+			if errors.Is(err, log.ErrMalformedJSON) {
+				resp.ParseErrors = append(resp.ParseErrors, err.Error())
+				//Append log generated from malformed line.
+				resp.Entries = append(resp.Entries, entry)
+				// The current implementation of decoding JSON formatted logs cannot
+				// recover from malformed lines. Hence, we break out of the loop and
+				// return the logs parsed until now, along with the parse error. This
+				// is better than returning no logs at all.
+				return &resp, nil
 			}
 			if errors.Is(err, log.ErrMalformedLogEntry) {
 				resp.ParseErrors = append(resp.ParseErrors, err.Error())
@@ -1479,6 +1592,9 @@ func (s *statusServer) LogFile(
 			return nil, srverrors.ServerError(ctx, err)
 		}
 		if tenantIDFilter != "" && entry.TenantID != tenantIDFilter {
+			continue
+		}
+		if _, excluded := excludeSev[entry.Severity]; excluded {
 			continue
 		}
 		resp.Entries = append(resp.Entries, entry)
@@ -2124,10 +2240,7 @@ func (s *systemStatusServer) nodesHelper(
 		Nodes: statuses,
 	}
 
-	nodeStatusMap, err := s.nodeLiveness.ScanNodeVitalityFromKV(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
+	nodeStatusMap := s.nodeLiveness.ScanAllNodeVitalityFromCache()
 	// TODO(baptist): Consider returning something better than LivenessStatus. It
 	// is an unfortunate mix of values.
 	resp.LivenessByNodeID = make(map[roachpb.NodeID]livenesspb.NodeLivenessStatus, len(nodeStatusMap))
@@ -2476,12 +2589,40 @@ type varsHandler struct {
 	useStaticLabels bool
 }
 
+// resolveVisibility returns the minimum visibility level for this request,
+// using the query parameter if present or the cluster setting otherwise.
+func (h varsHandler) resolveVisibility(r *http.Request) (metric.Metadata_MetricVisibility, error) {
+	if raw := r.URL.Query().Get("visibility"); raw != "" {
+		level, ok := parseMetricsVisibility(raw)
+		if !ok {
+			return 0, fmt.Errorf(
+				"invalid visibility value %q; valid values are: all, internal, support, essential",
+				raw,
+			)
+		}
+		return level, nil
+	}
+	v := defaultMetricsVisibility.Get(&h.st.SV)
+	if v == metricsVisibilityInternalAlias {
+		return metric.Metadata_INTERNAL, nil
+	}
+	return metric.Metadata_MetricVisibility(v), nil
+}
+
 func (h varsHandler) handleVars(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	minVisibility, err := h.resolveVisibility(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	contentType := expfmt.Negotiate(r.Header)
 	w.Header().Set(httputil.ContentTypeHeader, string(contentType))
-	err := h.metricSource.PrintAsText(w, contentType, h.useStaticLabels)
+	err = h.metricSource.PrintAsText(
+		w, contentType, h.useStaticLabels, minVisibility,
+	)
 	if err != nil {
 		log.Dev.Errorf(ctx, "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -3340,6 +3481,128 @@ func (s *statusServer) ListLocalSessions(
 	return &serverpb.ListSessionsResponse{Sessions: sessions}, nil
 }
 
+// ListLocalActiveSessionHistory returns ASH samples from this node.
+// In a shared-process multi-tenant environment, the global ring
+// buffer contains samples from all tenants. Secondary tenants only
+// receive samples matching their tenant ID; the system tenant sees
+// all samples.
+func (s *statusServer) ListLocalActiveSessionHistory(
+	ctx context.Context, req *serverpb.ListActiveSessionHistoryRequest,
+) (*serverpb.ListActiveSessionHistoryResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	if err := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+		return nil, err
+	}
+
+	ashSamples := ash.GetSamples()
+
+	tID, ok := roachpb.ClientTenantFromContext(ctx)
+	filterByTenant := ok && !tID.IsSystem()
+
+	protoSamples := make([]serverpb.ASHSample, 0, len(ashSamples))
+	for _, sample := range ashSamples {
+		if filterByTenant && sample.TenantID != tID {
+			continue
+		}
+		protoSamples = append(protoSamples, serverpb.ASHSample{
+			SampleTime:    sample.SampleTime,
+			NodeID:        sample.NodeID,
+			TenantID:      sample.TenantID,
+			WorkloadID:    sample.WorkloadID,
+			WorkloadType:  sample.WorkloadType,
+			AppName:       sample.AppName,
+			WorkEventType: serverpb.WorkEventType(sample.WorkEventType),
+			WorkEvent:     sample.WorkEvent,
+			GoroutineID:   sample.GoroutineID,
+		})
+	}
+
+	// Apply per-node limit, keeping only the newest samples.
+	if limit := int(req.PerNodeLimit); limit > 0 && len(protoSamples) > limit {
+		protoSamples = protoSamples[len(protoSamples)-limit:]
+	}
+
+	return &serverpb.ListActiveSessionHistoryResponse{
+		Samples: protoSamples,
+	}, nil
+}
+
+// AppNameMappings returns app name ID to string mappings from this
+// node's local cache for the requested IDs. This is used by ASH so
+// that nodes can resolve an app_name_id when they perform work for
+// queries that they have not recieved as a gateway node (i.e. they
+// do not have the app name mapping locally).
+func (s *statusServer) AppNameMappings(
+	ctx context.Context, req *serverpb.AppNameMappingsRequest,
+) (*serverpb.AppNameMappingsResponse, error) {
+	ctx = s.AnnotateCtx(ctx)
+
+	if err := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+		return nil, err
+	}
+
+	return &serverpb.AppNameMappingsResponse{
+		Mappings: ash.GetAppNameMappings(req.Ids),
+	}, nil
+}
+
+// ListActiveSessionHistory returns ASH samples from all nodes in the cluster.
+func (s *statusServer) ListActiveSessionHistory(
+	ctx context.Context, req *serverpb.ListActiveSessionHistoryRequest,
+) (*serverpb.ListActiveSessionHistoryResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	if err := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err != nil {
+		return nil, err
+	}
+
+	// Apply the default per-node limit from the cluster setting when
+	// the caller has not specified one.
+	if req.PerNodeLimit == 0 {
+		req.PerNodeLimit = int32(ashResponseLimit.Get(&s.st.SV))
+	}
+
+	response := &serverpb.ListActiveSessionHistoryResponse{
+		Samples: make([]serverpb.ASHSample, 0),
+		Errors:  make([]serverpb.ListActiveSessionHistoryError, 0),
+	}
+
+	nodeFn := func(
+		ctx context.Context,
+		statusClient serverpb.RPCStatusClient,
+		_ roachpb.NodeID,
+	) ([]serverpb.ASHSample, error) {
+		resp, err := statusClient.ListLocalActiveSessionHistory(ctx, req)
+		if resp != nil && err == nil {
+			return resp.Samples, nil
+		}
+		return nil, err
+	}
+
+	responseFn := func(_ roachpb.NodeID, samples []serverpb.ASHSample) {
+		response.Samples = append(response.Samples, samples...)
+	}
+
+	errorFn := func(nodeID roachpb.NodeID, err error) {
+		response.Errors = append(response.Errors, serverpb.ListActiveSessionHistoryError{
+			NodeID:  nodeID,
+			Message: err.Error(),
+		})
+	}
+
+	if err := iterateNodes(
+		ctx, s.serverIterator, s.stopper,
+		redact.Sprint("active session history"), noTimeout,
+		s.dialNode, nodeFn, responseFn, errorFn,
+	); err != nil {
+		return nil, srverrors.ServerError(ctx, err)
+	}
+	return response, nil
+}
+
 // iterateNodes calls iterateNodesExt with max concurrency
 func iterateNodes[Client, Result any](
 	ctx context.Context,
@@ -4099,7 +4362,7 @@ func (s *systemStatusServer) Stores(
 
 	resp := &serverpb.StoresResponse{}
 	err = s.stores.VisitStores(func(store *kvserver.Store) error {
-		eng := store.TODOEngine()
+		eng := store.TODOBothEngines()
 		envStats, err := eng.GetEnvStats()
 		if err != nil {
 			return err

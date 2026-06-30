@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/sqlwriter"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -116,8 +117,6 @@ func newCdcEventDecoder(
 	return cdcevent.NewEventDecoderWithCache(ctx, rfCache, false, false, cdcevent.DecoderOptions{}), nil
 }
 
-var originID1Options = &kvpb.WriteOptions{OriginID: 1}
-
 func (p *kvRowProcessor) HandleBatch(
 	ctx context.Context, batch []streampb.StreamEvent_KV,
 ) (batchStats, error) {
@@ -177,10 +176,14 @@ func (p *kvRowProcessor) processRow(
 		return batchStats{}, errors.Wrap(err, "stripping tenant prefix")
 	}
 
-	row, err := p.decoder.DecodeKV(ctx, keyValue, cdcevent.CurrentRow, keyValue.Value.Timestamp, false)
+	row, status, err := p.decoder.DecodeKV(ctx, keyValue, cdcevent.CurrentRow, keyValue.Value.Timestamp, false)
 	if err != nil {
 		p.lastRow = cdcevent.Row{}
 		return batchStats{}, errors.Wrap(err, "decoding KeyValue")
+	}
+	if status != cdcevent.DecodeOK {
+		p.lastRow = cdcevent.Row{}
+		return batchStats{}, errors.Newf("unexpected decode status: %v", status)
 	}
 	dstTableID, ok := p.dstBySrc[row.TableID]
 	if !ok {
@@ -231,7 +234,7 @@ const maxRefreshCount = 10
 
 func makeKVBatch(lowPri bool, txn *kv.Txn) *kv.Batch {
 	b := txn.NewBatch()
-	b.Header.WriteOptions = originID1Options
+	b.Header.WriteOptions = sqlwriter.OriginID1Options
 	if lowPri {
 		b.AdmissionHeader.Priority = int32(admissionpb.BulkLowPri)
 	} else {
@@ -333,12 +336,15 @@ func (p *kvRowProcessor) addToBatch(
 		return err
 	}
 
-	prevRow, err := p.decoder.DecodeKV(ctx, roachpb.KeyValue{
+	prevRow, prevStatus, err := p.decoder.DecodeKV(ctx, roachpb.KeyValue{
 		Key:   keyValue.Key,
 		Value: prevValue,
 	}, cdcevent.PrevRow, prevValue.Timestamp, false)
 	if err != nil {
 		return err
+	}
+	if prevStatus != cdcevent.DecodeOK {
+		return errors.Newf("unexpected decode status: %v", prevStatus)
 	}
 
 	if row.IsDeleted() {

@@ -23,7 +23,10 @@ type bulkMergeFunc func(
 	genOutputURIAndRecordPrefix func(base.SQLInstanceID) (string, error),
 	iteration int,
 	maxIterations int,
-	writeTS *hlc.Timestamp,
+	writeTimestamp *hlc.Timestamp,
+	enforceUniqueness bool,
+	onProgress func(context.Context, *execinfrapb.ProducerMetadata) error,
+	memoryMonitor execinfrapb.BulkMergeSpec_MemoryMonitor,
 ) ([]execinfrapb.BulkMergeSpec_SST, error)
 
 var registeredBulkMerge bulkMergeFunc
@@ -42,10 +45,17 @@ func invokeBulkMerge(
 	genOutputURIAndRecordPrefix func(base.SQLInstanceID) (string, error),
 	iteration int,
 	maxIterations int,
-	writeTS *hlc.Timestamp,
+	writeTimestamp *hlc.Timestamp,
+	enforceUniqueness bool,
+	onProgress func(context.Context, *execinfrapb.ProducerMetadata) error,
+	memoryMonitor execinfrapb.BulkMergeSpec_MemoryMonitor,
 ) ([]execinfrapb.BulkMergeSpec_SST, error) {
 	if registeredBulkMerge == nil {
 		return nil, errors.AssertionFailedf("bulk merge implementation not registered")
 	}
-	return registeredBulkMerge(ctx, execCtx, ssts, spans, genOutputURIAndRecordPrefix, iteration, maxIterations, writeTS)
+	return registeredBulkMerge(
+		ctx, execCtx, ssts, spans, genOutputURIAndRecordPrefix,
+		iteration, maxIterations, writeTimestamp, enforceUniqueness,
+		onProgress, memoryMonitor,
+	)
 }

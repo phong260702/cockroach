@@ -39,6 +39,8 @@ const (
 	TagUsage = "usage"
 	// TagArch is the CPU architecture tag const.
 	TagArch = "arch"
+	// TagManaged is the label used to identify managed clusters
+	TagManaged = "managed"
 
 	ArchARM64   = CPUArch("arm64")
 	ArchAMD64   = CPUArch("amd64")
@@ -70,7 +72,8 @@ func ParseArch(s string) CPUArch {
 		return ArchAMD64
 	}
 	if strings.Contains(arch, "arm64") || strings.Contains(arch, "aarch64") ||
-		strings.Contains(arch, "ampere") || strings.Contains(arch, "graviton") {
+		strings.Contains(arch, "ampere") || strings.Contains(arch, "graviton") ||
+		strings.Contains(arch, "axion") {
 		return ArchARM64
 	}
 	if strings.Contains(arch, "fips") {
@@ -286,6 +289,9 @@ func (vm *VM) ZoneEntry() (string, error) {
 }
 
 func (vm *VM) AttachVolume(l *logger.Logger, v Volume) (deviceName string, _ error) {
+	// N.B. The volume is appended before calling the provider so that
+	// provider implementations can use len(NonBootAttachedVolumes) to
+	// derive the device index.
 	vm.NonBootAttachedVolumes = append(vm.NonBootAttachedVolumes, v)
 	if err := ForProvider(vm.Provider, func(provider Provider) error {
 		var err error
@@ -448,6 +454,20 @@ type ProviderOpts interface {
 type VolumeSnapshot struct {
 	ID   string
 	Name string
+	// Region is set and used by the AWS provider to scope snapshot
+	// operations to the correct region. Other providers may leave it empty.
+	Region string
+	// Status is the current state of the snapshot. The value is
+	// provider-specific (e.g. "completed" on AWS, "READY" on GCE).
+	// An empty string means the state is unknown.
+	Status string
+}
+
+// IsReady returns true when the snapshot has finished being created and
+// is usable. See VolumeSnapshot.Status for provider-specific values.
+func (v VolumeSnapshot) IsReady() bool {
+	return v.Status == "READY" || // GCE
+		v.Status == "completed" // AWS
 }
 
 type VolumeSnapshots []VolumeSnapshot
@@ -608,8 +628,10 @@ type Provider interface {
 	DeleteVolume(l *logger.Logger, volume Volume, vm *VM) error
 	// AttachVolume attaches the given volume to the given VM.
 	AttachVolume(l *logger.Logger, volume Volume, vm *VM) (string, error)
-	// CreateVolumeSnapshot creates a snapshot of the given volume, using the
-	// given options.
+	// CreateVolumeSnapshot creates a snapshot of the given volume. Some
+	// providers may return before the snapshot is fully ready. Callers
+	// that need a completed snapshot should poll ListVolumeSnapshots
+	// and check the Status field.
 	CreateVolumeSnapshot(l *logger.Logger, volume Volume, vsco VolumeSnapshotCreateOpts) (VolumeSnapshot, error)
 	// ListVolumeSnapshots lists the individual volume snapshots that satisfy
 	// the search criteria.

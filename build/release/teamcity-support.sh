@@ -16,11 +16,19 @@ remove_files_on_exit() {
 trap remove_files_on_exit EXIT
 
 tc_start_block() {
-  echo "##teamcity[blockOpened name='$1']"
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    echo "::group::$1"
+  else
+    echo "##teamcity[blockOpened name='$1']"
+  fi
 }
 
 tc_end_block() {
-  echo "##teamcity[blockClosed name='$1']"
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    echo "::endgroup::"
+  else
+    echo "##teamcity[blockClosed name='$1']"
+  fi
 }
 
 docker_login_with_google() {
@@ -30,10 +38,15 @@ docker_login_with_google() {
 
 docker_login_gcr() {
   local repo=$1
-  local credentials=$2
+  local credentials=${2:-}
   local hostname="${repo%%/*}"
-  # https://cloud.google.com/container-registry/docs/advanced-authentication#json-key
-  echo "${credentials}" | docker login -u _json_key --password-stdin "https://${hostname}"
+  if [[ -n "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ]]; then
+    # WIF: use gcloud credential helper for Docker.
+    gcloud auth configure-docker "${hostname}" --quiet
+  else
+    # https://cloud.google.com/container-registry/docs/advanced-authentication#json-key
+    echo "${credentials}" | docker login -u _json_key --password-stdin "https://${hostname}"
+  fi
 }
 
 docker_login() {
@@ -126,6 +139,28 @@ function is_release_or_master_build(){
   #                                             ^ "v" is optional to match main release branches, e.g. release-23.2
   #                                                ^ calver prefix, e.g. 25.1
   # We don't strictly match the suffix to allow different ones, e.g. "rc" or have none.
+}
+
+# create_and_push_multi_arch_manifest creates a multi-architecture manifest
+# (image index) and pushes it to the registry. Uses `docker buildx imagetools
+# create` which handles both plain manifests and OCI image indexes as sources
+# (newer Docker versions produce the latter even for single-arch builds).
+# Falls back to `docker manifest create` for environments without buildx.
+#
+# Usage: create_and_push_multi_arch_manifest TARGET SOURCE1 SOURCE2 ...
+create_and_push_multi_arch_manifest() {
+  local target=$1
+  shift
+  local sources=("$@")
+
+  if docker buildx imagetools create -t "$target" "${sources[@]}"; then
+    return
+  fi
+
+  echo "Falling back to docker manifest create..."
+  docker manifest rm "$target" || :
+  docker manifest create "$target" "${sources[@]}"
+  docker manifest push "$target"
 }
 
 # Compare the passed version to the latest published version. Returns 0 if the

@@ -23,6 +23,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"storj.io/drpc"
+	"storj.io/drpc/drpcclient"
 )
 
 // TestMetricsRelease verifies that peerMetrics.release() removes tracking for
@@ -71,33 +73,87 @@ func TestMetricsRelease(t *testing.T) {
 	// added/deleted).
 	require.Equal(t, expectedCount, verifyAllFields(m, 0))
 	// Verify that a new peer's metrics all get registered.
-	pm, lm := m.acquire(k1, l1)
+	pm, lm := m.acquire(k1, l1, rpcProtocolGRPC)
 	require.Equal(t, expectedCount, verifyAllFields(m, 1))
 	// Acquire the same peer. The count remains at 1.
-	pm2, lm2 := m.acquire(k1, l1)
+	pm2, lm2 := m.acquire(k1, l1, rpcProtocolGRPC)
 	require.Equal(t, expectedCount, verifyAllFields(m, 1))
 	require.Equal(t, pm, pm2)
 	require.Equal(t, lm, lm2)
 
 	// Acquire a different peer but the same locality.
-	pm3, lm3 := m.acquire(k2, l1)
+	pm3, lm3 := m.acquire(k2, l1, rpcProtocolGRPC)
 	require.NotEqual(t, pm, pm3)
 	require.Equal(t, lm, lm3)
 
 	// Acquire a different locality but the same peer.
-	pm4, lm4 := m.acquire(k1, l2)
+	pm4, lm4 := m.acquire(k1, l2, rpcProtocolGRPC)
 	require.Equal(t, pm, pm4)
 	require.NotEqual(t, lm, lm4)
 
 	// We added one extra peer and one extra locality, verify counts.
 	require.Equal(t, expectedCount, verifyAllFields(m, 2))
+
+	// Acquire the same peer and locality with drpc protocol
+	pm5, lm5 := m.acquire(k1, l1, rpcProtocolDRPC)
+	require.NotEqual(t, pm, pm5)
+	require.NotEqual(t, lm, lm5)
+}
+
+func TestDRPCServerRequestInterceptor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	req := struct{}{}
+
+	testcase := []struct {
+		service      string
+		methodName   string
+		statusCode   codes.Code
+		shouldRecord bool
+	}{
+		{"testservice", "rpc/test/method", codes.OK, true},
+		{"testservice", "rpc/test/method", codes.Internal, true},
+		{"testservice", "rpc/test/method", codes.Aborted, true},
+		{"testservice", "rpc/test/notRecorded", codes.OK, false},
+	}
+
+	for _, tc := range testcase {
+		t.Run(fmt.Sprintf("%s %s", tc.methodName, tc.statusCode),
+			func(t *testing.T) {
+				requestMetrics := NewServerRequestMetrics()
+				rpc := "/" + tc.service + "/" + tc.methodName
+				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+					if tc.statusCode == codes.OK {
+						time.Sleep(time.Millisecond)
+						return struct{}{}, nil
+					}
+					return nil, status.Error(tc.statusCode, tc.statusCode.String())
+				}
+				interceptor := NewDRPCUnaryServerRequestMetricsInterceptor(requestMetrics, func(fullMethodName string) bool {
+					return tc.shouldRecord
+				})
+				_, err := interceptor(ctx, req, rpc, handler)
+				if err != nil {
+					require.Equal(t, tc.statusCode, status.Code(err))
+				}
+				var expectedCount uint64
+				if tc.shouldRecord {
+					expectedCount = 1
+				}
+				assertRpcMetrics(t, requestMetrics.RequestDuration.ToPrometheusMetrics(), map[string]uint64{
+					fmt.Sprintf("%s %s", rpc, tc.statusCode): expectedCount,
+				})
+			})
+	}
 }
 
 func TestServerRequestInstrumentInterceptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	requestMetrics := NewRequestMetrics()
+	requestMetrics := NewServerRequestMetrics()
 
 	ctx := context.Background()
 	req := struct{}{}
@@ -114,30 +170,32 @@ func TestServerRequestInstrumentInterceptor(t *testing.T) {
 	}
 
 	for _, tc := range testcase {
-		t.Run(fmt.Sprintf("%s %s", tc.methodName, tc.statusCode), func(t *testing.T) {
-			info := &grpc.UnaryServerInfo{FullMethod: tc.methodName}
-			handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-				if tc.statusCode == codes.OK {
-					time.Sleep(time.Millisecond)
-					return struct{}{}, nil
+		t.Run(fmt.Sprintf("%s %s", tc.methodName, tc.statusCode),
+			func(t *testing.T) {
+				info := &grpc.UnaryServerInfo{FullMethod: tc.methodName}
+				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+					if tc.statusCode == codes.OK {
+						time.Sleep(time.Millisecond)
+						return struct{}{}, nil
+					}
+					return nil, status.Error(tc.statusCode, tc.statusCode.String())
 				}
-				return nil, status.Error(tc.statusCode, tc.statusCode.String())
-			}
-			interceptor := NewRequestMetricsInterceptor(requestMetrics, func(fullMethodName string) bool {
-				return tc.shouldRecord
+				interceptor := NewRequestMetricsInterceptor(requestMetrics, func(fullMethodName string) bool {
+					return tc.shouldRecord
+				})
+				_, err := interceptor(ctx, req, info, handler)
+				if err != nil {
+					require.Equal(t, tc.statusCode, status.Code(err))
+				}
+				var expectedCount uint64
+				if tc.shouldRecord {
+					expectedCount = 1
+				}
+				assertRpcMetrics(t, requestMetrics.RequestDuration.ToPrometheusMetrics(),
+					map[string]uint64{
+						fmt.Sprintf("%s %s", tc.methodName, tc.statusCode): expectedCount,
+					})
 			})
-			_, err := interceptor(ctx, req, info, handler)
-			if err != nil {
-				require.Equal(t, tc.statusCode, status.Code(err))
-			}
-			var expectedCount uint64
-			if tc.shouldRecord {
-				expectedCount = 1
-			}
-			assertRpcMetrics(t, requestMetrics.Duration.ToPrometheusMetrics(), map[string]uint64{
-				fmt.Sprintf("%s %s", tc.methodName, tc.statusCode): expectedCount,
-			})
-		})
 	}
 }
 
@@ -209,6 +267,137 @@ func TestGatewayRequestRecoveryInterceptor(t *testing.T) {
 	})
 }
 
+func TestDRPCServerUnaryInterceptorAllMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	requestMetrics := NewServerRequestMetrics()
+
+	ctx := context.Background()
+	req := struct{}{}
+
+	rpc := "/testservice/TestMethod"
+	interceptor := NewDRPCUnaryServerRequestMetricsInterceptor(
+		requestMetrics, func(string) bool { return true })
+
+	// Successful call.
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		time.Sleep(time.Millisecond)
+		return struct{}{}, nil
+	}
+	_, err := interceptor(ctx, req, rpc, handler)
+	require.NoError(t, err)
+
+	startedLabels := map[string]string{
+		RPCMethodLabel: rpc,
+		RPCState:       "started",
+	}
+	codeLabelsOK := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "OK",
+	}
+
+	// RequestsTotal with state="started" tracks started requests.
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(startedLabels))
+	// RequestsTotal with state="completed" tracks completed requests.
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(codeLabelsOK))
+
+	// Error call.
+	errHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return nil, status.Error(codes.Internal, "internal error")
+	}
+	_, err = interceptor(ctx, req, rpc, errHandler)
+	require.Error(t, err)
+
+	codeLabelsInternal := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "Internal",
+	}
+
+	// Two RPCs started total.
+	require.Equal(t, int64(2), requestMetrics.RequestsTotal.Count(startedLabels))
+	// One completed with OK, one with Internal.
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(codeLabelsOK))
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(codeLabelsInternal))
+}
+
+// mockDRPCStream is a minimal drpc.Stream implementation for testing.
+type mockDRPCStream struct {
+	ctx     context.Context
+	sendErr error
+	recvErr error
+}
+
+var _ drpc.Stream = (*mockDRPCStream)(nil)
+
+func (s *mockDRPCStream) Context() context.Context                  { return s.ctx }
+func (s *mockDRPCStream) Kind() drpc.StreamKind                     { return drpc.StreamKindUnknown }
+func (s *mockDRPCStream) MsgSend(drpc.Message, drpc.Encoding) error { return s.sendErr }
+func (s *mockDRPCStream) MsgRecv(drpc.Message, drpc.Encoding) error { return s.recvErr }
+func (s *mockDRPCStream) CloseSend() error                          { return nil }
+func (s *mockDRPCStream) Close() error                              { return nil }
+
+func TestDRPCStreamServerRequestInterceptor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	requestMetrics := NewServerRequestMetrics()
+
+	rpc := "/testservice/StreamMethod"
+	interceptor := NewDRPCStreamServerRequestMetricsInterceptor(
+		requestMetrics, func(string) bool { return true })
+
+	startedLabels := map[string]string{
+		RPCMethodLabel: rpc,
+		RPCState:       "started",
+	}
+
+	// Successful stream call.
+	stream := &mockDRPCStream{ctx: context.Background()}
+	_, err := interceptor(stream, rpc, func(s drpc.Stream) (interface{}, error) {
+		return "ok", nil
+	})
+	require.NoError(t, err)
+
+	codeLabelsOK := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "OK",
+	}
+
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(startedLabels))
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(codeLabelsOK))
+
+	// Error stream call.
+	stream2 := &mockDRPCStream{ctx: context.Background()}
+	_, err = interceptor(stream2, rpc, func(s drpc.Stream) (interface{}, error) {
+		return nil, status.Error(codes.Unavailable, "unavailable")
+	})
+	require.Error(t, err)
+
+	codeLabelsUnavailable := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "Unavailable",
+	}
+
+	require.Equal(t, int64(2), requestMetrics.RequestsTotal.Count(startedLabels))
+	require.Equal(t, int64(1), requestMetrics.RequestsTotal.Count(codeLabelsUnavailable))
+
+	// shouldRecord=false: no metrics recorded.
+	noRecordInterceptor := NewDRPCStreamServerRequestMetricsInterceptor(
+		requestMetrics, func(string) bool { return false })
+	stream3 := &mockDRPCStream{ctx: context.Background()}
+	_, err = noRecordInterceptor(stream3, rpc, func(s drpc.Stream) (interface{}, error) {
+		return "skipped", nil
+	})
+	require.NoError(t, err)
+	// Counts should not have changed.
+	require.Equal(t, int64(2), requestMetrics.RequestsTotal.Count(startedLabels))
+}
+
 func assertRpcMetrics(
 	t *testing.T, metrics []*io_prometheus_client.Metric, expected map[string]uint64,
 ) {
@@ -218,9 +407,9 @@ func assertRpcMetrics(
 		var method, statusCode string
 		for _, l := range m.Label {
 			switch *l.Name {
-			case RpcMethodLabel:
+			case RPCMethodLabel:
 				method = *l.Value
-			case RpcStatusCodeLabel:
+			case RPCStatusCodeLabel:
 				statusCode = *l.Value
 			}
 		}
@@ -240,4 +429,217 @@ func assertRpcMetrics(
 			require.Equal(t, val, *histogram.SampleCount, "expected `%s` to have SampleCount of %d", key, val)
 		}
 	}
+}
+
+func TestDRPCUnaryClientRequestMetricsInterceptor_ShouldRecordFalse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	rpc := "/testservice/TestMethod"
+
+	invoker := func(
+		ctx context.Context, rpc string, enc drpc.Encoding,
+		in, out drpc.Message, cc *drpcclient.ClientConn,
+	) error {
+		return nil
+	}
+
+	// shouldRecord returns false — no metrics recorded.
+	t.Run("shouldRecord=false", func(t *testing.T) {
+		clientMetrics := NewClientRequestMetrics()
+		interceptor := NewDRPCUnaryClientRequestMetricsInterceptor(
+			clientMetrics, func(rpc string) bool { return false })
+		err := interceptor(ctx, rpc, nil, nil, nil, nil, invoker)
+		require.NoError(t, err)
+		startedLabels := map[string]string{
+			RPCMethodLabel: rpc, RPCState: "started",
+		}
+		require.Equal(t, int64(0), clientMetrics.RequestsTotal.Count(startedLabels))
+	})
+
+	// shouldRecord is nil — no metrics recorded, no panic.
+	t.Run("shouldRecord=nil", func(t *testing.T) {
+		clientMetrics := NewClientRequestMetrics()
+		interceptor := NewDRPCUnaryClientRequestMetricsInterceptor(
+			clientMetrics, nil)
+		err := interceptor(ctx, rpc, nil, nil, nil, nil, invoker)
+		require.NoError(t, err)
+		startedLabels := map[string]string{
+			RPCMethodLabel: rpc, RPCState: "started",
+		}
+		require.Equal(t, int64(0), clientMetrics.RequestsTotal.Count(startedLabels))
+	})
+
+	// clientMetrics is nil — no panic.
+	t.Run("clientMetrics=nil", func(t *testing.T) {
+		interceptor := NewDRPCUnaryClientRequestMetricsInterceptor(
+			nil, func(rpc string) bool { return true })
+		err := interceptor(ctx, rpc, nil, nil, nil, nil, invoker)
+		require.NoError(t, err)
+	})
+}
+
+func TestDRPCStreamClientRequestMetricsInterceptor_ShouldRecordFalse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	rpc := "/testservice/StreamMethod"
+
+	streamer := func(
+		ctx context.Context, rpc string, enc drpc.Encoding,
+		cc *drpcclient.ClientConn,
+	) (drpc.Stream, error) {
+		return &mockDRPCStream{ctx: ctx}, nil
+	}
+
+	// shouldRecord returns false — no metrics recorded.
+	t.Run("shouldRecord=false", func(t *testing.T) {
+		clientMetrics := NewClientRequestMetrics()
+		interceptor := NewDRPCStreamClientRequestMetricsInterceptor(
+			clientMetrics, func(rpc string) bool { return false })
+		str, err := interceptor(ctx, rpc, nil, nil, streamer)
+		require.NoError(t, err)
+		require.NotNil(t, str)
+		startedLabels := map[string]string{
+			RPCMethodLabel: rpc, RPCState: "started",
+		}
+		require.Equal(t, int64(0), clientMetrics.RequestsTotal.Count(startedLabels))
+	})
+
+	// shouldRecord is nil — no metrics recorded, no panic.
+	t.Run("shouldRecord=nil", func(t *testing.T) {
+		clientMetrics := NewClientRequestMetrics()
+		interceptor := NewDRPCStreamClientRequestMetricsInterceptor(
+			clientMetrics, nil)
+		str, err := interceptor(ctx, rpc, nil, nil, streamer)
+		require.NoError(t, err)
+		require.NotNil(t, str)
+		startedLabels := map[string]string{
+			RPCMethodLabel: rpc, RPCState: "started",
+		}
+		require.Equal(t, int64(0), clientMetrics.RequestsTotal.Count(startedLabels))
+	})
+
+	// clientMetrics is nil — no panic.
+	t.Run("clientMetrics=nil", func(t *testing.T) {
+		interceptor := NewDRPCStreamClientRequestMetricsInterceptor(
+			nil, func(rpc string) bool { return true })
+		str, err := interceptor(ctx, rpc, nil, nil, streamer)
+		require.NoError(t, err)
+		require.NotNil(t, str)
+	})
+}
+
+func TestDRPCUnaryClientRequestMetricsInterceptor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	clientMetrics := NewClientRequestMetrics()
+	ctx := context.Background()
+	rpc := "/testservice/TestMethod"
+	interceptor := NewDRPCUnaryClientRequestMetricsInterceptor(clientMetrics, func(rpc string) bool { return true })
+
+	startedLabels := map[string]string{
+		RPCMethodLabel: rpc,
+		RPCState:       "started",
+	}
+
+	// Successful call.
+	invoker := func(
+		ctx context.Context, rpc string, enc drpc.Encoding,
+		in, out drpc.Message, cc *drpcclient.ClientConn,
+	) error {
+		time.Sleep(time.Millisecond)
+		return nil
+	}
+	err := interceptor(ctx, rpc, nil, nil, nil, nil, invoker)
+	require.NoError(t, err)
+
+	codeLabelsOK := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "OK",
+	}
+
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(startedLabels))
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(codeLabelsOK))
+
+	// Error call.
+	errInvoker := func(
+		ctx context.Context, rpc string, enc drpc.Encoding,
+		in, out drpc.Message, cc *drpcclient.ClientConn,
+	) error {
+		return status.Error(codes.Internal, "internal error")
+	}
+	err = interceptor(ctx, rpc, nil, nil, nil, nil, errInvoker)
+	require.Error(t, err)
+
+	codeLabelsInternal := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "Internal",
+	}
+
+	require.Equal(t, int64(2), clientMetrics.RequestsTotal.Count(startedLabels))
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(codeLabelsOK))
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(codeLabelsInternal))
+}
+
+func TestDRPCStreamClientRequestMetricsInterceptor(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	clientMetrics := NewClientRequestMetrics()
+	ctx := context.Background()
+	rpc := "/testservice/StreamMethod"
+	interceptor := NewDRPCStreamClientRequestMetricsInterceptor(clientMetrics, func(rpc string) bool { return true })
+
+	startedLabels := map[string]string{
+		RPCMethodLabel: rpc,
+		RPCState:       "started",
+	}
+
+	// Successful call.
+	successStreamer := func(
+		ctx context.Context, rpc string, enc drpc.Encoding,
+		cc *drpcclient.ClientConn,
+	) (drpc.Stream, error) {
+		return &mockDRPCStream{ctx: ctx}, nil
+	}
+	str, err := interceptor(ctx, rpc, nil, nil, successStreamer)
+	require.NoError(t, err)
+	require.NotNil(t, str)
+
+	codeLabelsOK := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "OK",
+	}
+
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(startedLabels))
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(codeLabelsOK))
+
+	// Error call.
+	errStreamer := func(
+		ctx context.Context, rpc string, enc drpc.Encoding,
+		cc *drpcclient.ClientConn,
+	) (drpc.Stream, error) {
+		return nil, status.Error(codes.Unavailable, "unavailable")
+	}
+	str, err = interceptor(ctx, rpc, nil, nil, errStreamer)
+	require.Error(t, err)
+	require.Nil(t, str)
+
+	codeLabelsUnavailable := map[string]string{
+		RPCMethodLabel:     rpc,
+		RPCState:           "completed",
+		RPCStatusCodeLabel: "Unavailable",
+	}
+
+	require.Equal(t, int64(2), clientMetrics.RequestsTotal.Count(startedLabels))
+	require.Equal(t, int64(1), clientMetrics.RequestsTotal.Count(codeLabelsOK))
+	require.Equal(t, int64(1),
+		clientMetrics.RequestsTotal.Count(codeLabelsUnavailable))
 }

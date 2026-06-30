@@ -9,7 +9,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/ccl",
-        "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/clusterversion",
         "//pkg/config/zonepb",
         "//pkg/keys",
@@ -24,6 +23,7 @@ go_test(
         "//pkg/sql",
         "//pkg/sql/catalog/lease",
         "//pkg/sql/isql",
+        "//pkg/sql/sqlstats",
         "//pkg/sql/sqlstats/persistedsqlstats/sqlstatstestutil",
         "//pkg/testutils",
         "//pkg/testutils/diagutils",

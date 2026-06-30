@@ -260,6 +260,7 @@ func registerBackupIntents(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:                      "backup/intents/pending",
 		Owner:                     registry.OwnerKV,
+		Benchmark:                 true,
 		Cluster:                   r.MakeClusterSpec(4),
 		EncryptionSupport:         registry.EncryptionMetamorphic,
 		Leases:                    registry.MetamorphicLeases,
@@ -290,6 +291,7 @@ func registerBackupIntents(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:                      "backup/intents/abandoned",
 		Owner:                     registry.OwnerKV,
+		Benchmark:                 true,
 		Cluster:                   r.MakeClusterSpec(4),
 		EncryptionSupport:         registry.EncryptionMetamorphic,
 		Leases:                    registry.MetamorphicLeases,
@@ -326,7 +328,7 @@ func runBackup(ctx context.Context, t test.Test, c cluster.Cluster, abandon bool
 	defer conn.Close()
 
 	const totalRowCount = 1000000
-	const perTransactionRowCount = 1000
+	const perTransactionRowCount = 10000
 	numTxns := totalRowCount / perTransactionRowCount
 
 	// Disable automatic stats collection to avoid additional contention.
@@ -379,8 +381,8 @@ func runBackup(ctx context.Context, t test.Test, c cluster.Cluster, abandon bool
 		}
 		baseKey := numTxns + txnIndex*perTransactionRowCount
 		statement = fmt.Sprintf(`
-          INSERT INTO foo (k, v) 
-          SELECT %d + gs, gs %% %d 
+          INSERT INTO foo (k, v)
+          SELECT %d + gs, gs %% %d
           FROM generate_series(0, %d) AS gs`,
 			baseKey, perTransactionRowCount, perTransactionRowCount-1)
 		_, err = tx.ExecContext(ctx, statement)
@@ -413,13 +415,17 @@ func runBackup(ctx context.Context, t test.Test, c cluster.Cluster, abandon bool
 		t.Fatalf(err.Error())
 	}
 
+	// Enable virtual intent resolution so that the pre-evaluation lock-table
+	// scan discovers distinct conflicting transactions for ranged resolution.
+	_, err = conn.ExecContext(ctx, "SET CLUSTER SETTING kv.concurrency.virtual_intent_resolution.enabled = true")
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
 	// The backup runs with a timeout configured by bulkio.backup.read_timeout,
-	// which defaults to 5min. Currently, before the virtualized intent resolution
-	// work, this test takes ~2min for the pending case and ~3min for the
-	// abandoned case. The 5min timeout should be sufficient for this test, and
-	// if exceeded, will provide a signal that the intent resolution is taking
-	// longer than expected.
-	// TODO(mira): Adjust the timeout if the test flakes, and after the VIR work.
+	// which defaults to 5min. With VIR + preferDistinctTxns + ranged resolution,
+	// each ExportRequest should complete in seconds, but the timeout may need
+	// adjustment if the test flakes.
 	t.Status("running backup")
 	_, err = conn.ExecContext(ctx, fmt.Sprintf("BACKUP TABLE foo INTO 'nodelocal://1/%s'", destinationName(c)))
 	if err != nil {
@@ -467,75 +473,6 @@ func initBulkJobPerfArtifacts(
 }
 
 func registerBackup(r registry.Registry) {
-	backup2TBSpec := r.MakeClusterSpec(10)
-	r.Add(registry.TestSpec{
-		Name:      fmt.Sprintf("backup/2TB/%s", backup2TBSpec),
-		Owner:     registry.OwnerDisasterRecovery,
-		Benchmark: true,
-		Cluster:   backup2TBSpec,
-		// The default storage on Azure Standard_D4ds_v5 is only 150 GiB compared
-		// to 400 on GCE, which is not enough for this test. We could request a
-		// larger volume size and set spec.LocalSSDDisable if we wanted to run
-		// this on Azure.
-		CompatibleClouds:          registry.OnlyGCE,
-		Suites:                    registry.Suites(registry.Nightly),
-		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
-		EncryptionSupport:         registry.EncryptionAlwaysDisabled,
-		PostProcessPerfMetrics: func(test string, histogram *roachtestutil.HistogramMetric) (roachtestutil.AggregatedPerfMetrics, error) {
-
-			metricName := fmt.Sprintf("%s_elapsed", test)
-			totalElapsed := histogram.Elapsed
-
-			numNodes := int64(10)
-			tb := int64(1 << 40)
-			mb := int64(1 << 20)
-			dataSizeInMB := (2 * tb) / mb
-			backupDuration := int64(totalElapsed / 1000)
-			avgRatePerNode := roachtestutil.MetricPoint(float64(dataSizeInMB) / float64(numNodes*backupDuration))
-
-			return roachtestutil.AggregatedPerfMetrics{
-				{
-					Name:           metricName,
-					Value:          avgRatePerNode,
-					Unit:           "MB/s/node",
-					IsHigherBetter: false,
-				},
-			}, nil
-		},
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			rows := rows2TiB
-			if c.IsLocal() {
-				rows = 100
-			}
-			dest := importBankData(ctx, rows, t, c)
-			exporter := roachtestutil.CreateWorkloadHistogramExporter(t, c)
-			tick, perfBuf := initBulkJobPerfArtifacts(2*time.Hour, t, exporter)
-			defer roachtestutil.CloseExporter(ctx, exporter, t, c, perfBuf, c.Node(1), "")
-
-			m := c.NewDeprecatedMonitor(ctx)
-			m.Go(func(ctx context.Context) error {
-				t.Status(`running backup`)
-				// Tick once before starting the backup, and once after to capture the
-				// total elapsed time. This is used by roachperf to compute and display
-				// the average MB/sec per node.
-				tick()
-				conn := c.Conn(ctx, t.L(), 1)
-				defer conn.Close()
-				var jobID jobspb.JobID
-				uri := `gs://` + backupTestingBucket + `/` + dest + `?AUTH=implicit`
-				if err := conn.QueryRowContext(ctx, fmt.Sprintf("BACKUP bank.bank INTO '%s' WITH detached", uri)).Scan(&jobID); err != nil {
-					return err
-				}
-				if err := AssertReasonableFractionCompleted(ctx, t.L(), c, jobID, 2); err != nil {
-					return err
-				}
-				tick()
-				return nil
-			})
-			m.Wait()
-		},
-	})
-
 	// Skip running on aws because the roachtest env does not have the proper
 	// credentials. See 127062
 	for _, cloudProvider := range []spec.Cloud{spec.GCE} {

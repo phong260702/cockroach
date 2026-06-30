@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
@@ -473,6 +474,12 @@ func (r *Registry) runJob(
 	// Make sure that we remove the job from the running set when this returns.
 	defer r.unregister(job.ID())
 
+	// Inject the job's ID into the context so that any kv.DB or
+	// InternalDB transaction created within the job automatically
+	// carries the workload ID in KV BatchRequest headers for ASH
+	// attribution.
+	ctx = kv.ContextWithWorkloadInfo(ctx, uint64(job.ID()), workloadid.WorkloadTypeJob)
+
 	// Bookkeeping.
 	execCtx, cleanup := r.execCtx(ctx, "resume-"+taskName, username)
 	defer cleanup()
@@ -621,8 +628,8 @@ func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqllivenes
 				})
 				log.Dev.Infof(ctx, "job %d, session %s: paused", id, s.ID())
 			case StateReverting:
-				if err := job.WithTxn(txn).Update(ctx, func(
-					txn isql.Txn, md JobMetadata, ju *JobUpdater,
+				if err := job.DeprecatedWithTxn(txn).Update(ctx, func(
+					txn isql.Txn, md DeprecatedJobMetadata, ju *DeprecatedJobUpdater,
 				) error {
 					if !r.cancelRegisteredJobContext(id) {
 						// If we didn't already have a running job for this

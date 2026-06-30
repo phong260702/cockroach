@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
@@ -33,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/redact"
 )
 
@@ -168,12 +168,18 @@ func declareKeysEndTxn(
 					EndKey: rightRangeIDUnreplicatedPrefix.PrefixEnd(),
 				})
 
-				// NB: the RHS LastReplicaGCTimestampKey, to which the LHS timestamp is
-				// copied, is covered above by the SpanReadWrite for the entire RHS
-				// unreplicated RangeID-local span.
-				latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
-					Key: keys.RangeLastReplicaGCTimestampKey(st.LeftDesc.RangeID),
-				})
+				// TODO(sep-raft-log): drop this branch when the version gate is
+				// removed. We could be checking the version gate here, but the plumbing
+				// wasn't worth it. Instead, just keep conservatively taking a latch for
+				// a bit longer, it's not contended or important.
+				if _ = clusterversion.V26_2_NoLastReplicaGCTimestampKeyOnEval; true {
+					// NB: the RHS LastReplicaGCTimestampKey, to which the LHS timestamp
+					// is copied, is covered above by the SpanReadWrite for the entire RHS
+					// unreplicated RangeID-local span.
+					latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
+						Key: keys.RangeLastReplicaGCTimestampKey(st.LeftDesc.RangeID),
+					})
+				}
 
 				latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
 					Key:    abortspan.MinKey(rs.GetRangeID()),
@@ -893,53 +899,30 @@ func RunCommitTrigger(
 			"commit wait. Was its timestamp bumped after acquiring latches?", txn, ct.Kind())
 	}
 
-	// Used by both splits and merges.
-	maybeWrapReplicaCorruptionError := func(ctx context.Context, err error) error {
-		if err == nil {
-			log.KvExec.Fatalf(ctx, "unexpected nil error")
-		}
-		if info := pebble.ExtractDataCorruptionInfo(err); info != nil {
-			// Data corruption errors due to external SSTable references getting
-			// deleted should not be wrapped in replica corruption errors. This
-			// ensures that we simply fail the split or merge and propagate the error,
-			// but don't crash the process. In such cases, an excise command should be
-			// used to get out of this data corruption situation.
-			return err
-		}
-		// Otherwise, fail the split or merge with a critical error that crashes the
-		// process. Reporting a replica corruption error ensures this. See
-		// setCorruptRaftMuLocked.
-		return kvpb.MaybeWrapReplicaCorruptionError(ctx, err)
-	}
-
 	// Stage the commit trigger's side-effects so that they will go into effect on
 	// each Replica when the corresponding Raft log entry is applied. Only one
 	// commit trigger can be set.
+	//
+	// Errors from trigger evaluation are returned as regular evaluation errors.
+	// Since evaluation is pre-Raft (no state has been committed), failing here
+	// simply prevents the proposal; the split/merge queue will retry.
 	if ct.GetSplitTrigger() != nil {
 		sl := MakeStateLoader(rec)
 		lhsLease, err := sl.LoadLease(ctx, batch)
 		if err != nil {
-			return result.Result{}, maybeWrapReplicaCorruptionError(
-				ctx, errors.Wrap(err, "unable to load lease"),
-			)
+			return result.Result{}, errors.Wrap(err, "unable to load lease")
 		}
 		gcThreshold, err := sl.LoadGCThreshold(ctx, batch)
 		if err != nil {
-			return result.Result{}, maybeWrapReplicaCorruptionError(
-				ctx, errors.Wrap(err, "unable to load GCThreshold"),
-			)
+			return result.Result{}, errors.Wrap(err, "unable to load GCThreshold")
 		}
 		gcHint, err := sl.LoadGCHint(ctx, batch)
 		if err != nil {
-			return result.Result{}, maybeWrapReplicaCorruptionError(
-				ctx, errors.Wrap(err, "unable to load GCHint"),
-			)
+			return result.Result{}, errors.Wrap(err, "unable to load GCHint")
 		}
 		replicaVersion, err := sl.LoadVersion(ctx, batch)
 		if err != nil {
-			return result.Result{}, maybeWrapReplicaCorruptionError(
-				ctx, errors.Wrap(err, "unable to load replica version"),
-			)
+			return result.Result{}, errors.Wrap(err, "unable to load replica version")
 		}
 		in := SplitTriggerHelperInput{
 			LeftLease:      lhsLease,
@@ -952,7 +935,7 @@ func RunCommitTrigger(
 			ctx, rec, batch, *ms, ct.SplitTrigger, in, txn.WriteTimestamp,
 		)
 		if err != nil {
-			return result.Result{}, maybeWrapReplicaCorruptionError(ctx, err)
+			return result.Result{}, err
 		}
 		*ms = newMS
 		return res, nil
@@ -960,7 +943,7 @@ func RunCommitTrigger(
 	if mt := ct.GetMergeTrigger(); mt != nil {
 		res, err := mergeTrigger(ctx, rec, batch, ms, mt, txn.WriteTimestamp)
 		if err != nil {
-			return result.Result{}, maybeWrapReplicaCorruptionError(ctx, err)
+			return result.Result{}, err
 		}
 		return res, nil
 	}
@@ -1254,6 +1237,19 @@ func splitTrigger(
 	return splitTriggerHelper(ctx, rec, batch, in, h, split, ts)
 }
 
+// TestingMergeTrigger is a wrapper around mergeTrigger that is exported for
+// testing purposes.
+func TestingMergeTrigger(
+	ctx context.Context,
+	rec EvalContext,
+	batch storage.Batch,
+	ms *enginepb.MVCCStats,
+	merge *roachpb.MergeTrigger,
+	ts hlc.Timestamp,
+) (result.Result, error) {
+	return mergeTrigger(ctx, rec, batch, ms, merge, ts)
+}
+
 // TestingSplitTrigger is a wrapper around splitTrigger that is exported for
 // testing purposes.
 func TestingSplitTrigger(
@@ -1348,19 +1344,26 @@ func splitTriggerHelper(
 	// NB: the replicated post-split left hand keyspace is frozen at this point.
 	// Only the RHS can be mutated (and we do so to seed its state).
 
-	// Copy the last replica GC timestamp. This value is unreplicated,
-	// which is why the MVCC stats are set to nil on calls to
-	// MVCCPutProto.
-	replicaGCTS, err := rec.GetLastReplicaGCTimestamp(ctx)
-	if err != nil {
-		return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to fetch last replica GC timestamp")
-	}
-
-	if err := storage.MVCCPutProto(
-		ctx, spanset.DisableForbiddenSpanAssertions(batch),
-		keys.RangeLastReplicaGCTimestampKey(split.RightDesc.RangeID), hlc.Timestamp{},
-		&replicaGCTS, storage.MVCCWriteOptions{Category: fs.BatchEvalReadCategory}); err != nil {
-		return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to copy last replica GC timestamp")
+	// Copy the last replica GC timestamp. This value is unreplicated, which is
+	// why the MVCC stats are set to nil on calls to MVCCBlindPutProto.
+	//
+	// TODO(sep-raft-log): remove when the version gate is removed. This key is
+	// unreplicated and should not be in the evaluated batch. It is now written
+	// locally at apply time.
+	if !rec.ClusterSettings().Version.IsActive(
+		ctx, clusterversion.V26_2_NoLastReplicaGCTimestampKeyOnEval,
+	) {
+		replicaGCTS, err := rec.GetLastReplicaGCTimestamp(ctx)
+		if err != nil {
+			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to fetch last replica GC timestamp")
+		}
+		if err := storage.MVCCBlindPutProto(
+			ctx, spanset.DisableForbiddenSpanAssertions(batch),
+			keys.RangeLastReplicaGCTimestampKey(split.RightDesc.RangeID), hlc.Timestamp{},
+			&replicaGCTS, storage.MVCCWriteOptions{Category: fs.BatchEvalReadCategory},
+		); err != nil {
+			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to copy last replica GC timestamp")
+		}
 	}
 
 	// Compute the absolute stats for the (post-split) ranges. No more
@@ -1403,6 +1406,7 @@ func splitTriggerHelper(
 
 	computeAccurateStats := (noPreComputedStats || manualSplit || emptyLeftOrRight || preComputedStatsDiff)
 	computeAccurateStats = computeAccurateStats && !shouldUseCrudeEstimates
+	var err error
 	if computeAccurateStats {
 		var reason redact.RedactableString
 		if noPreComputedStats {

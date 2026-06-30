@@ -8,6 +8,7 @@ go_library(
         "logical.go",
         "replication_helpers.go",
         "span_config_helpers.go",
+        "stream_test_helpers.go",
         "testutils.go",
         "uri_util.go",
     ],
@@ -59,6 +60,7 @@ go_library(
         "//pkg/util/metamorphic",
         "//pkg/util/protoutil",
         "//pkg/util/randutil",
+        "//pkg/util/rangescanstats/rangescanstatspb",
         "//pkg/util/retry",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
@@ -77,7 +79,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/ccl",
-        "//pkg/ccl/storageccl",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -41,10 +42,11 @@ func TestDeleteOldStatsForColumns(t *testing.T) {
 	s := srv.ApplicationLayer()
 	db := s.InternalDB().(descs.DB)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		db,
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, s.Codec(), s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 
@@ -260,9 +262,7 @@ func TestDeleteOldStatsForColumns(t *testing.T) {
 		}
 
 		return testutils.SucceedsSoonError(func() error {
-			tableStats, err := cache.getTableStatsFromCache(
-				ctx, tableID, nil /* forecast */, nil /* udtCols */, nil, /* typeResolver */
-			)
+			tableStats, _, _, err := cache.getTableStatsFromCache(ctx, tableID, nil /* forecast */, nil /* udtCols */, nil /* typeResolver */, false /* stable */, 0 /* canaryWindowSize */, hlc.Timestamp{} /* statsAsOf */)
 			if err != nil {
 				return err
 			}
@@ -270,9 +270,7 @@ func TestDeleteOldStatsForColumns(t *testing.T) {
 			for i := range testData {
 				stat := &testData[i]
 				if stat.TableID != tableID {
-					stats, err := cache.getTableStatsFromCache(
-						ctx, stat.TableID, nil /* forecast */, nil /* udtCols */, nil, /* typeResolver */
-					)
+					stats, _, _, err := cache.getTableStatsFromCache(ctx, stat.TableID, nil /* forecast */, nil /* udtCols */, nil /* typeResolver */, false /* stable */, 0 /* canaryWindowSize */, hlc.Timestamp{} /* statsAsOf */)
 					if err != nil {
 						return err
 					}
@@ -342,10 +340,11 @@ func TestDeleteOldStatsForOtherColumns(t *testing.T) {
 	s := srv.ApplicationLayer()
 	db := s.InternalDB().(isql.DB)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, s.Codec(), s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	testData := []TableStatisticProto{
@@ -558,9 +557,7 @@ func TestDeleteOldStatsForOtherColumns(t *testing.T) {
 		}
 
 		return testutils.SucceedsSoonError(func() error {
-			tableStats, err := cache.getTableStatsFromCache(
-				ctx, tableID, nil /* forecast */, nil /* udtCols */, nil, /* typeResolver */
-			)
+			tableStats, _, _, err := cache.getTableStatsFromCache(ctx, tableID, nil /* forecast */, nil /* udtCols */, nil /* typeResolver */, false /* stable */, 0 /* canaryWindowSize */, hlc.Timestamp{} /* statsAsOf */)
 			if err != nil {
 				return err
 			}
@@ -568,9 +565,7 @@ func TestDeleteOldStatsForOtherColumns(t *testing.T) {
 			for i := range testData {
 				stat := &testData[i]
 				if stat.TableID != tableID {
-					stats, err := cache.getTableStatsFromCache(
-						ctx, stat.TableID, nil /* forecast */, nil /* udtCols */, nil, /* typeResolver */
-					)
+					stats, _, _, err := cache.getTableStatsFromCache(ctx, stat.TableID, nil /* forecast */, nil /* udtCols */, nil /* typeResolver */, false /* stable */, 0 /* canaryWindowSize */, hlc.Timestamp{} /* statsAsOf */)
 					if err != nil {
 						return err
 					}

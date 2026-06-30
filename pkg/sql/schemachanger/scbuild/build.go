@@ -160,10 +160,6 @@ func determineDistributedMergeModeForStatement(
 	if incumbent.DistributedMergeMode != scpb.DistributedMergeModeUnset {
 		mode = incumbent.DistributedMergeMode
 	}
-	if mode == scpb.DistributedMergeModeEnabled &&
-		stmt != nil && !backfill.StatementAllowsDistributedMerge(stmt) {
-		mode = scpb.DistributedMergeModeDisabled
-	}
 	return mode, nil
 }
 
@@ -173,6 +169,8 @@ func jobModeToStateMode(
 	switch jobMode {
 	case jobspb.IndexBackfillDistributedMergeMode_Enabled:
 		return scpb.DistributedMergeModeEnabled
+	case jobspb.IndexBackfillDistributedMergeMode_Force:
+		return scpb.DistributedMergeModeForce
 	case jobspb.IndexBackfillDistributedMergeMode_Disabled:
 		return scpb.DistributedMergeModeDisabled
 	default:
@@ -296,7 +294,6 @@ type builderState struct {
 	commentGetter            scdecomp.CommentGetter
 	zoneConfigReader         scdecomp.ZoneConfigGetter
 	referenceProviderFactory ReferenceProviderFactory
-	createPartCCL            CreatePartitioningCCLCallback
 	hasAdmin                 bool
 
 	// output contains the schema change targets that have been planned so far.
@@ -319,7 +316,7 @@ type cachedDesc struct {
 	backrefs         catalog.DescriptorIDSet
 	outputIndexes    []int
 	cachedCollection *scpb.ElementCollection[scpb.Element]
-	privileges       map[privilege.Kind]error
+	privileges       map[privilege.Kind]bool
 	hasOwnership     bool
 	backrefsResolved bool
 
@@ -347,7 +344,6 @@ func newBuilderState(
 		cr:                       d.CatalogReader(),
 		tr:                       d.TableReader(),
 		auth:                     d.AuthorizationAccessor(),
-		createPartCCL:            d.IndexPartitioningCCLCallback(),
 		output:                   make([]elementState, 0, len(incumbent.Current)),
 		descCache:                make(map[catid.DescID]*cachedDesc),
 		tempSchemas:              make(map[catid.DescID]catalog.SchemaDescriptor),
@@ -510,6 +506,11 @@ func (b buildCtx) DropTransient(element scpb.Element) {
 // Drop implements the scbuildstmt.BuildCtx interface.
 func (b buildCtx) Drop(element scpb.Element) {
 	b.Ensure(element, scpb.ToAbsent, b.TargetMetadata())
+}
+
+// Replace implements the scbuildstmt.BuildCtx interface.
+func (b buildCtx) Replace(element scpb.Element) {
+	b.BuilderState.(*builderState).replaceElement(element, b.TargetMetadata())
 }
 
 // WithNewSourceElementID implements the scbuildstmt.BuildCtx interface.

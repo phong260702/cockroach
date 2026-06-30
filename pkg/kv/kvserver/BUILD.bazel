@@ -47,7 +47,6 @@ go_library(
         "replica_closedts.go",
         "replica_command.go",
         "replica_consistency.go",
-        "replica_corruption.go",
         "replica_destroy.go",
         "replica_eval_context.go",
         "replica_eval_context_span.go",
@@ -109,6 +108,7 @@ go_library(
         "stores_store_liveness.go",
         "testing_knobs.go",
         "ts_maintenance_queue.go",
+        ":gen-raftleadertransferoutcome-stringer",  # keep
         ":gen-refreshraftreason-stringer",  # keep
     ],
     embed = [":kvserver_go_proto"],
@@ -161,6 +161,8 @@ go_library(
         "//pkg/kv/kvserver/kvserverpb",
         "//pkg/kv/kvserver/kvstorage",
         "//pkg/kv/kvserver/kvstorage/snaprecv",
+        "//pkg/kv/kvserver/kvstorage/wag",
+        "//pkg/kv/kvserver/kvstorage/wag/wagpb",
         "//pkg/kv/kvserver/leases",
         "//pkg/kv/kvserver/liveness",
         "//pkg/kv/kvserver/liveness/livenesspb",
@@ -191,6 +193,7 @@ go_library(
         "//pkg/multitenant",
         "//pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer",
         "//pkg/multitenant/tenantcostmodel",
+        "//pkg/obs/ash",
         "//pkg/obs/workloadid",
         "//pkg/raft",
         "//pkg/raft/raftlogger",
@@ -262,6 +265,7 @@ go_library(
         "@com_github_cockroachdb_pebble//sstable/block",
         "@com_github_cockroachdb_pebble//vfs",
         "@com_github_cockroachdb_redact//:redact",
+        "@com_github_cockroachdb_tokenbucket//:tokenbucket",
         "@com_github_gogo_protobuf//proto",
         "@com_github_kr_pretty//:pretty",
         "@com_github_prometheus_client_golang//prometheus",
@@ -280,6 +284,7 @@ go_test(
     srcs = [
         "addressing_test.go",
         "allocator_impl_test.go",
+        "app_batch_test.go",
         "batch_spanset_test.go",
         "below_raft_protos_test.go",
         "client_atomic_membership_change_test.go",
@@ -339,6 +344,7 @@ go_test(
         "raft_transport_unit_test.go",
         "range_log_test.go",
         "rebalance_objective_test.go",
+        "replica_app_batch_test.go",
         "replica_application_cmd_buf_test.go",
         "replica_application_result_test.go",
         "replica_application_state_machine_test.go",
@@ -355,6 +361,7 @@ go_test(
         "replica_learner_test.go",
         "replica_lease_renewal_test.go",
         "replica_lifecycle_datadriven_test.go",
+        "replica_load_bench_test.go",
         "replica_metrics_test.go",
         "replica_probe_test.go",
         "replica_proposal_bench_test.go",
@@ -364,9 +371,11 @@ go_test(
         "replica_raft_test.go",
         "replica_raft_truncation_test.go",
         "replica_raftlog_test.go",
+        "replica_rangefeed_internal_test.go",
         "replica_rangefeed_lag_observer_test.go",
         "replica_rangefeed_test.go",
         "replica_rankings_test.go",
+        "replica_read_test.go",
         "replica_sideload_test.go",
         "replica_split_load_test.go",
         "replica_store_liveness_test.go",
@@ -408,7 +417,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/ccl",
-        "//pkg/cli/exit",
         "//pkg/cloud",
         "//pkg/cloud/nodelocal",
         "//pkg/clusterversion",
@@ -454,6 +462,8 @@ go_test(
         "//pkg/kv/kvserver/kvserverpb",
         "//pkg/kv/kvserver/kvstorage",
         "//pkg/kv/kvserver/kvstorage/snaprecv",
+        "//pkg/kv/kvserver/kvstorage/wag",
+        "//pkg/kv/kvserver/kvstorage/wag/wagpb",
         "//pkg/kv/kvserver/leases",
         "//pkg/kv/kvserver/liveness",
         "//pkg/kv/kvserver/liveness/livenesspb",
@@ -587,6 +597,8 @@ go_test(
         "@com_github_raduberinde_btreemap//:btreemap",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@io_storj_drpc//:drpc",
+        "@io_storj_drpc//drpcclient",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//metadata",
         "@org_golang_x_exp//maps",
@@ -630,6 +642,12 @@ go_proto_library(
         "//pkg/util/uuid",  # keep
         "@com_github_gogo_protobuf//gogoproto",
     ],
+)
+
+stringer(
+    name = "gen-raftleadertransferoutcome-stringer",
+    src = "replica_raft.go",
+    typ = "raftLeaderTransferOutcome",
 )
 
 stringer(

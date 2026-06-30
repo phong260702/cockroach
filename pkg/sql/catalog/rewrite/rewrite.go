@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/walkutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -117,33 +118,33 @@ func TableDescs(
 			func(expr *string, typ catalog.DescExprType) error {
 				switch typ {
 				case catalog.SQLExpr:
-					newExpr, err := rewriteTypesInExpr(*expr, descriptorRewrites)
+					newExpr, err := rewriteTypesInExpr((catpb.Expression)(*expr), descriptorRewrites)
 					if err != nil {
 						return err
 					}
-					*expr = newExpr
+					*expr = string(newExpr)
 
-					newExpr, err = rewriteSequencesInExpr(*expr, descriptorRewrites)
+					newExpr, err = rewriteSequencesInExpr((catpb.Expression)(*expr), descriptorRewrites)
 					if err != nil {
 						return err
 					}
-					*expr = newExpr
+					*expr = string(newExpr)
 
-					newExpr, err = rewriteFunctionsInExpr(*expr, descriptorRewrites)
+					newExpr, err = rewriteFunctionsInExpr((catpb.Expression)(*expr), descriptorRewrites)
 					if err != nil {
 						return err
 					}
-					*expr = newExpr
+					*expr = string(newExpr)
 				case catalog.SQLStmt, catalog.PLpgSQLStmt:
 					lang := catpb.Function_SQL
 					if typ == catalog.PLpgSQLStmt {
 						lang = catpb.Function_PLPGSQL
 					}
-					newExpr, err := rewriteRoutineBody(descriptorRewrites, *expr, overrideDB, lang)
+					newExpr, err := rewriteRoutineBody(descriptorRewrites, (catpb.RoutineBody)(*expr), overrideDB, lang)
 					if err != nil {
 						return err
 					}
-					*expr = newExpr
+					*expr = string(newExpr)
 				default:
 					return errors.AssertionFailedf("unexpected expression type")
 				}
@@ -187,13 +188,54 @@ func TableDescs(
 			// we update the FK to point to it?
 			table.OutboundFKs = append(table.OutboundFKs, *fk)
 		}
-		for idx := range table.Mutations {
-			if c := table.Mutations[idx].GetConstraint(); c != nil &&
+
+		// If the table has an RBRUsingConstraint, check that the referenced FK
+		// constraint still exists after dropping FKs with missing referenced tables.
+		if table.RBRUsingConstraint != 0 {
+			found := false
+			for i := range table.OutboundFKs {
+				if table.OutboundFKs[i].ConstraintID == table.RBRUsingConstraint {
+					found = true
+					break
+				}
+			}
+			if !found {
+				table.RBRUsingConstraint = 0
+			}
+		}
+
+		origMutations := table.Mutations
+		table.Mutations = table.Mutations[:0]
+		for idx := range origMutations {
+			if c := origMutations[idx].GetConstraint(); c != nil &&
 				c.ConstraintType == descpb.ConstraintToUpdate_FOREIGN_KEY {
 				fk := &c.ForeignKey
 				if rewriteOfReferencedTable, ok := descriptorRewrites[fk.ReferencedTableID]; ok {
 					fk.ReferencedTableID = rewriteOfReferencedTable.ID
 					fk.OriginTableID = tableRewrite.ID
+				} else {
+					// The referenced table is not being restored. If the user
+					// specified skip_missing_foreign_keys, drop this mutation.
+					// Error checking for the case where the user did not specify
+					// the option has already been done in allocateDescriptorRewrites.
+					continue
+				}
+			}
+			table.Mutations = append(table.Mutations, origMutations[idx])
+		}
+		// Clean up MutationJobs entries for mutation IDs that no longer
+		// have any corresponding mutations (e.g. because we dropped FK
+		// mutations above).
+		if len(table.Mutations) < len(origMutations) {
+			remainingMutIDs := make(map[descpb.MutationID]struct{})
+			for i := range table.Mutations {
+				remainingMutIDs[table.Mutations[i].MutationID] = struct{}{}
+			}
+			origMutJobs := table.MutationJobs
+			table.MutationJobs = table.MutationJobs[:0]
+			for i := range origMutJobs {
+				if _, ok := remainingMutIDs[origMutJobs[i].MutationID]; ok {
+					table.MutationJobs = append(table.MutationJobs, origMutJobs[i])
 				}
 			}
 		}
@@ -473,21 +515,49 @@ func TableDescs(
 	// references from the view, which cannot have triggers and thus are not
 	// included in relationBackrefRemovalCandidates.
 	if len(relationBackrefRemovalCandidates) > 0 {
+		// Build a lookup map from rewritten table ID to table descriptor, so we
+		// can check whether a trigger still exists on a referencing table.
+		tablesByID := make(map[descpb.ID]*tabledesc.Mutable, len(tables))
+		for _, t := range tables {
+			tablesByID[t.ID] = t
+		}
+
 		for _, table := range tables {
 			if refsToRemove, ok := relationBackrefRemovalCandidates[table.ID]; ok {
 				newDependedOnBy := table.DependedOnBy[:0]
 				for _, ref := range table.DependedOnBy {
 					if _, remove := refsToRemove[ref.ID]; !remove {
 						newDependedOnBy = append(newDependedOnBy, ref)
+					} else if ref.TriggerID != 0 {
+						// This backref is for a specific trigger. Only remove
+						// it if that trigger no longer exists on the
+						// referencing table (i.e., it was dropped due to
+						// missing dependencies).
+						if refTable, ok := tablesByID[ref.ID]; ok {
+							triggerStillExists := false
+							for i := range refTable.Triggers {
+								if refTable.Triggers[i].ID == ref.TriggerID {
+									triggerStillExists = true
+									break
+								}
+							}
+							if triggerStillExists {
+								newDependedOnBy = append(newDependedOnBy, ref)
+							}
+						}
+						// If the referencing table is not in the restore set,
+						// the backref is stale and can be safely dropped.
 					} else {
 						// Sequences are a special case: we remove only the backref created
-						// by the trigger or policy. This is represented as a minimal
-						// TableDescriptor_Reference with just ID and ByID=true. Other
+						// by the trigger or policy. This is represented as a
+						// TableDescriptor_Reference with just ID and ByID=true, and
+						// optionally a TriggerID (for trigger-based references). Other
 						// backrefs, such as those created by column usage, are preserved.
 						if table.IsSequence() {
 							seqRefUsedInTriggerOrPolicy := descpb.TableDescriptor_Reference{
-								ID:   ref.ID,
-								ByID: true,
+								ID:        ref.ID,
+								ByID:      true,
+								TriggerID: ref.TriggerID,
 							}
 							if !seqRefUsedInTriggerOrPolicy.Equal(ref) {
 								newDependedOnBy = append(newDependedOnBy, ref)
@@ -518,7 +588,7 @@ func makeDBNameReplaceFunc(newDB string) func(ctx *tree.FmtCtx, tn *tree.TableNa
 // rewriteViewQueryDBNames rewrites the passed table's ViewQuery replacing all
 // non-empty db qualifiers with `newDB`.
 func rewriteViewQueryDBNames(table *tabledesc.Mutable, newDB string) error {
-	stmt, err := parser.ParseOne(table.ViewQuery)
+	stmt, err := parser.ParseOne(string(table.ViewQuery))
 	if err != nil {
 		return pgerror.Wrapf(err, pgcode.Syntax,
 			"failed to parse underlying query from view %q", table.Name)
@@ -529,18 +599,18 @@ func rewriteViewQueryDBNames(table *tabledesc.Mutable, newDB string) error {
 		tree.FmtReformatTableNames(makeDBNameReplaceFunc(newDB)),
 	)
 	f.FormatNode(stmt.AST)
-	table.ViewQuery = f.CloseAndGetString()
+	table.ViewQuery = descpb.Statement(f.CloseAndGetString())
 	return nil
 }
 
 func rewriteFunctionBodyDBNames(
-	fnBody string, newDB string, lang catpb.Function_Language,
-) (string, error) {
+	fnBody catpb.RoutineBody, newDB string, lang catpb.Function_Language,
+) (catpb.RoutineBody, error) {
 	replaceFunc := makeDBNameReplaceFunc(newDB)
 	switch lang {
 	case catpb.Function_SQL:
 		fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
-		stmts, err := parser.Parse(fnBody)
+		stmts, err := parser.Parse(string(fnBody))
 		if err != nil {
 			return "", err
 		}
@@ -556,10 +626,10 @@ func rewriteFunctionBodyDBNames(
 			fmtCtx.WriteString(f.CloseAndGetString())
 			fmtCtx.WriteString(";")
 		}
-		return fmtCtx.CloseAndGetString(), nil
+		return catpb.RoutineBody(fmtCtx.CloseAndGetString()), nil
 
 	case catpb.Function_PLPGSQL:
-		stmt, err := plpgsqlparser.Parse(fnBody)
+		stmt, err := plpgsqlparser.Parse(string(fnBody))
 		if err != nil {
 			return "", err
 		}
@@ -568,7 +638,7 @@ func rewriteFunctionBodyDBNames(
 			tree.FmtReformatTableNames(replaceFunc),
 		)
 		fmtCtx.FormatNode(stmt.AST)
-		return fmtCtx.CloseAndGetString(), nil
+		return catpb.RoutineBody(fmtCtx.CloseAndGetString()), nil
 
 	default:
 		return "", errors.AssertionFailedf("unexpected function language %s", lang)
@@ -577,35 +647,39 @@ func rewriteFunctionBodyDBNames(
 
 // rewriteTypesInExpr rewrites all explicit ID type references in the input
 // expression string according to rewrites.
-func rewriteTypesInExpr(expr string, rewrites jobspb.DescRewriteMap) (string, error) {
-	parsed, err := parser.ParseExpr(expr)
+func rewriteTypesInExpr(
+	expr catpb.Expression, rewrites jobspb.DescRewriteMap,
+) (catpb.Expression, error) {
+	parsed, err := parser.ParseExpr(string(expr))
 	if err != nil {
 		return "", err
 	}
 	ctx := makeTypeReplaceFmtCtx(rewrites)
 	ctx.FormatNode(parsed)
-	return ctx.CloseAndGetString(), nil
+	return catpb.Expression(ctx.CloseAndGetString()), nil
 }
 
 // rewriteTypesInView rewrites all explicit ID type references in the input view
 // query string according to rewrites.
-func rewriteTypesInView(viewQuery string, rewrites jobspb.DescRewriteMap) (string, error) {
-	stmt, err := parser.ParseOne(viewQuery)
+func rewriteTypesInView(
+	viewQuery catpb.Statement, rewrites jobspb.DescRewriteMap,
+) (catpb.Statement, error) {
+	stmt, err := parser.ParseOne(string(viewQuery))
 	if err != nil {
 		return "", err
 	}
 	ctx := makeTypeReplaceFmtCtx(rewrites)
 	ctx.FormatNode(stmt.AST)
-	return ctx.CloseAndGetString(), nil
+	return catpb.Statement(ctx.CloseAndGetString()), nil
 }
 
 func rewriteTypesInRoutine(
-	fnBody string, rewrites jobspb.DescRewriteMap, lang catpb.Function_Language,
-) (string, error) {
+	fnBody catpb.RoutineBody, rewrites jobspb.DescRewriteMap, lang catpb.Function_Language,
+) (catpb.RoutineBody, error) {
 	switch lang {
 	case catpb.Function_SQL:
 		fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
-		stmts, err := parser.Parse(fnBody)
+		stmts, err := parser.Parse(string(fnBody))
 		if err != nil {
 			return "", err
 		}
@@ -618,16 +692,16 @@ func rewriteTypesInRoutine(
 			fmtCtx.WriteString(typeReplaceCtx.CloseAndGetString())
 			fmtCtx.WriteString(";")
 		}
-		return fmtCtx.CloseAndGetString(), nil
+		return catpb.RoutineBody(fmtCtx.CloseAndGetString()), nil
 
 	case catpb.Function_PLPGSQL:
-		stmt, err := plpgsqlparser.Parse(fnBody)
+		stmt, err := plpgsqlparser.Parse(string(fnBody))
 		if err != nil {
 			return "", err
 		}
 		typeReplaceCtx := makeTypeReplaceFmtCtx(rewrites)
 		typeReplaceCtx.FormatNode(stmt.AST)
-		return typeReplaceCtx.CloseAndGetString(), nil
+		return catpb.RoutineBody(typeReplaceCtx.CloseAndGetString()), nil
 
 	default:
 		return "", errors.AssertionFailedf("unexpected function language: %v", lang)
@@ -652,8 +726,10 @@ func makeTypeReplaceFmtCtx(rewrites jobspb.DescRewriteMap) *tree.FmtCtx {
 
 // rewriteSequencesInExpr rewrites all sequence IDs in the input expression
 // string according to rewrites.
-func rewriteSequencesInExpr(expr string, rewrites jobspb.DescRewriteMap) (string, error) {
-	parsed, err := parser.ParseExpr(expr)
+func rewriteSequencesInExpr(
+	expr catpb.Expression, rewrites jobspb.DescRewriteMap,
+) (catpb.Expression, error) {
+	parsed, err := parser.ParseExpr(string(expr))
 	if err != nil {
 		return "", err
 	}
@@ -662,11 +738,13 @@ func rewriteSequencesInExpr(expr string, rewrites jobspb.DescRewriteMap) (string
 	if err != nil {
 		return "", err
 	}
-	return newExpr.String(), nil
+	return catpb.Expression(newExpr.String()), nil
 }
 
-func rewriteFunctionsInExpr(expr string, rewrites jobspb.DescRewriteMap) (string, error) {
-	parsed, err := parser.ParseExpr(expr)
+func rewriteFunctionsInExpr(
+	expr catpb.Expression, rewrites jobspb.DescRewriteMap,
+) (catpb.Expression, error) {
+	parsed, err := parser.ParseExpr(string(expr))
 	if err != nil {
 		return "", err
 	}
@@ -696,7 +774,7 @@ func rewriteFunctionsInExpr(expr string, rewrites jobspb.DescRewriteMap) (string
 	if err != nil {
 		return "", err
 	}
-	return newExpr.String(), nil
+	return catpb.Expression(newExpr.String()), nil
 }
 
 func makeSequenceReplaceFunc(
@@ -726,8 +804,10 @@ func makeSequenceReplaceFunc(
 
 // rewriteSequencesInView walks the given viewQuery and
 // rewrites all sequence IDs in it according to rewrites.
-func rewriteSequencesInView(viewQuery string, rewrites jobspb.DescRewriteMap) (string, error) {
-	stmt, err := parser.ParseOne(viewQuery)
+func rewriteSequencesInView(
+	viewQuery catpb.Statement, rewrites jobspb.DescRewriteMap,
+) (catpb.Statement, error) {
+	stmt, err := parser.ParseOne(string(viewQuery))
 	if err != nil {
 		return "", err
 	}
@@ -735,17 +815,17 @@ func rewriteSequencesInView(viewQuery string, rewrites jobspb.DescRewriteMap) (s
 	if err != nil {
 		return "", err
 	}
-	return newStmt.String(), nil
+	return catpb.Statement(newStmt.String()), nil
 }
 
 func rewriteSequencesInFunction(
-	fnBody string, rewrites jobspb.DescRewriteMap, lang catpb.Function_Language,
-) (string, error) {
+	fnBody catpb.RoutineBody, rewrites jobspb.DescRewriteMap, lang catpb.Function_Language,
+) (catpb.RoutineBody, error) {
 	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
 	replaceSeqFunc := makeSequenceReplaceFunc(rewrites)
 	switch lang {
 	case catpb.Function_SQL:
-		stmts, err := parser.Parse(fnBody)
+		stmts, err := parser.Parse(string(fnBody))
 		if err != nil {
 			return "", err
 		}
@@ -762,7 +842,7 @@ func rewriteSequencesInFunction(
 		}
 
 	case catpb.Function_PLPGSQL:
-		stmt, err := plpgsqlparser.Parse(fnBody)
+		stmt, err := plpgsqlparser.Parse(string(fnBody))
 		if err != nil {
 			return "", err
 		}
@@ -773,7 +853,7 @@ func rewriteSequencesInFunction(
 	default:
 		return "", errors.AssertionFailedf("unexpected function language %s", lang)
 	}
-	return fmtCtx.CloseAndGetString(), nil
+	return catpb.RoutineBody(fmtCtx.CloseAndGetString()), nil
 }
 
 // RewriteIDsInTypesT rewrites all ID's in the input types.T using the input
@@ -804,9 +884,10 @@ func RewriteIDsInTypesT(typ *types.T, descriptorRewrites jobspb.DescRewriteMap) 
 // rewriteRoutineBody rewrites a set of SQL or PL/pgSQL statements.
 func rewriteRoutineBody(
 	descriptorRewrites jobspb.DescRewriteMap,
-	fnBody, overrideDB string,
+	fnBody catpb.RoutineBody,
+	overrideDB string,
 	fnLang catpb.Function_Language,
-) (string, error) {
+) (catpb.RoutineBody, error) {
 	if overrideDB != "" {
 		dbNameReplaced, err := rewriteFunctionBodyDBNames(fnBody, overrideDB, fnLang)
 		if err != nil {
@@ -902,9 +983,13 @@ func TypeDescs(
 		typ.ReferencingDescriptorIDs = newRefs
 
 		switch t := typ.Kind; t {
-		case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_COMPOSITE, descpb.TypeDescriptor_MULTIREGION_ENUM:
+		case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_COMPOSITE,
+			descpb.TypeDescriptor_MULTIREGION_ENUM, descpb.TypeDescriptor_DOMAIN:
 			if rw, ok := descriptorRewrites[typ.ArrayTypeID]; ok {
 				typ.ArrayTypeID = rw.ID
+			}
+			if t == descpb.TypeDescriptor_DOMAIN && typ.Domain != nil && typ.Domain.BaseType != nil {
+				RewriteIDsInTypesT(typ.Domain.BaseType, descriptorRewrites)
 			}
 		case descpb.TypeDescriptor_ALIAS:
 			// We need to rewrite any ID's present in the aliased types.T.
@@ -986,6 +1071,7 @@ func rewriteSchemaChangerState(
 	}()
 
 	var droppedConstraints catalog.ConstraintIDSet
+	var droppedTriggers catalog.TriggerIDSet
 	for i := 0; i < len(state.Targets); i++ {
 		t := &state.Targets[i]
 		// Since the parent database ID is never written in the descriptorRewrites
@@ -1019,7 +1105,7 @@ func rewriteSchemaChangerState(
 		}
 
 		missingID := descpb.InvalidID
-		if err := screl.WalkDescIDs(t.Element(), func(id *descpb.ID) error {
+		if err := walkutil.Walk(t.Element(), func(id *descpb.ID) error {
 			if *id == descpb.InvalidID {
 				// Some descriptor ID fields in elements may be deliberately unset.
 				// Skip these as they are not subject to rewrite.
@@ -1039,6 +1125,22 @@ func rewriteSchemaChangerState(
 				_, scExists := descriptorRewrites[el.SchemaID]
 				if !scExists && state.CurrentStatuses[i] == scpb.Status_ABSENT {
 					removeElementAtCurrentIdx()
+					continue
+				}
+			case *scpb.ForeignKeyConstraint:
+				// If the referenced table is missing, drop this FK constraint
+				// element. This mirrors the skip_missing_foreign_keys handling
+				// for legacy schema changer mutations in TableDescs.
+				if el.ReferencedTableID == missingID {
+					removeElementAtCurrentIdx()
+					droppedConstraints.Add(el.ConstraintID)
+					continue
+				}
+			case *scpb.ForeignKeyConstraintUnvalidated:
+				// Same handling as ForeignKeyConstraint for unvalidated FKs.
+				if el.ReferencedTableID == missingID {
+					removeElementAtCurrentIdx()
+					droppedConstraints.Add(el.ConstraintID)
 					continue
 				}
 			case *scpb.CheckConstraint:
@@ -1065,16 +1167,20 @@ func rewriteSchemaChangerState(
 					continue
 				}
 			case *scpb.TriggerFunctionCall:
-				// If there is a missing function, then this was in middle of creating
-				// a trigger when the back-up was taken.
+				// If there is a missing function dependency, drop this element
+				// and record the trigger ID so sibling trigger elements are also
+				// removed.
 				if el.FuncID == missingID {
+					droppedTriggers.Add(el.TriggerID)
 					removeElementAtCurrentIdx()
 					continue
 				}
 			case *scpb.TriggerDeps:
-				// If there is a missing function, then this was in middle of creating
-				// a trigger when the back-up was taken.
+				// If there is a missing function dependency, drop this element
+				// and record the trigger ID so sibling trigger elements are also
+				// removed.
 				if catalog.MakeDescriptorIDSet(el.UsesRoutineIDs...).Contains(missingID) {
+					droppedTriggers.Add(el.TriggerID)
 					removeElementAtCurrentIdx()
 					continue
 				}
@@ -1101,11 +1207,11 @@ func rewriteSchemaChangerState(
 			return errors.Wrap(err, "rewriting descriptor ids")
 		}
 
-		if err := screl.WalkExpressions(t.Element(), func(expr *catpb.Expression) error {
+		if err := walkutil.Walk(t.Element(), func(expr *catpb.Expression) error {
 			if *expr == "" {
 				return nil
 			}
-			newExpr, err := rewriteTypesInExpr(string(*expr), descriptorRewrites)
+			newExpr, err := rewriteTypesInExpr(*expr, descriptorRewrites)
 			if err != nil {
 				return errors.Wrapf(err, "rewriting expression type references: %q", *expr)
 			}
@@ -1117,12 +1223,12 @@ func rewriteSchemaChangerState(
 			if err != nil {
 				return errors.Wrapf(err, "rewriting expression function references: %q", newExpr)
 			}
-			*expr = catpb.Expression(newExpr)
+			*expr = newExpr
 			return nil
 		}); err != nil {
 			return err
 		}
-		if err := screl.WalkTypes(t.Element(), func(t *types.T) error {
+		if err := walkutil.Walk(t.Element(), func(t *types.T) error {
 			RewriteIDsInTypesT(t, descriptorRewrites)
 			return nil
 		}); err != nil {
@@ -1135,7 +1241,7 @@ func rewriteSchemaChangerState(
 	// Drop all children targets of dropped CHECK constraint.
 	for i := 0; i < len(state.Targets); i++ {
 		t := &state.Targets[i]
-		if err := screl.WalkConstraintIDs(t.Element(), func(id *catid.ConstraintID) error {
+		if err := walkutil.Walk(t.Element(), func(id *catid.ConstraintID) error {
 			if !droppedConstraints.Contains(*id) {
 				return nil
 			}
@@ -1148,6 +1254,26 @@ func rewriteSchemaChangerState(
 			return err
 		}
 	}
+
+	// Drop all sibling targets of triggers with missing dependencies.
+	if !droppedTriggers.Empty() {
+		for i := 0; i < len(state.Targets); i++ {
+			t := &state.Targets[i]
+			if err := walkutil.Walk(t.Element(), func(id *catid.TriggerID) error {
+				if !droppedTriggers.Contains(*id) {
+					return nil
+				}
+				state.Targets = append(state.Targets[:i], state.Targets[i+1:]...)
+				state.CurrentStatuses = append(state.CurrentStatuses[:i], state.CurrentStatuses[i+1:]...)
+				state.TargetRanks = append(state.TargetRanks[:i], state.TargetRanks[i+1:]...)
+				i--
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
 	d.SetDeclarativeSchemaChangerState(state)
 	return nil
 }
@@ -1318,12 +1444,14 @@ func dropTriggerMissingDeps(
 			}
 
 			// Note: We do not track removed routine references here. This is
-			// intentional. Unlike types or relations, routines are only restored at
-			// the database level and cannot be selectively restored. If a routine is
-			// missing, any table that references it must be dropped prior to restore,
-			// which clears the backref from the function. This avoids any possibility
-			// of dangling function backrefs and eliminates the need for special
-			// cleanup logic here.
+			// intentional. When a trigger or policy is dropped during restore due
+			// to missing dependencies, any function it referenced either (a) was
+			// not found in descriptorRewrites and is not part of the restore, so
+			// there are no backrefs to clean up, or (b) maps to an existing
+			// function (ToExisting) that does not yet have a backref to the newly
+			// restored table. In case (b), backrefs are added separately in
+			// createImportingDescriptors. In both cases, no backref cleanup is
+			// needed for routines here.
 
 			continue
 		}
@@ -1394,12 +1522,14 @@ func dropPolicyMissingDeps(
 			}
 
 			// Note: We do not track removed routine references here. This is
-			// intentional. Unlike types or relations, routines are only restored at
-			// the database level and cannot be selectively restored. If a routine is
-			// missing, any table that references it must be dropped prior to restore,
-			// which clears the backref from the function. This avoids any possibility
-			// of dangling function backrefs and eliminates the need for special
-			// cleanup logic here.
+			// intentional. When a trigger or policy is dropped during restore due
+			// to missing dependencies, any function it referenced either (a) was
+			// not found in descriptorRewrites and is not part of the restore, so
+			// there are no backrefs to clean up, or (b) maps to an existing
+			// function (ToExisting) that does not yet have a backref to the newly
+			// restored table. In case (b), backrefs are added separately in
+			// createImportingDescriptors. In both cases, no backref cleanup is
+			// needed for routines here.
 		}
 	}
 	table.Policies = newPolicies

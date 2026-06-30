@@ -10,6 +10,8 @@ import {
   DatabasesPageV2,
   DatabaseDetailsPageV2,
   TableDetailsPageV2,
+  ScheduleDetails,
+  util,
 } from "@cockroachlabs/cluster-ui";
 import { ConfigProvider } from "antd";
 import { ConnectedRouter } from "connected-react-router";
@@ -19,8 +21,10 @@ import { Provider, ReactReduxContext } from "react-redux";
 import { Redirect, Route, Switch } from "react-router-dom";
 import "react-select/dist/react-select.css";
 import { Action, Store } from "redux";
+import { SWRConfig } from "swr";
 
-import { TimezoneProvider } from "src/contexts/timezoneProvider";
+import { clearTenantCookie } from "src/redux/cookies";
+import { getLoginPage } from "src/redux/login";
 import { AdminUIState } from "src/redux/state";
 import { createLoginRoute, createLogoutRoute } from "src/routes/login";
 import { RedirectToStatementDetails } from "src/routes/RedirectToStatementDetails";
@@ -47,6 +51,7 @@ import {
   tableIdAttr,
 } from "src/util/constants";
 import NotFound from "src/views/app/components/errorMessage/notFound";
+import { AlertDataProvider } from "src/views/app/containers/alertDataProvider";
 import Layout from "src/views/app/containers/layout";
 import DataDistributionPage from "src/views/cluster/containers/dataDistribution";
 import { EventPage } from "src/views/cluster/containers/events";
@@ -77,7 +82,6 @@ import Range from "src/views/reports/containers/range";
 import ReduxDebug from "src/views/reports/containers/redux";
 import Settings from "src/views/reports/containers/settings";
 import Stores from "src/views/reports/containers/stores";
-import ScheduleDetails from "src/views/schedules/scheduleDetails";
 import SchedulesPage from "src/views/schedules/schedulesPage";
 import SessionDetails from "src/views/sessions/sessionDetails";
 import SQLActivityPage from "src/views/sqlActivity/sqlActivityPage";
@@ -112,11 +116,39 @@ export interface AppProps {
 export const App: React.FC<AppProps> = (props: AppProps) => {
   const { store, history } = props;
 
+  const swrConfig = {
+    errorRetryCount: 3,
+    onError: (error: Error) => {
+      if (util.isRequestError(error) && error.status === 401) {
+        // Avoid a redirect loop if a request from the login or JWT auth
+        // page itself returns 401.
+        const { pathname } = history.location;
+        if (pathname.startsWith("/login") || pathname.startsWith("/jwt")) {
+          return;
+        }
+        clearTenantCookie();
+        history.push(getLoginPage(history.location));
+      }
+    },
+    onErrorRetry: (
+      error: Error,
+      _key: string,
+      _config: unknown,
+      revalidate: (opts: { retryCount: number }) => void,
+      { retryCount }: { retryCount: number },
+    ) => {
+      if (util.isRequestError(error) && error.status === 403) return;
+      if (retryCount >= 3) return;
+      setTimeout(() => revalidate({ retryCount }), 5000 * (retryCount + 1));
+    },
+  };
+
   return (
     <Provider store={store} context={ReactReduxContext}>
-      <ConnectedRouter history={history} context={ReactReduxContext}>
-        <CockroachCloudContext.Provider value={false}>
-          <TimezoneProvider>
+      <SWRConfig value={swrConfig}>
+        <AlertDataProvider />
+        <ConnectedRouter history={history} context={ReactReduxContext}>
+          <CockroachCloudContext.Provider value={false}>
             {/* Apply CRL theme twice, with ConfigProvider instance from Db Console and
              imported instance from Cluster UI as it applies theme imported components only. */}
             <ClusterUIConfigProvider theme={crlTheme} prefixCls={"crdb-ant"}>
@@ -520,9 +552,9 @@ export const App: React.FC<AppProps> = (props: AppProps) => {
                 </Switch>
               </ConfigProvider>
             </ClusterUIConfigProvider>
-          </TimezoneProvider>
-        </CockroachCloudContext.Provider>
-      </ConnectedRouter>
+          </CockroachCloudContext.Provider>
+        </ConnectedRouter>
+      </SWRConfig>
     </Provider>
   );
 };

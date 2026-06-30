@@ -48,8 +48,6 @@ func TestHintTableOperations(t *testing.T) {
 	var hint1, hint2 hints.Hint
 	hint1.SetValue(&hintpb.InjectHints{DonorSQL: "SELECT a FROM t@t_b_idx WHERE b = $1"})
 	hint2.SetValue(&hintpb.InjectHints{DonorSQL: "SELECT c FROM t@{NO_FULL_SCAN} WHERE d = $2"})
-	hint1.Enabled = true
-	hint2.Enabled = true
 	var err error
 	donorStmt1, err := parserutils.ParseOne(hint1.InjectHints.DonorSQL)
 	require.NoError(t, err)
@@ -67,7 +65,7 @@ func TestHintTableOperations(t *testing.T) {
 
 	// Retrieve nonexistent hints.
 	hintIDs, fingerprints, hintsFromDB, err := hints.GetStatementHintsFromDB(
-		ctx, ex, hash1, fingerprintFlags,
+		ctx, ts.ClusterSettings(), ex, hash1, fingerprintFlags,
 	)
 	require.NoError(t, err)
 	require.Empty(t, hintIDs)
@@ -77,7 +75,7 @@ func TestHintTableOperations(t *testing.T) {
 	// Insert a hint.
 	var insertedHintID1 int64
 	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		insertedHintID1, err = hints.InsertHintIntoDB(ctx, txn, fingerprint1, hint1.StatementHintUnion)
+		insertedHintID1, err = hints.InsertHintIntoDB(ctx, ts.ClusterSettings(), txn, fingerprint1, hint1.StatementHintUnion, "" /* optDatabase */)
 		return err
 	})
 	require.NoError(t, err)
@@ -90,7 +88,7 @@ func TestHintTableOperations(t *testing.T) {
 
 	// Fetch the inserted hint.
 	hintIDs, fingerprints, hintsFromDB, err = hints.GetStatementHintsFromDB(
-		ctx, ex, hash1, fingerprintFlags,
+		ctx, ts.ClusterSettings(), ex, hash1, fingerprintFlags,
 	)
 	require.NoError(t, err)
 	require.Len(t, hintIDs, 1)
@@ -103,7 +101,7 @@ func TestHintTableOperations(t *testing.T) {
 	// Insert multiple hints for the same fingerprint.
 	var insertedHintID2 int64
 	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		insertedHintID2, err = hints.InsertHintIntoDB(ctx, txn, fingerprint1, hint1.StatementHintUnion)
+		insertedHintID2, err = hints.InsertHintIntoDB(ctx, ts.ClusterSettings(), txn, fingerprint1, hint1.StatementHintUnion, "" /* optDatabase */)
 		return err
 	})
 	require.NoError(t, err)
@@ -112,7 +110,7 @@ func TestHintTableOperations(t *testing.T) {
 
 	// Fetch all hints for the fingerprint.
 	hintIDs, fingerprints, hintsFromDB, err = hints.GetStatementHintsFromDB(
-		ctx, ex, hash1, fingerprintFlags,
+		ctx, ts.ClusterSettings(), ex, hash1, fingerprintFlags,
 	)
 	require.NoError(t, err)
 	require.Len(t, hintIDs, 2)
@@ -125,7 +123,7 @@ func TestHintTableOperations(t *testing.T) {
 	// Insert hint for different fingerprint.
 	var insertedHintID3 int64
 	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		insertedHintID3, err = hints.InsertHintIntoDB(ctx, txn, fingerprint2, hint2.StatementHintUnion)
+		insertedHintID3, err = hints.InsertHintIntoDB(ctx, ts.ClusterSettings(), txn, fingerprint2, hint2.StatementHintUnion, "" /* optDatabase */)
 		return err
 	})
 	require.NoError(t, err)
@@ -133,7 +131,7 @@ func TestHintTableOperations(t *testing.T) {
 
 	// Retrieve hint for the new fingerprint.
 	hintIDs2, fingerprints2, hintsFromDB2, err := hints.GetStatementHintsFromDB(
-		ctx, ex, hash2, fingerprintFlags,
+		ctx, ts.ClusterSettings(), ex, hash2, fingerprintFlags,
 	)
 	require.NoError(t, err)
 	require.Len(t, hintIDs2, 1)
@@ -147,9 +145,114 @@ func TestHintTableOperations(t *testing.T) {
 	var hintEmpty hintpb.StatementHintUnion
 	hintEmpty.SetValue(&hintpb.InjectHints{})
 	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		emptyFingerprintHintID, err = hints.InsertHintIntoDB(ctx, txn, "", hintEmpty)
+		emptyFingerprintHintID, err = hints.InsertHintIntoDB(ctx, ts.ClusterSettings(), txn, "", hintEmpty, "" /* optDatabase */)
 		return err
 	})
 	require.NoError(t, err)
 	require.Greater(t, emptyFingerprintHintID, int64(0))
+
+	// Test SetHintEnabledInDB by rowID.
+	var numAffected int64
+	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		numAffected, err = hints.SetHintEnabledInDB(
+			ctx, ts.ClusterSettings(), txn,
+			insertedHintID1, "", /* fingerprint */
+			false, /* enabled */
+			"",    /* optDatabase */
+		)
+		return err
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), numAffected)
+
+	// Verify the hint is now disabled.
+	_, _, hintsFromDB, err = hints.GetStatementHintsFromDB(
+		ctx, ts.ClusterSettings(), ex, hash1, fingerprintFlags,
+	)
+	require.NoError(t, err)
+	found := false
+	for _, h := range hintsFromDB {
+		if !h.Enabled() {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "expected to find a disabled hint")
+
+	// Test SetHintEnabledInDB by fingerprint.
+	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		numAffected, err = hints.SetHintEnabledInDB(
+			ctx, ts.ClusterSettings(), txn,
+			0,                   /* rowID */
+			fingerprint1, false, /* enabled */
+			"", /* optDatabase */
+		)
+		return err
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), numAffected)
+
+	// Re-enable by fingerprint.
+	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		numAffected, err = hints.SetHintEnabledInDB(
+			ctx, ts.ClusterSettings(), txn,
+			0,                  /* rowID */
+			fingerprint1, true, /* enabled */
+			"", /* optDatabase */
+		)
+		return err
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), numAffected)
+
+	// Test SetHintEnabledInDB with no filter returns error.
+	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		_, err = hints.SetHintEnabledInDB(
+			ctx, ts.ClusterSettings(), txn,
+			0,     /* rowID */
+			"",    /* fingerprint */
+			false, /* enabled */
+			"",    /* optDatabase */
+		)
+		return err
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must specify at least one of row_id or fingerprint")
+}
+
+// TestStatementHintConflicts tests the Conflicts method on StatementHintUnion.
+func TestStatementHintConflicts(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	inject1 := &hintpb.StatementHintUnion{}
+	inject1.SetValue(&hintpb.InjectHints{DonorSQL: "SELECT a FROM t@idx1"})
+
+	inject2 := &hintpb.StatementHintUnion{}
+	inject2.SetValue(&hintpb.InjectHints{DonorSQL: "SELECT a FROM t@idx2"})
+
+	varHintA := &hintpb.StatementHintUnion{}
+	varHintA.SetValue(&hintpb.SessionVariableHint{VariableName: "distsql", VariableValue: "off"})
+
+	varHintA2 := &hintpb.StatementHintUnion{}
+	varHintA2.SetValue(&hintpb.SessionVariableHint{VariableName: "distsql", VariableValue: "on"})
+
+	varHintB := &hintpb.StatementHintUnion{}
+	varHintB.SetValue(&hintpb.SessionVariableHint{VariableName: "reorder_joins_limit", VariableValue: "0"})
+
+	// InjectHints vs InjectHints → true.
+	require.True(t, inject1.Conflicts(inject2))
+	require.True(t, inject2.Conflicts(inject1))
+
+	// SessionVariableHint vs SessionVariableHint (same var) → true.
+	require.True(t, varHintA.Conflicts(varHintA2))
+	require.True(t, varHintA2.Conflicts(varHintA))
+
+	// SessionVariableHint vs SessionVariableHint (different var) → false.
+	require.False(t, varHintA.Conflicts(varHintB))
+	require.False(t, varHintB.Conflicts(varHintA))
+
+	// InjectHints vs SessionVariableHint → false.
+	require.False(t, inject1.Conflicts(varHintA))
+	require.False(t, varHintA.Conflicts(inject1))
 }

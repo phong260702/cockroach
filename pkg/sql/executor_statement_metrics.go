@@ -102,6 +102,10 @@ type EngineMetrics struct {
 
 	// QueryWithStatementHintsCount counts queries executed with external statement hints.
 	QueryWithStatementHintsCount *metric.Counter
+
+	// RLSPoliciesAppliedCount counts the number of SQL statements where
+	// row-level security policies were applied during query planning.
+	RLSPoliciesAppliedCount *metric.Counter
 }
 
 // EngineMetrics implements the metric.Struct interface.
@@ -205,7 +209,6 @@ func (ex *connExecutor) recordStatementSummary(
 				flags.IsSet(planFlagGeneric),
 				flags.ShouldBeDistributed(),
 				flags.IsSet(planFlagVectorized),
-				flags.IsSet(planFlagImplicitTxn),
 				flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan),
 			).
 			PlanGist(planner.instrumentation.planGist.String(), planner.instrumentation.planGist.Hash()).
@@ -227,6 +230,10 @@ func (ex *connExecutor) recordStatementSummary(
 
 		if len(stmt.Hints) > 0 {
 			b.AppliedStatementHints()
+		}
+
+		if flags.IsSet(planFlagCanaryAndStableStatsDiffer) {
+			b.CanaryStatsRollout(planner.EvalContext().StatsRollout)
 		}
 
 		ex.statsCollector.RecordStatement(ctx, b.Build())

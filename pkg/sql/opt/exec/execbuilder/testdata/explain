@@ -369,12 +369,12 @@ distribution: local
 └── • render
     │
     └── • hash join (left outer)
-        │ equality: (column80) = (table_id)
+        │ equality: (column86) = (table_id)
         │
         ├── • render
         │   │
         │   └── • hash join (left outer)
-        │       │ equality: (column62) = (table_id)
+        │       │ equality: (column67) = (table_id)
         │       │ right cols are key
         │       │
         │       ├── • render
@@ -423,12 +423,12 @@ distribution: local
 └── • render
     │
     └── • hash join (left outer)
-        │ equality: (column95) = (table_id)
+        │ equality: (column104) = (table_id)
         │
         ├── • render
         │   │
         │   └── • hash join (left outer)
-        │       │ equality: (column77) = (table_id)
+        │       │ equality: (column85) = (table_id)
         │       │ right cols are key
         │       │
         │       ├── • render
@@ -466,7 +466,7 @@ distribution: local
         │       │                       └── • render
         │       │                           │
         │       │                           └── • filter
-        │       │                               │ filter: classoid = <oid>
+        │       │                               │ filter: (classoid != 4294967069) AND (compat_classoid = <oid>)
         │       │                               │
         │       │                               └── • virtual table
         │       │                                     table: kv_catalog_comments@primary
@@ -656,36 +656,159 @@ distribution: local
 └── • render
     │
     └── • virtual table lookup join
-        │ table: pg_namespace@pg_namespace_oid_idx
-        │ equality: (relnamespace) = (oid)
-        │ pred: nspname = index_schema
+        │ table: pg_index@pg_index_indrelid_idx
+        │ equality: (oid) = (indrelid)
+        │ pred: indexrelid = oid
         │
         └── • hash join
-            │ equality: (indexrelid, indrelid) = (oid, oid)
+            │ equality: (relname, relnamespace) = (index_name, relnamespace)
             │
             ├── • virtual table
-            │     table: pg_index@primary
+            │     table: pg_class@primary
             │
             └── • hash join
-                │ equality: (relname, relnamespace) = (index_name, relnamespace)
+                │ equality: (relname, nspname) = (table_name, index_schema)
                 │
-                ├── • virtual table
-                │     table: pg_class@primary
+                ├── • merge join
+                │   │ equality: (oid) = (relnamespace)
+                │   │
+                │   ├── • virtual table
+                │   │     table: pg_namespace@pg_namespace_oid_idx
+                │   │
+                │   └── • sort
+                │       │ order: +relnamespace
+                │       │
+                │       └── • filter
+                │           │ filter: relname = 'foo'
+                │           │
+                │           └── • virtual table
+                │                 table: pg_class@primary
                 │
-                └── • merge join
-                    │ equality: (relname) = (table_name)
+                └── • filter
+                    │ filter: ((table_name = 'foo') AND (table_catalog = 'test')) AND (table_schema = 'public')
                     │
-                    ├── • filter
-                    │   │ filter: relname = 'foo'
-                    │   │
-                    │   └── • virtual table
-                    │         table: pg_class@primary
+                    └── • virtual table
+                          table: statistics@primary
+
+# Verify that SHOW INDEX FROM DATABASE also avoids virtual table lookup join
+# on pg_class for the index-OID alias (c), using a hash join instead.
+query T
+EXPLAIN SHOW INDEX FROM DATABASE test
+----
+distribution: local
+·
+• sort
+│ order: +table_name,+index_name,+non_unique
+│
+└── • render
+    │
+    └── • hash join
+        │ equality: (oid, nspname) = (relnamespace, index_schema)
+        │
+        ├── • virtual table
+        │     table: pg_namespace@primary
+        │
+        └── • hash join
+            │ equality: (index_name, table_name) = (relname, relname)
+            │
+            ├── • virtual table
+            │     table: statistics@primary
+            │
+            └── • hash join
+                │ equality: (relnamespace, indexrelid) = (relnamespace, oid)
+                │
+                ├── • merge join
+                │   │ equality: (oid) = (indrelid)
+                │   │
+                │   ├── • virtual table
+                │   │     table: pg_class@pg_class_oid_idx
+                │   │
+                │   └── • virtual table
+                │         table: pg_index@pg_index_indrelid_idx
+                │
+                └── • virtual table
+                      table: pg_class@primary
+
+# Verify that pg_get_indexdef (3-arg) avoids virtual table lookup join on
+# pg_attribute for the index-OID join (a.attrelid = i.indexrelid).
+query T
+EXPLAIN SELECT pg_get_indexdef(oid, 1, true) FROM pg_class WHERE relkind = 'i' LIMIT 1
+----
+distribution: local
+·
+• render
+│
+└── • limit
+    │ count: 1
+    │
+    └── • filter
+        │ filter: relkind = 'i'
+        │
+        └── • virtual table
+              table: pg_class@primary
+
+# Verify that the Smither's extractIndexes query avoids a virtual table lookup
+# join on pg_class for the index-OID alias (c). This query previously caused
+# timeouts when the database had many objects.
+statement ok
+CREATE TABLE table_2 (a INT PRIMARY KEY, b INT, INDEX idx_b(b))
+
+query T
+EXPLAIN SELECT si.index_name, column_name, storing, direction = 'ASC', is_inverted
+FROM [SHOW INDEXES FROM test.public.table_2] AS si
+JOIN "".crdb_internal.table_indexes AS ti
+  ON (si.table_name = ti.descriptor_name) AND (si.index_name = ti.index_name)
+WHERE column_name != 'rowid'
+----
+distribution: local
+·
+• render
+│
+└── • hash join
+    │ equality: (descriptor_name, index_name) = (table_name, index_name)
+    │
+    ├── • virtual table
+    │     table: table_indexes@primary
+    │
+    └── • filter
+        │ filter: column_name != 'rowid'
+        │
+        └── • render
+            │
+            └── • virtual table lookup join
+                │ table: pg_index@pg_index_indrelid_idx
+                │ equality: (oid) = (indrelid)
+                │ pred: indexrelid = oid
+                │
+                └── • hash join
+                    │ equality: (relname, relnamespace) = (index_name, relnamespace)
                     │
-                    └── • filter
-                        │ filter: ((table_name = 'foo') AND (table_catalog = 'test')) AND (table_schema = 'public')
+                    ├── • virtual table
+                    │     table: pg_class@primary
+                    │
+                    └── • hash join
+                        │ equality: (nspname, oid) = (index_schema, relnamespace)
                         │
-                        └── • virtual table
-                              table: statistics@primary
+                        ├── • virtual table
+                        │     table: pg_namespace@primary
+                        │
+                        └── • merge join
+                            │ equality: (relname) = (table_name)
+                            │
+                            ├── • filter
+                            │   │ filter: relname = 'table_2'
+                            │   │
+                            │   └── • virtual table
+                            │         table: pg_class@primary
+                            │
+                            └── • filter
+                                │ filter: ((table_name = 'table_2') AND (table_catalog = 'test')) AND (table_schema = 'public')
+                                │
+                                └── • virtual table
+                                      table: statistics@primary
+
+statement ok
+DROP TABLE table_2
 
 query T
 EXPLAIN SHOW CONSTRAINTS FROM foo
@@ -1138,13 +1261,8 @@ EXPLAIN (TYPES) SELECT 2*count(k) as z, v FROM t WHERE v>123 GROUP BY v HAVING v
 distribution: local
 vectorized: true
 ·
-• render
-│ columns: (z int, v int)
-│ render z: ((count)[int] * (2)[int])[int]
-│ render v: (v)[int]
-│
-└── • norows
-      columns: (v int, count int)
+• norows
+  columns: (z int, v int)
 
 query T
 EXPLAIN (TYPES) DELETE FROM t WHERE v > 1
@@ -1372,7 +1490,7 @@ query T
 EXPLAIN (OPT,REDACT) SELECT 1 AS r
 ----
 values
- └── ‹(‹×›,)›
+ └── (‹×›,)
 
 query T
 EXPLAIN (OPT,VERBOSE) SELECT 1 AS r
@@ -1400,7 +1518,7 @@ values
  ├── fd: ()-->(1)
  ├── distribution: test
  ├── prune: (1)
- └── ‹(‹×›,)›
+ └── (‹×›,)
 
 query T
 EXPLAIN (OPT,TYPES) SELECT 1 AS r
@@ -2530,7 +2648,7 @@ query T
 EXPLAIN SELECT k FROM t_hints WHERE k >= 100
 ----
 distribution: local
-statement hints count: 1
+statement hints: 1
 ·
 • filter
 │ filter: k >= 100
@@ -2545,7 +2663,7 @@ EXPLAIN (VERBOSE) SELECT k FROM t_hints WHERE k >= 100
 ----
 distribution: local
 vectorized: true
-statement hints count: 1
+statement hints: 1
 ·
 • filter
 │ columns: (k)
@@ -2557,3 +2675,7 @@ statement hints count: 1
       estimated row count: 1,000 (missing stats)
       table: t_hints@t_hints_v_idx
       spans: FULL SCAN
+·
+applied statement hints: 1
+ └── REWRITE INLINE HINTS
+     donor: SELECT k FROM t_hints@t_hints_v_idx WHERE k >= _

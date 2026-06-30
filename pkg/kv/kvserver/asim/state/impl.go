@@ -259,6 +259,7 @@ func (s *state) updateStoreCapacity(storeID StoreID) {
 			capacity = mergeOverride(capacity, override)
 		}
 		store.desc.Capacity = capacity
+		store.desc.NodeCapacity = s.NodeCapacity(store.nodeID)
 		s.publishNewCapacityEvent(capacity, storeID)
 	}
 }
@@ -301,10 +302,12 @@ func (s *state) capacity(storeID StoreID) roachpb.StoreCapacity {
 		}
 	}
 
-	// TODO(kvoli): parameterize the logical to actual used storage bytes. At the
-	// moment we use 1.25 as a rough estimate.
-	used := int64(float64(capacity.LogicalBytes) * 1.25)
-	available := capacity.Capacity - used
+	physical := s.nodes[store.nodeID].physical
+	used := int64(float64(capacity.LogicalBytes) * physical.SpaceAmplification)
+	available := capacity.Capacity - used - physical.ReservedDiskBytes
+	if available < 0 {
+		available = 0
+	}
 	capacity.Used = used
 	capacity.Available = available
 	return capacity
@@ -432,6 +435,7 @@ func (s *state) AddNode(nodeCPUCapacity int64, locality roachpb.Locality) Node {
 	node := &node{
 		nodeID:      nodeID,
 		desc:        roachpb.NodeDescriptor{NodeID: roachpb.NodeID(nodeID)},
+		physical:    DefaultNodePhysicalCharacteristics(),
 		stores:      []StoreID{},
 		mmAllocator: mmAllocator,
 		storepool:   sp,
@@ -464,9 +468,22 @@ func (s *state) SetNodeCPURateCapacity(nodeID NodeID, cpuRateCapacity int64) {
 	node.cpuRateCapacity = cpuRateCapacity
 }
 
-// NodeCapacity returns the capacity of the Node with ID NodeID. Note that it is
-// currently unused.
-// TODO(wenyihu6): MMA integration should later use it.
+func (s *state) SetNodePhysicalCharacteristics(nodeID NodeID, chars NodePhysicalCharacteristics) {
+	node, ok := s.nodes[nodeID]
+	if !ok {
+		panic(fmt.Sprintf("programming error: node with ID %d doesn't exist", nodeID))
+	}
+	node.physical = chars
+}
+
+// NodeCapacity returns the capacity of the Node with ID NodeID. Used by
+// updateStoreCapacity to populate StoreDescriptor.NodeCapacity, which feeds
+// into MakeStoreLoadMsg and ComputeAmplificationFactors.
+//
+// NodeCPURateUsage is inflated by cpuOverheadMultiplier to simulate the gap
+// between OS-level CPU (which includes GC, goroutine overhead, etc.) and the
+// directly-tracked per-replica CPU (StoresCPURate). In real clusters this
+// ratio is typically 1.0-3.0.
 func (s *state) NodeCapacity(nodeID NodeID) roachpb.NodeCapacity {
 	node := s.nodes[nodeID]
 	stores := node.Stores()
@@ -476,10 +493,11 @@ func (s *state) NodeCapacity(nodeID NodeID) roachpb.NodeCapacity {
 		cpuRate += int(capacity.CPUPerSecond)
 	}
 
+	nodeCPURateUsage := int64(float64(cpuRate) * node.physical.CPUOverheadMultiplier)
 	return roachpb.NodeCapacity{
 		StoresCPURate:       int64(cpuRate),
 		NumStores:           int32(len(stores)),
-		NodeCPURateUsage:    int64(cpuRate),
+		NodeCPURateUsage:    nodeCPURateUsage,
 		NodeCPURateCapacity: node.cpuRateCapacity,
 	}
 }
@@ -613,6 +631,21 @@ func (s *state) SetStoreCapacity(storeID StoreID, capacity int64) {
 	}
 	// TODO(kvoli): deal with overwriting this.
 	store.desc.Capacity.Capacity = capacity
+}
+
+// SetStoreAttrs sets the store-level attributes that the constraint matcher
+// sees as "+attr" tokens (alongside locality tiers). This is the asim
+// analogue of starting a real CRDB store with --store=attrs=…; without it,
+// asim stores have empty Attrs and constraints can only discriminate at the
+// node-locality granularity (region, zone, …).
+func (s *state) SetStoreAttrs(storeID StoreID, attrs []string) {
+	store, ok := s.stores[storeID]
+	if !ok {
+		panic(fmt.Sprintf("programming error: store with ID %d doesn't exist", storeID))
+	}
+	// Clone to avoid aliasing the caller's slice (the event author may
+	// retain it).
+	store.desc.Attrs = roachpb.Attributes{Attrs: slices.Clone(attrs)}
 }
 
 // AddReplica modifies the state to include one additional range for the
@@ -1361,19 +1394,24 @@ func (s *state) ComputeSplitKey(
 	panic("not implemented")
 }
 
+// ForEachOverlappingSpanConfig is part of the spanconfig.StoreReader interface.
+func (s *state) ForEachOverlappingSpanConfig(
+	context.Context, roachpb.Span, func(roachpb.Span, roachpb.SpanConfig) error,
+) error {
+	// We don't need to implement this method for conformance reports.
+	panic("not implemented")
+}
+
 // GetSpanConfigForKey is added for the spanconfig.StoreReader interface, required for
 // SpanConfigConformanceReport.
 func (s *state) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, roachpb.Span, error) {
+) (roachpb.SpanConfig, error) {
 	rng := s.rangeFor(ToKey(key.AsRawKey()))
 	if rng == nil {
 		panic(fmt.Sprintf("programming error: range for key %s doesn't exist", key))
 	}
-	return *rng.config, roachpb.Span{
-		Key:    rng.startKey.ToRKey().AsRawKey(),
-		EndKey: rng.endKey.ToRKey().AsRawKey(),
-	}, nil
+	return *rng.config, nil
 }
 
 // Scan is added for the rangedesc.Scanner interface, required for
@@ -1446,7 +1484,7 @@ func (s *state) RegisterConfigChangeListener(listener ConfigChangeListener) {
 func (s *state) SetClusterSetting(Key string, Value interface{}) {
 	switch Key {
 	case "LBRebalancingMode":
-		kvserverbase.LoadBasedRebalancingMode.Override(context.Background(), &s.settings.ST.SV, kvserverbase.LBRebalancingMode(Value.(int64)))
+		kvserverbase.OverrideLoadBasedRebalancingMode(context.Background(), &s.settings.ST.SV, kvserverbase.LBRebalancingMode(Value.(int64)))
 	case "LBRebalancingObjective":
 		kvserver.LoadBasedRebalancingObjective.Override(context.Background(), &s.settings.ST.SV, kvserver.LBRebalancingObjective(Value.(int64)))
 	default:
@@ -1517,10 +1555,39 @@ func (s *state) NodesStringWithTag(tag string) string {
 }
 
 // node is an implementation of the Node interface.
+// NodePhysicalCharacteristics models OS-level and filesystem characteristics
+// that affect how the physical model computes load, capacity, and amplification
+// factors. All stores on a node share these characteristics.
+type NodePhysicalCharacteristics struct {
+	// CPUOverheadMultiplier inflates NodeCPURateUsage relative to StoresCPURate
+	// to simulate OS-level overhead (GC, goroutine scheduling, etc.) that isn't
+	// tracked per-replica. In real clusters this ratio is typically 1.0-3.0.
+	CPUOverheadMultiplier float64
+	// SpaceAmplification is the ratio of physical disk bytes (Used) to logical
+	// bytes (LogicalBytes). Default 1.25. Feeds into StoreCapacity.Used and
+	// therefore into computePhysicalDisk's amplification factor.
+	SpaceAmplification float64
+	// ReservedDiskBytes models filesystem reserved blocks (e.g. ext4 reserved
+	// block count). Subtracted from Available in capacity(), making
+	// Total - Available > Used.
+	ReservedDiskBytes int64
+}
+
+// DefaultNodePhysicalCharacteristics returns characteristics with sensible
+// defaults: no CPU overhead, 1.25x space amplification, no reserved blocks.
+func DefaultNodePhysicalCharacteristics() NodePhysicalCharacteristics {
+	return NodePhysicalCharacteristics{
+		CPUOverheadMultiplier: 1.0,
+		SpaceAmplification:    1.25,
+	}
+}
+
+// node is an implementation of the Node interface.
 type node struct {
 	nodeID          NodeID
 	desc            roachpb.NodeDescriptor
 	cpuRateCapacity int64
+	physical        NodePhysicalCharacteristics
 
 	stores      []StoreID
 	storepool   *storepool.StorePool

@@ -77,7 +77,7 @@ func (r *deleteRun) init(params runParams, columns colinfo.ResultColumns) {
 	}
 
 	r.rows = rowcontainer.NewRowContainer(
-		params.p.Mon().MakeBoundAccount(),
+		params.p.ExecMon().MakeBoundAccount(),
 		colinfo.ColTypeInfoFromResCols(columns),
 	)
 	r.resultRowBuffer = make([]tree.Datum, len(columns))
@@ -266,6 +266,10 @@ func (d *deleteNode) returnsRowsAffected() bool {
 
 func (d *deleteNode) kvCPUTime() int64 {
 	return d.run.td.kvCPUTime
+}
+
+func (d *deleteNode) localKVCPUTime() int64 {
+	return d.run.td.localKVCPUTime
 }
 
 func (d *deleteNode) enableAutoCommit() {

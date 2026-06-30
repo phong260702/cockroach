@@ -28,13 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgurlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -494,7 +494,8 @@ func TestCutoverFractionProgressed(t *testing.T) {
 	jobID := registry.MakeJobID()
 	replicationJob, err := registry.CreateJobWithTxn(ctx, mockReplicationJobRecord, jobID, nil)
 	require.NoError(t, err)
-	require.NoError(t, replicationJob.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+	//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+	require.NoError(t, replicationJob.DeprecatedNoTxn().Update(ctx, func(txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
 		if err := md.CheckRunningOrReverting(); err != nil {
 			return err
 		}
@@ -646,6 +647,84 @@ func TestCutoverCheckpointing(t *testing.T) {
 	require.Equal(t, getCutoverRemainingSpans().String(), roachpb.Spans{}.String())
 }
 
+// TestWatchForCutoverRangefeedWake verifies that watchForCutover returns
+// promptly when a cutover-reaching progress write occurs, relying on the
+// rangefeed wake-up rather than the (deliberately long) poll interval.
+func TestCutoverRangefeedNudgesPoller(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	// Set the poll interval to something effectively infinite so that a return
+	// from the poller within the test's timeout can only be explained by the
+	// rangefeed nudging it.
+	sysSQL := sqlutils.MakeSQLRunner(srv.SystemLayer().SQLConn(t))
+	sysSQL.Exec(t,
+		`SET CLUSTER SETTING physical_replication.consumer.failover_signal_poll_interval = '1h'`)
+
+	cutover := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+
+	execCfg := srv.SystemLayer().ExecutorConfig().(sql.ExecutorConfig)
+	registry := execCfg.JobRegistry
+	jobID := registry.MakeJobID()
+	record := jobs.Record{
+		Details: jobspb.StreamIngestionDetails{},
+		Progress: jobspb.StreamIngestionProgress{
+			// CutoverTime is set but ReplicatedTime is not, so cutoverReached
+			// initially returns false.
+			CutoverTime: cutover,
+		},
+		Username: username.RootUserName(),
+	}
+	job, err := registry.CreateJobWithTxn(ctx, record, jobID, nil)
+	require.NoError(t, err)
+
+	resumer := &streamIngestionResumer{job: job}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	nudge := make(chan struct{}, 1)
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- ctxgroup.GoAndWait(runCtx,
+			func(ctx context.Context) error {
+				return cutoverSignalRangefeed(ctx, &execCfg, job.ID(), nudge)
+			},
+			func(ctx context.Context) error {
+				return resumer.pollForCutoverSignal(ctx, &execCfg, nudge)
+			},
+		)
+	}()
+
+	// Give the rangefeed a moment to establish itself before triggering the
+	// cutover write. Without this, the write could race with rangefeed setup
+	// and we would have to wait for the (1h) poll to catch up.
+	time.Sleep(500 * time.Millisecond)
+
+	//lint:ignore SA1019 mirrors TestCutoverFractionProgressed; legacy API is the
+	// available path for in-test progress edits.
+	require.NoError(t, job.DeprecatedNoTxn().Update(ctx,
+		func(_ isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
+			progress := md.Progress
+			progress.Details.(*jobspb.Progress_StreamIngest).StreamIngest.ReplicatedTime = cutover
+			ju.UpdateProgress(progress)
+			return nil
+		}))
+
+	select {
+	case err := <-resultCh:
+		require.True(t, errors.Is(err, errCutoverSignaled),
+			"expected errCutoverSignaled, got %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("poller did not return within 30s of cutover write; " +
+			"rangefeed nudge appears not to be firing")
+	}
+}
+
 // ALTER VIRTUAL CLUSTER STOP SERVICE does not block until the service
 // is stopped. But, we need to wait until the SQLServer is stopped to
 // ensure that nothing is writing to the relevant keyspace.
@@ -704,13 +783,9 @@ func TestPhysicalReplicationGatewayRoute(t *testing.T) {
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		Knobs: base.TestingKnobs{
 			Streaming: &sql.StreamingTestingKnobs{
-				OnGetSQLInstanceInfo: func(node *roachpb.NodeDescriptor) *roachpb.NodeDescriptor {
-					copy := *node
-					copy.SQLAddress = util.UnresolvedAddr{
-						NetworkField: "tcp",
-						AddressField: blackhole.Addr().String(),
-					}
-					return &copy
+				OnGetSQLInstanceInfo: func(node sqlinstance.InstanceInfo) sqlinstance.InstanceInfo {
+					node.InstanceSQLAddr = blackhole.Addr().String()
+					return node
 				},
 			},
 		},

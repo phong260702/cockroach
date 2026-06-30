@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/hints"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
@@ -159,6 +160,10 @@ type instrumentationHelper struct {
 	// optimized is true if the plan was optimized or re-optimized during the
 	// current execution.
 	optimized bool
+	// tableStatsRollout records the canary table stats rollout selection for
+	// this query. Used by EXPLAIN ANALYZE to emit the table stats mode
+	// annotation.
+	tableStatsRollout eval.StatsRolloutSelection
 
 	traceMetadata execNodeTraceMetadata
 
@@ -207,9 +212,18 @@ type instrumentationHelper struct {
 	// stats scanned by this query.
 	nanosSinceStatsForecasted time.Duration
 
-	// stmtHintsCount is the number of hints from system.statement_hints applied
-	// to the statement.
-	stmtHintsCount uint64
+	// stmtHints and stmtHintIDs are the statement hints loaded for this query.
+	// Hint counts are computed from these at output time (rather than at Setup
+	// time) so that hints which fail during application are correctly reflected.
+	stmtHints            []hints.Hint
+	stmtHintIDs          []int64
+	deterministicExplain bool
+
+	// runtimeHintErrors stores per-hint runtime errors, keyed by hint index
+	// into stmtHints. It is lazily allocated on first error. Errors are stored
+	// here rather than on hint.Err to avoid mutating shared hint state across
+	// prepared statement executions.
+	runtimeHintErrors map[int]error
 
 	// retryCount is the number of times the transaction was retried.
 	retryCount uint64
@@ -433,12 +447,9 @@ func (ih *instrumentationHelper) Setup(
 	ih.implicitTxn = implicitTxn
 	ih.txnPriority = txnPriority
 	ih.txnBufferedWritesEnabled = p.txn.BufferedWritesEnabled()
-	ih.stmtHintsCount = 0
-	for _, hint := range stmt.Hints {
-		if hint.Enabled && hint.Err == nil {
-			ih.stmtHintsCount += 1
-		}
-	}
+	ih.stmtHints = stmt.Hints
+	ih.stmtHintIDs = stmt.HintIDs
+	ih.deterministicExplain = cfg.TestingKnobs.DeterministicExplain
 	ih.retryCount = uint64(retryCount)
 	ih.codec = cfg.Codec
 	ih.origCtx = ctx
@@ -447,7 +458,7 @@ func (ih *instrumentationHelper) Setup(
 		cfg.DistSQLSrv.TenantCostController != nil
 	ih.topLevelStats = topLevelQueryStats{}
 	stmtFingerprintId := appstatspb.ConstructStatementFingerprintID(
-		stmt.StmtNoConstants, implicitTxn, p.SessionData().Database)
+		stmt.StmtNoConstants, p.SessionData().Database)
 	ih.fingerprintId = stmtFingerprintId
 	ih.stmtDiagnosticsRecorder = stmtDiagnosticsRecorder
 	ih.withStatementTrace = cfg.TestingKnobs.WithStatementTrace
@@ -505,7 +516,7 @@ func (ih *instrumentationHelper) Setup(
 	}
 
 	if collectTxnExecStats {
-		statsCollector.SetStatementSampled(stmt.StmtNoConstants, implicitTxn, p.SessionData().Database)
+		statsCollector.SetStatementSampled(stmt.StmtNoConstants, p.SessionData().Database)
 	} else {
 		collectTxnExecStats = func() bool {
 			if stmt.AST.StatementType() == tree.TypeTCL {
@@ -522,7 +533,7 @@ func (ih *instrumentationHelper) Setup(
 			// If this is the first time we see this statement in the current stats
 			// container, we'll collect its execution stats anyway (unless the user
 			// disabled txn or stmt stats collection entirely).
-			return statsCollector.ShouldSampleNewStatement(stmt.StmtNoConstants, implicitTxn, p.SessionData().Database)
+			return statsCollector.ShouldSampleNewStatement(stmt.StmtNoConstants, p.SessionData().Database)
 		}()
 	}
 
@@ -648,8 +659,20 @@ func (ih *instrumentationHelper) Finish(
 	statsCollector := ex.statsCollector
 	txnStats := &ex.extraTxnState.accumulatedStats
 	txnHelper := &ex.state.txnInstrumentationHelper
+	inTxnMode := txnHelper.diagnosticsCollector.InProgress()
 	if _, ok := ih.Tracing(); !ok {
 		return retErr
+	}
+	// 'ctx' is likely to not have a tracing span associated with it, so we
+	// don't use log.VEvent and record events directly.
+	//
+	// There is no point in logging the exit from this method into ih.sp because
+	// we're collecting the trace recording next, so that event won't show up in
+	// the stmt bundle's trace.
+	ih.sp.Record("in instrumenationHelper.Finish")
+	if inTxnMode {
+		txnHelper.diagnosticsCollector.span.Record("instrumenationHelper.Finish start")
+		defer txnHelper.diagnosticsCollector.span.Record("instrumenationHelper.Finish end")
 	}
 
 	if ih.shouldFinishSpan {
@@ -746,7 +769,7 @@ func (ih *instrumentationHelper) Finish(
 				payloadErr, retErr, &p.extendedEvalCtx.Settings.SV, ih.inFlightTraceCollector,
 			)
 
-			if !txnHelper.diagnosticsCollector.InProgress() {
+			if !inTxnMode {
 				// Include all non-critical errors as warnings. Note that these
 				// error strings might contain PII, but the warnings are only shown
 				// to the current user and aren't included into the bundle.
@@ -759,7 +782,7 @@ func (ih *instrumentationHelper) Finish(
 		}
 	}
 
-	if txnHelper.diagnosticsCollector.InProgress() {
+	if inTxnMode {
 		// If we're collecting a transaction bundle, add the statement to the
 		// current txn diagnostic bundle. These will be persisted at the end
 		// of the transaction if the transaction matches the request.
@@ -871,7 +894,8 @@ func (ih *instrumentationHelper) emitExplainAnalyzePlanToOutputBuilder(
 	ob.AddDistribution(ih.distribution.String())
 	ob.AddVectorized(ih.vectorized)
 	ob.AddPlanType(ih.generic, ih.optimized)
-	ob.AddStmtHintCount(ih.stmtHintsCount)
+	ob.AddTableStatsMode(ih.tableStatsRollout.String())
+	ob.AddStmtHintCount(ih.stmtHints, ih.runtimeHintErrors)
 	ob.AddRetryCount("transaction", ih.retryCount)
 	ob.AddRetryTime("transaction", phaseTimes.GetTransactionRetryLatency())
 	ob.AddRetryCount("statement", ih.retryStmtCount)
@@ -910,12 +934,7 @@ func (ih *instrumentationHelper) emitExplainAnalyzePlanToOutputBuilder(
 		if grunning.Supported {
 			ob.AddKVCPUTime(ih.topLevelStats.kvCPUTimeNanos)
 		}
-		if !ih.containsMutation && ih.vectorized && grunning.Supported {
-			// Currently we cannot separate SQL CPU time from local KV CPU time for
-			// mutations, since they do not collect statistics. Additionally, CPU time
-			// is only collected for vectorized plans since it is gathered by the
-			// vectorizedStatsCollector operator.
-			// TODO(drewk): lift these restrictions.
+		if grunning.Supported {
 			ob.AddSQLCPUTime(queryStats.SQLCPUTime)
 		}
 		if ih.isTenant && ih.vectorized {
@@ -963,6 +982,15 @@ func (ih *instrumentationHelper) emitExplainAnalyzePlanToOutputBuilder(
 	return ob
 }
 
+// recordHintError records a runtime error for the hint at the given index.
+// The map is lazily allocated on first use.
+func (ih *instrumentationHelper) recordHintError(idx int, err error) {
+	if ih.runtimeHintErrors == nil {
+		ih.runtimeHintErrors = make(map[int]error)
+	}
+	ih.runtimeHintErrors[idx] = err
+}
+
 // setExplainAnalyzeResult sets the result for an EXPLAIN ANALYZE or EXPLAIN
 // ANALYZE (DISTSQL) statement (in the former case, distSQLFlowInfos and trace
 // are nil).
@@ -985,6 +1013,12 @@ func (ih *instrumentationHelper) setExplainAnalyzeResult(
 
 	ob := ih.emitExplainAnalyzePlanToOutputBuilder(ctx, ih.explainFlags, phaseTimes, queryLevelStats)
 	rows := ob.BuildStringRows()
+	if ih.explainFlags.Verbose && len(ih.stmtHints) > 0 {
+		rows = append(rows, buildStmtHintTreeRows(
+			ih.stmtHints, ih.stmtHintIDs, ih.deterministicExplain,
+			ih.runtimeHintErrors,
+		)...)
+	}
 	if distSQLFlowInfos != nil {
 		rows = append(rows, "")
 		for i, d := range distSQLFlowInfos {
@@ -1078,6 +1112,9 @@ func (m execNodeTraceMetadata) annotateExplain(
 	makeDeterministic bool,
 	p *planner,
 ) {
+	// TODO(yuzefovich): we currently call ExtractStatsFromSpans twice: once in
+	// execstats.GetQueryLevelStats, and again here. I think there is an
+	// opportunity to consolidate that into a single call.
 	statsMap := execinfrapb.ExtractStatsFromSpans(spans, makeDeterministic)
 
 	// Retrieve which region each node is on.
@@ -1087,8 +1124,6 @@ func (m execNodeTraceMetadata) annotateExplain(
 			sqlInstanceIDToRegion[int64(componentId.SQLInstanceID)] = componentId.Region
 		}
 	}
-
-	noMutations := !p.curPlan.flags.IsSet(planFlagContainsMutation)
 
 	var walk func(n *explain.Node)
 	walk = func(n *explain.Node) {
@@ -1147,18 +1182,7 @@ func (m execNodeTraceMetadata) annotateExplain(
 					nodeStats.ExecTime.MaybeAdd(stats.Exec.ExecTime)
 					nodeStats.MaxAllocatedMem.MaybeAdd(stats.Exec.MaxAllocatedMem)
 					nodeStats.MaxAllocatedDisk.MaybeAdd(stats.Exec.MaxAllocatedDisk)
-					if noMutations && !makeDeterministic {
-						// Currently we cannot separate SQL CPU time from local
-						// KV CPU time for mutations, since they do not collect
-						// statistics. Additionally, some platforms do not
-						// support usage of the grunning library, so we can't
-						// show this field when a deterministic output is
-						// required.
-						// TODO(drewk): once the grunning library is fully
-						// supported we can unconditionally display the CPU time
-						// here and in output.go and component_stats.go.
-						nodeStats.SQLCPUTime.MaybeAdd(stats.Exec.CPUTime)
-					}
+					nodeStats.SQLCPUTime.MaybeAdd(stats.Exec.CPUTime)
 					nodeStats.UsedFollowerRead = nodeStats.UsedFollowerRead || stats.KV.UsedFollowerRead
 				}
 			}

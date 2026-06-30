@@ -7,6 +7,7 @@ package roachprod
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -43,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/promhelperclient"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/pyroscope"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/ui"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/aws"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/azure"
@@ -708,6 +711,9 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string, sync bo
 	}
 	// Fetch public keys from gcloud to set up ssh access for all users into the
 	// shared ubuntu user.
+	if gce.Infrastructure == nil {
+		return errors.New("GCE infrastructure not initialized (gcloud CLI may not be installed)")
+	}
 	authorizedKeys, err := gce.Infrastructure.GetUserAuthorizedKeys()
 	if err != nil {
 		return errors.Wrap(err, "failed to retrieve authorized keys from gcloud")
@@ -795,11 +801,25 @@ func UpdateTargets(
 	if err := LoadClusters(); err != nil {
 		return err
 	}
-	return updatePrometheusTargets(ctx, l, clusterName, clusterSettingsOpts...)
+	updatePrometheusTargets(ctx, l, clusterName, clusterSettingsOpts...)
+	return nil
 }
 
-// updatePrometheusTargets updates the prometheus instance cluster config. Any error is logged and ignored.
+// updatePrometheusTargets updates the prometheus instance cluster config.
+// This is best-effort: errors are logged but never propagated, since
+// monitoring failures should not cause test or start failures.
 func updatePrometheusTargets(
+	ctx context.Context,
+	l *logger.Logger,
+	clusterName string,
+	clusterSettingsOpts ...install.ClusterSettingOption,
+) {
+	if err := updatePrometheusTargetsErr(ctx, l, clusterName, clusterSettingsOpts...); err != nil {
+		l.Errorf("updating prometheus targets: %v", err)
+	}
+}
+
+func updatePrometheusTargetsErr(
 	ctx context.Context,
 	l *logger.Logger,
 	clusterName string,
@@ -895,10 +915,10 @@ func updatePrometheusTargets(
 	if len(nodeIPPorts) > 0 {
 		cl, err := promhelperclient.NewPromClient()
 		if err != nil {
-			return err
+			return errors.Wrap(err, "creating prometheus helper client")
 		}
 		if err := cl.UpdatePrometheusTargets(ctx, c.Name, nodeIPPorts, l); err != nil {
-			l.Errorf("creating cluster config failed for the ip:ports %v: %v", nodeIPPorts, err)
+			return errors.Wrapf(err, "updating targets for ip:ports %v", nodeIPPorts)
 		}
 	}
 	return nil
@@ -1593,6 +1613,13 @@ func destroyCluster(
 ) error {
 	c, ok := cld.Clusters[clusterName]
 	if !ok {
+		// Best-effort: try to clean up Prometheus config even if the
+		// cluster no longer exists (e.g. VMs were preempted).
+		if cl, err := promhelperclient.NewPromClient(); err == nil {
+			if err := cl.DeleteClusterConfig(ctx, clusterName, l); err != nil {
+				l.Printf("WARNING: failed to delete prometheus config for %s: %s", clusterName, err)
+			}
+		}
 		return fmt.Errorf("cluster %s does not exist", clusterName)
 	}
 	if c.IsEmptyCluster() {
@@ -1628,15 +1655,44 @@ func (e *ClusterAlreadyExistsError) Error() string {
 	return fmt.Sprintf("cluster %s already exists", e.name)
 }
 
-func cleanupFailedCreate(l *logger.Logger, clusterName string) error {
+func cleanupFailedCreate(l *logger.Logger, clusterName string, providers []string) error {
 	c, err := getClusterFromCloud(l, clusterName)
 	if err != nil {
-		// If the cluster doesn't exist, we didn't manage to create any VMs
-		// before failing. Not an error.
-		//nolint:returnerrcheck
-		return nil
+		// We failed to list the cluster (e.g., due to API rate limiting),
+		// but VMs may still have been created. Fall back to asking the
+		// providers that were involved in creation to delete by name.
+		l.Printf(
+			"failed to list cluster %s for cleanup, trying DeleteCluster: %v",
+			clusterName, err,
+		)
+		return deleteClusterByName(l, clusterName, providers)
 	}
 	return cloud.DestroyCluster(l, c)
+}
+
+// deleteClusterByName asks the specified providers to delete any resources
+// matching the given cluster name. Providers that support DeleteCluster can
+// find instances by name pattern even when tag queries fail.
+func deleteClusterByName(l *logger.Logger, clusterName string, providers []string) error {
+	var errs []error
+	for _, name := range providers {
+		p, ok := vm.Providers[name]
+		if !ok || !p.Active() {
+			continue
+		}
+		dc, ok := p.(vm.DeleteCluster)
+		if !ok {
+			continue
+		}
+		if err := dc.DeleteCluster(l, clusterName); err != nil {
+			l.Printf(
+				"failed to delete cluster %s via provider %s: %v",
+				clusterName, name, err,
+			)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // AddLabels adds (or updates) the given labels to the VMs corresponding to the given cluster.
@@ -1740,7 +1796,7 @@ func Create(
 				return
 			}
 			l.Errorf("Cleaning up partially-created cluster (prev err: %s)", retErr)
-			if err := cleanupFailedCreate(l, clusterName); err != nil {
+			if err := cleanupFailedCreate(l, clusterName, includeProviders); err != nil {
 				l.Errorf("Error while cleaning up partially-created cluster: %s", err)
 			} else {
 				l.Printf("Cleaning up OK")
@@ -1839,9 +1895,13 @@ func Grow(
 		// reload the clusters before returning.
 		err = LoadClusters()
 	default:
-		// Save the cluster to the cache.
+		// Save the cluster to the cache and reload in-memory state so that
+		// subsequent operations (e.g., SetupSSH, Put) see the new nodes.
 		err = saveCluster(l, &c.Cluster)
 		if err != nil {
+			return err
+		}
+		if err = LoadClusters(); err != nil {
 			return err
 		}
 		err = SetupSSH(ctx, l, clusterName, false /* sync */)
@@ -2288,6 +2348,48 @@ func PrometheusSnapshot(
 // SnapshotTTL controls how long volume snapshots are kept around.
 const SnapshotTTL = 30 * 24 * time.Hour // 30 days
 
+// snapshotName returns the name for a volume snapshot. For single-store
+// nodes the format is "{prefix}-{version}-n{nodes}-{node}". For multi-store
+// nodes it additionally encodes the store count and index:
+// "{prefix}-{version}-n{nodes}-s{stores}-{node}-{storeIdx}".
+// The node index is zero-padded to 4 digits and the store index to 2 digits.
+func snapshotName(
+	prefix string, crdbVersion string, nodeCount, numStores, node, storeIdx int,
+) string {
+	if numStores == 1 && storeIdx != 1 {
+		panic(fmt.Sprintf("unexpected storeIdx %d for single-store node", storeIdx))
+	}
+	infix := strings.ReplaceAll(
+		fmt.Sprintf("%s-n%d", crdbVersion, nodeCount), ".", "-")
+	if numStores > 1 {
+		return fmt.Sprintf("%s-%s-s%d-%04d-%02d", prefix, infix, numStores, node, storeIdx)
+	}
+	return fmt.Sprintf("%s-%s-%04d", prefix, infix, node)
+}
+
+// parseSnapshotName extracts the node index and store index from a snapshot
+// name. It expects the name to end with "-{node}" for single-store snapshots
+// or "-{node}-{storeIdx}" for multi-store snapshots, where node is a 4-digit
+// zero-padded integer and storeIdx is a 2-digit zero-padded integer.
+func parseSnapshotName(name string) (nodeIdx, storeIdx int, err error) {
+	parts := strings.Split(name, "-")
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("unable to parse snapshot name %q", name)
+	}
+	lastPart := parts[len(parts)-1]
+	secondLastPart := parts[len(parts)-2]
+	// Try multi-store format: last two parts are node and storeIdx.
+	if si, siErr := strconv.Atoi(lastPart); siErr == nil {
+		if ni, niErr := strconv.Atoi(secondLastPart); niErr == nil && len(secondLastPart) == 4 {
+			// Multi-store: ...-{node}-{storeIdx}
+			return ni, si, nil
+		}
+		// Single-store: ...-{node}
+		return si, 1, nil
+	}
+	return 0, 0, fmt.Errorf("unable to parse snapshot name %q", name)
+}
+
 // CreateSnapshot snapshots all the persistent volumes attached to nodes in the
 // named cluster.
 func CreateSnapshot(
@@ -2315,6 +2417,10 @@ func CreateSnapshot(
 	// probably the predecessor one. Also ensure that any running CRDB processes
 	// have been stopped since we're taking raw disk snapshots cluster-wide.
 
+	spinner := ui.NewDefaultCountingSpinner(l, "creating snapshots", len(nodes))
+	defer spinner.Start()()
+
+	var nodesSnapped atomic.Int32
 	volumesSnapshotMu := struct {
 		syncutil.Mutex
 		snapshots []vm.VolumeSnapshot
@@ -2361,28 +2467,33 @@ func CreateSnapshot(
 					return fmt.Errorf("node %d does not have any non-bootable persistent volumes attached", node)
 				}
 
-				for _, volume := range volumes {
-					snapshotFingerprintInfix := strings.ReplaceAll(
-						fmt.Sprintf("%s-n%d", crdbVersion, len(nodes)), ".", "-")
-					snapshotName := fmt.Sprintf("%s-%s-%04d", vsco.Name, snapshotFingerprintInfix, node)
-					if len(snapshotName) > 63 {
-						return fmt.Errorf("snapshot name %q exceeds 63 characters; shorten name prefix and use description arg. for more context", snapshotName)
-					}
-					volumeSnapshot, err := provider.CreateVolumeSnapshot(l, volume,
-						vm.VolumeSnapshotCreateOpts{
-							Name:        snapshotName,
-							Labels:      labels,
-							Description: vsco.Description,
-						})
-					if err != nil {
-						return err
-					}
-					l.Printf("created volume snapshot %s (id=%s) for volume %s on %s/n%d\n",
-						volumeSnapshot.Name, volumeSnapshot.ID, volume.Name, volume.ProviderResourceID, node)
-					volumesSnapshotMu.Lock()
-					volumesSnapshotMu.snapshots = append(volumesSnapshotMu.snapshots, volumeSnapshot)
-					volumesSnapshotMu.Unlock()
+				numStores := len(volumes)
+				g := ctxgroup.WithContext(ctx)
+				for storeIdx, volume := range volumes {
+					g.Go(func() error {
+						snapName := snapshotName(vsco.Name, crdbVersion, len(nodes), numStores, int(node), storeIdx+1)
+						if len(snapName) > 63 {
+							return fmt.Errorf("snapshot name %q exceeds 63 characters; shorten name prefix and use description arg. for more context", snapName)
+						}
+						volumeSnapshot, err := provider.CreateVolumeSnapshot(l, volume,
+							vm.VolumeSnapshotCreateOpts{
+								Name:        snapName,
+								Labels:      labels,
+								Description: vsco.Description,
+							})
+						if err != nil {
+							return err
+						}
+						volumesSnapshotMu.Lock()
+						volumesSnapshotMu.snapshots = append(volumesSnapshotMu.snapshots, volumeSnapshot)
+						volumesSnapshotMu.Unlock()
+						return nil
+					})
 				}
+				if err := g.Wait(); err != nil {
+					return err
+				}
+				spinner.CountStatus(int(nodesSnapped.Add(1)))
 				return nil
 			}); err != nil {
 				res.Err = err
@@ -2430,10 +2541,33 @@ func ApplySnapshots(
 		return err
 	}
 
-	if n := len(c.Nodes); n != len(snapshots) {
-		return fmt.Errorf("mismatched number of snapshots (%d) to node count (%d)", len(snapshots), n)
-		// TODO(irfansharif): Validate labels (version, instance types).
+	// Group snapshots by node index by parsing the trailing
+	// "-{node}-{storeIdx}" or "-{node}" suffix from snapshot names.
+	// For multi-store: "...-0001-01", for single-store: "...-0001".
+	type nodeSnapshot struct {
+		snap     vm.VolumeSnapshot
+		storeIdx int // 1-indexed
 	}
+	snapshotsByNode := make(map[int][]nodeSnapshot)
+	for _, snap := range snapshots {
+		nodeIdx, storeIdx, err := parseSnapshotName(snap.Name)
+		if err != nil {
+			return err
+		}
+		snapshotsByNode[nodeIdx] = append(snapshotsByNode[nodeIdx], nodeSnapshot{
+			snap:     snap,
+			storeIdx: storeIdx,
+		})
+	}
+
+	nodeCount := len(c.Nodes)
+	if len(snapshotsByNode) != nodeCount {
+		return fmt.Errorf(
+			"snapshot node count (%d) does not match cluster node count (%d)",
+			len(snapshotsByNode), nodeCount,
+		)
+	}
+	// TODO(irfansharif): Validate labels (version, instance types).
 
 	// Detach and delete existing volumes. This is destructive.
 	if err := c.Parallel(ctx, l, install.WithNodes(c.Nodes),
@@ -2452,6 +2586,7 @@ func ApplySnapshots(
 					}
 					l.Printf("detached and deleted volume %s from %s", volume.ProviderResourceID, cVM.Name)
 				}
+				cVM.NonBootAttachedVolumes = nil
 				return nil
 			}); err != nil {
 				res.Err = err
@@ -2465,65 +2600,83 @@ func ApplySnapshots(
 		func(ctx context.Context, node install.Node) (*install.RunResultDetails, error) {
 			res := &install.RunResultDetails{Node: node}
 
-			volumeOpts := opts // make a copy
-			volumeOpts.Labels = map[string]string{}
-			for k, v := range opts.Labels {
-				volumeOpts.Labels[k] = v
-			}
-
 			// TODO: same issue as above if the target nodes are not sequential starting from 1
 			cVM := &c.VMs[node-1]
 			if err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
-				volumeOpts.Zone = cVM.Zone
-				// NB: The "-1" signifies that it's the first attached non-boot volume.
-				// This is typical naming convention in GCE clusters.
-				volumeOpts.Name = fmt.Sprintf("%s-%04d-1", clusterName, node)
-				volumeOpts.SourceSnapshotID = snapshots[node-1].ID
-
-				volumes, err := provider.ListVolumes(l, cVM)
-				if err != nil {
-					return err
+				nodeSnaps, ok := snapshotsByNode[int(node)]
+				if !ok {
+					return fmt.Errorf("no snapshots found for node %d", node)
 				}
-				for _, vol := range volumes {
-					if vol.Name == volumeOpts.Name {
-						l.Printf(
-							"volume (%s) is already attached to node %d skipping volume creation", vol.ProviderResourceID, node)
+
+				// Create all volumes in parallel since they are
+				// independent GCE disk operations.
+				type createdVolume struct {
+					volume   vm.Volume
+					storeIdx int
+				}
+				createdVolumes := make([]createdVolume, len(nodeSnaps))
+				g := ctxgroup.WithContext(ctx)
+				for i, ns := range nodeSnaps {
+					g.Go(func() error {
+						volumeOpts := opts // make a copy
+						volumeOpts.Labels = map[string]string{}
+						for k, v := range opts.Labels {
+							volumeOpts.Labels[k] = v
+						}
+
+						volumeOpts.Zone = cVM.Zone
+						volumeOpts.Name = fmt.Sprintf("%s-%04d-%d", clusterName, node, ns.storeIdx)
+						volumeOpts.SourceSnapshotID = ns.snap.ID
+
+						volumeOpts.Labels[vm.TagCluster] = clusterName
+						volumeOpts.Labels[vm.TagLifetime] = cVM.Lifetime.String()
+						volumeOpts.Labels[vm.TagRoachprod] = "true"
+						volumeOpts.Labels[vm.TagCreated] = strings.ToLower(
+							strings.ReplaceAll(timeutil.Now().Format(time.RFC3339), ":", "_")) // format according to gce label naming requirements
+
+						volume, err := provider.CreateVolume(l, volumeOpts)
+						if err != nil {
+							return err
+						}
+						l.Printf("created volume %s from snapshot %s", volume.ProviderResourceID, ns.snap.Name)
+						createdVolumes[i] = createdVolume{volume: volume, storeIdx: ns.storeIdx}
 						return nil
+					})
+				}
+				if err := g.Wait(); err != nil {
+					return err
+				}
+
+				// Sort by storeIdx so volumes are attached in order.
+				// AttachVolume assigns device names sequentially
+				// (/dev/sdd, /dev/sde, ...) based on attachment order,
+				// so attaching in storeIdx order ensures the device-to-
+				// store mapping is consistent with the original cluster.
+				slices.SortFunc(createdVolumes, func(a, b createdVolume) int {
+					return cmp.Compare(a.storeIdx, b.storeIdx)
+				})
+
+				// Attach and mount volumes sequentially since GCE
+				// does not support concurrent instance modifications.
+				for _, cv := range createdVolumes {
+					device, err := cVM.AttachVolume(l, cv.volume)
+					if err != nil {
+						return err
 					}
+					l.Printf("attached volume %s to %s", cv.volume.ProviderResourceID, cVM.Name)
+
+					mountDir := fmt.Sprintf("/mnt/data%d", cv.storeIdx)
+					var buf bytes.Buffer
+					if err := c.Run(ctx, l, &buf, &buf, install.WithNodes([]install.Node{node}),
+						"mounting volume", genMountCommands(device, mountDir)); err != nil {
+						l.Printf(buf.String())
+						return err
+					}
+					l.Printf("mounted %s at %s on %s", cv.volume.ProviderResourceID, mountDir, cVM.Name)
 				}
-
-				volumeOpts.Labels[vm.TagCluster] = clusterName
-				volumeOpts.Labels[vm.TagLifetime] = cVM.Lifetime.String()
-				volumeOpts.Labels[vm.TagRoachprod] = "true"
-				volumeOpts.Labels[vm.TagCreated] = strings.ToLower(
-					strings.ReplaceAll(timeutil.Now().Format(time.RFC3339), ":", "_")) // format according to gce label naming requirements
-
-				volume, err := provider.CreateVolume(l, volumeOpts)
-				if err != nil {
-					return err
-				}
-				l.Printf("created volume %s", volume.ProviderResourceID)
-
-				device, err := cVM.AttachVolume(l, volume)
-				if err != nil {
-					return err
-				}
-				l.Printf("attached volume %s to %s", volume.ProviderResourceID, cVM.ProviderID)
-
-				// Save the cluster to cache.
-				if err := saveCluster(l, &c.Cluster); err != nil {
-					return err
-				}
-
-				var buf bytes.Buffer
-				if err := c.Run(ctx, l, &buf, &buf, install.WithNodes([]install.Node{node}),
-					"mounting volume", genMountCommands(device, "/mnt/data1")); err != nil {
-					l.Printf(buf.String())
-					return err
-				}
-				l.Printf("mounted %s to %s", volume.ProviderResourceID, cVM.ProviderID)
-
-				return nil
+				// Save the cluster cache once after all volumes are
+				// attached and mounted for this node.
+				return saveCluster(l, &c.Cluster)
 			}); err != nil {
 				res.Err = err
 			}
@@ -2711,6 +2864,28 @@ func StartOpenTelemetry(
 	}
 
 	return opentelemetry.Install(ctx, l, c, config)
+}
+
+// RestartOpenTelemetry regenerates the configuration and restarts an
+// already-installed OpenTelemetry Collector on the cluster identified by
+// clusterName.
+func RestartOpenTelemetry(
+	ctx context.Context, l *logger.Logger, clusterName string, config opentelemetry.Config,
+) error {
+	if config.DatadogAPIKey == "" {
+		return errors.New("Datadog API cannot be empty")
+	}
+
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+
+	return opentelemetry.Restart(ctx, l, c, config)
 }
 
 // StopOpenTelemetry stops the OpenTelemetry Collector on the cluster identified by clusterName.

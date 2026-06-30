@@ -82,11 +82,6 @@ type Enforcer struct {
 	// are bypassed. This is typically used to disable enforcement for single-node deployments.
 	isDisabled atomic.Bool
 
-	// trialUsageExpiry records the expiration timestamp, in seconds, of any
-	// trial license on this cluster (past or present). A value of 0 indicates
-	// that no trial license has ever been installed.
-	trialUsageExpiry atomic.Int64
-
 	// db is a pointer to the database for use for KV read/writes. This is only
 	// set for the system tenant.
 	db isql.DB
@@ -101,6 +96,20 @@ type Enforcer struct {
 	// in the metadata accessor. This is set to true during initialization if the
 	// latest timestamp was not received.
 	continueToPollMetadataAccessor atomic.Bool
+
+	// currentLicenseID is the license ID for the currently active license.
+	// Used to write vCPU audit records and detect license rotation.
+	// Stores sentinel value if no license is installed.
+	currentLicenseID atomic.Value
+
+	// auditMu serializes license ID updates and rotation detection in
+	// updateLicenseIDAndMaybeWrite.
+	auditMu syncutil.Mutex
+
+	// nodeID is the node ID used in vCPU audit records. It is set once when
+	// the audit writer starts via StartVCPUAuditWriter. A non-zero value
+	// indicates the writer is active and audit records should be emitted.
+	nodeID atomic.Int32
 }
 
 type TestingKnobs struct {
@@ -129,6 +138,20 @@ type TestingKnobs struct {
 	// OverrideTelemetryStatusReporter, if set, will set the telemetry status
 	// reporter in Start().
 	OverrideTelemetryStatusReporter TelemetryStatusReporter
+
+	// OverrideVCPUAuditInterval if set, overrides the 1-hour vCPU audit interval.
+	// Used for testing to accelerate ticker firing.
+	OverrideVCPUAuditInterval *time.Duration
+
+	// OverrideVCPUCount if set, overrides the value returned by status.GetVCPUs().
+	// Used for testing to provide deterministic vCPU counts.
+	OverrideVCPUCount *float64
+
+	// OnAuditRecordWritten if set, is called each time writeVCPUAuditRecord
+	// fires, both on normal ticker intervals and on immediate writes triggered
+	// by license rotation. Intended for use with an atomic counter or channel
+	// to verify write behavior in tests.
+	OnAuditRecordWritten func()
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -202,12 +225,12 @@ func (e *Enforcer) Start(ctx context.Context, st *cluster.Settings, opts ...Opti
 	// must be done after setting the cluster init grace period timestamp. And it
 	// is needed for testing that may be running this in isolation to the license
 	// ccl package.
-	e.RefreshForLicenseChange(ctx, LicTypeNone, time.Time{})
+	e.RefreshForLicenseChange(ctx, LicTypeNone, time.Time{}, nil /* licenseID */)
 
-	// Add a hook into the license setting so that we refresh our state whenever
-	// the license changes. This will also update the state for the current
-	// license if not in test.
-	RegisterCallbackOnLicenseChange(ctx, st, e)
+	// Register a callback so that we refresh our state whenever the license
+	// changes. This will also update the state for the current license if not
+	// in test.
+	registerCallbackOnLicenseChange(ctx, st, e)
 
 	// This should be the final step after all error checks are completed.
 	e.isDisabled.Store(false)
@@ -255,12 +278,12 @@ func (e *Enforcer) initClusterMetadata(ctx context.Context, options options) err
 			return err
 		}
 		if trialUsageCount.Value == nil {
-			e.trialUsageExpiry.Store(0)
+			trialLicenseExpiryTimestamp.Store(0)
 		} else {
-			e.trialUsageExpiry.Store(trialUsageCount.ValueInt())
+			trialLicenseExpiryTimestamp.Store(trialUsageCount.ValueInt())
 		}
 		log.Dev.Infof(ctx, "trial license expiry initialized to %s",
-			timeutil.Unix(e.trialUsageExpiry.Load(), 0))
+			timeutil.Unix(trialLicenseExpiryTimestamp.Load(), 0))
 
 		// Cache and maybe set the cluster init grace period timestamp. This is the
 		// grace period we will use if the cluster does not have a license installed.
@@ -460,8 +483,11 @@ func (e *Enforcer) MaybeFailIfThrottled(
 // information to optimize enforcement. Instead of reading the license from the
 // settings, unmarshaling it, and checking its type and expiry each time,
 // caching the information improves efficiency since licenses change infrequently.
+//
+// The licenseID parameter is used to detect license rotation for vCPU audit purposes.
+// Pass nil if no license is installed.
 func (e *Enforcer) RefreshForLicenseChange(
-	ctx context.Context, licType LicType, licenseExpiry time.Time,
+	ctx context.Context, licType LicType, licenseExpiry time.Time, licenseID []byte,
 ) {
 	e.hasLicense.Store(licType != LicTypeNone)
 	e.licenseExpiryTS.Store(licenseExpiry.Unix())
@@ -496,22 +522,25 @@ func (e *Enforcer) RefreshForLicenseChange(
 	}
 	sb.Printf("telemetry required: %t", e.licenseRequiresTelemetry.Load())
 	log.Dev.Infof(ctx, "%s", sb.RedactableString())
+
+	// Detect license rotation and trigger immediate vCPU audit write if needed.
+	e.updateLicenseIDAndMaybeWrite(ctx, licenseID)
 }
 
-// UpdateTrialLicenseExpiry returns the expiration timestamp of any trial license
-// used on the cluster, including the new trial license if a change is being applied.
-// This function updates the expiry if the current license is changing and is a trial.
+// UpdateTrialLicenseExpiry updates the expiration timestamp of trial license
+// usage on the cluster. This function updates the expiry if the current license
+// is changing and is a trial.
 func (e *Enforcer) UpdateTrialLicenseExpiry(
 	ctx context.Context, currentLicense LicType, isLicenseChange bool, expiry int64,
-) (curExpiry int64, err error) {
-	// If we aren't setting a new trial license, return the cached copy. The e.db
-	// check is necessary as that's needed to read/write to the KV. This will be
-	// set for the system tenant, which is where the license can ever be set anyway.
+) error {
+	// If we aren't setting a new trial license, return early. The e.db check is
+	// necessary as that's needed to read/write to the KV. This will be set for
+	// the system tenant, which is where the license can ever be set anyway.
 	if currentLicense != LicTypeTrial || !isLicenseChange || e.db == nil {
-		return e.trialUsageExpiry.Load(), nil
+		return nil
 	}
 
-	err = e.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+	err := e.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// We only allow a single trial license to be installed. If one is
 		// already set in the KV, exit and return that expiry value.
 		oldVal, err := txn.KV().Get(ctx, keys.TrialLicenseExpiry)
@@ -519,22 +548,23 @@ func (e *Enforcer) UpdateTrialLicenseExpiry(
 			return err
 		}
 		if oldVal.Value != nil && oldVal.ValueInt() > 0 {
-			e.trialUsageExpiry.Store(oldVal.ValueInt())
+			trialLicenseExpiryTimestamp.Store(oldVal.ValueInt())
 			return nil
 		}
 		err = txn.KV().Put(ctx, keys.TrialLicenseExpiry, expiry)
 		if err != nil {
 			return err
 		}
-		e.trialUsageExpiry.Store(expiry)
+		trialLicenseExpiryTimestamp.Store(expiry)
 		return nil
 	})
 	if err != nil {
-		return
+		return err
 	}
-	curExpiry = e.trialUsageExpiry.Load()
-	log.Dev.Infof(ctx, "trial license expiry timestamp is %s", timeutil.Unix(curExpiry, 0))
-	return
+	curExpiry := trialLicenseExpiryTimestamp.Load()
+	log.Dev.Infof(ctx, "trial license expiry timestamp is %s",
+		timeutil.Unix(curExpiry, 0))
+	return nil
 }
 
 // TestingResetTrialUsage is an API to clear the license expiry in the KV. This is only used
@@ -548,10 +578,16 @@ func (e *Enforcer) TestingResetTrialUsage(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		e.trialUsageExpiry.Store(0)
+		trialLicenseExpiryTimestamp.Store(0)
 		log.Dev.Infof(ctx, "trial license expiry was reset")
 		return nil
 	})
+}
+
+// TestingGetTrialUsageExpiry returns the trial usage expiry timestamp for
+// testing purposes.
+func (e *Enforcer) TestingGetTrialUsageExpiry() int64 {
+	return trialLicenseExpiryTimestamp.Load()
 }
 
 // TestingMaybeFailIfThrottled is a helper that runs MaybeFailIfThrottled in a separate goroutine.

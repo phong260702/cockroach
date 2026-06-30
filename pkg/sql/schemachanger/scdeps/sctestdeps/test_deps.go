@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
@@ -168,6 +167,13 @@ func (s *TestState) IncrementSchemaChangeIndexCounter(counterType string) {
 	s.LogSideEffectf("increment telemetry for sql.schema.%s_index", counterType)
 }
 
+// IncrementAlterTableLocalityCounter implements the scbuild.Dependencies interface.
+func (s *TestState) IncrementAlterTableLocalityCounter(counterTypeFrom, counterTypeTo string) {
+	s.LogSideEffectf(
+		"increment telemetry for sql.multiregion.alter_table.locality.from.%s.to.%s",
+		counterTypeFrom, counterTypeTo)
+}
+
 var _ scbuild.AuthorizationAccessor = (*TestState)(nil)
 
 // CheckPrivilege implements the scbuild.AuthorizationAccessor interface.
@@ -243,27 +249,6 @@ func (s *TestState) HasGlobalPrivilegeOrRoleOption(
 func (s *TestState) CheckRoleExists(ctx context.Context, role username.SQLUsername) error {
 	s.LogSideEffectf("checking role/user %q exists", role)
 	return nil
-}
-
-// IndexPartitioningCCLCallback implements the scbuild.Dependencies interface.
-func (s *TestState) IndexPartitioningCCLCallback() scbuild.CreatePartitioningCCLCallback {
-	if ccl := scdeps.CreatePartitioningCCL; ccl != nil {
-		return ccl
-	}
-	return func(
-		ctx context.Context,
-		st *cluster.Settings,
-		evalCtx *eval.Context,
-		columnLookupFn func(tree.Name) (catalog.Column, error),
-		oldNumImplicitColumns int,
-		oldKeyColumnNames []string,
-		partBy *tree.PartitionBy,
-		allowedNewColumnNames []tree.Name,
-		allowImplicitPartitioning bool,
-	) (newImplicitCols []catalog.Column, newPartitioning catpb.PartitioningDescriptor, err error) {
-		newPartitioning.NumColumns = uint32(len(partBy.Fields))
-		return nil, newPartitioning, nil
-	}
 }
 
 var _ scbuild.CatalogReader = (*TestState)(nil)
@@ -748,6 +733,11 @@ func (s *TestState) MustReadMutableDescriptor(
 	return s.mustReadMutableDescriptor(id)
 }
 
+// TestingEnsureLatestLeaseIsAvailable( implements the scexec.Catalog interface.
+func (s *TestState) TestingEnsureLatestLeaseIsAvailable(ctx context.Context, id descpb.IDs) error {
+	return nil
+}
+
 // GetFullyQualifiedName implements scexec.Catalog
 func (s *TestState) GetFullyQualifiedName(ctx context.Context, id descpb.ID) (string, error) {
 	obj, err := s.mustReadImmutableDescriptor(id)
@@ -1140,7 +1130,7 @@ func (s *TestState) UpdateSchemaChangeJob(
 		Details:          jobspb.WrapPayloadDetails(scJob.Details),
 		PauseReason:      "",
 	}
-	oldJobMetadata := jobs.JobMetadata{
+	oldJobMetadata := jobs.DeprecatedJobMetadata{
 		ID:       scJob.JobID,
 		State:    jobs.StateRunning,
 		Payload:  &oldPayload,
@@ -1260,6 +1250,20 @@ func (s *TestState) ValidateConstraint(
 ) error {
 	s.LogSideEffectf("validate %v constraint %v in table #%d",
 		catalog.GetConstraintType(constraint), constraint.GetName(), tbl.GetID())
+	return nil
+}
+
+// ValidateEnumTypeValueRemoval implements the validator interface.
+func (s *TestState) ValidateEnumTypeValueRemoval(
+	ctx context.Context,
+	job *jobs.Job,
+	typeDesc catalog.TypeDescriptor,
+	physicalRep []byte,
+	logicalRep string,
+	override sessiondata.InternalExecutorOverride,
+) error {
+	s.LogSideEffectf("validate enum value %q removal in type #%d",
+		logicalRep, typeDesc.GetID())
 	return nil
 }
 
@@ -1516,6 +1520,11 @@ func (s *TestState) GetTypeComment(typeID catid.DescID) (comment string, ok bool
 	return s.get(typeID, 0, catalogkeys.TypeCommentType)
 }
 
+// GetFunctionComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetFunctionComment(funcID catid.DescID) (comment string, ok bool) {
+	return s.get(funcID, 0, catalogkeys.FunctionCommentType)
+}
+
 // GetColumnComment implements the scdecomp.CommentGetter interface.
 func (s *TestState) GetColumnComment(
 	tableID catid.DescID, pgAttrNum catid.PGAttributeNum,
@@ -1627,7 +1636,52 @@ func (s *TestState) GetRegions(ctx context.Context) (*serverpb.RegionsResponse, 
 func (s *TestState) SynthesizeRegionConfig(
 	ctx context.Context, dbID descpb.ID, opts ...multiregion.SynthesizeRegionConfigOption,
 ) (multiregion.RegionConfig, error) {
-	return multiregion.RegionConfig{}, nil
+	var o multiregion.SynthesizeRegionConfigOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	// Read the database descriptor.
+	dbDesc, err := s.mustReadImmutableDescriptor(dbID)
+	if err != nil {
+		return multiregion.RegionConfig{}, err
+	}
+
+	db, err := catalog.AsDatabaseDescriptor(dbDesc)
+	if err != nil {
+		return multiregion.RegionConfig{}, err
+	}
+
+	// Return empty config if the database is not multi-region.
+	if !db.IsMultiRegion() {
+		return multiregion.RegionConfig{}, nil
+	}
+
+	// Get the region enum type ID.
+	regionEnumID, err := db.MultiRegionEnumID()
+	if err != nil {
+		return multiregion.RegionConfig{}, err
+	}
+
+	// Read the region enum type descriptor.
+	typeDesc, err := s.mustReadImmutableDescriptor(regionEnumID)
+	if err != nil {
+		return multiregion.RegionConfig{}, err
+	}
+
+	typ, err := catalog.AsTypeDescriptor(typeDesc)
+	if err != nil {
+		return multiregion.RegionConfig{}, err
+	}
+
+	regionEnumDesc := typ.AsRegionEnumTypeDescriptor()
+	if regionEnumDesc == nil {
+		return multiregion.RegionConfig{}, errors.AssertionFailedf(
+			"expected region enum type, not %s for type %q (%d)",
+			typ.GetKind(), typ.GetName(), typ.GetID())
+	}
+
+	return multiregion.SynthesizeRegionConfig(regionEnumDesc, db, o)
 }
 
 func (s *TestState) GetDefaultZoneConfig() *zonepb.ZoneConfig {

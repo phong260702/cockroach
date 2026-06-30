@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -18,14 +19,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	crdbworkload "github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/errors"
@@ -152,6 +157,24 @@ func registerOnlineRestorePerf(r registry.Registry) {
 			},
 			linkPhaseTimeout:     45 * time.Second, // typically takes 20 seconds
 			downloadPhaseTimeout: 20 * time.Minute, // typically takes 10 minutes.
+		},
+		{
+			// 350 GB tpcc Online Restore on Azure with 48 incrementals
+			restoreSpecs: restoreSpecs{
+				hardware: makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
+				backup: backupSpecs{
+					cloud:   spec.Azure,
+					fixture: SmallFixture,
+				},
+				timeout: 1 * time.Hour,
+				suites:  registry.Suites(registry.Nightly),
+			},
+			workload: tpccRestore{
+				opts: tpccRunOpts{waitFraction: 0, workers: 100, maxRate: 300},
+			},
+			linkPhaseTimeout: 2 * time.Minute,
+			// Download phase takes 15 minutes.
+			downloadPhaseTimeout: 30 * time.Minute,
 		},
 		// OR Benchmarking tests
 		// See benchmark plan here: https://docs.google.com/spreadsheets/d/1uPcQ1YPohXKxwFxWWDUMJrYLKQOuqSZKVrI8SJam5n8
@@ -329,6 +352,108 @@ func registerOnlineRestorePerf(r registry.Registry) {
 	}
 }
 
+func registerFastRestorePerf(r registry.Registry) {
+	// This driver creates roachtests to benchmark fast restore performance
+	// (using EXPERIMENTAL COPY) with the prefix restore/fast-restore/*.
+	for _, sp := range []onlineRestoreSpecs{
+		{
+			// 350 GB tpcc Fast Restore
+			restoreSpecs: restoreSpecs{
+				hardware: makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
+				backup: backupSpecs{
+					cloud:   spec.GCE,
+					fixture: SmallFixture,
+				},
+				skipFingerprint: true,
+				timeout:         1 * time.Hour,
+				suites:          registry.Suites(registry.Nightly),
+			},
+		},
+		{
+			// 2 TiB tpcc Fast Restore
+			restoreSpecs: restoreSpecs{
+				hardware: makeHardwareSpecs(hardwareSpecs{
+					nodes: 10, volumeSize: 1500, workloadNode: true,
+				}),
+				backup: backupSpecs{
+					cloud:   spec.GCE,
+					fixture: MediumFixture,
+				},
+				skipFingerprint: true,
+				timeout:         3 * time.Hour,
+				suites:          registry.Suites(registry.Nightly),
+			},
+		},
+	} {
+		for _, useDistFlow := range []bool{true, false} {
+			clusterSettings := []string{}
+			if useDistFlow {
+				clusterSettings = append(clusterSettings,
+					"backup.restore.online_use_dist_flow.enabled=true")
+				sp.namePrefix = "fast-restore/dist-flow=true"
+			} else {
+				clusterSettings = append(clusterSettings,
+					"backup.restore.online_use_dist_flow.enabled=false")
+				sp.namePrefix = "fast-restore/dist-flow=false"
+			}
+
+			sp.initTestName()
+			r.Add(registry.TestSpec{
+				Name:      sp.testName,
+				Owner:     registry.OwnerDisasterRecovery,
+				Benchmark: true,
+				Cluster:   sp.hardware.makeClusterSpecs(r),
+				Timeout:   sp.timeout,
+				// These tests measure performance. To ensure consistent perf,
+				// disable metamorphic encryption.
+				EncryptionSupport:         registry.EncryptionAlwaysDisabled,
+				CompatibleClouds:          sp.backup.CompatibleClouds(),
+				Suites:                    sp.suites,
+				TestSelectionOptOutSuites: sp.suites,
+				SkipPostValidations:       registry.PostValidationReplicaDivergence,
+				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+					rd := makeRestoreDriver(ctx, t, c, sp.restoreSpecs)
+					rd.prepareCluster(ctx)
+
+					dut, err := roachtestutil.NewDiskUsageTracker(rd.c, t.L())
+					require.NoError(t, err)
+					startDu := dut.GetDiskUsage(ctx, sp.hardware.getCRDBNodes())
+
+					db, err := rd.c.ConnE(ctx, t.L(), rd.c.Node(1)[0])
+					require.NoError(t, err)
+					defer db.Close()
+
+					// Set cluster settings
+					for _, setting := range clusterSettings {
+						_, err := db.Exec(fmt.Sprintf("SET CLUSTER SETTING %s", setting))
+						require.NoError(t, err, "failed to set cluster setting %s", setting)
+					}
+
+					opts := "WITH EXPERIMENTAL COPY"
+
+					restoreStartTime := timeutil.Now()
+					restoreCmd := rd.restoreCmd(ctx, fmt.Sprintf("DATABASE %s", sp.backup.fixture.DatabaseName()), opts)
+					t.L().Printf("Starting fast restore: %s", restoreCmd)
+					if _, err := db.ExecContext(ctx, restoreCmd); err != nil {
+						rd.markFixtureWithFailure(ctx)
+						t.Fatal(err)
+					}
+					restoreEndTime := timeutil.Now()
+
+					restoreDuration := restoreEndTime.Sub(restoreStartTime)
+					t.L().Printf("Fast restore completed in %s", restoreDuration)
+
+					endDu := dut.GetDiskUsage(ctx, sp.hardware.getCRDBNodes())
+					throughput := float64(endDu-startDu) / (float64(sp.hardware.nodes) * restoreDuration.Seconds())
+					t.L().Printf("Usage %d, Nodes %d, Duration %f; Throughput: %f MB/s/node",
+						endDu-startDu, sp.hardware.nodes, restoreDuration.Seconds(), throughput)
+					uploadRestoreSummaryStats(t, c, restoreDuration.Seconds(), throughput)
+				},
+			})
+		}
+	}
+}
+
 // maybeAddSomeEmptyTables adds some empty tables to the cluster to exercise
 // prefix rewrite rules.
 func maybeAddSomeEmptyTables(ctx context.Context, rd restoreDriver) error {
@@ -436,6 +561,136 @@ func registerOnlineRestoreCorrectness(r registry.Registry) {
 			},
 		},
 	)
+}
+
+func registerOnlineRestoreRecovery(r registry.Registry) {
+	r.Add(registry.TestSpec{
+		Name:                       "backup-restore/online-restore-recovery",
+		Timeout:                    4 * time.Hour,
+		Owner:                      registry.OwnerDisasterRecovery,
+		Cluster:                    r.MakeClusterSpec(4, spec.WorkloadNode()),
+		EncryptionSupport:          registry.EncryptionMetamorphic,
+		NativeLibs:                 registry.LibGEOS,
+		CompatibleClouds:           registry.Clouds(spec.GCE, spec.Local),
+		Suites:                     registry.Suites(registry.Nightly),
+		TestSelectionOptOutSuites:  registry.Suites(registry.Nightly),
+		Randomized:                 true,
+		RequiresDeprecatedWorkload: true, // uses schemachange
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			testOnlineRestoreRecovery(ctx, t, c)
+		},
+	})
+}
+
+// registerOnlineRestoreChaos registers a roachtest that restores SmallFixture
+// (350 GiB TPCC) via online restore and injects a process-kill failure during
+// the download phase, then verifies the restored data against the fixture's
+// stored fingerprint. The link phase is fast (~20s) and the download is
+// ~10min, so most of the 4h timeout is reserved for the fingerprint check.
+func registerOnlineRestoreChaos(r registry.Registry) {
+	sp := onlineRestoreSpecs{
+		restoreSpecs: restoreSpecs{
+			hardware:   makeHardwareSpecs(hardwareSpecs{workloadNode: true}),
+			backup:     backupSpecs{cloud: spec.GCE, fixture: SmallFixture},
+			timeout:    4 * time.Hour,
+			suites:     registry.Suites(registry.Nightly),
+			namePrefix: "online-restore-chaos",
+		},
+	}
+	if !backuptestutils.IsOnlineRestoreSupported() {
+		sp.skip = "online restore is only tested on development branch"
+	}
+	sp.initTestName()
+	r.Add(registry.TestSpec{
+		Name:                      sp.testName,
+		Owner:                     registry.OwnerDisasterRecovery,
+		Cluster:                   sp.hardware.makeClusterSpecs(r),
+		Timeout:                   sp.timeout,
+		EncryptionSupport:         registry.EncryptionMetamorphic,
+		CompatibleClouds:          sp.backup.CompatibleClouds(),
+		Suites:                    sp.suites,
+		TestSelectionOptOutSuites: sp.suites,
+		SkipPostValidations:       registry.PostValidationReplicaDivergence,
+		Randomized:                true,
+		Monitor:                   true,
+		Skip:                      sp.skip,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runOnlineRestoreChaos(ctx, t, c, sp)
+		},
+	})
+}
+
+func runOnlineRestoreChaos(
+	ctx context.Context, t test.Test, c cluster.Cluster, sp onlineRestoreSpecs,
+) {
+	testRNG, seed := randutil.NewLockedPseudoRand()
+	t.L().Printf("random seed: %d", seed)
+
+	rd := makeRestoreDriver(ctx, t, c, sp.restoreSpecs)
+	rd.prepareCluster(ctx)
+
+	testUtils, err := setupBackupRestoreTestUtils(
+		ctx, t, c, testRNG, withOnlineRestore(true), withCompaction(false),
+	)
+	require.NoError(t, err)
+	defer testUtils.CloseConnections()
+	defer testUtils.takeDebugZip(ctx, t.L())
+
+	// Cap the download retry duration so a stalled job pauses in minutes
+	// rather than after the 72h default.
+	require.NoError(t, testUtils.Exec(ctx, testRNG,
+		"SET CLUSTER SETTING backup.restore.online_download_retry_max_duration = '30m'",
+	))
+
+	const numToKill = 1
+	failureNodes := c.CRDBNodes()[:numToKill]
+	liveNodes := c.CRDBNodes()[numToKill:]
+	isGraceful := testRNG.Intn(2) == 0
+	t.L().Printf("process kill failure isGraceful: %t", isGraceful)
+	t.Monitor().ExpectProcessDead(failureNodes)
+	failer, args, err := roachtestutil.MakeProcessKillFailer(
+		t.L(), c, failureNodes, isGraceful, 5*time.Minute, /* gracePeriod */
+	)
+	require.NoError(t, err)
+	require.NoError(t, failer.Setup(ctx, t.L(), args))
+	defer func() {
+		if err := failer.Cleanup(ctx, t.L()); err != nil {
+			t.L().Printf("failed to clean up failure: %v", err)
+		}
+	}()
+
+	// Link phase. The non-detached restore blocks until the link completes,
+	// after which the download job is queryable from the jobs table.
+	if _, _, err := executeTestRestorePhase(
+		ctx, t, c, sp, rd, true, /* runOnline */
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	queryNode := testUtils.RandomNode(testRNG, liveNodes)
+	var downloadJobID int
+	require.NoError(t, testUtils.QueryRow(ctx, testRNG,
+		`SELECT job_id FROM [SHOW JOBS]
+		 WHERE description LIKE '%Background Data Download%' AND job_type = 'RESTORE'
+		 ORDER BY created DESC LIMIT 1`,
+	).Scan(&downloadJobID))
+	t.L().Printf("OR download job id: %d", downloadJobID)
+
+	injectAndRecoverFailure(
+		ctx, t, t.L(), testUtils, queryNode, downloadJobID, failer, args,
+		randFloatBetween(testRNG, 0.15, 0.50),
+		randFloatBetween(testRNG, 0.50, 0.66),
+	)
+
+	// injectAndRecoverFailure returns once the job has succeeded, but it does
+	// not assert the cluster has actually drained external bytes. Do that
+	// explicitly before the (expensive) fingerprint.
+	conn, err := c.ConnE(ctx, t.L(), queryNode)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, checkNoExternalBytesRemaining(ctx, conn))
+
+	rd.maybeValidateFingerprint(ctx)
 }
 
 func postRestoreValidation(
@@ -828,4 +1083,115 @@ func executeTestDownloadPhase(
 		return time.Time{}, time.Time{}, time.Time{}, err
 	}
 	return downloadEndTimeLowerBound, workloadStartTime, workloadEndTime, nil
+}
+
+func testOnlineRestoreRecovery(ctx context.Context, t test.Test, c cluster.Cluster) {
+	testRNG, seed := randutil.NewLockedPseudoRand()
+	workloadSeed := testRNG.Int63()
+	t.L().Printf("random seed: %d", seed)
+
+	c.Start(ctx, t.L(), roachtestutil.MaybeUseMemoryBudget(t, 50), install.MakeClusterSettings(), c.CRDBNodes())
+	const jobStatusWait = time.Minute * 5
+
+	testUtils, err := setupBackupRestoreTestUtils(
+		ctx, t, c, testRNG,
+		withOnlineRestore(true), withCompaction(true),
+	)
+	require.NoError(t, err)
+	defer testUtils.CloseConnections()
+
+	dbs := []string{"bank", "tpcc", schemaChangeDB}
+	d, runBackgroundWorkload, _, err := createDriversForBackupRestore(
+		ctx, t, c, testRNG, workloadSeed, testUtils, dbs, nil, /* excludedWorkloads */
+	)
+	require.NoError(t, err)
+
+	stopBackgroundCommands, err := runBackgroundWorkload()
+	require.NoError(t, err)
+	defer stopBackgroundCommands()
+
+	dbConn := c.Conn(ctx, t.L(), c.CRDBNodes().RandNode()[0])
+	defer dbConn.Close()
+
+	allNodes := labeledNodes{Nodes: c.CRDBNodes(), Version: clusterupgrade.CurrentVersion().String()}
+	bspec := backupSpec{
+		Plan:    allNodes,
+		Execute: allNodes,
+	}
+
+	// Since we are intentionally failing the download job by deleting a file,
+	// we reduce the retry duration for the job to speed up the test.
+	_, err = dbConn.ExecContext(
+		ctx, "SET CLUSTER SETTING backup.restore.online_download_retry_max_duration = '5s'",
+	)
+	require.NoError(t, err, "failed to set download phase retry duration")
+
+	// A cluster backup will not allow deleting SSTs before the link phase
+	// completes, as it reads from the SSTs to restore the system tables. #170225
+	// outlines a bug where linked SSTs are being ingested into L0, which triggers
+	// a Pebble compaction that downloads the SSTs before the download job
+	// attempts to download them, which breaks this test. Until that issue is
+	// resolved, we will only run database/table backups so that we can delete the
+	// SSTs before the link phase, preventing Pebble compaction.
+	scopes := []CollectionConfig{
+		WithDatabaseScope(),
+		WithTableScope(),
+	}
+	builder := d.NewCollectionBuilder(
+		t.L(), t,
+		testRNG,
+		"online-restore-recovery",
+		bspec, bspec,
+		true /* internalSystemsJobs */, false, /* isMultitenant */
+		WithSkipRevisionHistory(),
+		scopes[rand.Intn(len(scopes))],
+	)
+	t.L().Printf("building backup collection")
+	_, err = builder.TakeFullSync(ctx)
+	require.NoError(t, err)
+	for range 3 {
+		d.randomWait(t.L(), testRNG)
+		_, err = builder.TakeIncSync(ctx)
+		require.NoError(t, err)
+	}
+	if testRNG.Intn(2) == 0 {
+		_, err = builder.TakeCompactedSync(ctx, 1, 3)
+		require.NoError(t, err)
+	}
+	collection, err := builder.Finalize(ctx)
+	require.NoError(t, err)
+
+	// Delete the backup SSTs as soon as possible after the link phase
+	// completes to minimize the window in which regular LSM compaction
+	// could download and incorporate the external SSTs, which would cause
+	// the download job to see 0 external bytes and succeed immediately.
+	err = d.deleteSSTFromBackupLayers(ctx, t.L(), dbConn, collection)
+	require.NoError(t, err, "failed to delete SSTs from backup layers")
+
+	// defaultdb is going to be set offline by the failed download job, so we
+	// need to switch to the system database first to avoid any errors.
+	_, err = dbConn.ExecContext(ctx, "USE system")
+	require.NoError(t, err)
+
+	t.L().Printf("performing online restore of backup")
+	_, err = d.RestoreSync(
+		ctx, t.L(), testRNG, collection,
+		false /* checkFiles */, true /* internalSystemJobs */, nil, /* mvHelper */
+	)
+	require.NoError(t, err, "failed to execute online restore link phase")
+
+	downloadJobID, err := d.getORDownloadJobID(ctx, t.L(), testRNG)
+	require.NoError(t, err, "failed to get online restore download job ID")
+
+	err = WaitForPaused(ctx, dbConn, jobspb.JobID(downloadJobID), jobStatusWait)
+	require.NoError(t, err, "download job did not pause due to deleted SSTs")
+
+	_, err = dbConn.ExecContext(ctx, "CANCEL JOB $1", downloadJobID)
+	require.NoError(t, err, "failed to cancel download job after it paused")
+
+	err = WaitForCanceled(ctx, dbConn, jobspb.JobID(downloadJobID), 10*time.Minute)
+	require.NoError(t, err, "download job did not reach canceled state")
+
+	err = checkNoExternalBytesRemaining(ctx, dbConn)
+	require.NoError(t, err, "external bytes still remain after download job failure")
 }

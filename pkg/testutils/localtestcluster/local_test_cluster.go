@@ -170,14 +170,8 @@ func (ltc *LocalTestCluster) Start(t testing.TB, initFactory InitFactoryFn) {
 	ltc.Eng = kvstorage.MakeEngines(eng)
 
 	ltc.Stores = kvserver.NewStores(ambient, ltc.Clock)
-	// Faster refresh intervals for testing.
-	cfg.NodeCapacityProvider = load.NewNodeCapacityProvider(ltc.stopper, ltc.Stores, load.NodeCapacityProviderConfig{
-		CPUUsageRefreshInterval:    10 * time.Millisecond,
-		CPUCapacityRefreshInterval: 10 * time.Millisecond,
-		CPUUsageMovingAverageAge:   20,
-	})
-
-	factory := initFactory(ctx, cfg.Settings, nodeDesc, ltc.stopper.Tracer(), ltc.Clock, ltc.Latency, ltc.Stores, ltc.stopper, ltc.Gossip)
+	factory := initFactory(ctx, cfg.Settings, nodeDesc, ltc.stopper.Tracer(), ltc.Clock, ltc.Latency,
+		kvserver.ToSenderForTesting(ltc.Stores), ltc.stopper, ltc.Gossip)
 
 	var nodeIDContainer base.NodeIDContainer
 	nodeIDContainer.Set(context.Background(), nodeID)
@@ -200,6 +194,12 @@ func (ltc *LocalTestCluster) Start(t testing.TB, initFactory InitFactoryFn) {
 	}
 	cfg.DB = ltc.DB
 	cfg.Gossip = ltc.Gossip
+	// Faster refresh intervals for testing.
+	cfg.NodeCapacityProvider = load.NewNodeCapacityProvider(ltc.stopper, ltc.Stores, ltc.DB.SQLCPUProvider, load.NodeCapacityProviderConfig{
+		CPUUsageRefreshInterval:    10 * time.Millisecond,
+		CPUCapacityRefreshInterval: 10 * time.Millisecond,
+		CPUUsageMovingAverageAge:   20,
+	})
 	cfg.HistogramWindowInterval = metric.TestSampleInterval
 	active, renewal := cfg.NodeLivenessDurations()
 	cfg.NodeLiveness = liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
@@ -249,6 +249,8 @@ func (ltc *LocalTestCluster) Start(t testing.TB, initFactory InitFactoryFn) {
 	)
 	cfg.MMAllocator = mmaprototype.NewAllocatorState(timeutil.DefaultTimeSource{},
 		rand.New(rand.NewSource(timeutil.Now().UnixNano())))
+	// AllocatorSync is co-constructed by kvserver.NewStore from MMAllocator and
+	// StorePool.
 
 	cfg.Transport = kvserver.NewDummyRaftTransport(cfg.AmbientCtx, cfg.Settings, ltc.Clock)
 	cfg.ClosedTimestampReceiver = sidetransport.NewReceiver(nc, ltc.stopper, ltc.Stores, nil /* testingKnobs */)
@@ -297,7 +299,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, initFactory InitFactoryFn) {
 
 	if err := kvserver.WriteInitialClusterData(
 		ctx,
-		ltc.Eng.TODOEngine(),
+		ltc.Eng,
 		initialValues,
 		clusterversion.Latest.Version(),
 		1, /* numStores */

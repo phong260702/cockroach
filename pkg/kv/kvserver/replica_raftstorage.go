@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/redact"
 )
 
@@ -311,8 +312,8 @@ type IncomingSnapshot struct {
 	placeholder      *ReplicaPlaceholder
 	raftAppliedIndex kvpb.RaftIndex      // logging only
 	msgAppRespCh     chan raftpb.Message // receives MsgAppResp if/when snap is applied
-	sharedSSTs       []pebble.SharedSSTMeta
-	externalSSTs     []pebble.ExternalFile
+	sharedSSTs       []kvserverpb.SnapshotRequest_SharedTable
+	externalSSTs     []kvserverpb.SnapshotRequest_ExternalTable
 	// clearedSpans represents the key spans in the existing store that will be
 	// cleared by doing the Ingest*. This is tracked so that we can convert the
 	// ssts into a WriteBatch if the total size of the ssts is small.
@@ -405,12 +406,12 @@ func (r *Replica) updateRangeInfo(ctx context.Context, desc *roachpb.RangeDescri
 	}
 
 	// Find span config for this range.
-	conf, sp, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
+	conf, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
 	if err != nil {
 		return errors.Wrapf(err, "%s: failed to lookup span config", r)
 	}
 
-	changed := r.SetSpanConfig(conf, sp)
+	changed := r.SetSpanConfig(conf)
 	if changed {
 		r.MaybeQueue(ctx, r.store.cfg.Clock.NowAsClockTimestamp())
 	}
@@ -614,12 +615,13 @@ func (r *Replica) applySnapshotRaftMuLocked(
 		}
 	}
 	if err := sw.prepareSnapApply(ctx, snapWrite{
-		sl:         r.raftMu.stateLoader.StateLoader,
-		truncState: truncState,
-		hardState:  hs,
-		desc:       desc,
-		origDesc:   r.shMu.state.Desc,
-		subsume:    subsume, // NB: ordered by StartKey
+		sl:               r.raftMu.stateLoader.StateLoader,
+		truncState:       truncState,
+		hardState:        hs,
+		desc:             desc,
+		origDesc:         r.shMu.state.Desc,
+		raftAppliedIndex: r.shMu.state.RaftAppliedIndex,
+		subsume:          subsume, // NB: ordered by StartKey
 	}); err != nil {
 		return err
 	}
@@ -829,9 +831,7 @@ func (r *Replica) clearSubsumedReplicaInMemoryData(
 		phs = append(phs, ph)
 		// We removed sr's data when we committed the batch. Finish subsumption by
 		// updating the in-memory bookkeping.
-		if err := sr.postDestroyRaftMuLocked(ctx); err != nil {
-			return nil, err
-		}
+		sr.postDestroyRaftMuLocked(ctx)
 	}
 	return phs, nil
 }
@@ -851,7 +851,52 @@ func testingAssert(cond bool, msg string) {
 func (r *Replica) destroyInfoRaftMuLocked() kvstorage.DestroyReplicaInfo {
 	r.raftMu.AssertHeld()
 	return kvstorage.DestroyReplicaInfo{
-		FullReplicaID: r.ID(),
-		Keys:          r.shMu.state.Desc.RSpan(),
+		FullReplicaID:    r.ID(),
+		RaftAppliedIndex: r.shMu.state.RaftAppliedIndex,
+		Keys:             r.shMu.state.Desc.RSpan(),
+		Separated:        r.store.EnginesSeparated(),
 	}
+}
+
+func convertSharedSSTs(sharedSSTs []kvserverpb.SnapshotRequest_SharedTable) []pebble.SharedSSTMeta {
+	res := make([]pebble.SharedSSTMeta, len(sharedSSTs))
+	pbToInternalKey := func(k *kvserverpb.SnapshotRequest_SharedTable_InternalKey) pebble.InternalKey {
+		return pebble.InternalKey{UserKey: k.UserKey, Trailer: pebble.InternalKeyTrailer(k.Trailer)}
+	}
+	for i, sst := range sharedSSTs {
+		res[i] = pebble.SharedSSTMeta{
+			Backing:          stubBackingHandle{sst.Backing},
+			Smallest:         pbToInternalKey(sst.Smallest),
+			Largest:          pbToInternalKey(sst.Largest),
+			SmallestRangeKey: pbToInternalKey(sst.SmallestRangeKey),
+			LargestRangeKey:  pbToInternalKey(sst.LargestRangeKey),
+			SmallestPointKey: pbToInternalKey(sst.SmallestPointKey),
+			LargestPointKey:  pbToInternalKey(sst.LargestPointKey),
+			Level:            uint8(sst.Level),
+			Size:             sst.Size_,
+		}
+	}
+	return res
+}
+
+func convertExternalSSTs(
+	externalSSTs []kvserverpb.SnapshotRequest_ExternalTable,
+) []pebble.ExternalFile {
+	res := make([]pebble.ExternalFile, len(externalSSTs))
+	for i, sst := range externalSSTs {
+		res[i] = pebble.ExternalFile{
+			Locator:           remote.MakeLocator(redact.RedactableString(sst.Locator)),
+			ObjName:           sst.ObjectName,
+			StartKey:          sst.StartKey,
+			EndKey:            sst.EndKey,
+			EndKeyIsInclusive: sst.EndKeyIsInclusive,
+			HasPointKey:       sst.HasPointKey,
+			HasRangeKey:       sst.HasRangeKey,
+			SyntheticPrefix:   sst.SyntheticPrefix,
+			SyntheticSuffix:   sst.SyntheticSuffix,
+			Level:             uint8(sst.Level),
+			Size:              sst.Size_,
+		}
+	}
+	return res
 }

@@ -12,8 +12,6 @@ import { StatementDetailsResponse } from "../api";
 
 import { StatementDetailsProps } from "./statementDetails";
 
-const lastUpdated = moment("Nov 28 2022 01:30:00 GMT");
-
 const statementDetailsNoData: StatementDetailsResponse = {
   statement: {
     metadata: {
@@ -21,7 +19,6 @@ const statementDetailsNoData: StatementDetailsResponse = {
       formatted_query: "",
       query_summary: "",
       stmt_type: "",
-      implicit_txn: false,
       dist_sql_count: new Long(0),
       full_scan_count: new Long(0),
       vec_count: new Long(0),
@@ -66,6 +63,9 @@ const statementDetailsNoData: StatementDetailsResponse = {
     aggregation_interval: {},
   },
   internal_app_name_prefix: "$ internal",
+  query: "",
+  query_summary: "",
+  database: "",
   statement_statistics_per_aggregated_ts: [],
   statement_statistics_per_plan_hash: [],
   statement_statistics_per_aggregated_ts_and_plan_hash: [],
@@ -77,7 +77,6 @@ const statementDetailsData: StatementDetailsResponse = {
       query: "SELECT * FROM crdb_internal.node_build_info",
       app_names: ["$ cockroach sql", "newname"],
       dist_sql_count: new Long(2),
-      implicit_txn: true,
       vec_count: new Long(2),
       full_scan_count: new Long(2),
       databases: ["defaultdb"],
@@ -820,12 +819,16 @@ const statementDetailsData: StatementDetailsResponse = {
     },
   ],
   internal_app_name_prefix: "$ internal",
+  query: "SELECT * FROM crdb_internal.node_build_info",
+  query_summary: "SELECT * FROM crdb_internal.node_build_info",
+  database: "defaultdb",
   statement_statistics_per_aggregated_ts_and_plan_hash: [],
 };
 
-export const getStatementDetailsPropsFixture = (
-  withData = true,
-): StatementDetailsProps => {
+export const statementDetailsFixtureData = statementDetailsData;
+export const statementDetailsFixtureNoData = statementDetailsNoData;
+
+export const getStatementDetailsPropsFixture = (): StatementDetailsProps => {
   const history = createMemoryHistory({ initialEntries: ["/statements"] });
   return {
     history,
@@ -843,8 +846,6 @@ export const getStatementDetailsPropsFixture = (
         statement: "4705782015019656142",
       },
     },
-    isLoading: false,
-    lastUpdated: lastUpdated,
     timeScale: {
       windowSize: moment.duration(5, "day"),
       sampleSize: moment.duration(5, "minutes"),
@@ -852,39 +853,9 @@ export const getStatementDetailsPropsFixture = (
       key: "Custom",
     },
     statementFingerprintID: "4705782015019656142",
-    statementDetails: withData ? statementDetailsData : statementDetailsNoData,
-    statementsError: null,
-    nodeRegions: {
-      "1": "gcp-us-east1",
-      "2": "gcp-us-east1",
-      "3": "gcp-us-west1",
-      "4": "gcp-europe-west1",
-    },
     requestTime: moment.utc("2021.12.12"),
-    refreshStatementDetails: noop,
-    refreshStatementDiagnosticsRequests: noop,
-    refreshNodes: noop,
-    refreshNodesLiveness: noop,
-    refreshUserSQLRoles: noop,
-    refreshStatementFingerprintInsights: noop,
-    diagnosticsReports: [
-      {
-        id: "123",
-        statement_fingerprint: "SELECT x, y FROM xy",
-        completed: true,
-        requested_at: moment("2021-12-08T09:51:27Z"),
-        min_execution_latency: moment.duration("1ms"),
-        expires_at: moment("2021-12-08T10:06:00Z"),
-      },
-    ],
     dismissStatementDiagnosticsAlertMessage: noop,
     onTimeScaleChange: noop,
     onRequestTimeChange: noop,
-    createStatementDiagnosticsReport: noop,
-    uiConfig: {
-      showStatementDiagnosticsLink: true,
-    },
-    isTenant: false,
-    hasViewActivityRedactedRole: false,
   };
 };

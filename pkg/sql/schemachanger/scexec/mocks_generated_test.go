@@ -303,6 +303,20 @@ func (mr *MockCatalogMockRecorder) SetSequence(arg0, arg1 interface{}) *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetSequence", reflect.TypeOf((*MockCatalog)(nil).SetSequence), arg0, arg1)
 }
 
+// TestingEnsureLatestLeaseIsAvailable mocks base method.
+func (m *MockCatalog) TestingEnsureLatestLeaseIsAvailable(arg0 context.Context, arg1 descpb.IDs) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TestingEnsureLatestLeaseIsAvailable", arg0, arg1)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// TestingEnsureLatestLeaseIsAvailable indicates an expected call of TestingEnsureLatestLeaseIsAvailable.
+func (mr *MockCatalogMockRecorder) TestingEnsureLatestLeaseIsAvailable(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TestingEnsureLatestLeaseIsAvailable", reflect.TypeOf((*MockCatalog)(nil).TestingEnsureLatestLeaseIsAvailable), arg0, arg1)
+}
+
 // UpdateComment mocks base method.
 func (m *MockCatalog) UpdateComment(arg0 context.Context, arg1 catalogkeys.CommentKey, arg2 string) error {
 	m.ctrl.T.Helper()
@@ -868,6 +882,20 @@ func (m *MockIndexSpanSplitter) MaybeSplitIndexSpansForPartitioning(arg0 context
 func (mr *MockIndexSpanSplitterMockRecorder) MaybeSplitIndexSpansForPartitioning(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MaybeSplitIndexSpansForPartitioning", reflect.TypeOf((*MockIndexSpanSplitter)(nil).MaybeSplitIndexSpansForPartitioning), arg0, arg1, arg2)
+}
+
+// ShouldSkipSplitForSmallTable mocks base method.
+func (m *MockIndexSpanSplitter) ShouldSkipSplitForSmallTable(arg0 context.Context, arg1 catalog.TableDescriptor) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ShouldSkipSplitForSmallTable", arg0, arg1)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// ShouldSkipSplitForSmallTable indicates an expected call of ShouldSkipSplitForSmallTable.
+func (mr *MockIndexSpanSplitterMockRecorder) ShouldSkipSplitForSmallTable(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ShouldSkipSplitForSmallTable", reflect.TypeOf((*MockIndexSpanSplitter)(nil).ShouldSkipSplitForSmallTable), arg0, arg1)
 }
 
 // MockPeriodicProgressFlusher is a mock of PeriodicProgressFlusher interface.

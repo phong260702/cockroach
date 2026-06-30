@@ -33,8 +33,9 @@ import (
 )
 
 var (
-	logRaftRecvQueueFullEvery = log.Every(1 * time.Second)
-	logRaftSendQueueFullEvery = log.Every(1 * time.Second)
+	logRaftRecvQueueFullEvery    = log.Every(1 * time.Second)
+	logRaftSendQueueFullEvery    = log.Every(1 * time.Second)
+	logReplicaRemovalFailedEvery = log.Every(1 * time.Second)
 )
 
 type raftRequestInfo struct {
@@ -640,7 +641,12 @@ func (s *Store) HandleRaftResponse(
 
 				repl.mu.Unlock()
 				nextReplicaID := tErr.ReplicaID + 1
-				return s.removeReplicaRaftMuLocked(ctx, repl, nextReplicaID, "received ReplicaTooOldError")
+				if err := s.removeReplicaRaftMuLocked(ctx, repl, nextReplicaID, "received ReplicaTooOldError"); err != nil {
+					if logReplicaRemovalFailedEvery.ShouldLog() {
+						log.KvExec.Warningf(ctx, "failed to remove replica %v: %v", repl, err)
+					}
+				}
+				return nil
 			case *kvpb.RaftGroupDeletedError:
 				if replErr != nil {
 					// RangeNotFoundErrors are expected here; nothing else is.
@@ -655,7 +661,9 @@ func (s *Store) HandleRaftResponse(
 				// also mean that it is so far behind it no longer knows where any of the
 				// other replicas are (#23994). Add it to the replica GC queue to do a
 				// proper check.
-				s.replicaGCQueue.AddAsync(ctx, repl, replicaGCPriorityDefault)
+				if !s.TestingKnobs().DisableReplicaGCQueueAddOnRaftGroupDeleted {
+					s.replicaGCQueue.AddAsync(ctx, repl, replicaGCPriorityDefault)
+				}
 			case *kvpb.StoreNotFoundError:
 				log.KvExec.Warningf(ctx, "raft error: node %d claims to not contain store %d for replica %s: %s",
 					resp.FromReplica.NodeID, resp.FromReplica.StoreID, resp.FromReplica, val)
@@ -1180,6 +1188,11 @@ func (s *Store) updateCapacityGauges(ctx context.Context) error {
 	s.metrics.Capacity.Update(desc.Capacity.Capacity)
 	s.metrics.Available.Update(desc.Capacity.Available)
 	s.metrics.Used.Update(desc.Capacity.Used)
+
+	if du, err := s.TODOBothEngines().WALFailoverDiskUsage(); err == nil {
+		s.metrics.WALFailoverSecondaryDiskCapacity.Update(int64(du.TotalBytes))
+		s.metrics.WALFailoverSecondaryDiskAvailable.Update(int64(du.AvailBytes))
+	}
 
 	return nil
 }

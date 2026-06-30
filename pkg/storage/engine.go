@@ -646,6 +646,18 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after it returns.
 	ClearUnversioned(key roachpb.Key, opts ClearOptions) error
+	// SingleClearUnversioned removes an unversioned item from the db using a
+	// Pebble SingleDelete. It has the same purpose as ClearUnversioned but uses
+	// SingleDelete which is more efficient when the caller can guarantee that
+	// the key has been Set exactly once since the last deletion.
+	//
+	// WARNING: using this on a key that has been Set multiple times without an
+	// intervening delete will not fully remove the key — it only cancels the
+	// most recent Set, leaving older Sets visible. See the Pebble SingleDelete
+	// documentation for the full contract.
+	//
+	// It is safe to modify the contents of the arguments after it returns.
+	SingleClearUnversioned(key roachpb.Key) error
 	// ClearEngineKey removes the given point key from the engine. It does not
 	// affect range keys.  Note that clear actually removes entries from the
 	// storage engine. This is a general-purpose and low-level method that should
@@ -911,7 +923,8 @@ type DurabilityRequirement int8
 const (
 	// StandardDurability is what should normally be used.
 	StandardDurability DurabilityRequirement = iota
-	// GuaranteedDurability is an advanced option (only for raftLogTruncator).
+	// GuaranteedDurability is an advanced option (only for raftLogTruncator
+	// and WAGTruncator).
 	GuaranteedDurability
 )
 
@@ -923,6 +936,9 @@ type Engine interface {
 	Attrs() roachpb.Attributes
 	// Capacity returns capacity details for the engine's available storage.
 	Capacity() (roachpb.StoreCapacity, error)
+	// WALFailoverDiskUsage returns disk usage for the WAL failover secondary
+	// volume. Returns vfs.ErrUnsupported if WAL failover is not configured.
+	WALFailoverDiskUsage() (vfs.DiskUsage, error)
 	// Properties returns the low-level properties for the engine's underlying storage.
 	Properties() roachpb.StoreProperties
 	// ProfileSeparatedValueRetrievals collects a profile of the engine's
@@ -1180,6 +1196,11 @@ type WriteBatch interface {
 	CommitNoSyncWait() error
 	// SyncWait waits for the disk write initiated by a call to CommitNoSyncWait
 	// to complete.
+	//
+	// An error means the WAL write or fsync failed; the data was already applied
+	// to the memtable and is visible, but durability is not guaranteed. After an
+	// error the batch must not be reused and the caller should treat the error
+	// as fatal.
 	SyncWait() error
 	// Empty returns whether the batch has been written to or not.
 	Empty() bool
@@ -1974,6 +1995,7 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	intents *[]roachpb.Intent,
 	maxLockConflicts int64,
 	targetLockConflictBytes int64,
+	preferDistinctTxns bool,
 ) (needIntentHistory bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -2017,6 +2039,16 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	var meta enginepb.MVCCMetadata
 	var ok bool
 	intentSize := int64(0)
+	// When preferDistinctTxns is set, we skip intents from transactions we've
+	// already collected, maximizing the number of distinct conflicting txns
+	// discovered within the maxLockConflicts budget.
+	// TODO(mira): consider collecting the first and last intent per transaction
+	// so that range resolve requests can be constructed more precisely, rather
+	// than widening to the full request span.
+	var seenTxns map[uuid.UUID]struct{}
+	if preferDistinctTxns {
+		seenTxns = make(map[uuid.UUID]struct{})
+	}
 	for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: ltStart}); ok; ok, err = iter.NextEngineKey() {
 		if maxLockConflicts != 0 && int64(len(*intents)) >= maxLockConflicts {
 			// Return early if we're done accumulating intents; make no claims about
@@ -2071,6 +2103,12 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 		}
 		if intentConflicts := meta.Timestamp.ToTimestamp().LessEq(ts); !intentConflicts {
 			continue
+		}
+		if seenTxns != nil {
+			if _, seen := seenTxns[meta.Txn.ID]; seen {
+				continue
+			}
+			seenTxns[meta.Txn.ID] = struct{}{}
 		}
 		key, err := iter.EngineKey()
 		if err != nil {

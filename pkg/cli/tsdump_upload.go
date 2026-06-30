@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/yamlutil"
 	"github.com/cockroachdb/errors"
+	"github.com/klauspost/compress/zstd"
 	"go.yaml.in/yaml/v4"
 )
 
@@ -43,6 +44,7 @@ const (
 	UploadStatusPartialSuccess = "Partial Success"
 	UploadStatusFailure        = "Failed"
 	nodeKey                    = "node_id"
+	regionKey                  = "region"
 )
 
 var (
@@ -61,6 +63,7 @@ var (
 		"tpl_var_cluster=%s&tpl_var_upload_id=%s&tpl_var_upload_day=%d&tpl_var_upload_month=%d&tpl_var_upload_year=%d&from_ts=%d&to_ts=%d"
 	zipFileSignature            = []byte{0x50, 0x4B, 0x03, 0x04}
 	gzipFileSignature           = []byte{0x1f, 0x8b}
+	zstdFileSignature           = []byte{0x28, 0xB5, 0x2F, 0xFD}
 	logMessageFormat            = "tsdump upload to datadog is partially failed for metric: %s"
 	partialFailureMessageFormat = "The Tsdump upload to Datadog succeeded but %d metrics partially failed to upload." +
 		" These failures can be due to transient network errors.\nMetrics:\n%s\n" +
@@ -75,6 +78,17 @@ var (
 		"COUNTER": datadogV2.METRICINTAKETYPE_COUNT.Ptr(),
 	}
 	prometheusNameReplaceRE = regexp.MustCompile("^[^a-zA-Z_:]|[^a-zA-Z0-9_:]")
+
+	// tsdumpMetricNameOverrides provides name overrides for metrics whose
+	// Datadog name from the auto-generated mapping conflicts with the same
+	// metric emitted through a different ingestion pipeline. For example,
+	// sys.uptime is emitted as a gauge via OTel but as a count via tsdump;
+	// Datadog requires a single type per metric name, so tsdump renames it
+	// to sys.uptime.count.
+	tsdumpMetricNameOverrides = map[string]string{
+		"sys_uptime": "sys.uptime.count",
+	}
+
 	// Skip patterns - metrics that we haven't included for historical reasons
 	skipPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`^auth_`),
@@ -108,8 +122,9 @@ type FailedRequestsFile struct {
 	Requests []FailedRequest `json:"requests"`
 }
 
-// GapFillProcessor interpolates 30-minute resolution counter metrics to 10-second resolution
+// GapFillProcessor interpolates higher-resolution counter metrics to 10-second resolution
 // by filling gaps with zero values while preserving the original data points.
+// Supports both 30-minute (1800s) and 1-minute (60s) resolution metrics.
 type GapFillProcessor struct{}
 
 func NewGapFillProcessor() *GapFillProcessor {
@@ -122,19 +137,25 @@ type BaseMappingsYAML struct {
 	LegacyMetrics             map[string]string `yaml:"legacy_metrics"`
 }
 
-// processCounterMetric interpolates 30-minute resolution counter metrics to 10-second resolution.
-// It checks if the metric is a counter type with 30-minute interval (1800 seconds) and converts
-// it to 10-second resolution by filling gaps with zero values between original data points.
+// processCounterMetric interpolates counter metrics to 10-second resolution.
+// It checks if the metric is a counter type with 30-minute (1800s) or 1-minute (60s) interval
+// and converts it to 10-second resolution by filling gaps with zero values between data points.
 func (gfp *GapFillProcessor) processCounterMetric(series *datadogV2.MetricSeries) error {
 	// Only process counter metrics
 	if series.Type == nil || *series.Type != datadogV2.METRICINTAKETYPE_COUNT {
 		return nil
 	}
 
-	// Only process 30-minute resolution metrics (1800 seconds)
-	if series.Interval == nil || *series.Interval != 1800 {
+	// Skip if interval is nil or already at 10-second target resolution.
+	// Only 60-second (child metrics) and 1800-second (30-min rollups) need gap-filling.
+	if series.Interval == nil || *series.Interval == 10 {
 		return nil
 	}
+
+	interval := *series.Interval
+
+	// Calculate the number of 10-second intervals to fill (e.g. 6 points for 60s, 180 points for 1800s)
+	pointsPerInterval := int(interval / 10)
 
 	// If no points or only one point, nothing to interpolate
 	if len(series.Points) <= 1 {
@@ -150,27 +171,26 @@ func (gfp *GapFillProcessor) processCounterMetric(series *datadogV2.MetricSeries
 		currentValue := *series.Points[i].Value
 		currentTimestamp := *series.Points[i].Timestamp
 
-		// Distribute the delta value across 180 points (1800s / 10s = 180)
-		distributedValue := currentValue / 180.0
+		// For COUNT metrics: distribute the value across all points in the interval
+		distributedValue := currentValue / float64(pointsPerInterval)
 
 		newPoints = append(newPoints, datadogV2.MetricPoint{
 			Timestamp: datadog.PtrInt64(currentTimestamp),
 			Value:     datadog.PtrFloat64(distributedValue),
 		})
 
-		// Add 179 zero points (10-second intervals) between current and next
-		for j := 1; j < 180; j++ {
+		// Add (pointsPerInterval - 1) zero points (10-second intervals) between current and next
+		for j := 1; j < pointsPerInterval; j++ {
 			// We are adding delta of 0 so that same distributed value is getting published
 			// across all points. This would help us to perform roll ups with 10 seconds
-			// for metrics with 30 minute intervals.
-			// metric value = (metric value/180) * 180
+			// for metrics with higher intervals.
+			// metric value = (metric value/pointsPerInterval) * pointsPerInterval
 			interpolatedTimestamp := currentTimestamp + int64(j*10)
 			newPoints = append(newPoints, datadogV2.MetricPoint{
 				Timestamp: datadog.PtrInt64(interpolatedTimestamp),
 				Value:     datadog.PtrFloat64(0.0),
 			})
 		}
-
 	}
 
 	// Update the series with new points and 10-second interval
@@ -204,6 +224,7 @@ type datadogWriter struct {
 	threshold         int
 	uploadTime        time.Time
 	storeToNodeMap    map[string]string
+	nodeToRegionMap   map[string]string
 	metricTypeMap     map[string]string
 	noOfUploadWorkers int
 	// isPartialUploadOfFailedRequests indicates whether are we retrying failed requests
@@ -220,6 +241,17 @@ type datadogWriter struct {
 	gapFillProcessor *GapFillProcessor
 	// metricsNameMap maps metric names to their Datadog format
 	metricsNameMap map[string]string
+	// minDataTimestamp and maxDataTimestamp track the actual time range of the
+	// tsdump data. These are used to generate a dashboard URL that reflects the
+	// real data window rather than a generic "now - 30 days".
+	// minDataTimestamp is offset by the smallest observed interval so the
+	// dashboard starts just past the first data point, whose cumulative counter
+	// value would otherwise appear as a misleading spike.
+	minDataTimestamp time.Time
+	maxDataTimestamp time.Time
+	// minInterval tracks the smallest data resolution seen across all series,
+	// used to offset the dashboard from_ts past the initial spike.
+	minInterval time.Duration
 }
 
 func makeDatadogWriter(
@@ -286,6 +318,7 @@ func makeDatadogWriter(
 		threshold:                       threshold,
 		uploadTime:                      currentTime,
 		storeToNodeMap:                  make(map[string]string),
+		nodeToRegionMap:                 make(map[string]string),
 		metricTypeMap:                   metricTypeMap,
 		noOfUploadWorkers:               noOfUploadWorkers,
 		isPartialUploadOfFailedRequests: isPartialUploadOfFailedRequests,
@@ -312,6 +345,56 @@ func appendTag(series *datadogV2.MetricSeries, tagKey, tagValue string) {
 	series.Tags = append(series.Tags, fmt.Sprintf("%s:%s", tagKey, tagValue))
 }
 
+// parseChildLabels parses a Prometheus-style label string and converts to Datadog tags.
+// Input format: `label1="value1", label2="value2"`
+// Output format: []string{"label1:value1", "label2:value2"}
+func parseChildLabels(labelsStr string) []string {
+	var tags []string
+	if labelsStr == "" {
+		return tags
+	}
+
+	// Split by comma and process each label
+	// Handle format: label="value", label2="value2"
+	parts := strings.Split(labelsStr, ", ")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		// Split by = to get key and value
+		eqIdx := strings.IndexByte(part, '=')
+		if eqIdx == -1 {
+			continue
+		}
+
+		key := part[:eqIdx]
+		value := part[eqIdx+1:]
+
+		// Remove quotes from value if present
+		value = strings.Trim(value, "\"")
+
+		if key != "" && value != "" {
+			tags = append(tags, fmt.Sprintf("%s:%s", key, value))
+		}
+	}
+
+	return tags
+}
+
+// hasTagKey checks if a tag with the given key already exists in the tags slice.
+// Tags are in format "key:value", so we check for "key:" prefix.
+func hasTagKey(tags []string, key string) bool {
+	prefix := key + ":"
+	for _, tag := range tags {
+		if strings.HasPrefix(tag, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, error) {
 	name, source, res, _, err := ts.DecodeDataKey(kv.Key)
 	if err != nil {
@@ -321,49 +404,99 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 	if err := kv.Value.GetProto(&idata); err != nil {
 		return nil, err
 	}
+
+	// Check if this is a child metric with labels (format: metric_name{label1="value1", label2="value2"}[-suffix])
+	// Histogram metrics may have suffixes like -p50, -p99, -avg, -count after the closing brace
+	var childLabels []string
+	isChildMetric := false
+	typeResolutionName := name
 	braceIdx := strings.IndexByte(name, '{')
 	if braceIdx != -1 {
-		// has child labels
-		// TODO(jasonlmfong): support uploading child labels
-		return nil, errors.Errorf("timeseries key with child labels: %s", name)
+		// Find the closing brace explicitly
+		closeBraceIdx := strings.IndexByte(name, '}')
+		if closeBraceIdx == -1 {
+			closeBraceIdx = len(name) - 1
+		}
+
+		// Extract base metric name, labels, and any suffix after the closing brace
+		baseName := name[:braceIdx]
+		labelsStr := name[braceIdx+1 : closeBraceIdx]
+		suffix := ""
+
+		// Extract suffix like -p50, -avg, -count, etc.
+		if closeBraceIdx < len(name)-1 {
+			suffix = name[closeBraceIdx+1:]
+		}
+
+		childLabels = parseChildLabels(labelsStr)
+
+		// Use base metric name (with suffix for histograms) for type resolution
+		typeResolutionName = baseName + suffix
+
+		// Append .child suffix to create a separate metric name for child metrics.
+		// This avoids double-counting in aggregations (parent already contains the
+		// aggregate of all children) and maintains backward compatibility with
+		// existing dashboards that query parent metrics.
+		name = baseName + suffix + ".child"
+		isChildMetric = true
 	}
 
 	series := &datadogV2.MetricSeries{
 		Metric:   name,
-		Tags:     []string{},
-		Type:     d.resolveMetricType(name),
+		Tags:     childLabels,
+		Type:     d.resolveMetricType(typeResolutionName),
 		Points:   make([]datadogV2.MetricPoint, idata.SampleCount()),
 		Interval: datadog.PtrInt64(int64(res.Duration().Seconds())), // convert from time.Duration to number of seconds.
 	}
 
+	// shouldAddTag returns true if the tag should be added. For parent metrics,
+	// tags are always added. For child metrics, skip adding if the tag already
+	// exists in childLabels to avoid duplicates.
+	shouldAddTag := func(tagKey string) bool {
+		return !isChildMetric || !hasTagKey(childLabels, tagKey)
+	}
+
 	sl := reCrStoreNode.FindStringSubmatch(name)
 	if len(sl) >= 3 {
-		// extract the node/store and metric name from the regex match.
 		key := sl[1]
 		series.Metric = sl[2]
 
+		// Resolve the node ID and tag accordingly. For "node" metrics the
+		// source is the node ID itself; for "store" metrics it is looked up
+		// via the store-to-node mapping.
+		var nodeID string
 		switch key {
 		case "node":
-			appendTag(series, nodeKey, source)
+			nodeID = source
 		case "store":
-			appendTag(series, key, source)
-			// We check the node associated with store if store to node mapping
-			// is provided as part of --store-to-node-map-file flag. If exists then
-			// emit node as tag.
-			if nodeID, ok := d.storeToNodeMap[source]; ok {
+			if shouldAddTag(key) {
+				appendTag(series, key, source)
+			}
+			nodeID = d.storeToNodeMap[source]
+		default:
+			if shouldAddTag(key) {
+				appendTag(series, key, source)
+			}
+		}
+
+		if nodeID != "" {
+			if shouldAddTag(nodeKey) {
 				appendTag(series, nodeKey, nodeID)
 			}
-		default:
-			appendTag(series, key, source)
+			if region, ok := d.nodeToRegionMap[nodeID]; ok && shouldAddTag(regionKey) {
+				appendTag(series, regionKey, region)
+			}
 		}
-	} else {
-		// add default node_id as 0 as there is no metric match for the regex.
+	} else if shouldAddTag(nodeKey) {
+		// No regex match - add default node_id:0
 		appendTag(series, nodeKey, "0")
 	}
 
 	// Convert metric name to Prometheus format and lookup in metricsNameMap
 	promName := prometheusNameReplaceRE.ReplaceAllString(series.Metric, "_")
-	if datadogName, ok := d.metricsNameMap[promName]; ok {
+	if override, ok := tsdumpMetricNameOverrides[promName]; ok {
+		series.Metric = override
+	} else if datadogName, ok := d.metricsNameMap[promName]; ok {
 		series.Metric = datadogName
 	}
 
@@ -378,6 +511,16 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 			series.Points[i].Value = datadog.PtrFloat64(idata.Samples[i].Sum)
 		}
 
+		// Track the actual time range of the tsdump data for the dashboard URL.
+		pointTS := *series.Points[i].Timestamp
+		pointTime := timeutil.Unix(pointTS, 0)
+		if d.minDataTimestamp.IsZero() || pointTime.Before(d.minDataTimestamp) {
+			d.minDataTimestamp = pointTime
+		}
+		if pointTime.After(d.maxDataTimestamp) {
+			d.maxDataTimestamp = pointTime
+		}
+
 		if !isSorted {
 			// if we already found a point out of order, we can skip further checks
 			continue
@@ -389,11 +532,17 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 		// 2. pkg/storage/pebble_merge.go sortAndDeduplicateRows/Columns shows storage merge
 		//    operations can result in out-of-order data before final sorting
 		// 3. Data from different storage slabs may be interleaved during tsdump reads
-		currentTimestamp := *series.Points[i].Timestamp
-		if i > 0 && previousTimestamp > currentTimestamp {
+		if i > 0 && previousTimestamp > pointTS {
 			isSorted = false
 		}
-		previousTimestamp = currentTimestamp
+		previousTimestamp = pointTS
+	}
+
+	// Track the smallest resolution interval across all series so we can
+	// offset the dashboard from_ts past the initial cumulative counter spike.
+	interval := res.Duration()
+	if interval > 0 && (d.minInterval == 0 || interval < d.minInterval) {
+		d.minInterval = interval
 	}
 
 	if !debugTimeSeriesDumpOpts.disableDeltaProcessing {
@@ -402,7 +551,7 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 		}
 	}
 
-	// Process gap-filling for 30-minute resolution counter metrics
+	// Process gap-filling for 30-minute and 1-minute resolution counter metrics
 	if err := d.gapFillProcessor.processCounterMetric(series); err != nil {
 		return nil, err
 	}
@@ -734,6 +883,10 @@ func (d *datadogWriter) upload(fileName string) error {
 	if metadataErr == nil && embeddedMetadata != nil {
 		d.storeToNodeMap = embeddedMetadata.StoreToNodeMap
 		fmt.Printf("Using embedded store-to-node mapping with %d entries\n", len(d.storeToNodeMap))
+		if len(embeddedMetadata.NodeToRegionMap) > 0 {
+			d.nodeToRegionMap = embeddedMetadata.NodeToRegionMap
+			fmt.Printf("Using embedded node-to-region mapping with %d entries\n", len(d.nodeToRegionMap))
+		}
 	} else {
 		// Reset the reader since we tried to read metadata. Close the file and
 		// reopen a fresh reader.
@@ -840,11 +993,8 @@ func (d *datadogWriter) upload(fileName string) error {
 	}
 
 	wg.Wait()
-	toUnixTimestamp := timeutil.Now().UnixMilli()
-	//create timestamp for T-30 days.
-	fromUnixTimestamp := toUnixTimestamp - (30 * 24 * 60 * 60 * 1000)
-	year, month, day := d.uploadTime.Date()
-	dashboardLink := fmt.Sprintf(datadogDashboardURLFormat, debugTimeSeriesDumpOpts.clusterLabel, d.uploadID, day, int(month), year, fromUnixTimestamp, toUnixTimestamp)
+
+	dashboardLink := d.buildDashboardLink()
 
 	var uploadStatus string
 	if metricsUploadState.isSingleUploadSucceeded && d.hasFailedRequestsInUpload {
@@ -959,6 +1109,32 @@ func (d *datadogWriter) upload(fileName string) error {
 	return nil
 }
 
+// buildDashboardLink returns the Datadog dashboard URL using the actual tsdump
+// data time range. from_ts is offset by the smallest observed data interval so
+// the dashboard view starts just past each metric's first data point (whose raw
+// cumulative counter value would otherwise appear as a misleading spike).
+// Falls back to a 30-day window ending at the current time when no data points
+// were processed.
+func (d *datadogWriter) buildDashboardLink() string {
+	var fromUnixTimestamp, toUnixTimestamp int64
+	if !d.minDataTimestamp.IsZero() {
+		offset := d.minInterval
+		if offset <= 0 {
+			offset = 10 * time.Second
+		}
+		fromUnixTimestamp = d.minDataTimestamp.Add(offset).UnixMilli()
+		toUnixTimestamp = d.maxDataTimestamp.UnixMilli()
+	} else {
+		now := getCurrentTime()
+		toUnixTimestamp = now.UnixMilli()
+		fromUnixTimestamp = now.Add(-30 * 24 * time.Hour).UnixMilli()
+	}
+	year, month, day := d.uploadTime.Date()
+	return fmt.Sprintf(datadogDashboardURLFormat,
+		debugTimeSeriesDumpOpts.clusterLabel, d.uploadID,
+		day, int(month), year, fromUnixTimestamp, toUnixTimestamp)
+}
+
 func (d *datadogWriter) populateNodeAndStoreMap(fileName string) {
 	file, err := os.Open(fileName)
 	if err != nil {
@@ -1025,6 +1201,13 @@ func getFileReader(fileName string) (io.Reader, error) {
 			return nil, err
 		}
 		return gzipReader, nil
+
+	case bytes.HasPrefix(buf, zstdFileSignature):
+		zstdReader, err := zstd.NewReader(file)
+		if err != nil {
+			return nil, err
+		}
+		return zstdReader, nil
 
 	default:
 		return file, nil

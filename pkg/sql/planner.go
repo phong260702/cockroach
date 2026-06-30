@@ -15,11 +15,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/repstream"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/advisorylock"
 	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
@@ -38,6 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/hints"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/prep"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
@@ -117,6 +121,9 @@ type extendedEvalContext struct {
 
 	// validateDbZoneConfig should the DB zone config on commit.
 	validateDbZoneConfig *bool
+
+	// advisoryLockManager is the manager for advisory locks.
+	advisoryLockManager *atomic.Pointer[advisorylock.Manager]
 }
 
 // copyFromExecCfg copies relevant fields from an ExecutorConfig.
@@ -202,9 +209,12 @@ type planner struct {
 		innerPlansMustUseLeafTxn int32
 	}
 
-	// monitor tracks the memory usage of txn-bound objects - for example,
-	// execution operators.
-	monitor *mon.BytesMonitor
+	// txnMon tracks the memory usage of txn-bound objects.
+	txnMon *mon.BytesMonitor
+
+	// execMon tracks the memory usage of a single query planning and execution
+	// step.
+	execMon *mon.BytesMonitor
 
 	// sessionMonitor tracks the memory of session-bound objects. It is currently
 	// only used internally for tracking SQL cursors declared using WITH HOLD.
@@ -288,6 +298,13 @@ type planner struct {
 	// instead.
 	noticeSender noticeSender
 
+	// stmtResultBuffering exposes the current statement's result writer so a
+	// side-effecting builtin can flush its results immediately and prevent
+	// transparent connExecutor rewind across the side effect. Set in
+	// execStmtInOpenState after resetPlanner; nil between statements and for
+	// the internal executor.
+	stmtResultBuffering resultBufferingDisabler
+
 	queryCacheSession querycache.Session
 
 	// evalCatalogBuiltins is used as part of the eval.Context.
@@ -356,6 +373,11 @@ func (p *planner) resumeFlowForPausablePortal(recv *DistSQLReceiver) error {
 // are set in newInternalPlanner.
 type internalPlannerParams struct {
 	collection *descs.Collection
+	// workloadID and workloadType, when set, are propagated to the
+	// planner's eval context so that DistSQL flows carry workload
+	// attribution for ASH sampling.
+	workloadID   uint64
+	workloadType workloadid.WorkloadType
 }
 
 // InternalPlannerParamsOption is an option that can be passed to
@@ -367,6 +389,20 @@ type InternalPlannerParamsOption func(*internalPlannerParams)
 func WithDescCollection(collection *descs.Collection) InternalPlannerParamsOption {
 	return func(params *internalPlannerParams) {
 		params.collection = collection
+	}
+}
+
+// WithWorkloadInfo propagates workload attribution to the planner's
+// EvalContext so that DistSQL flows carry the workload ID for ASH
+// sampling. Callers that create an internal planner outside of
+// MakeJobExecContext (e.g. job resumers that need a txn-bound planner,
+// or system tasks) should use this option to preserve attribution.
+func WithWorkloadInfo(
+	workloadID uint64, workloadType workloadid.WorkloadType,
+) InternalPlannerParamsOption {
+	return func(params *internalPlannerParams) {
+		params.workloadID = workloadID
+		params.workloadType = workloadType
 	}
 }
 
@@ -443,16 +479,21 @@ func newInternalPlanner(
 		ts = readTimestamp.GoTime()
 	}
 
-	plannerMon := mon.NewMonitor(mon.Options{
+	txnMon := mon.NewMonitor(mon.Options{
 		Name:     mon.MakeName("internal-planner." + opName),
 		CurCount: memMetrics.CurBytesCount,
 		MaxHist:  memMetrics.MaxBytesHist,
 		Settings: execCfg.Settings,
 	})
-	plannerMon.StartNoReserved(ctx, execCfg.RootMemoryMonitor)
+	txnMon.StartNoReserved(ctx, execCfg.RootMemoryMonitor)
+	execMon := mon.NewMonitor(mon.Options{
+		Name:     mon.MakeName("internal-planner.exec." + opName),
+		Settings: execCfg.Settings,
+	})
+	execMon.StartNoReserved(ctx, txnMon)
 
 	p := &planner{execCfg: execCfg, datumAlloc: &tree.DatumAlloc{}}
-	p.resetPlanner(ctx, txn, sd, plannerMon, nil /* sessionMon */)
+	p.resetPlanner(ctx, txn, sd, txnMon, execMon, nil /* sessionMon */)
 
 	smi := sessionmutator.MakeSessionDataMutatorIterator(
 		sds,
@@ -500,9 +541,14 @@ func newInternalPlanner(
 	p.schemaResolver.sessionDataStack = sds
 	p.schemaResolver.txn = p.txn
 	p.schemaResolver.authAccessor = p
-	p.evalCatalogBuiltins.Init(execCfg.Codec, p.txn, p.Descriptors())
+	p.evalCatalogBuiltins.Init(execCfg.Codec, p.txn, p.Descriptors(), p)
 	p.extendedEvalCtx.CatalogBuiltins = &p.evalCatalogBuiltins
 	p.statsCollector = &sslocal.StatsCollector{}
+
+	if params.workloadID != 0 {
+		p.extendedEvalCtx.WorkloadID = params.workloadID
+		p.extendedEvalCtx.WorkloadType = params.workloadType
+	}
 
 	return p, func() {
 		// Note that we capture ctx here. This is only valid as long as we create
@@ -518,8 +564,9 @@ func newInternalPlanner(
 			p.Descriptors().ReleaseAll(ctx)
 		}
 
-		// Stop the memory monitor.
-		plannerMon.Stop(ctx)
+		// Stop the memory monitors.
+		execMon.Stop(ctx)
+		txnMon.Stop(ctx)
 	}
 }
 
@@ -615,9 +662,33 @@ func (p *planner) Descriptors() *descs.Collection {
 	return p.extendedEvalCtx.Descs
 }
 
-// Mon is part of the eval.Planner interface.
-func (p *planner) Mon() *mon.BytesMonitor {
-	return p.monitor
+// TxnMon is part of the eval.Planner interface.
+func (p *planner) TxnMon() *mon.BytesMonitor {
+	return p.txnMon
+}
+
+// ExecMon is part of the eval.Planner interface.
+func (p *planner) ExecMon() *mon.BytesMonitor {
+	return p.execMon
+}
+
+// MaybeResolveSystemRoleOID is part of the eval.Planner interface.
+func (p *planner) MaybeResolveSystemRoleOID(ctx context.Context, roleOID oid.Oid) (string, bool) {
+	h := makeOidHasher()
+	// Fast-path for the most common built-in role owners to minimize virtual table scans.
+	if roleOID == h.UserOid(username.NodeUserName()).Oid {
+		return username.NodeUser, true
+	}
+	if roleOID == h.UserOid(username.RootUserName()).Oid {
+		return username.RootUser, true
+	}
+	if roleOID == h.UserOid(username.AdminRoleName()).Oid {
+		return username.AdminRole, true
+	}
+	if roleOID == h.UserOid(username.PublicRoleName()).Oid {
+		return username.PublicRole, true
+	}
+	return "", false
 }
 
 // ExecCfg implements the PlanHookState interface.
@@ -674,10 +745,11 @@ func (p *planner) InternalSQLTxn() descs.Txn {
 		ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
 		ie.SetSessionData(p.SessionData())
 		ie.extraTxnState = &extraTxnState{
-			txn:                p.Txn(),
-			descCollection:     p.Descriptors(),
-			jobs:               p.extendedEvalCtx.jobs,
-			schemaChangerState: p.extendedEvalCtx.SchemaChangerState,
+			txn:                 p.Txn(),
+			descCollection:      p.Descriptors(),
+			jobs:                p.extendedEvalCtx.jobs,
+			schemaChangerState:  p.extendedEvalCtx.SchemaChangerState,
+			advisoryLockManager: p.extendedEvalCtx.advisoryLockManager,
 		}
 		p.internalSQLTxn.init(p.txn, ie)
 	}
@@ -706,7 +778,7 @@ func (p *planner) regionsProvider() *regions.Provider {
 }
 
 func (p *planner) User() username.SQLUsername {
-	return p.SessionData().User()
+	return p.EvalContext().EffectiveUser()
 }
 
 // TemporarySchemaName implements scbuildstmt.TemporarySchemaProvider.
@@ -846,6 +918,11 @@ func (p *planner) ExecutorConfig() interface{} {
 	return p.execCfg
 }
 
+// TimeSeriesQuerier implements the eval.Planner interface.
+func (p *planner) TimeSeriesQuerier() eval.TimeSeriesQuerier {
+	return p.execCfg.TimeSeriesQuerier
+}
+
 // statementPreparer is an interface used when deserializing a session in order
 // to prepare statements.
 type statementPreparer interface {
@@ -974,14 +1051,16 @@ func (p *planner) resetPlanner(
 	ctx context.Context,
 	txn *kv.Txn,
 	sd *sessiondata.SessionData,
-	plannerMon *mon.BytesMonitor,
+	txnMon *mon.BytesMonitor,
+	execMon *mon.BytesMonitor,
 	sessionMon *mon.BytesMonitor,
 ) {
 	p.txn = txn
 	p.stmt = Statement{}
 	p.instrumentation = instrumentationHelper{}
 	p.curPlan = planTop{}
-	p.monitor = plannerMon
+	p.txnMon = txnMon
+	p.execMon = execMon
 	p.sessionMonitor = sessionMon
 
 	p.cancelChecker.Reset(ctx)
@@ -1001,7 +1080,7 @@ func (p *planner) resetPlanner(
 
 	p.schemaResolver.txn = txn
 	p.schemaResolver.sessionDataStack = p.EvalContext().SessionDataStack
-	p.evalCatalogBuiltins.Init(p.execCfg.Codec, txn, p.Descriptors())
+	p.evalCatalogBuiltins.Init(p.execCfg.Codec, txn, p.Descriptors(), p)
 	p.skipDescriptorCache = false
 	p.typeResolutionDbID = descpb.InvalidID
 	p.pausablePortal = nil
@@ -1148,9 +1227,75 @@ func (p *planner) ProcessVectorIndexFixups(
 
 // InsertStatementHint is part of the eval.Planner interface.
 func (p *planner) InsertStatementHint(
-	ctx context.Context, statementFingerprint string, hint hintpb.StatementHintUnion,
+	ctx context.Context,
+	statementFingerprint string,
+	hint hintpb.StatementHintUnion,
+	optDatabase string,
+) (int64, int64, error) {
+	txn := p.InternalSQLTxn()
+	hintID, err := hints.InsertHintIntoDB(
+		ctx, p.execCfg.Settings, txn, statementFingerprint, hint, optDatabase,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	numOverridden, err := hints.CountConflictingHintsInDB(
+		ctx, p.execCfg.Settings, txn, statementFingerprint, hint, hintID,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	return hintID, numOverridden, nil
+}
+
+// DeleteStatementHint is part of the eval.Planner interface.
+func (p *planner) DeleteStatementHint(
+	ctx context.Context, rowID int64, statementFingerprint string, optDatabase string,
+) ([]int64, []string, [][]byte, error) {
+	return hints.DeleteHintFromDB(ctx, p.InternalSQLTxn(), rowID, statementFingerprint, optDatabase)
+}
+
+// SetStatementHintEnabled is part of the eval.Planner interface.
+func (p *planner) SetStatementHintEnabled(
+	ctx context.Context, rowID int64, statementFingerprint string, enabled bool, optDatabase string,
 ) (int64, error) {
-	return hints.InsertHintIntoDB(ctx, p.InternalSQLTxn(), statementFingerprint, hint)
+	return hints.SetHintEnabledInDB(
+		ctx, p.execCfg.Settings, p.InternalSQLTxn(), rowID, statementFingerprint, enabled, optDatabase,
+	)
+}
+
+// ValidateSessionVariableHint is part of the eval.Planner interface.
+func (p *planner) ValidateSessionVariableHint(
+	ctx context.Context, varName, varValue string, safeUpdates bool,
+) error {
+	v, ok := varGen[varName]
+	if !ok {
+		return pgerror.Newf(pgcode.UndefinedObject, "unrecognized session variable: %q", varName)
+	}
+	if v.Set == nil && v.SetWithPlanner == nil {
+		return pgerror.Newf(pgcode.InvalidParameterValue,
+			"session variable %q is read-only and cannot be set in a statement hint", varName)
+	}
+	// Validate the value by attempting a dry-run set on a temporary copy of
+	// the session data. This catches invalid values (e.g. non-numeric strings
+	// for integer variables) at hint creation time rather than at execution
+	// time, where errors are silently skipped.
+	if v.Set != nil {
+		sdCopy := *p.SessionData()
+		tempMutator := sessionmutator.SessionDataMutator{
+			Data:                   &sdCopy,
+			SessionDataMutatorBase: p.sessionDataMutatorIterator.SessionDataMutatorBase,
+		}
+		if err := v.Set(ctx, tempMutator, varValue); err != nil {
+			return pgerror.Wrapf(err, pgcode.InvalidParameterValue,
+				"invalid value for session variable %q", varName)
+		}
+	}
+	// For SetWithPlanner-only variables, we skip dry-run validation because
+	// SetWithPlanner requires a fully initialized planner and may have side
+	// effects (e.g. sending client notices). The value will be validated at
+	// hint application time.
+	return nil
 }
 
 // UsingHintInjection is part of the eval.Planner interface.
@@ -1161,6 +1306,87 @@ func (p *planner) UsingHintInjection() bool {
 // LogEvent is part of the eval.Planner interface.
 func (p *planner) LogEvent(ctx context.Context, event interface{}) error {
 	return p.logEvent(ctx, 0 /* descID */, event.(logpb.EventPayload))
+}
+
+// AdvisoryXactLock is part of the eval.Planner interface.
+func (p *planner) AdvisoryXactLock(ctx context.Context, key int64, shared bool) error {
+	_, err := p.advisoryXactLockImpl(ctx, shared, func(dbID descpb.ID) advisorylock.LockKey {
+		return advisorylock.MakeLockKeyInt64(dbID, key)
+	}, true /* wait */)
+	return err
+}
+
+// AdvisoryXactLockInt4 is part of the eval.Planner interface.
+func (p *planner) AdvisoryXactLockInt4(ctx context.Context, key1, key2 int32, shared bool) error {
+	_, err := p.advisoryXactLockImpl(ctx, shared, func(dbID descpb.ID) advisorylock.LockKey {
+		return advisorylock.MakeLockKeyInt32(dbID, key1, key2)
+	}, true /* wait */)
+	return err
+}
+
+// AdvisoryTryXactLock is part of the eval.Planner interface.
+func (p *planner) AdvisoryTryXactLock(ctx context.Context, key int64, shared bool) (bool, error) {
+	return p.advisoryXactLockImpl(ctx, shared, func(dbID descpb.ID) advisorylock.LockKey {
+		return advisorylock.MakeLockKeyInt64(dbID, key)
+	}, false /* wait */)
+}
+
+// AdvisoryTryXactLockInt4 is part of the eval.Planner interface.
+func (p *planner) AdvisoryTryXactLockInt4(
+	ctx context.Context, key1, key2 int32, shared bool,
+) (bool, error) {
+	return p.advisoryXactLockImpl(ctx, shared, func(dbID descpb.ID) advisorylock.LockKey {
+		return advisorylock.MakeLockKeyInt32(dbID, key1, key2)
+	}, false /* wait */)
+}
+
+func (p *planner) advisoryXactLockImpl(
+	ctx context.Context, shared bool, mk func(descpb.ID) advisorylock.LockKey, wait bool,
+) (bool, error) {
+	if !p.execCfg.Settings.Version.IsActive(ctx, clusterversion.V26_3_AddAdvisoryLocksTable) {
+		return false, pgerror.Newf(pgcode.FeatureNotSupported,
+			"advisory locks are not available until the cluster upgrade to v26.3 is finalized")
+	}
+	if p.txn == nil || !p.txn.IsOpen() {
+		return false, pgerror.New(pgcode.NoActiveSQLTransaction,
+			"advisory locks are only available in a transaction")
+	}
+	mgr := p.extendedEvalCtx.advisoryLockManager.Load()
+	if mgr == nil {
+		return false, errors.AssertionFailedf("advisory lock manager not initialized")
+	}
+	dbName := p.CurrentDatabase()
+	if dbName == "" {
+		return false, pgerror.New(pgcode.InvalidName, "no database is set")
+	}
+	db, err := p.Descriptors().ByName(p.txn).Get().Database(ctx, dbName)
+	if err != nil {
+		return false, err
+	}
+	mode := advisorylock.LockModeExclusive
+	if shared {
+		mode = advisorylock.LockModeShare
+	}
+	lockKey := mk(db.GetID())
+	// When wait is true, honor the session's lock_timeout (if set). The non-
+	// waiting (try_*) variants ignore lockTimeout entirely on the KV side
+	// because WaitPolicy_Error short-circuits before any waiting happens.
+	lockTimeout := p.SessionData().LockTimeout
+	err = mgr.AcquireInTxn(ctx, p.txn, lockKey, mode, wait /* wait */, lockTimeout /* lockTimeout */)
+	if err != nil {
+		if !wait && errors.Is(err, advisorylock.LockIsNotAvailableErr) {
+			return false, nil
+		}
+		return false, err
+	}
+	// The acquire is a visible side effect; flush the statement's result so
+	// the connExecutor cannot transparently rewind past it on a subsequent
+	// serializable push (e.g. a deadlock break would otherwise be masked by
+	// auto-retry and the losing client would see no error).
+	if w := p.stmtResultBuffering; w != nil {
+		w.DisableBuffering()
+	}
+	return true, nil
 }
 
 // GetHintIDs is part of the eval.Planner interface.

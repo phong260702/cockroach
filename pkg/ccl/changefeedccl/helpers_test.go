@@ -11,7 +11,6 @@ import (
 	gosql "database/sql"
 	gojson "encoding/json"
 	"fmt"
-	"maps"
 	"math"
 	"math/rand"
 	"net/url"
@@ -34,18 +33,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl" // allow locality-related mutations
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobfrontier"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -485,13 +484,21 @@ func withTimeout(
 	if jobFeed, ok := f.(cdctest.EnterpriseTestFeed); ok {
 		jobID = jobFeed.JobID()
 	}
-	return timeutil.RunWithTimeout(context.Background(),
+	err := timeutil.RunWithTimeout(context.Background(),
 		redact.Sprintf("withTimeout-%d", jobID), timeout,
 		func(ctx context.Context) error {
 			defer stopFeedWhenDone(ctx, f)()
 			return fn(ctx)
 		},
 	)
+	if err != nil {
+		var timeoutErr *timeutil.TimeoutError
+		if errors.As(err, &timeoutErr) {
+			dumpFile := testutils.WriteGoroutineDump()
+			return errors.WithDetail(err, fmt.Sprintf("goroutine dump: %s", dumpFile))
+		}
+	}
+	return err
 }
 
 func assertPayloads(t testing.TB, f cdctest.TestFeed, expected []string) {
@@ -937,8 +944,7 @@ func requireNoFeedsFail(t *testing.T) (fn updateKnobsFn) {
 		`was truncated`,
 		`connection refused`,
 		`connection reset by peer`,
-		`knobs.RaiseRetryableError`,
-		`test error`,
+		`test .*error`,
 		`context canceled`,
 	}
 	shouldIgnoreErr := func(err error) bool {
@@ -1070,13 +1076,15 @@ var jobRecordRetryOpts = retry.Options{
 	MaxRetries:     10,
 }
 
-// waitForCheckpoint waits for the specified job to have a non-empty checkpoint
-func waitForCheckpoint(t *testing.T, jf cdctest.EnterpriseTestFeed, jr *jobs.Registry) {
+// waitForCheckpoint waits for the persisted frontier to contain spans above
+// the minimum timestamp, indicating that some spans have advanced ahead of
+// others (i.e. a checkpoint exists).
+func waitForCheckpoint(t *testing.T, jf cdctest.EnterpriseTestFeed, idb isql.DB) {
 	for r := retry.Start(jobRecordRetryOpts); ; {
 		t.Log("waiting for checkpoint")
-		progress := loadProgress(t, jf, jr)
-		if p := progress.GetChangefeed(); p != nil && !p.SpanLevelCheckpoint.IsEmpty() {
-			t.Logf("read checkpoint: %#v", p.SpanLevelCheckpoint)
+		spans := loadCheckpointSpans(t, jf.JobID(), idb)
+		if len(spans) > 0 {
+			t.Logf("read checkpoint: %v", spans)
 			return
 		}
 		if !r.Next() {
@@ -1113,30 +1121,66 @@ func loadProgress(
 	return job.Progress()
 }
 
-// loadCheckpoint loads the span-level checkpoint from the job progress.
-func loadCheckpoint(t *testing.T, progress jobspb.Progress) *jobspb.TimestampSpansMap {
+// loadFrontierSpans loads the frontier checkpoint from the job_info table.
+func loadFrontierSpans(t *testing.T, jobID jobspb.JobID, idb isql.DB) []jobspb.ResolvedSpan {
 	t.Helper()
-	changefeedProgress := progress.GetChangefeed()
-	if changefeedProgress == nil {
+	ctx := context.Background()
+	var spans []jobspb.ResolvedSpan
+	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		var found bool
+		var err error
+		spans, found, err = jobfrontier.GetResolvedSpans(ctx, txn, jobID, coordinatorFrontierName)
+		if err != nil {
+			return err
+		}
+		if !found {
+			spans = nil
+		}
 		return nil
+	}))
+	if len(spans) > 0 {
+		t.Logf("found frontier checkpoint: %v", spans)
 	}
-	spanLevelCheckpoint := changefeedProgress.SpanLevelCheckpoint
-	if spanLevelCheckpoint.IsEmpty() {
-		return nil
-	}
-	t.Logf("found checkpoint: %v", maps.Collect(spanLevelCheckpoint.All()))
-	return spanLevelCheckpoint
+	return spans
 }
 
-// makeSpanGroupFromCheckpoint makes a span group containing all the spans
-// contained in a span-level checkpoint.
-func makeSpanGroupFromCheckpoint(
-	t *testing.T, checkpoint *jobspb.TimestampSpansMap,
-) roachpb.SpanGroup {
+// loadCheckpointSpans loads frontier spans that represent checkpoint progress
+// above the effective highwater (the minimum frontier timestamp). This is
+// analogous to the old span-level checkpoint, which only contained spans
+// ahead of the highwater.
+func loadCheckpointSpans(t *testing.T, jobID jobspb.JobID, idb isql.DB) []jobspb.ResolvedSpan {
+	t.Helper()
+	allSpans := loadFrontierSpans(t, jobID, idb)
+	if len(allSpans) == 0 {
+		return nil
+	}
+	// Find the minimum timestamp across all spans (the effective highwater).
+	minTS := allSpans[0].Timestamp
+	for _, rs := range allSpans[1:] {
+		if rs.Timestamp.Less(minTS) {
+			minTS = rs.Timestamp
+		}
+	}
+	// Return only spans strictly above the minimum.
+	var result []jobspb.ResolvedSpan
+	for _, rs := range allSpans {
+		if minTS.Less(rs.Timestamp) {
+			result = append(result, rs)
+		}
+	}
+	if len(result) > 0 {
+		t.Logf("found checkpoint spans (above min %s): %v", minTS, result)
+	}
+	return result
+}
+
+// makeSpanGroupFromFrontierSpans makes a span group containing all the spans
+// contained in a frontier checkpoint.
+func makeSpanGroupFromFrontierSpans(t *testing.T, spans []jobspb.ResolvedSpan) roachpb.SpanGroup {
 	t.Helper()
 	var spanGroup roachpb.SpanGroup
-	for _, sp := range checkpoint.All() {
-		spanGroup.Add(sp...)
+	for _, rs := range spans {
+		spanGroup.Add(rs.Span)
 	}
 	return spanGroup
 }
@@ -1147,7 +1191,8 @@ type optOutOfMetamorphicEnrichedEnvelope struct {
 	reason string
 }
 
-var forceDBLevelChangefeed = metamorphic.ConstantWithTestBool("changefeed-force-database-level", false)
+// TODO(#154053): Add back metamorphic testing for db-level changefeeds once it's enabled.
+var forceDBLevelChangefeed = false
 
 type optOutOfMetamorphicDBLevelChangefeed struct {
 	reason string
@@ -1294,30 +1339,20 @@ func maybeForceDBLevelChangefeed(
 	return create, args, nil
 }
 
-// isUsingDefaultInitialScan returns true if the changefeed is does not specify
+// isUsingDefaultInitialScan returns true if the changefeed does not specify
 // an initial scan type and does not have a cursor, resulting in the default
 // behavior of the initial scan.
 func isUsingDefaultInitialScan(opts []tree.KVOption) bool {
-	initialScanType := ""
-	hasCursor := false
 	for _, opt := range opts {
-		key := opt.Key.String()
-		if strings.EqualFold(key, "initial_scan") {
-			if opt.Value != nil {
-				initialScanType = opt.Value.String()
-			}
-		}
-		if strings.EqualFold(key, "no_initial_scan") {
-			initialScanType = "'no'"
-		}
-		if strings.EqualFold(key, "initial_scan_only") {
-			initialScanType = "'only'"
-		}
-		if strings.EqualFold(key, "cursor") {
-			hasCursor = true
+		switch strings.ToLower(opt.Key.String()) {
+		case "cursor":
+			return false
+		case "initial_scan", "no_initial_scan", "initial_scan_only":
+			return false
 		}
 	}
-	return initialScanType == "" && !hasCursor
+
+	return true
 }
 
 func maybeForceEnrichedEnvelope(
@@ -1343,8 +1378,7 @@ func maybeForceEnrichedEnvelope(
 	// - sinkless feeds can't be tracked by job id
 	// - sql & pulsar are not supported
 	// - cloudstorage uses parquet sometimes which complicates things
-	// - pubsub feeds have an issue with leaking goroutines; see #144102
-	case *sinklessFeedFactory, *tableFeedFactory, *pulsarFeedFactory, *cloudFeedFactory, *pubsubFeedFactory:
+	case *sinklessFeedFactory, *tableFeedFactory, *pulsarFeedFactory, *cloudFeedFactory:
 		t.Logf("did not force enriched envelope for %s because %T is not supported", create, f)
 		return create, args, false, nil
 	}
@@ -1897,12 +1931,11 @@ func verifyLogsWithEmittedBytesAndMessages(
 	t *testing.T,
 	jobID jobspb.JobID,
 	logSpy *logtestutils.StructuredLogSpy[eventpb.ChangefeedEmittedBytes],
-	sv *settings.Values,
 	interval int64,
 	closing bool,
 ) {
 	testutils.SucceedsSoon(t, func() error {
-		emittedBytesLogs := logSpy.GetUnreadLogs(getChangefeedLoggingChannel(sv))
+		emittedBytesLogs := logSpy.GetUnreadLogs(getChangefeedLoggingChannel())
 		if len(emittedBytesLogs) == 0 {
 			return errors.New("no logs found")
 		}

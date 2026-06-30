@@ -79,12 +79,17 @@ var MinLeaseTransferStatsDuration = 30 * time.Second
 // EnableLoadBasedLeaseRebalancing controls whether lease rebalancing is done
 // via the new heuristic based on request load and latency or via the simpler
 // approach that purely seeks to balance the number of leases per node evenly.
+//
+// This setting is retired and can be removed once the multi-metric allocator
+// cannot be disabled (as having the multi-metric allocator enabled already
+// implicitly disables this setting).
 var EnableLoadBasedLeaseRebalancing = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.allocator.load_based_lease_rebalancing.enabled",
-	"set to enable rebalancing of range leases based on load and latency",
-	true,
-	settings.WithPublic)
+	"set to enable rebalancing of range leases based on load and latency;"+
+		" has no effect when kv.allocator.load_based_rebalancing is set"+
+		" to 'multi-metric only', 'multi-metric and count', or 'auto'",
+	false, settings.Retired)
 
 // leaseRebalancingAggressiveness enables users to tweak how aggressive their
 // cluster is at moving leases towards the localities where the most requests
@@ -1585,14 +1590,24 @@ func (a *Allocator) allocateTargetFromList(
 	return roachpb.ReplicationTarget{}, ""
 }
 
+// simulateRemoveTarget chooses which existing replica of the rebalance set
+// (voters for VoterTarget, non-voters for NonVoterTarget) to remove given
+// that a new replica is about to be added on targetStore.
+//
+// rebalanceSet is the existing replicas of the rebalance type PLUS the
+// to-be-added replica on targetStore (the caller appends it before
+// invoking; see RebalanceTarget). otherReplicas is the existing replicas
+// of the other type (untouched by this rebalance). candidates is the
+// subset of rebalanceSet that is eligible for removal (already filtered
+// for raft removability — notably excludes the just-appended target).
 func (a Allocator) simulateRemoveTarget(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
 	targetStore roachpb.StoreID,
 	conf *roachpb.SpanConfig,
 	candidates []roachpb.ReplicaDescriptor,
-	existingVoters []roachpb.ReplicaDescriptor,
-	existingNonVoters []roachpb.ReplicaDescriptor,
+	rebalanceSet []roachpb.ReplicaDescriptor,
+	otherReplicas []roachpb.ReplicaDescriptor,
 	sl storepool.StoreList,
 	rangeUsageInfo allocator.RangeUsageInfo,
 	targetType TargetReplicaType,
@@ -1606,6 +1621,26 @@ func (a Allocator) simulateRemoveTarget(
 			}
 		}
 	}
+
+	// If the to-be-added target lands on a node that already holds another
+	// replica of this range (i.e. the rebalance is logically a same-node
+	// store-to-store swap), narrow the remove candidates to that same node.
+	// See narrowRemoveCandidatesToSameNode for why.
+	narrowed, abort := narrowRemoveCandidatesToSameNode(
+		candidateStores, targetStore, rebalanceSet, otherReplicas)
+	if abort {
+		log.KvDistribution.VEventf(ctx, 2,
+			"refusing rebalance to s%d: target node already holds a replica "+
+				"but its same-node sibling is not a removable candidate", targetStore)
+		// Returning a removeReplica with the same StoreID as the add
+		// target signals the outer RebalanceTarget loop to skip this
+		// (add, remove) pair and try the next one from
+		// bestRebalanceTarget (the loop's check is `target.store.StoreID
+		// != removeReplica.StoreID`). The NodeID is unused by that
+		// check; zero is fine.
+		return roachpb.ReplicationTarget{StoreID: targetStore}, "", nil
+	}
+	candidateStores = narrowed
 
 	// Update statistics first
 	switch t := targetType; t {
@@ -1621,7 +1656,7 @@ func (a Allocator) simulateRemoveTarget(
 
 		return a.RemoveTarget(
 			ctx, storePool, conf, storepool.MakeStoreList(candidateStores),
-			existingVoters, existingNonVoters, VoterTarget, options,
+			rebalanceSet, otherReplicas, VoterTarget, options,
 		)
 	case NonVoterTarget:
 		storePool.UpdateLocalStoreAfterRebalance(targetStore, rangeUsageInfo, roachpb.ADD_NON_VOTER)
@@ -1634,11 +1669,82 @@ func (a Allocator) simulateRemoveTarget(
 			targetStore)
 		return a.RemoveTarget(
 			ctx, storePool, conf, storepool.MakeStoreList(candidateStores),
-			existingVoters, existingNonVoters, NonVoterTarget, options,
+			rebalanceSet, otherReplicas, NonVoterTarget, options,
 		)
 	default:
 		panic(fmt.Sprintf("unknown targetReplicaType: %s", t))
 	}
+}
+
+// rebalanceSetNodeFor returns the NodeID for storeID by scanning the
+// rebalance set. Returns 0 if not found.
+func rebalanceSetNodeFor(
+	rebalanceSet []roachpb.ReplicaDescriptor, storeID roachpb.StoreID,
+) roachpb.NodeID {
+	for _, repl := range rebalanceSet {
+		if repl.StoreID == storeID {
+			return repl.NodeID
+		}
+	}
+	return 0
+}
+
+// narrowRemoveCandidatesToSameNode implements the
+// same-node-swap-on-conflict policy used by simulateRemoveTarget.
+//
+// The contract: if the to-be-added rebalance target (identified by
+// targetStore, with its NodeID resolved from rebalanceSet) lands on a
+// node that already holds another replica of this range (counting both
+// the rebalanceSet and otherReplicas, since validateOneReplicaPerNode is
+// type-agnostic — an ADD_VOTER on a node already holding a non-voter,
+// paired with a cross-node REMOVE, is rejected just as readily as the
+// same-type case), the returned candidate slice is narrowed to
+// candidates on that same node. Otherwise the original slice is returned
+// unchanged. If the same-node sibling exists but is not among the
+// removable candidates (e.g. it was filtered out by
+// simulateFilterUnremovableReplicas because it is the leaseholder), the
+// function returns abort=true to signal that the caller should reject
+// this (add, remove) pair entirely; the rebalance loop will then try
+// the next one from bestRebalanceTarget.
+//
+// Without this narrowing, the RemoveTarget call that simulateRemoveTarget
+// makes downstream scores removal candidates against the existing replica
+// set without modelling the simultaneous ADD. With per-store
+// voter_constraints that none of the existing voters individually
+// satisfy, all candidates score "constraint check fail" equally, and
+// locality-collapsed diversity scores then leave the tie-break to pick
+// an arbitrary cross-node remove — which the production validator throws
+// away, leaving the range stuck forever. See cockroach issue #170471.
+func narrowRemoveCandidatesToSameNode(
+	candidateStores []roachpb.StoreDescriptor,
+	targetStore roachpb.StoreID,
+	rebalanceSet, otherReplicas []roachpb.ReplicaDescriptor,
+) (narrowed []roachpb.StoreDescriptor, abort bool) {
+	targetNodeID := rebalanceSetNodeFor(rebalanceSet, targetStore)
+	if targetNodeID == 0 {
+		return candidateStores, false
+	}
+	hasOnNode := func(repls []roachpb.ReplicaDescriptor) bool {
+		for _, repl := range repls {
+			if repl.StoreID != targetStore && repl.NodeID == targetNodeID {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasOnNode(rebalanceSet) && !hasOnNode(otherReplicas) {
+		return candidateStores, false
+	}
+	sameNode := candidateStores[:0]
+	for _, c := range candidateStores {
+		if c.Node.NodeID == targetNodeID {
+			sameNode = append(sameNode, c)
+		}
+	}
+	if len(sameNode) == 0 {
+		return nil, true
+	}
+	return sameNode, false
 }
 
 // RemoveTarget returns a suitable replica (of the given type) to remove from
@@ -1912,7 +2018,7 @@ func (a Allocator) RebalanceTarget(
 	// continues to correspond to the original candidate set and source store,
 	// even as candidates are removed.
 	for {
-		target, existingCandidate, bestIdx = bestRebalanceTarget(a.randGen, results, a.as)
+		target, existingCandidate, bestIdx = bestRebalanceTarget(ctx, a.randGen, results, a.as)
 		if target == nil {
 			return zero, zero, "", false
 		}
@@ -2367,8 +2473,11 @@ func (a *Allocator) LeaseholderShouldMoveDueToPreferences(
 	allExistingReplicas []roachpb.ReplicaDescriptor,
 	exclReplsInNeedOfSnapshots bool,
 ) bool {
-	// Defensive check to ensure that this is never called with a replica set that
-	// does not contain the leaseholder.
+	// Callers pass VoterDescriptors(), which excludes demoting voters,
+	// non-voters, and learners - none of which can hold a lease. The
+	// leaseholder should always be present, but the descriptor and lease are
+	// not loaded under a consistent lock, so they may drift. As defense in
+	// depth, we verify that the leaseholder is in the provided replica set.
 	var leaseholderInExisting bool
 	for _, repl := range allExistingReplicas {
 		if repl.StoreID == leaseRepl.StoreID() {
@@ -2376,12 +2485,10 @@ func (a *Allocator) LeaseholderShouldMoveDueToPreferences(
 			break
 		}
 	}
-	// If the leaseholder is not in the descriptor, then we should not move the
-	// lease since we don't know who the leaseholder is. This normally doesn't
-	// happen, but can occasionally since the loading of the leaseholder and of
-	// the existing replicas aren't always under a consistent lock.
 	if !leaseholderInExisting {
-		log.KvDistribution.Info(ctx, "expected leaseholder store to be in the slice of existing replicas")
+		log.KvDistribution.VEventf(ctx, 2,
+			"expected leaseholder s%d to be in the slice of existing replicas %s",
+			leaseRepl.StoreID(), roachpb.MakeReplicaSet(allExistingReplicas))
 		return false
 	}
 
@@ -2543,11 +2650,16 @@ func (a *Allocator) TransferLeaseTarget(
 			return validTargets[a.randGen.Intn(len(validTargets))]
 		}
 
+		// Construct targetStores from sl.Stores (all constraint-satisfying
+		// stores) so that MMA computes its load summary over the same set used
+		// to compute candidateLeasesMean above. This ensures both the allocator
+		// and MMA reason about the same baseline when validating lease transfer
+		// targets. See the detailed explanation in mmaintegration/thrashing.go.
 		targetStores := make([]roachpb.StoreID, 0, len(sl.Stores))
 		for _, s := range sl.Stores {
 			targetStores = append(targetStores, s.StoreID)
 		}
-		handle := a.as.BuildMMARebalanceAdvisor(source.StoreID, targetStores)
+		handle := a.as.BuildMMARebalanceAdvisor(ctx, source.StoreID, targetStores)
 		var bestOption roachpb.ReplicaDescriptor
 		candidates := make([]roachpb.ReplicaDescriptor, 0, len(validTargets))
 		bestOptionLeaseCount := int32(math.MaxInt32)
@@ -2828,8 +2940,8 @@ func (t TransferLeaseDecision) String() string {
 // be disabled. Count-based rebalancing is disabled only when
 // LBRebalancingMultiMetricOnly mode is active. To enable both multi-metric and
 // count-based rebalancing, use LBRebalancingMultiMetricAndCount mode instead.
-func (a *Allocator) CountBasedRebalancingDisabled() bool {
-	return kvserverbase.LoadBasedRebalancingMode.Get(&a.st.SV) == kvserverbase.LBRebalancingMultiMetricOnly
+func (a *Allocator) CountBasedRebalancingDisabled(ctx context.Context) bool {
+	return kvserverbase.GetLoadBasedRebalancingMode(ctx, a.st) == kvserverbase.LBRebalancingMultiMetricOnly
 }
 
 // ShouldTransferLease returns true if the specified store is overfull in terms
@@ -2949,6 +3061,13 @@ func (a Allocator) shouldTransferLeaseForAccessLocality(
 	rebalanceAdjustments map[roachpb.StoreID]float64,
 	candidateLeasesMean float64,
 ) (accessLocalityTransferDecision, roachpb.ReplicaDescriptor) {
+	// When the multi-metric allocator (MMA) is active, follow-the-workload
+	// lease transfers are disabled. The MMA handles load-based rebalancing
+	// directly, so locality-driven lease transfers would conflict with its
+	// decisions.
+	if kvserverbase.LoadBasedRebalancingModeIsMMA(ctx, a.st) {
+		return decideWithoutStats, roachpb.ReplicaDescriptor{}
+	}
 	// Only use load-based rebalancing if it's enabled and we have both
 	// stats and locality information to base our decision on.
 	if usageInfo.RequestLocality == nil ||
@@ -3132,7 +3251,7 @@ func (a Allocator) shouldTransferLeaseForLeaseCountConvergence(
 	existing []roachpb.ReplicaDescriptor,
 ) bool {
 	// Return false early if count based rebalancing is disabled.
-	if a.CountBasedRebalancingDisabled() {
+	if a.CountBasedRebalancingDisabled(ctx) {
 		return false
 	}
 	// TODO(a-robinson): Should we disable this behavior when load-based lease

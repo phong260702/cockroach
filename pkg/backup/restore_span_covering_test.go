@@ -17,14 +17,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -47,7 +48,7 @@ func MockBackupChain(
 	length, spans, baseFiles, fileSize int,
 	r *rand.Rand,
 	hasExternalFilesList bool,
-	execCfg sql.ExecutorConfig,
+	storageFactory cloud.ExternalStorageFactory,
 ) ([]backuppb.BackupManifest, error) {
 	backups := make([]backuppb.BackupManifest, length)
 	ts := hlc.Timestamp{WallTime: time.Second.Nanoseconds()}
@@ -109,12 +110,16 @@ func MockBackupChain(
 			backups[i].Files[f].EntryCounts.DataSize = int64(fileSize)
 		}
 
-		es, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx,
-			fmt.Sprintf("nodelocal://1/mock%s", timeutil.Now().String()), username.RootUserName())
+		config := cloudpb.ExternalStorage{
+			Provider: cloudpb.ExternalStorageProvider_nodelocal,
+			LocalFileConfig: cloudpb.ExternalStorage_LocalFileConfig{
+				Path: fmt.Sprintf("/mock%d-%s", i, timeutil.Now().String()),
+			},
+		}
+		es, err := storageFactory(ctx, config)
 		if err != nil {
 			return nil, err
 		}
-		config := es.Conf()
 		if backups[i].HasExternalManifestSSTs {
 			// Write the Files to an SST and put them at a well known location.
 			manifestCopy := backups[i]
@@ -269,6 +274,7 @@ func makeImportSpans(
 	targetSize int64,
 	introducedSpanFrontier spanUtils.Frontier,
 	completedSpans []jobspb.RestoreProgress_FrontierEntry,
+	useLink bool,
 ) ([]execinfrapb.RestoreSpanEntry, error) {
 	cover := make([]execinfrapb.RestoreSpanEntry, 0)
 	spanCh := make(chan execinfrapb.RestoreSpanEntry)
@@ -300,7 +306,9 @@ func makeImportSpans(
 		nil,
 		filter,
 		&inclusiveEndKeyComparator{},
-		spanCh)
+		spanCh,
+		useLink,
+	)
 	close(spanCh)
 
 	if err != nil {
@@ -415,7 +423,7 @@ func TestRestoreEntryCoverExample(t *testing.T) {
 			layerToIterFactory,
 			noSpanTargetSize,
 			emptySpanFrontier,
-			emptyCompletedSpans)
+			emptyCompletedSpans, false)
 		require.NoError(t, err)
 		require.Equal(t, reduce([]execinfrapb.RestoreSpanEntry{
 			{Span: c.sp("a", "b"), Files: c.paths("1", "6")},
@@ -436,7 +444,7 @@ func TestRestoreEntryCoverExample(t *testing.T) {
 			layerToIterFactory,
 			2<<20,
 			emptySpanFrontier,
-			emptyCompletedSpans)
+			emptyCompletedSpans, false)
 		require.NoError(t, err)
 		require.Equal(t, reduce([]execinfrapb.RestoreSpanEntry{
 			{Span: c.sp("a", "b"), Files: c.paths("1", "6")},
@@ -459,7 +467,7 @@ func TestRestoreEntryCoverExample(t *testing.T) {
 			layerToIterFactory,
 			noSpanTargetSize,
 			introducedSpanFrontier,
-			emptyCompletedSpans)
+			emptyCompletedSpans, false)
 		require.NoError(t, err)
 		require.Equal(t, reduce([]execinfrapb.RestoreSpanEntry{
 			{Span: c.sp("a", "f"), Files: c.paths("6")},
@@ -487,7 +495,8 @@ func TestRestoreEntryCoverExample(t *testing.T) {
 			layerToIterFactory,
 			noSpanTargetSize,
 			emptySpanFrontier,
-			persistFrontier(frontier, 0))
+			persistFrontier(frontier, 0),
+			false)
 		require.NoError(t, err)
 		require.Equal(t, reduce([]execinfrapb.RestoreSpanEntry{
 			{Span: c.sp("a", "b"), Files: c.paths("1", "6")},
@@ -514,7 +523,7 @@ func TestRestoreEntryCoverExample(t *testing.T) {
 			layerToIterFactory,
 			noSpanTargetSize,
 			emptySpanFrontier,
-			emptyCompletedSpans)
+			emptyCompletedSpans, false)
 		require.NoError(t, err)
 		require.Equal(t, reduce([]execinfrapb.RestoreSpanEntry{
 			{Span: c.sp("a", "f"), Files: c.paths("1")},
@@ -714,78 +723,116 @@ func sanityCheckFileIterator(
 	}
 }
 
-func TestRestoreEntryCoverTinyFiles(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	runTestRestoreEntryCoverForSpanAndFileCounts(t, 5, 5<<10, []int{5}, []int{1000, 5000})
-}
-
-func TestRestoreEntryCover1(t *testing.T) {
+func TestRestoreEntryCover(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	runTestRestoreEntryCover(t, 1)
-}
+	dir := t.TempDir()
+	settings := cluster.MakeTestingClusterSettings()
+	storageFactory := func(ctx context.Context, dest cloudpb.ExternalStorage, opts ...cloud.ExternalStorageOption) (cloud.ExternalStorage, error) {
+		return nodelocal.TestingMakeNodelocalStorage(dir, settings, dest), nil
+	}
 
-func TestRestoreEntryCover2(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	runTestRestoreEntryCover(t, 2)
-}
-
-func TestRestoreEntryCover5(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	runTestRestoreEntryCover(t, 5)
-}
-
-func TestRestoreEntryCover9(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	runTestRestoreEntryCover(t, 9)
-}
-
-func TestRestoreEntryCover12(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderRace(t, "excessive memory usage")
-
-	runTestRestoreEntryCover(t, 12)
-}
-
-func TestRestoreEntryCover20(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderRace(t, "excessive memory usage")
-
-	runTestRestoreEntryCover(t, 20)
-}
-
-func runTestRestoreEntryCover(t *testing.T, numBackups int) {
-	spans := []int{1, 2, 3, 5, 9, 11, 12}
-	files := []int{0, 1, 2, 3, 4, 10, 12, 50}
-	runTestRestoreEntryCoverForSpanAndFileCounts(t, numBackups, 1<<20, spans, files)
-}
-
-func runTestRestoreEntryCoverForSpanAndFileCounts(
-	t *testing.T, numBackups, fileSize int, spanCounts, fileCounts []int,
-) {
 	r, _ := randutil.NewTestRand()
-	ctx := context.Background()
-	tc, _, _, cleanupFn := backupRestoreTestSetup(t, singleNode, 2, InitManualReplication)
-	defer cleanupFn()
-	execCfg := tc.ApplicationLayer(0).ExecutorConfig().(sql.ExecutorConfig)
 
-	// getRandomCompletedSpans randomly gets up to maxNumSpans completed
-	// spans from the cover. A completed span can cover 1 or more
-	// RestoreSpanEntry in the cover.
+	// Number of backups in the chain (1 full + up to 19 incrementals).
+	numBackups := r.Intn(20) + 1
+
+	// Number of table spans covered by the backup.
+	numSpans := r.Intn(12) + 1
+
+	// Number of SST files per backup (0 exercises the empty-files edge case).
+	// High values (up to 5000) exercise the many-small-files merging path.
+	numFiles := r.Intn(5000)
+
+	// Simulated size in bytes of each SST file (1 B to 1 MiB). This value is
+	// set on each file's EntryCounts.DataSize and drives the size-based span
+	// merging decisions in the covering logic.
+	fileSize := r.Intn(1<<20) + 1
+
+	// Target size in MiB for each restore span entry. Adjacent spans are merged
+	// until their combined file sizes exceed targetSize<<20. A value of 0
+	// disables size-based merging (spans are only merged when file sets are
+	// subsets). The production default is 384 MiB.
+	targetSize := r.Intn(1000)
+	if r.Intn(5) == 0 {
+		// 20% of the time, choose a 0 targetSize, to exercise the disabled size-based merging path.
+		targetSize = 0
+	}
+
+	// Whether file metadata is stored in external SSTs (true) or kept in-memory
+	// in the manifest (false). Tests the SST serialization roundtrip.
+	hasExternalFilesList := r.Intn(2) == 1
+
+	ctx := t.Context()
+	log.Dev.Infof(ctx,
+		"running TestRestoreEntryCover with: numBackups=%d, numSpans=%d, numFiles=%d, fileSize=%d, targetSize=%d, hasExternalFilesList=%t",
+		numBackups,
+		numSpans,
+		numFiles,
+		fileSize,
+		targetSize,
+		hasExternalFilesList,
+	)
+	runTestRestoreEntryCover(
+		t,
+		r,
+		ctx,
+		storageFactory,
+		numBackups,
+		numSpans,
+		numFiles,
+		fileSize,
+		targetSize,
+		hasExternalFilesList,
+	)
+}
+
+func runTestRestoreEntryCover(
+	t *testing.T,
+	r *rand.Rand,
+	ctx context.Context,
+	storageFactory cloud.ExternalStorageFactory,
+	numBackups int,
+	numSpans int,
+	numFiles int,
+	fileSize int,
+	targetSize int,
+	hasExternalFilesList bool,
+) {
+	backups, err := MockBackupChain(
+		ctx, numBackups, numSpans, numFiles, fileSize, r, hasExternalFilesList, storageFactory,
+	)
+	require.NoError(t, err)
+	layerToIterFactory, err := backupinfo.GetBackupManifestIterFactories(ctx,
+		storageFactory, backups, nil, nil)
+	require.NoError(t, err)
+	randLayer := r.Intn(len(backups))
+	randBackup := backups[randLayer]
+	sanityCheckFileIterator(ctx, t, layerToIterFactory[randLayer], randBackup)
+
+	introducedSpanFrontier, err := createIntroducedSpanFrontier(backups, hlc.Timestamp{})
+	require.NoError(t, err)
+	cover, err := makeImportSpans(
+		ctx,
+		backups[numBackups-1].Spans,
+		backups,
+		layerToIterFactory,
+		int64(targetSize)<<20,
+		introducedSpanFrontier,
+		[]jobspb.RestoreProgress_FrontierEntry{},
+		false)
+	require.NoError(t, err)
+	require.NoError(t, checkRestoreCovering(ctx, backups, backups[numBackups-1].Spans,
+		cover, targetSize != noSpanTargetSize, storageFactory))
+
+	// getRandomCompletedSpans randomly gets up to maxNumSpans completed spans from the cover.
+	// A completed span can cover 1 or more RestoreSpanEntry in the cover.
 	getRandomCompletedSpans := func(cover []execinfrapb.RestoreSpanEntry, maxNumSpans int) []roachpb.Span {
 		var completedSpans []roachpb.Span
 		for i := 0; i < maxNumSpans; i++ {
-			start := rand.Intn(len(cover) + 1)
-			length := rand.Intn(len(cover) + 1 - start)
+			start := r.Intn(len(cover) + 1)
+			length := r.Intn(len(cover) + 1 - start)
 			if length == 0 {
 				continue
 			}
@@ -801,79 +848,47 @@ func runTestRestoreEntryCoverForSpanAndFileCounts(
 		return merged
 	}
 
-	for _, spans := range spanCounts {
-		for _, files := range fileCounts {
-			for _, hasExternalFilesList := range []bool{true, false} {
-				backups, err := MockBackupChain(ctx, numBackups, spans, files, fileSize, r, hasExternalFilesList, execCfg)
-				require.NoError(t, err)
-				layerToIterFactory, err := backupinfo.GetBackupManifestIterFactories(ctx,
-					execCfg.DistSQLSrv.ExternalStorage, backups, nil, nil)
-				require.NoError(t, err)
-				randLayer := rand.Intn(len(backups))
-				randBackup := backups[randLayer]
-				sanityCheckFileIterator(ctx, t, layerToIterFactory[randLayer], randBackup)
-				for _, target := range []int64{0, 1, 4, 100, 1000} {
-					t.Run(fmt.Sprintf("numSpans=%d, numFiles=%d, merge=%d, slim=%t",
-						spans, files, target, hasExternalFilesList), func(t *testing.T) {
-						introducedSpanFrontier, err := createIntroducedSpanFrontier(backups, hlc.Timestamp{})
-						require.NoError(t, err)
-						cover, err := makeImportSpans(
-							ctx,
-							backups[numBackups-1].Spans,
-							backups,
-							layerToIterFactory,
-							target<<20,
-							introducedSpanFrontier,
-							[]jobspb.RestoreProgress_FrontierEntry{})
-						require.NoError(t, err)
-						require.NoError(t, checkRestoreCovering(ctx, backups, backups[numBackups-1].Spans,
-							cover, target != noSpanTargetSize, execCfg.DistSQLSrv.ExternalStorage))
+	// Check that the correct import spans are created if the job is
+	// resumed after the completion of some random entries in the cover.
+	if len(cover) > 0 {
+		for n := 1; n <= 5; n++ {
+			var completedSpans []roachpb.Span
+			var frontierEntries []jobspb.RestoreProgress_FrontierEntry
 
-						// Check that the correct import spans are created if the job is
-						// resumed after the completion of some random entries in the cover.
-						if len(cover) > 0 {
-							for n := 1; n <= 5; n++ {
-								var completedSpans []roachpb.Span
-								var frontierEntries []jobspb.RestoreProgress_FrontierEntry
-
-								// Randomly choose to use frontier checkpointing instead of
-								// explicitly testing both forms to avoid creating an exponential
-								// number of tests.
-								completedSpans = getRandomCompletedSpans(cover, n)
-								for _, sp := range completedSpans {
-									frontierEntries = append(frontierEntries, jobspb.RestoreProgress_FrontierEntry{
-										Span:      sp,
-										Timestamp: completedSpanTime,
-									})
-								}
-								resumeCover, err := makeImportSpans(
-									ctx,
-									backups[numBackups-1].Spans,
-									backups,
-									layerToIterFactory,
-									target<<20,
-									introducedSpanFrontier,
-									frontierEntries)
-								require.NoError(t, err)
-
-								// Compute the spans that are required on resume by subtracting
-								// completed spans from the original required spans.
-								var resumedRequiredSpans roachpb.Spans
-								for _, origReq := range backups[numBackups-1].Spans {
-									resumeReq := roachpb.SubtractSpans([]roachpb.Span{origReq}, completedSpans)
-									resumedRequiredSpans = append(resumedRequiredSpans, resumeReq...)
-								}
-
-								errorMsg := fmt.Sprintf("completed spans in frontier: %v", completedSpans)
-
-								require.NoError(t, checkRestoreCovering(ctx, backups, resumedRequiredSpans,
-									resumeCover, target != noSpanTargetSize, execCfg.DistSQLSrv.ExternalStorage),
-									errorMsg)
-							}
-						}
-					})
-				}
+			// Randomly choose to use frontier checkpointing instead of
+			// explicitly testing both forms to avoid creating an exponential
+			// number of tests.
+			completedSpans = getRandomCompletedSpans(cover, n)
+			for _, sp := range completedSpans {
+				frontierEntries = append(frontierEntries, jobspb.RestoreProgress_FrontierEntry{
+					Span:      sp,
+					Timestamp: completedSpanTime,
+				})
 			}
+			resumeCover, err := makeImportSpans(
+				ctx,
+				backups[numBackups-1].Spans,
+				backups,
+				layerToIterFactory,
+				int64(targetSize)<<20,
+				introducedSpanFrontier,
+				frontierEntries,
+				false)
+			require.NoError(t, err)
+
+			// Compute the spans that are required on resume by subtracting
+			// completed spans from the original required spans.
+			var resumedRequiredSpans roachpb.Spans
+			for _, origReq := range backups[numBackups-1].Spans {
+				resumeReq := roachpb.SubtractSpans([]roachpb.Span{origReq}, completedSpans)
+				resumedRequiredSpans = append(resumedRequiredSpans, resumeReq...)
+			}
+
+			errorMsg := fmt.Sprintf("completed spans in frontier: %v", completedSpans)
+
+			require.NoError(t, checkRestoreCovering(ctx, backups, resumedRequiredSpans,
+				resumeCover, targetSize != noSpanTargetSize, storageFactory),
+				errorMsg)
 		}
 	}
 }
@@ -1003,7 +1018,7 @@ func TestRestoreEntryCoverZeroSizeFiles(t *testing.T) {
 				expectedCover = tt.expectedCoverGenerated
 			}
 
-			cover, err := makeImportSpans(ctx, tt.requiredSpans, backups, layerToIterFactory, noSpanTargetSize, emptySpanFrontier, emptyCompletedSpans)
+			cover, err := makeImportSpans(ctx, tt.requiredSpans, backups, layerToIterFactory, noSpanTargetSize, emptySpanFrontier, emptyCompletedSpans, false)
 			require.NoError(t, err)
 
 			simpleCover := make([]simpleRestoreSpanEntry, len(cover))
@@ -1018,5 +1033,131 @@ func TestRestoreEntryCoverZeroSizeFiles(t *testing.T) {
 
 			require.Equal(t, expectedCover, simpleCover)
 		})
+	}
+}
+
+// TestUseLinkLayerOrdering verifies that UseLink is correctly set based on
+// layer ordering: once a layer with revision history is encountered, that
+// layer and all subsequent layers must have UseLink=false.
+func TestUseLinkLayerOrdering(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc, _, _, cleanupFn := backupRestoreTestSetup(t, singleNode, 2, InitManualReplication)
+	defer cleanupFn()
+	execCfg := tc.ApplicationLayer(0).ExecutorConfig().(sql.ExecutorConfig)
+
+	c := makeCoverUtils(ctx, t, &execCfg)
+
+	makeSpan := func(start, end string) roachpb.Span {
+		return roachpb.Span{Key: roachpb.Key(start), EndKey: roachpb.Key(end)}
+	}
+
+	// Create backup manifests with different revision history configurations.
+	// Layer 0: no revision history (can link)
+	// Layer 1: no revision history (can link)
+	// Layer 2: HAS revision history (cannot link)
+	// Layer 3: no revision history (cannot link - because layer 2 has rev history)
+	backups := []backuppb.BackupManifest{
+		{
+			Spans:             roachpb.Spans{makeSpan("a", "z")},
+			EndTime:           hlc.Timestamp{WallTime: 1},
+			RevisionStartTime: hlc.Timestamp{}, // no revision history
+			MVCCFilter:        backuppb.MVCCFilter_Latest,
+			Dir:               c.dir,
+			Files: []backuppb.BackupManifest_File{
+				{Span: makeSpan("a", "m"), Path: "layer0-file1"},
+			},
+		},
+		{
+			Spans:             roachpb.Spans{makeSpan("a", "z")},
+			StartTime:         hlc.Timestamp{WallTime: 1},
+			EndTime:           hlc.Timestamp{WallTime: 2},
+			RevisionStartTime: hlc.Timestamp{}, // no revision history
+			MVCCFilter:        backuppb.MVCCFilter_Latest,
+			Dir:               c.dir,
+			Files: []backuppb.BackupManifest_File{
+				{Span: makeSpan("a", "m"), Path: "layer1-file1"},
+			},
+		},
+		{
+			Spans:             roachpb.Spans{makeSpan("a", "z")},
+			StartTime:         hlc.Timestamp{WallTime: 2},
+			EndTime:           hlc.Timestamp{WallTime: 3},
+			RevisionStartTime: hlc.Timestamp{WallTime: 2}, // HAS revision history!
+			MVCCFilter:        backuppb.MVCCFilter_All,
+			Dir:               c.dir,
+			Files: []backuppb.BackupManifest_File{
+				{Span: makeSpan("a", "m"), Path: "layer2-file1"},
+			},
+		},
+		{
+			Spans:             roachpb.Spans{makeSpan("a", "z")},
+			StartTime:         hlc.Timestamp{WallTime: 3},
+			EndTime:           hlc.Timestamp{WallTime: 4},
+			RevisionStartTime: hlc.Timestamp{}, // no revision history, but after layer with rev history
+			MVCCFilter:        backuppb.MVCCFilter_Latest,
+			Dir:               c.dir,
+			Files: []backuppb.BackupManifest_File{
+				{Span: makeSpan("a", "m"), Path: "layer3-file1"},
+			},
+		},
+	}
+
+	layerToIterFactory, err := backupinfo.GetBackupManifestIterFactories(ctx, execCfg.DistSQLSrv.ExternalStorage, backups, nil, nil)
+	require.NoError(t, err)
+
+	emptySpanFrontier, err := spanUtils.MakeFrontierAt(hlc.Timestamp{})
+	require.NoError(t, err)
+
+	// Test with useLink=true to verify per-layer UseLink assignment.
+	cover, err := makeImportSpans(
+		ctx,
+		roachpb.Spans{makeSpan("a", "z")},
+		backups,
+		layerToIterFactory,
+		noSpanTargetSize,
+		emptySpanFrontier,
+		nil,
+		true, /* useLink */
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, cover)
+
+	// Check UseLink values for each file.
+	for _, entry := range cover {
+		for _, file := range entry.Files {
+			switch file.Layer {
+			case 0:
+				require.True(t, file.UseLink, "layer 0 file should be linkable")
+			case 1:
+				require.True(t, file.UseLink, "layer 1 file should be linkable")
+			case 2:
+				require.False(t, file.UseLink, "layer 2 file should NOT be linkable (has revision history)")
+			case 3:
+				require.False(t, file.UseLink, "layer 3 file should NOT be linkable (after layer with revision history)")
+			}
+		}
+	}
+
+	// Test with useLink=false to verify all files have UseLink=false.
+	coverNoLink, err := makeImportSpans(
+		ctx,
+		roachpb.Spans{makeSpan("a", "z")},
+		backups,
+		layerToIterFactory,
+		noSpanTargetSize,
+		emptySpanFrontier,
+		nil,
+		false, /* useLink */
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, coverNoLink)
+
+	for _, entry := range coverNoLink {
+		for _, file := range entry.Files {
+			require.False(t, file.UseLink, "all files should have UseLink=false when useLink=false")
+		}
 	}
 }

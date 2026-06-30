@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -34,6 +35,7 @@ import (
 func TestExtractIngestExternalCatalog(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t)
 
 	ctx := context.Background()
 	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -110,7 +112,7 @@ func TestExtractIngestExternalCatalog(t *testing.T) {
 
 		var written externalpb.ExternalCatalog
 		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-			written, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, ingestableCatalog, txn, col, defaultdbID, defaultdbpublicID, false, ingestedTableNames)
+			written, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, ingestableCatalog, txn, col, defaultdbID, defaultdbpublicID, false, ingestedTableNames, false /* skipForeignKeys */)
 			return err
 		}))
 		require.Equal(t, 2, len(written.Tables))
@@ -148,7 +150,7 @@ func TestExtractIngestExternalCatalog(t *testing.T) {
 		// an error.
 		require.ErrorContains(t,
 			sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-				_, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, udtCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"data"})
+				_, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, udtCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"data"}, false /* skipForeignKeys */)
 				return err
 			}),
 			"cross database type references are not supported",
@@ -158,20 +160,124 @@ func TestExtractIngestExternalCatalog(t *testing.T) {
 		require.Zero(t, res)
 	})
 
-	t.Run("fk", func(t *testing.T) {
+	t.Run("fk missing constraints", func(t *testing.T) {
 		sqlDB.Exec(t, "CREATE TABLE db1.sc1.tab3 (a INT PRIMARY KEY, b INT REFERENCES db1.sc1.tab2(a))")
 		sadCatalog, err := extractCatalog("db1.sc1.tab3")
 		require.NoError(t, err)
 		require.ErrorContains(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-			_, err := IngestExternalCatalog(ctx, &execCfg, sqlUser, sadCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"tab3"})
+			_, err := IngestExternalCatalog(ctx, &execCfg, sqlUser, sadCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"tab3"}, false /* skipForeignKeys */)
 			return err
-		}), "invalid outbound foreign key")
+		}), "not in the replication set")
 
 		anotherSadCatalog, err := extractCatalog("db1.sc1.tab2")
 		require.NoError(t, err)
 		require.ErrorContains(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-			_, err := IngestExternalCatalog(ctx, &execCfg, sqlUser, anotherSadCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"tab2"})
+			_, err := IngestExternalCatalog(ctx, &execCfg, sqlUser, anotherSadCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"tab2"}, false /* skipForeignKeys */)
 			return err
-		}), "invalid inbound foreign key")
+		}), "not in the replication set")
+	})
+
+	t.Run("fk rewrite parent and child", func(t *testing.T) {
+		sqlDB.Exec(t, "CREATE TABLE db1.sc1.rw_parent (a INT PRIMARY KEY)")
+		sqlDB.Exec(t, "CREATE TABLE db1.sc1.rw_child (a INT PRIMARY KEY, b INT REFERENCES db1.sc1.rw_parent(a))")
+
+		bothCatalog, err := extractCatalog("db1.sc1.rw_parent", "db1.sc1.rw_child")
+		require.NoError(t, err)
+
+		var written externalpb.ExternalCatalog
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			written, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, bothCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"rw_parent_dst", "rw_child_dst"}, false /* skipForeignKeys */)
+			return err
+		}))
+
+		parentDesc := written.Tables[0]
+		childDesc := written.Tables[1]
+
+		// Verify that table IDs were rewritten to new destination IDs.
+		require.NotEqual(t, bothCatalog.Tables[0].ID, parentDesc.ID)
+		require.NotEqual(t, bothCatalog.Tables[1].ID, childDesc.ID)
+
+		// Verify that parent DB and schema IDs were rewritten.
+		require.Equal(t, defaultdbID, parentDesc.ParentID)
+		require.Equal(t, defaultdbpublicID, parentDesc.UnexposedParentSchemaID)
+		require.Equal(t, defaultdbID, childDesc.ParentID)
+		require.Equal(t, defaultdbpublicID, childDesc.UnexposedParentSchemaID)
+
+		// Check that the FK IDs point to the replicated IDs instead of the old.
+		require.Len(t, childDesc.OutboundFKs, 1)
+		require.Equal(t, parentDesc.ID, childDesc.OutboundFKs[0].ReferencedTableID)
+		require.Equal(t, childDesc.ID, childDesc.OutboundFKs[0].OriginTableID)
+
+		require.Len(t, parentDesc.InboundFKs, 1)
+		require.Equal(t, childDesc.ID, parentDesc.InboundFKs[0].OriginTableID)
+		require.Equal(t, parentDesc.ID, parentDesc.InboundFKs[0].ReferencedTableID)
+
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			return DropIngestedExternalCatalog(ctx, &execCfg, sqlUser, written, txn, s.JobRegistry().(*jobs.Registry), col, "test gc fk rewrite")
+		}))
+	})
+
+	t.Run("fk self-referencing", func(t *testing.T) {
+		sqlDB.Exec(t, "CREATE TABLE db1.sc1.self_ref (a INT PRIMARY KEY, b INT REFERENCES db1.sc1.self_ref(a))")
+
+		selfCatalog, err := extractCatalog("db1.sc1.self_ref")
+		require.NoError(t, err)
+
+		var written externalpb.ExternalCatalog
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			written, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, selfCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"self_ref_dst"}, false /* skipForeignKeys */)
+			return err
+		}))
+
+		desc := written.Tables[0]
+		require.NotEqual(t, selfCatalog.Tables[0].ID, desc.ID)
+
+		// Both sides of the self-referencing FK should point to the new ID.
+		require.Len(t, desc.OutboundFKs, 1)
+		require.Equal(t, desc.ID, desc.OutboundFKs[0].OriginTableID)
+		require.Equal(t, desc.ID, desc.OutboundFKs[0].ReferencedTableID)
+
+		require.Len(t, desc.InboundFKs, 1)
+		require.Equal(t, desc.ID, desc.InboundFKs[0].OriginTableID)
+		require.Equal(t, desc.ID, desc.InboundFKs[0].ReferencedTableID)
+
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			return DropIngestedExternalCatalog(ctx, &execCfg, sqlUser, written, txn, s.JobRegistry().(*jobs.Registry), col, "test gc self ref fk")
+		}))
+	})
+
+	t.Run("skip fk", func(t *testing.T) {
+		sqlDB.Exec(t, "CREATE TABLE db1.sc1.child (a INT PRIMARY KEY, b INT REFERENCES db1.sc1.tab2(a))")
+
+		childCatalog, err := extractCatalog("db1.sc1.child")
+		require.NoError(t, err)
+		require.NotEmpty(t, childCatalog.Tables[0].OutboundFKs)
+
+		var written externalpb.ExternalCatalog
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			written, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, childCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"child"}, true /* skipForeignKeys */)
+			return err
+		}))
+		require.Empty(t, written.Tables[0].InboundFKs)
+		require.Empty(t, written.Tables[0].OutboundFKs)
+
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			return DropIngestedExternalCatalog(ctx, &execCfg, sqlUser, written, txn, s.JobRegistry().(*jobs.Registry), col, "test gc skip fk outbound")
+		}))
+
+		parentCatalog, err := extractCatalog("db1.sc1.tab2")
+		require.NoError(t, err)
+		require.NotEmpty(t, parentCatalog.Tables[0].InboundFKs)
+
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			written, err = IngestExternalCatalog(ctx, &execCfg, sqlUser, parentCatalog, txn, col, defaultdbID, defaultdbpublicID, false, []string{"tab2_skip"}, true /* skipForeignKeys */)
+			return err
+		}))
+		require.Empty(t, written.Tables[0].InboundFKs)
+		require.Empty(t, written.Tables[0].OutboundFKs)
+
+		require.NoError(t, sqltestutils.TestingDescsTxn(ctx, srv, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			return DropIngestedExternalCatalog(ctx, &execCfg, sqlUser, written, txn, s.JobRegistry().(*jobs.Registry), col, "test gc skip fk inbound")
+		}))
 	})
 }

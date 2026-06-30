@@ -59,9 +59,8 @@ func TestReplicaCollection(t *testing.T) {
 	defer listenerReg.Close()
 	tc := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			DefaultDRPCOption: base.TestDRPCDisabled,
-			StoreSpecs:        []base.StoreSpec{{InMemory: true}},
-			Insecure:          true,
+			StoreSpecs: []base.StoreSpec{{InMemory: true}},
+			Insecure:   true,
 			Knobs: base.TestingKnobs{
 				LOQRecovery: &loqrecovery.TestingKnobs{
 					MetadataScanTimeout: 15 * time.Second,
@@ -143,7 +142,7 @@ func TestStreamRestart(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				LOQRecovery: &loqrecovery.TestingKnobs{
 					MetadataScanTimeout: 15 * time.Second,
-					ForwardReplicaFilter: func(response *serverpb.RecoveryCollectLocalReplicaInfoResponse) error {
+					MaybeInjectError: func(response *serverpb.RecoveryCollectLocalReplicaInfoResponse) error {
 						if response.ReplicaInfo.NodeID == 2 && response.ReplicaInfo.Desc.RangeID == 14 && failCount.Add(1) < 3 {
 							return errors.New("rpc stream stopped")
 						}

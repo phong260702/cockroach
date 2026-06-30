@@ -429,6 +429,11 @@ func (q *byIDLookupContext) lookupTemporary(
 ) (catalog.Descriptor, catalog.ValidationLevel, error) {
 	td := q.tc.getTemporarySchemaByID(id)
 	if td == nil {
+		// Check if this ID corresponds to a temp schema from another session
+		// that we've seen in the namespace cache.
+		td = q.tc.getOtherSessionTemporarySchemaByID(id)
+	}
+	if td == nil {
 		return nil, catalog.NoValidation, nil
 	}
 	if q.flags.isMutable {
@@ -481,6 +486,9 @@ func (q *byIDLookupContext) lookupLeased(
 	id descpb.ID,
 ) (catalog.Descriptor, catalog.ValidationLevel, error) {
 	if q.flags.layerFilters.withoutLeased || lease.TestingTableLeasesAreDisabled() {
+		return nil, catalog.NoValidation, nil
+	}
+	if q.tc.forceStorageLookupIDs.Contains(id) {
 		return nil, catalog.NoValidation, nil
 	}
 	// If we have already read all of the descriptors, use it as a negative
@@ -544,6 +552,19 @@ func getDescriptorByName(
 		// retrieve.
 		if flags.layerFilters.withoutStorage {
 			return nil, err
+		}
+		// Evict the stale name→ID mapping from the SystemDatabaseCache so
+		// that the next lookup goes to KV and self-heals. This handles PCR
+		// reader tenants where SetupOrAdvanceStandbyReaderCatalog rewrites
+		// the namespace but the cache still holds the bootstrap ID. While this
+		// request will still fail, we expect the next request will hydrate the
+		// cache correctly and succeed.
+		if db != nil && db.GetID() == keys.SystemDatabaseID && sc != nil {
+			tc.cr.InvalidateSystemCacheEntry(descpb.NameInfo{
+				ParentID:       db.GetID(),
+				ParentSchemaID: sc.GetID(),
+				Name:           name,
+			})
 		}
 		// In all other cases, having an ID should imply having a descriptor.
 		return nil, errors.Wrapf(

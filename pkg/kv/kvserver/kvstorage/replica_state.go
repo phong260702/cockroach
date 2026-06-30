@@ -10,6 +10,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag/wagpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -41,16 +43,15 @@ func LoadReplicaState(
 	replicaID roachpb.ReplicaID,
 ) (LoadedReplicaState, error) {
 	sl := MakeStateLoader(desc.RangeID)
-	id, err := sl.LoadRaftReplicaID(ctx, stateRO)
-	if err != nil {
+	if mark, err := sl.LoadReplicaMark(ctx, stateRO); err != nil {
 		return LoadedReplicaState{}, err
-	}
-	if loaded := id.ReplicaID; loaded != replicaID {
+	} else if !mark.Is(replicaID) {
 		return LoadedReplicaState{}, errors.AssertionFailedf(
-			"r%d: loaded RaftReplicaID %d does not match %d", desc.RangeID, loaded, replicaID)
+			"r%d: loaded ReplicaMark %+v does not match ReplicaID %d", desc.RangeID, mark, replicaID)
 	}
 
 	ls := LoadedReplicaState{ReplicaID: replicaID}
+	var err error
 	if ls.hardState, err = sl.LoadHardState(ctx, raftRO); err != nil {
 		return LoadedReplicaState{}, err
 	}
@@ -104,17 +105,6 @@ func (r LoadedReplicaState) check(storeID roachpb.StoreID) error {
 	return nil
 }
 
-// CreateUninitReplicaTODO is the plan for splitting CreateUninitializedReplica
-// into cross-engine writes.
-//
-//  1. Log storage write (durable):
-//     1.1. Write WAG node with the state machine mutation (2).
-//  2. State machine mutation:
-//     2.1. Write the new RaftReplicaID.
-//
-// TODO(sep-raft-log): support the status quo in which only 2.1 is written.
-const CreateUninitReplicaTODO = 0
-
 // CreateUninitializedReplica creates an uninitialized replica in storage.
 // Returns kvpb.RaftGroupDeletedError if this replica can not be created
 // because it has been deleted.
@@ -122,27 +112,26 @@ func CreateUninitializedReplica(
 	ctx context.Context,
 	stateRW State,
 	raftRO RaftRO,
+	w *wag.Writer,
 	storeID roachpb.StoreID,
 	id roachpb.FullReplicaID,
 ) error {
 	sl := MakeStateLoader(id.RangeID)
-	// Before creating the replica, see if there is a tombstone or a newer replica
-	// which would indicate that our replica has been removed.
-	if ts, err := sl.LoadRangeTombstone(ctx, stateRW.RO); err != nil {
+	// Before creating the replica, see if there is a tombstone or an existing
+	// replica which would indicate that our ReplicaID is stale and can not come
+	// back to this Store again.
+	if mark, err := sl.LoadReplicaMark(ctx, stateRW.RO); err != nil {
 		return err
-	} else if id.ReplicaID < ts.NextReplicaID {
+	} else if mark.Destroyed(id.ReplicaID) {
 		return &kvpb.RaftGroupDeletedError{}
-	} else if rID, err := sl.LoadRaftReplicaID(ctx, stateRW.RO); err != nil {
-		return err
-	} else if rID.ReplicaID > id.ReplicaID {
-		return &kvpb.RaftGroupDeletedError{}
-	} else if rID.ReplicaID == id.ReplicaID {
+	} else if mark.Is(id.ReplicaID) {
 		return nil // the replica already exists
-	} else if rID.ReplicaID != 0 {
+	} else if mark.Exists() {
 		// TODO(pav-kv): there is a replica with an older ReplicaID. We must destroy
 		// it, and create a new one. Right now, the code falls through and writes
 		// the new RaftReplicaID, but this replica can already have a non-empty
 		// HardState. This is a bug.
+		_ = 0 // make linter happy
 	}
 
 	// Write the RaftReplicaID for this replica. This is the only place in the
@@ -151,7 +140,7 @@ func CreateUninitializedReplica(
 	// Before this point, raft and state machine state of this replica are
 	// non-existent. The only RangeID-specific key that can be present is the
 	// RangeTombstone inspected above.
-	_ = CreateUninitReplicaTODO
+	w.AddEvent(wagpb.MakeAddr(id, 0), wagpb.EventCreate, nil /* startKey */)
 	if err := sl.SetRaftReplicaID(ctx, stateRW.WO, id.ReplicaID); err != nil {
 		return err
 	}

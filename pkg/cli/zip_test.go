@@ -75,6 +75,7 @@ table_name NOT IN (
 	'builtin_functions',
 	'cluster_contended_keys',
 	'cluster_contended_indexes',
+	'cluster_active_session_history',
 	'cluster_contended_tables',
 	'cluster_execution_insights',
 	'cluster_inflight_traces',
@@ -100,6 +101,7 @@ table_name NOT IN (
 	'kv_flow_token_deductions',
 	'kv_flow_token_deductions_v2',
 	'lost_descriptors_with_data',
+	'node_active_session_history',
 	'table_columns',
 	'table_row_statistics',
 	'ranges',
@@ -383,6 +385,27 @@ func TestZipExcludeRangeInfo(t *testing.T) {
 			return out
 		},
 	)
+}
+
+func TestZipExcludeLogSeverityValidation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	c := NewCLITest(TestCLIParams{
+		StoreSpecs: []base.StoreSpec{{
+			Path: dir,
+		}},
+	})
+	defer c.Cleanup()
+
+	// Invalid severity name should produce an error.
+	out, err := c.RunWithCapture(
+		"debug zip --exclude-log-severities=INVALID " + os.DevNull)
+	require.NoError(t, err)
+	require.Contains(t, out, `unknown log severity "INVALID"`)
 }
 
 // This tests the operation of zip running concurrently.
@@ -695,11 +718,15 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving goroutine_dump.*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving ash_report.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ execution traces found$`)
 	out = re.ReplaceAllString(out, `[node ?] ? execution traces found`)
 
 	// Remove license-related NOTICE messages that may appear intermittently.
-	re = regexp.MustCompile(`(?m)^NOTICE: No license is installed.*\n?`)
+	// Most NOTICE messages are stripped earlier in RunWithCapture, but this
+	// catches any that appear outside of SQL data retrieval lines.
+	re = regexp.MustCompile(`(?m)NOTICE: No license is installed[^\n]*\n?`)
 	out = re.ReplaceAllString(out, ``)
 
 	return out
@@ -1495,6 +1522,15 @@ func trimNonDeterministicZipOutputFiles(out string) string {
 	re = regexp.MustCompile(`(?m).*(memprof|memstats|memmonitoring).*\.(txt|pprof)$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m).*goroutine_dump.*\.pb\.gz$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+	// ASH report files have timestamps in filenames, making them non-deterministic.
+	re = regexp.MustCompile(`(?m).*ash_report.*\.(json|txt)$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+	// CPU profiles are non-deterministic: stored profiles have timestamps in
+	// filenames, and live profile collection may fail producing error files.
+	re = regexp.MustCompile(`(?m).*cpuprof/cpuprof\..*\.pprof$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+	re = regexp.MustCompile(`(?m).*cpu\.pprof\.err\.txt$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 	return out
 }

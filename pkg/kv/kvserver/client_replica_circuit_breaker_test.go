@@ -1063,6 +1063,10 @@ func setupCircuitBreakerTest(t *testing.T, leaseType roachpb.LeaseType) *circuit
 		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, leaseType)
 	}
 
+	// Disable the leaderless watcher; it is tested separately and can
+	// interfere with circuit breaker assertions. See #163999.
+	kvserver.ReplicaLeaderlessUnavailableThreshold.Override(ctx, &st.SV, 0)
+
 	storeKnobs := &kvserver.StoreTestingKnobs{
 		SlowReplicationThresholdOverride: func(ba *kvpb.BatchRequest) time.Duration {
 			t.Helper()
@@ -1315,7 +1319,7 @@ func (cbt *circuitBreakerTest) SendCtxTS(
 	// going to leak memory.
 	ctx = context.WithValue(ctx, req, struct{}{})
 
-	_, pErr := repl.Send(ctx, ba)
+	_, pErr := kvserver.ToSenderForTesting(repl.Replica).Send(ctx, ba)
 	// If our context got canceled, return an opaque error regardless of presence or
 	// absence of actual error. This makes sure we don't accidentally pass tests as
 	// a result of our context cancellation.

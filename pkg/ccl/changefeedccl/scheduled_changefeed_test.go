@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedpb"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
@@ -325,9 +324,6 @@ func TestCreateChangefeedScheduleChecksPermissionsDuringDryRun(t *testing.T) {
 	sysDB.Exec(t, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
-	enableEnterprise := utilccl.TestingDisableEnterprise()
-	enableEnterprise()
-
 	sqlDB.Exec(t, `CREATE TABLE table_a (i int)`)
 	sqlDB.Exec(t, `CREATE USER testuser WITH PASSWORD 'test'`)
 
@@ -832,6 +828,11 @@ func TestCheckScheduleAlreadyExists(t *testing.T) {
 	require.Equal(t, present, true)
 
 	present, err = schedulebase.CheckScheduleAlreadyExists(ctx, p.(sql.PlanHookState), "not-existing")
+	require.NoError(t, err)
+	require.Equal(t, present, false)
+
+	// Verify a label containing a quote is handled safely (#167602).
+	present, err = schedulebase.CheckScheduleAlreadyExists(ctx, p.(sql.PlanHookState), "it's a label")
 	require.NoError(t, err)
 	require.Equal(t, present, false)
 }

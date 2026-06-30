@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -45,10 +46,11 @@ type replicaToApplyChanges interface {
 // TODO(wenyihu6): add allocator sync which coordinates with replicate queue
 // and store rebalancer and store pool.
 type mmaStoreRebalancer struct {
-	store *mmaStore
-	mma   mmaprototype.Allocator
-	st    *cluster.Settings
-	as    *mmaintegration.AllocatorSync
+	store              *mmaStore
+	mma                mmaprototype.Allocator
+	st                 *cluster.Settings
+	as                 *mmaintegration.AllocatorSync
+	processTimeoutFunc queueProcessTimeoutFunc
 }
 
 func newMMAStoreRebalancer(
@@ -57,11 +59,16 @@ func newMMAStoreRebalancer(
 	// Initialize disk utilization thresholds from cluster settings.
 	opts := allocatorimpl.MakeDiskCapacityOptions(&st.SV)
 	mma.SetDiskUtilThresholds(opts.RebalanceToThreshold, opts.ShedAndBlockAllThreshold)
+	as := s.cfg.AllocatorSync
+	if as == nil {
+		panic(errors.AssertionFailedf("AllocatorSync must be set on StoreConfig"))
+	}
 	return &mmaStoreRebalancer{
-		store: (*mmaStore)(s),
-		mma:   mma,
-		st:    st,
-		as:    s.cfg.AllocatorSync,
+		store:              (*mmaStore)(s),
+		mma:                mma,
+		st:                 st,
+		as:                 as,
+		processTimeoutFunc: makeRateLimitedTimeoutFunc(rebalanceSnapshotRate),
 	}
 }
 
@@ -70,7 +77,7 @@ func newMMAStoreRebalancer(
 func (m *mmaStoreRebalancer) run(ctx context.Context, stopper *stop.Stopper) {
 	timer := time.NewTicker(jitteredInterval(allocator.LoadBasedRebalanceInterval.Get(&m.st.SV)))
 	defer timer.Stop()
-	log.KvDistribution.Infof(ctx, "starting multi-metric store rebalancer with mode=%v", kvserverbase.LoadBasedRebalancingMode.Get(&m.st.SV))
+	log.KvDistribution.Infof(ctx, "starting multi-metric store rebalancer with mode=%v", kvserverbase.GetLoadBasedRebalancingMode(ctx, m.st))
 
 	for {
 		select {
@@ -82,7 +89,7 @@ func (m *mmaStoreRebalancer) run(ctx context.Context, stopper *stop.Stopper) {
 			// Wait out the first tick before doing anything since the store is still
 			// starting up and we might as well wait for some stats to accumulate.
 			timer.Reset(jitteredInterval(allocator.LoadBasedRebalanceInterval.Get(&m.st.SV)))
-			if !kvserverbase.LoadBasedRebalancingModeIsMMA(&m.st.SV) {
+			if !kvserverbase.LoadBasedRebalancingModeIsMMA(ctx, m.st) {
 				continue
 			}
 
@@ -180,33 +187,45 @@ func (m *mmaStoreRebalancer) applyChange(
 	return err
 }
 
+// processTimeout computes the timeout for applying a change to a replica,
+// using the same rate-limited timeout function as the replicate queue and the
+// old store rebalancer.
+func (m *mmaStoreRebalancer) processTimeout(repl replicaToApplyChanges) time.Duration {
+	return m.processTimeoutFunc(m.st, repl.(*Replica))
+}
+
 // applyLeaseTransfer applies a lease transfer change.
 func (m *mmaStoreRebalancer) applyLeaseTransfer(
 	ctx context.Context, repl replicaToApplyChanges, change mmaprototype.ExternalRangeChange,
 ) error {
-	return repl.AdminTransferLease(
-		ctx,
-		change.LeaseTransferTarget(),
-		false, /* bypassSafetyChecks */
-	)
+	timeout := m.processTimeout(repl)
+	return timeutil.RunWithTimeout(ctx, "mma transfer lease", timeout,
+		func(ctx context.Context) error {
+			return repl.AdminTransferLease(
+				ctx,
+				change.LeaseTransferTarget(),
+				false, /* bypassSafetyChecks */
+			)
+		})
 }
 
 // applyReplicaChanges applies replica membership changes.
 func (m *mmaStoreRebalancer) applyReplicaChanges(
 	ctx context.Context, repl replicaToApplyChanges, change mmaprototype.ExternalRangeChange,
 ) error {
-	// TODO(mma): We should be setting a timeout on the ctx here, in the case
-	// where rebalancing takes a long time (stuck behind other snapshots).
-	// See replicateQueue.processTimeoutFunc.
 	// TODO(wenyihu6): store rebalancer uses RelocateRange
-	_, err := repl.changeReplicasImpl(
-		ctx,
-		repl.Desc(),
-		kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
-		0,
-		kvserverpb.ReasonRebalance,
-		"todo: this is the rebalance detail for the range log",
-		change.ReplicationChanges(),
-	)
-	return err
+	timeout := m.processTimeout(repl)
+	return timeutil.RunWithTimeout(ctx, "mma change replicas", timeout,
+		func(ctx context.Context) error {
+			_, err := repl.changeReplicasImpl(
+				ctx,
+				repl.Desc(),
+				kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
+				0,
+				kvserverpb.ReasonRebalance,
+				"todo: this is the rebalance detail for the range log",
+				change.ReplicationChanges(),
+			)
+			return err
+		})
 }

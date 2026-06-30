@@ -455,10 +455,12 @@ SELECT * FROM enum_array
 {hello} {hello}
 {howdy} {howdy}
 
+# In certain configs, the type doesn't get hydrated with the fully-qualified name.
+skipif config 3node-tenant fakedist-disk fakedist-vec-off fakedist
 query TTT
 SELECT pg_typeof(x), pg_typeof(x[1]), pg_typeof(ARRAY['hello']::_greeting) FROM enum_array LIMIT 1
 ----
-greeting[]  greeting  greeting[]
+public.greeting[]  public.greeting  public.greeting[]
 
 # Ensure that the implicitly created array type will tolerate collisions.
 # _collision will create __collision as its implicit array type, so the
@@ -492,7 +494,7 @@ FROM
 WHERE
   descriptor_name = 'enum_array' AND column_name = 'x'
 ----
-x  family:ArrayFamily width:0 precision:0 locale:"" visible_type:0 oid:100118 array_contents:<family: EnumFamily width: 0 precision: 0 locale: "" visible_type: 0 oid: 100117 time_precision_is_set: false udt_metadata: <   array_type_oid: 100118 > > time_precision_is_set:false
+x  family:ArrayFamily width:0 precision:0 locale:"" oid:100118 array_contents:<family: EnumFamily width: 0 precision: 0 locale: "" oid: 100117 time_precision_is_set: false udt_metadata: <   array_type_oid: 100118 > > time_precision_is_set:false
 
 # Test tables using enums in DEFAULT expressions.
 statement ok
@@ -1479,7 +1481,6 @@ CREATE TABLE table_ifne (x INT)
 statement ok
 CREATE TYPE IF NOT EXISTS table_ifne AS ENUM ('hi')
 
-
 subtest enum_array_cast
 
 statement ok
@@ -1539,7 +1540,6 @@ query T
 SELECT * from arr_t5
 ----
 {a,b}
-
 
 # Test that if an enum value is being used by a default expression
 # or computed column, we disallow dropping it.
@@ -1627,7 +1627,6 @@ ALTER TYPE computed_abc2 DROP VALUE 'a'
 
 statement error could not remove enum value "b" as it is being used in a computed column of "t7"
 ALTER TYPE computed_abc2 DROP VALUE 'b'
-
 
 # Test that types used in arrays can be renamed.
 subtest rename_type_in_array
@@ -1921,7 +1920,6 @@ USE "DB➕➕"
 statement ok
 CREATE SCHEMA "➖➖"
 
-
 statement ok
 CREATE TABLE t (i INT PRIMARY KEY);
 CREATE TYPE "➖➖"."MixedCase" AS ENUM ('mixed', 'Case');
@@ -1944,7 +1942,6 @@ CREATE TABLE public.t (
   CONSTRAINT t_pkey PRIMARY KEY (i ASC)
 );
 
-
 skipif config schema-locked-disabled
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE t]
@@ -1955,7 +1952,6 @@ CREATE TABLE public.t (
   🙏 public."Emoji 😉" NULL DEFAULT e'\U0001F60A':::public."Emoji 😉" ON UPDATE e'\U0001F614':::public."Emoji 😉",
   CONSTRAINT t_pkey PRIMARY KEY (i ASC)
 ) WITH (schema_locked = true);
-
 
 # Ensure that there's a database qualification on the enum type in
 # SHOW CREATE TABLE.
@@ -2037,6 +2033,7 @@ WHERE stat->>'columns' = '["a"]'
     "columns": [
         "a"
     ],
+    "delay_delete": false,
     "distinct_count": 3,
     "histo_buckets": [
         {
@@ -2095,6 +2092,7 @@ WHERE stat->>'columns' = '["a"]'
     "columns": [
         "a"
     ],
+    "delay_delete": false,
     "distinct_count": 2,
     "histo_buckets": [
         {

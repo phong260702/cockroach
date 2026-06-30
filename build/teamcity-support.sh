@@ -266,9 +266,9 @@ tc_release_branch() {
   [[ "$branch" == master || "$branch" == release-* || "$branch" == provisional_*  || "$branch" == "staging-"* ]]
 }
 
-tc_bors_branch() {
+is_trunk_branch() {
   branch=$(tc_build_branch)
-  [[ "$branch" == staging ]]
+  [[ "$branch" == trunk-merge/* ]]
 }
 
 if_tc() {
@@ -323,4 +323,18 @@ function check_gcs_path_exists() {
   local path=$1
   gsutil ls "$path" &>/dev/null
   return
+}
+
+# Activate GCS service account credentials from GOOGLE_EPHEMERAL_CREDENTIALS.
+# Idempotent — safe to call multiple times.
+function gcs_setup_credentials() {
+  if [[ "${GOOGLE_EPHEMERAL_CREDENTIALS:-}" != "" ]]; then
+    echo "$GOOGLE_EPHEMERAL_CREDENTIALS" > creds.json
+    gcloud auth activate-service-account --key-file=creds.json
+    export ROACHPROD_USER=teamcity
+    export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/creds.json"
+  else
+    echo 'warning: GOOGLE_EPHEMERAL_CREDENTIALS not set' >&2
+    echo "Assuming that you've run \`gcloud auth login\` from inside the builder." >&2
+  fi
 }

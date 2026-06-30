@@ -7,6 +7,7 @@ package backup
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -14,11 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -429,12 +432,10 @@ func TestScheduleChainingWithDatabaseExpansion(t *testing.T) {
 		skip.IgnoreLint(t, "test flakes when the machine clock is too close to midnight")
 	}
 
-	th.sqlDB.Exec(t, `
-CREATE DATABASE db;
-USE db;
-CREATE TABLE t(a INT, b INT);
-INSERT INTO t select x, y from generate_series(1, 100) as g(x), generate_series(1, 100) as g2(y);
-`)
+	th.sqlDB.Exec(t, `CREATE DATABASE db`)
+	th.sqlDB.Exec(t, `USE db`)
+	th.sqlDB.Exec(t, `CREATE TABLE t(a INT, b INT)`)
+	th.sqlDB.Exec(t, `INSERT INTO t SELECT x, y FROM generate_series(1, 10) AS g(x), generate_series(1, 10) AS g2(y)`)
 
 	backupAsOfTimes := make([]time.Time, 0)
 	th.cfg.TestingKnobs.(*jobs.TestingKnobs).OverrideAsOfClause = func(clause *tree.AsOfClause, statementTime time.Time) {
@@ -496,9 +497,7 @@ INSERT INTO t select x, y from generate_series(1, 100) as g(x), generate_series(
 	checkProtectionPolicy(fullBackupAsOf, "db", "t")
 
 	// Insert some more data.
-	th.sqlDB.Exec(t, `
-INSERT INTO t select x, y from generate_series(1, 100) as g(x), generate_series(1, 100) as g2(y);
-`)
+	th.sqlDB.Exec(t, `INSERT INTO t SELECT x, y FROM generate_series(1, 10) AS g(x), generate_series(1, 10) AS g2(y)`)
 
 	// Now, let's run the incremental schedule.
 	incSchedule := th.loadSchedule(t, incID)
@@ -513,9 +512,7 @@ INSERT INTO t select x, y from generate_series(1, 100) as g(x), generate_series(
 	// covered by the protection policy that the incremental schedule is holding
 	// on to.
 	th.sqlDB.Exec(t, `CREATE TABLE s (a INT, b INT)`)
-	th.sqlDB.Exec(t, `
-INSERT INTO s select x, y from generate_series(1, 100) as g(x), generate_series(1, 100) as g2(y);
-`)
+	th.sqlDB.Exec(t, `INSERT INTO s SELECT x, y FROM generate_series(1, 10) AS g(x), generate_series(1, 10) AS g2(y)`)
 
 	// The protection policy should exist on the newly created table.
 	checkProtectionPolicy(incBackupAsOf, "db", "s")
@@ -523,4 +520,98 @@ INSERT INTO s select x, y from generate_series(1, 100) as g(x), generate_series(
 	// We should be able to run an incremental backup.
 	incSchedule = th.loadSchedule(t, incID)
 	runSchedule(t, incSchedule)
+}
+
+// TestSchedulePTSChainingExcludeFromBackupDrop tests that a scheduled
+// incremental backup with revision_history succeeds when a table with
+// exclude_data_from_backup=true is dropped between full and incremental.
+//
+// This was the regression test for the backup-side fix in #169087, which
+// taught the backup processor to skip ExportRequests for spans whose
+// descriptors were dropped. The test deliberately sets up the bad state
+// (span config record removed because the descriptor was deleted) to
+// exercise that recovery path. Subsequent changes to the GC job
+// (#169148) prevent that bad state from arising naturally because
+// descriptor cleanup now waits for any covering PTS to be released, and
+// the chained schedule PTS would normally block it. The
+// SkipWaitingForPTSRelease knob is used here to bypass that wait so the
+// test can still set up the original scenario.
+func TestSchedulePTSChainingExcludeFromBackupDrop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanup := newTestHelper(t, func(knobs *base.TestingKnobs) {
+		knobs.GCJob = &sql.GCJobTestingKnobs{SkipWaitingForPTSRelease: true}
+	})
+	defer cleanup()
+
+	th.sqlDB.Exec(t, `SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms'`)
+	th.sqlDB.Exec(t, `SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s'`)
+	th.sqlDB.Exec(t, `ALTER RANGE default CONFIGURE ZONE USING gc.ttlseconds = 1`)
+
+	th.sqlDB.Exec(t, `CREATE DATABASE db`)
+	th.sqlDB.Exec(t, `USE db`)
+	th.sqlDB.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, v STRING)`)
+	th.sqlDB.Exec(t, `ALTER TABLE t SET (exclude_data_from_backup = true)`)
+	th.sqlDB.Exec(t, `INSERT INTO t SELECT generate_series(1, 100), 'initial'`)
+
+	var tableID int
+	th.sqlDB.QueryRow(t,
+		`SELECT table_id FROM crdb_internal.tables WHERE name = 't' AND database_name = 'db'`,
+	).Scan(&tableID)
+
+	// The table needs its own range so GC respects ExcludeDataFromBackup
+	// and ignores the schedule's PTS.
+	waitForTableSplit(t, th.sqlDB.DB.(*gosql.DB), "t", "db")
+
+	th.cfg.TestingKnobs.(*jobs.TestingKnobs).OverrideAsOfClause = func(
+		clause *tree.AsOfClause, statementTime time.Time,
+	) {
+		backupAsOfTime := th.cfg.DB.KV().Clock().PhysicalTime()
+		if backupAsOfTime.After(statementTime) {
+			backupAsOfTime = statementTime
+		}
+		expr, err := tree.MakeDTimestampTZ(backupAsOfTime, time.Microsecond)
+		require.NoError(t, err)
+		clause.Expr = expr
+	}
+
+	fullID, incID, cleanupSchedules := th.createSchedules(t,
+		`BACKUP INTO 'nodelocal://1/exclude_test'`, "revision_history")
+	defer cleanupSchedules()
+
+	fullSchedule := th.loadSchedule(t, fullID)
+	th.env.SetTime(fullSchedule.NextRun().Add(time.Second))
+	require.NoError(t, th.executeSchedules())
+	th.waitForSuccessfulScheduledJob(t, fullSchedule.ScheduleID())
+
+	// Advance GC past the backup's AOST while the span config still has the
+	// flag (so the PTS is ignored).
+	var rangeID int
+	th.sqlDB.QueryRow(t, `SELECT range_id FROM [SHOW RANGES FROM TABLE db.t]`).Scan(&rangeID)
+	th.sqlDB.Exec(t,
+		fmt.Sprintf(`SELECT crdb_internal.kv_enqueue_replica(%d, 'mvccGC', true, true)`, rangeID))
+
+	// Drop the table and wait for the span config to be fully cleaned up.
+	th.sqlDB.Exec(t, `DROP TABLE db.t`)
+	testutils.SucceedsSoon(t, func() error {
+		th.sqlDB.Exec(t,
+			fmt.Sprintf(`SELECT crdb_internal.kv_enqueue_replica(%d, 'mvccGC', true, true)`, rangeID))
+		var count int
+		if err := th.sqlDB.DB.QueryRowContext(context.Background(),
+			`SELECT count(*) FROM system.span_configurations
+			 WHERE start_key = crdb_internal.table_span($1)[1]`, tableID,
+		).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			return errors.Newf("waiting for span config removal (still %d entries)", count)
+		}
+		return nil
+	})
+
+	incSchedule := th.loadSchedule(t, incID)
+	th.env.SetTime(incSchedule.NextRun().Add(time.Second))
+	require.NoError(t, th.executeSchedules())
+	th.waitForSuccessfulScheduledJob(t, incSchedule.ScheduleID())
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigptsreader"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -468,11 +470,15 @@ func TestBackfillQueryWithProtectedTS(t *testing.T) {
 				t.Logf("%s running backfill with PTS not setup early enough", timeutil.Now().Format(time.RFC3339))
 				blockBackFillsForPTSFailure.Swap(true)
 				_, err := db.ExecContext(ctx, tc.backfillSchemaChange)
-				if err == nil || !testutils.IsError(err, "unable to retry backfill since fixed timestamp is before the GC timestamp") {
-					if err == nil {
-						return errors.AssertionFailedf("expected error was not hit")
-					}
+				if err == nil {
+					return errors.AssertionFailedf("expected error was not hit; got nil")
+				}
+				if !testutils.IsError(err, "unable to backfill since fixed timestamp is before the GC timestamp") {
 					return errors.NewAssertionErrorWithWrappedErrf(err, "expected error was not hit")
+				}
+				if pgErr := (*pq.Error)(nil); !errors.As(err, &pgErr) ||
+					pgcode.MakeCode(string(pgErr.Code)) != pgcode.InvalidParameterValue {
+					return errors.NewAssertionErrorWithWrappedErrf(err, "expected error code was not found")
 				}
 				err = testutils.SucceedsSoonError(func() error {
 					// Wait until schema change is fully rolled back.
@@ -514,4 +520,39 @@ func TestBackfillQueryWithProtectedTS(t *testing.T) {
 			require.Falsef(t, blockBackFillsForPTSCheck.Load(), "no backfill txn was detected in testing knob.")
 		})
 	}
+}
+
+// TestBackfillQueryPTSInstallErrorPropagation verifies that errors during PTS
+// installation in backfillQueryIntoTable are properly propagated. This is a
+// regression test for a bug where a variable shadowing issue inside a
+// sync.Once closure caused PTS installation errors to be silently swallowed.
+func TestBackfillQueryPTSInstallErrorPropagation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	injectedErr := errors.New("injected PTS installation error")
+	ptsInstallCalled := atomic.Int32{}
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+				RunBeforeQueryBackfillPTSInstall: func() error {
+					ptsInstallCalled.Add(1)
+					return injectedErr
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	r := sqlutils.MakeSQLRunner(db)
+	r.Exec(t, "SET create_table_with_schema_locked=false")
+	r.Exec(t, "CREATE TABLE src(n int)")
+	r.Exec(t, "INSERT INTO src VALUES (1), (2), (3)")
+
+	_, err := db.ExecContext(ctx, "CREATE MATERIALIZED VIEW mv AS SELECT n FROM src")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "injected PTS installation error")
+	require.Greater(t, ptsInstallCalled.Load(), int32(0),
+		"PTS installation knob should have been called")
 }

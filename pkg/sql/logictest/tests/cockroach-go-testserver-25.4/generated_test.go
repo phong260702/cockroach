@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -25,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 21
+const configIdx = 23
 
 var logicTestDir string
 
@@ -42,15 +43,12 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
+	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
-	serverutils.InitTestServerFactory(server.TestServerFactory)
+	serverutils.InitTestServerFactory(server.TestServerFactory,
+		serverutils.WithTenantOption(base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(156124)))
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
-
-	defer serverutils.TestingSetDefaultTenantSelectionOverride(
-		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(156124),
-	)()
-
 	os.Exit(m.Run())
 }
 
@@ -80,6 +78,13 @@ func TestLogic_cross_version_tenant_backup(
 	runLogicTest(t, "cross_version_tenant_backup")
 }
 
+func TestLogic_mixed_version_aclitem(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_aclitem")
+}
+
 func TestLogic_mixed_version_bootstrap_tenant(
 	t *testing.T,
 ) {
@@ -94,6 +99,20 @@ func TestLogic_mixed_version_can_login(
 	runLogicTest(t, "mixed_version_can_login")
 }
 
+func TestLogic_mixed_version_new_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_new_privileges")
+}
+
+func TestLogic_mixed_version_statement_hints_session_settings(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_statement_hints_session_settings")
+}
+
 func TestLogic_mixed_version_stats(
 	t *testing.T,
 ) {
@@ -106,6 +125,13 @@ func TestLogic_mixed_version_timeseries_range_already_exists(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "mixed_version_timeseries_range_already_exists")
+}
+
+func TestLogic_mixed_version_trigger_backref(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "mixed_version_trigger_backref")
 }
 
 func TestLogic_mixed_version_upgrade_preserve_ttl(

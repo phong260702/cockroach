@@ -529,6 +529,14 @@
 <p>Note that a TimestampTZ has less precision than a CockroachDB HLC. It is intended as
 a convenience function to display HLCs in a print-friendly form. Use the decimal
 value if you rely on the HLC for accuracy.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="min_scale"></a><code>min_scale(val: <a href="decimal.html">decimal</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the minimum scale (number of fractional decimal digits) needed to represent <code>val</code> exactly.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="scale"></a><code>scale(val: <a href="decimal.html">decimal</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the scale (number of fractional decimal digits) of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="to_number"></a><code>to_number(value: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Convert a string to a numeric using the given format.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="trim_scale"></a><code>trim_scale(val: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Returns <code>val</code> with any trailing zeros after the decimal point removed.</p>
 </span></td><td>Immutable</td></tr></tbody>
 </table>
 
@@ -728,13 +736,13 @@ has no relationship with the commit order of concurrent transactions.</p>
 and which stays constant throughout the transaction. This timestamp
 has no relationship with the commit order of concurrent transactions.</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="make_date"></a><code>make_date(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>) &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Create date (formatted according to ISO 8601) from year, month, and day fields (negative years signify BC).</p>
+<tr><td><a name="make_date"></a><code>make_date(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>) &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Create date from year, month, and day fields (negative years signify BC).</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="make_timestamp"></a><code>make_timestamp(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Create timestamp (formatted according to ISO 8601) from year, month, day, hour, minute, and seconds fields (negative years signify BC).</p>
+<tr><td><a name="make_timestamp"></a><code>make_timestamp(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Create timestamp from year, month, day, hour, minute, and seconds fields (negative years signify BC).</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="make_timestamptz"></a><code>make_timestamptz(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Create timestamp (formatted according to ISO 8601) with time zone from year, month, day, hour, minute and seconds fields (negative years signify BC). If timezone is not specified, the current time zone is used.</p>
+<tr><td><a name="make_timestamptz"></a><code>make_timestamptz(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Create timestamp with time zone from year, month, day, hour, minute and seconds fields (negative years signify BC). If timezone is not specified, the current time zone is used.</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="make_timestamptz"></a><code>make_timestamptz(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>, timezone: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Create timestamp (formatted according to ISO 8601) with time zone from year, month, day, hour, minute and seconds fields (negative years signify BC). If timezone is not specified, the current time zone is used.</p>
+<tr><td><a name="make_timestamptz"></a><code>make_timestamptz(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>, timezone: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Create timestamp with time zone from year, month, day, hour, minute and seconds fields (negative years signify BC). If timezone is not specified, the current time zone is used.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="now"></a><code>now() &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Returns the time of the current transaction.</p>
 <p>The value is based on a timestamp picked when the transaction starts
@@ -804,11 +812,21 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(interval: <a href="interval.html">interval</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string using the given format.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(number: <a href="decimal.html">decimal</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a decimal to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(number: <a href="float.html">float</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a float to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(number: <a href="int.html">int</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an integer to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(timestamp: <a href="timestamp.html">timestamp</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string assuming the ISO, MDY DateStyle.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(timestamp: <a href="timestamp.html">timestamp</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an timestamp to a string using the given format.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(timestamptz: <a href="timestamp.html">timestamptz</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a timestamp with time zone to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_date"></a><code>to_date(date_string: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Convert a string to a date using the given format.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="to_timestamp"></a><code>to_timestamp(date_string: <a href="string.html">string</a>, format: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert a string to a timestamp with time zone using the given format.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="to_timestamp"></a><code>to_timestamp(timestamp: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.</p>
 </span></td><td>Immutable</td></tr>
@@ -936,6 +954,10 @@ available replica will error.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="div"></a><code>div(x: <a href="int.html">int</a>, y: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the integer quotient of <code>x</code>/<code>y</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="erf"></a><code>erf(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the error function of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="erfc"></a><code>erfc(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the complementary error function: <code>1 - erf(val)</code>.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="exp"></a><code>exp(val: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates <em>e</em> ^ <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="exp"></a><code>exp(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates <em>e</em> ^ <code>val</code>.</p>
@@ -954,13 +976,25 @@ available replica will error.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="ln"></a><code>ln(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the natural log of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="ln"></a><code>ln(val: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the natural log of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="log"></a><code>log(b: <a href="decimal.html">decimal</a>, x: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the base <code>b</code> log of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="log"></a><code>log(b: <a href="float.html">float</a>, x: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the base <code>b</code> log of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="log"></a><code>log(b: <a href="int.html">int</a>, x: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the base <code>b</code> log of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="log"></a><code>log(val: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the base 10 log of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="log"></a><code>log(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the base 10 log of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="log"></a><code>log(val: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the base 10 log of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="log10"></a><code>log10(val: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the base 10 log of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="log10"></a><code>log10(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Calculates the base 10 log of <code>val</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="log10"></a><code>log10(val: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the base 10 log of <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="mod"></a><code>mod(x: <a href="decimal.html">decimal</a>, y: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates <code>x</code>%<code>y</code>.</p>
 </span></td><td>Immutable</td></tr>
@@ -985,6 +1019,10 @@ available replica will error.</p>
 <tr><td><a name="radians"></a><code>radians(val: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Converts <code>val</code> as a degree value to a radians value.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="random"></a><code>random() &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns a random floating-point number between 0 (inclusive) and 1 (exclusive). Note that the value contains at most 53 bits of randomness.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="random_normal"></a><code>random_normal() &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns a random floating-point value drawn from the standard normal distribution (mean 0, standard deviation 1).</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="random_normal"></a><code>random_normal(mean: <a href="float.html">float</a>, stddev: <a href="float.html">float</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns a random floating-point value drawn from a normal distribution with the given <code>mean</code> and <code>stddev</code>.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="round"></a><code>round(input: <a href="decimal.html">decimal</a>, decimal_accuracy: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Keeps <code>decimal_accuracy</code> number of figures to the right of the zero position in <code>input</code> using half away from zero rounding. If <code>decimal_accuracy</code> is not in the range -2^31…(2^31-1), the results are undefined.</p>
 </span></td><td>Immutable</td></tr>
@@ -1064,6 +1102,12 @@ available replica will error.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
+<tr><td><a name="daitch_mokotoff"></a><code>daitch_mokotoff(source: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a>[]</code></td><td><span class="funcdesc"><p>Returns an array of Daitch-Mokotoff soundex codes for the input string.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="dmetaphone"></a><code>dmetaphone(source: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the primary Double Metaphone code for the input string.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="dmetaphone_alt"></a><code>dmetaphone_alt(source: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the alternate Double Metaphone code for the input string.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="levenshtein"></a><code>levenshtein(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the Levenshtein distance between two strings. Maximum input length is 255 characters.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="levenshtein"></a><code>levenshtein(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>, ins_cost: <a href="int.html">int</a>, del_cost: <a href="int.html">int</a>, sub_cost: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the Levenshtein distance between two strings. The cost parameters specify how much to charge for each edit operation. Maximum input length is 255 characters.</p>
@@ -1161,6 +1205,8 @@ available replica will error.</p>
 </span></td><td>Leakproof</td></tr>
 <tr><td><a name="crc32ieee"></a><code>crc32ieee(<a href="string.html">string</a>...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the CRC-32 hash using the IEEE polynomial.</p>
 </span></td><td>Leakproof</td></tr>
+<tr><td><a name="factorial"></a><code>factorial(val: <a href="int.html">int</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the factorial of <code>val</code>. <code>val</code> must be between 0 and 32177 inclusive.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="fnv32"></a><code>fnv32(<a href="bytes.html">bytes</a>...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the 32-bit FNV-1 hash value of a set of values.</p>
 </span></td><td>Leakproof</td></tr>
 <tr><td><a name="fnv32"></a><code>fnv32(<a href="string.html">string</a>...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the 32-bit FNV-1 hash value of a set of values.</p>
@@ -1177,6 +1223,14 @@ available replica will error.</p>
 </span></td><td>Leakproof</td></tr>
 <tr><td><a name="fnv64a"></a><code>fnv64a(<a href="string.html">string</a>...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the 64-bit FNV-1a hash value of a set of values.</p>
 </span></td><td>Leakproof</td></tr>
+<tr><td><a name="gcd"></a><code>gcd(a: <a href="decimal.html">decimal</a>, b: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the greatest common divisor of <code>a</code> and <code>b</code>. Returns 0 if both inputs are 0; otherwise returns a positive value. Returns NaN if either input is NaN or Infinity.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="gcd"></a><code>gcd(a: <a href="int.html">int</a>, b: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the greatest common divisor of <code>a</code> and <code>b</code>. Returns 0 if both inputs are 0; otherwise returns a positive value.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="lcm"></a><code>lcm(a: <a href="decimal.html">decimal</a>, b: <a href="decimal.html">decimal</a>) &rarr; <a href="decimal.html">decimal</a></code></td><td><span class="funcdesc"><p>Calculates the least common multiple of <code>a</code> and <code>b</code>. Returns 0 if either input is 0. Returns NaN if either input is NaN or Infinity.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="lcm"></a><code>lcm(a: <a href="int.html">int</a>, b: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the least common multiple of <code>a</code> and <code>b</code>. Returns 0 if either input is 0.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="width_bucket"></a><code>width_bucket(operand: <a href="decimal.html">decimal</a>, b1: <a href="decimal.html">decimal</a>, b2: <a href="decimal.html">decimal</a>, count: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>return the bucket number to which operand would be assigned in a histogram having count equal-width buckets spanning the range b1 to b2. Returns 0 or count+1 for an input outside that range.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="width_bucket"></a><code>width_bucket(operand: <a href="int.html">int</a>, b1: <a href="int.html">int</a>, b2: <a href="int.html">int</a>, count: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>return the bucket number to which operand would be assigned in a histogram having count equal-width buckets spanning the range b1 to b2.</p>
@@ -1541,7 +1595,9 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
-<tr><td><a name="aclexplode"></a><code>aclexplode(aclitems: <a href="string.html">string</a>[]) &rarr; tuple{oid AS grantor, oid AS grantee, string AS privilege_type, bool AS is_grantable}</code></td><td><span class="funcdesc"><p>Produces a virtual table containing aclitem stuff (returns no rows as this feature is unsupported in CockroachDB)</p>
+<tr><td><a name="aclexplode"></a><code>aclexplode(aclitems: <a href="string.html">string</a>[]) &rarr; tuple{oid AS grantor, oid AS grantee, string AS privilege_type, bool AS is_grantable}</code></td><td><span class="funcdesc"><p>Produces a virtual table containing aclitem privileges.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="aclexplode"></a><code>aclexplode(aclitems: aclitem[]) &rarr; tuple{oid AS grantor, oid AS grantee, string AS privilege_type, bool AS is_grantable}</code></td><td><span class="funcdesc"><p>Produces a virtual table containing aclitem privileges.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="generate_series"></a><code>generate_series(start: <a href="int.html">int</a>, end: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Produces a virtual table containing the integer values from <code>start</code> to <code>end</code>, inclusive.</p>
 </span></td><td>Immutable</td></tr>
@@ -1665,6 +1721,12 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
+<tr><td><a name="_st_3ddfullywithin"></a><code>_st_3ddfullywithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if every point in geometry_a is within distance units of geometry_b, using 3D Euclidean distance. This variant does not utilize any spatial index.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="_st_3ddwithin"></a><code>_st_3ddwithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geometry_a is within distance units of geometry_b, using 3D Euclidean distance. This variant does not utilize any spatial index.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="_st_3dintersects"></a><code>_st_3dintersects(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a shares any portion of space with geometry_b, using 3D Euclidean distance. This variant does not utilize any spatial index.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="_st_contains"></a><code>_st_contains(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if no points of geometry_b lie in the exterior of geometry_a, and there is at least one point in the interior of geometry_b that lies in the interior of geometry_a.</p>
 <p>This function utilizes the GEOS module.</p>
 <p>This function variant does not utilize any spatial index.</p>
@@ -1811,10 +1873,28 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="postgis_wagyu_version"></a><code>postgis_wagyu_version() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Compatibility placeholder function with PostGIS. Returns a fixed string based on PostGIS 3.0.1, with minor edits.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3dclosestpoint"></a><code>st_3dclosestpoint(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the 3-dimensional point on geometry_a that is closest to geometry_b.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3ddfullywithin"></a><code>st_3ddfullywithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if every point in geometry_a is within distance units of geometry_b, using 3D Euclidean distance.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3ddistance"></a><code>st_3ddistance(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the 3-dimensional minimum Cartesian distance between two geometries. If either geometry has no Z component, this is equivalent to ST_Distance.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3ddwithin"></a><code>st_3ddwithin(geometry_a: geometry, geometry_b: geometry, distance: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if any of geometry_a is within distance units of geometry_b, using 3D Euclidean distance.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3dintersects"></a><code>st_3dintersects(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if geometry_a shares any portion of space with geometry_b, using 3D Euclidean distance.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="st_3dlength"></a><code>st_3dlength(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the 3-dimensional or 2-dimensional length of the geometry.</p>
 <p>Note ST_3DLength is only valid for LineString or MultiLineString.
 For 2-D lines it will return the 2-D length (same as ST_Length and ST_Length2D)</p>
 <p>This function utilizes the GEOS module.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3dlongestline"></a><code>st_3dlongestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the 3-dimensional longest line between two geometries.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3dmaxdistance"></a><code>st_3dmaxdistance(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the 3-dimensional maximum Cartesian distance between two geometries. If either geometry has no Z component, this is equivalent to ST_MaxDistance.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3dperimeter"></a><code>st_3dperimeter(geometry: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the 3-dimensional perimeter of the geometry. Note ST_3DPerimeter is only valid for Polygon or MultiPolygon. For 2D geometries it returns the 2D perimeter.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_3dshortestline"></a><code>st_3dshortestline(geometry_a: geometry, geometry_b: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the 3-dimensional shortest line between two geometries.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="st_addmeasure"></a><code>st_addmeasure(geometry: geometry, start: <a href="float.html">float</a>, end: <a href="float.html">float</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a copy of a LineString or MultiLineString with measure coordinates linearly interpolated between the specified start and end values. Any existing M coordinates will be overwritten.</p>
 </span></td><td>Immutable</td></tr>
@@ -2219,6 +2299,11 @@ from the given Geometry.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="st_distancespheroid"></a><code>st_distancespheroid(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geometry_a and geometry_b assuming the coordinates represent lng/lat points on a spheroid.</p>
+<p>When operating on a spheroid, this function will use the sphere to calculate the closest two points. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
+<p>This function utilizes the S2 library for spherical calculations.</p>
+<p>This function utilizes the GeographicLib library for spheroid calculations.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_distancespheroid"></a><code>st_distancespheroid(geometry_a: geometry, geometry_b: geometry, spheroid: <a href="string.html">string</a>) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the distance in meters between geometry_a and geometry_b using the supplied spheroid for the geodesic computation. The spheroid argument follows the PostGIS textual format, e.g. <code>SPHEROID[&quot;GRS_1980&quot;,6378137,298.257222101]</code>, where the second number is the semi-major axis in meters and the third is the inverse flattening.</p>
 <p>When operating on a spheroid, this function will use the sphere to calculate the closest two points. The spheroid distance between these two points is calculated using GeographicLib. This follows observed PostGIS behavior.</p>
 <p>This function utilizes the S2 library for spherical calculations.</p>
 <p>This function utilizes the GeographicLib library for spheroid calculations.</p>
@@ -3374,7 +3459,25 @@ may increase either contention or retry errors, or both.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
+<tr><td><a name="information_schema.crdb_delete_statement_hints"></a><code>information_schema.crdb_delete_statement_hints(rowid: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function deletes a statement hint by its row ID. It returns the number of deleted rows.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_delete_statement_hints"></a><code>information_schema.crdb_delete_statement_hints(statement_fingerprint: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function deletes all statement hints matching the given statement fingerprint. The statement fingerprint argument is normalized before matching. It returns the number of deleted rows.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_delete_statement_hints"></a><code>information_schema.crdb_delete_statement_hints(statement_fingerprint: <a href="string.html">string</a>, database: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function deletes all statement hints matching the given statement fingerprint and database. The statement fingerprint argument is normalized before matching. It returns the number of deleted rows.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_enable_statement_hints"></a><code>information_schema.crdb_enable_statement_hints(enabled: <a href="bool.html">bool</a>, rowid: <a href="int.html">int</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function enables or disables the statement hint with the given row ID. It returns the number of affected rows.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_enable_statement_hints"></a><code>information_schema.crdb_enable_statement_hints(enabled: <a href="bool.html">bool</a>, statement_fingerprint: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function enables or disables all statement hints matching the given statement fingerprint. The statement fingerprint argument is normalized before matching. It returns the number of affected rows.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_enable_statement_hints"></a><code>information_schema.crdb_enable_statement_hints(enabled: <a href="bool.html">bool</a>, statement_fingerprint: <a href="string.html">string</a>, database: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function enables or disables all statement hints matching the given statement fingerprint and database. The statement fingerprint argument is normalized before matching. It returns the number of affected rows.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="information_schema.crdb_rewrite_inline_hints"></a><code>information_schema.crdb_rewrite_inline_hints(statement_fingerprint: <a href="string.html">string</a>, donor_sql: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function adds an inline-hints rewrite rule for a statement fingerprint. It returns the hint ID of the newly created rewrite rule. The rewrite rule only applies to matching statement fingerprints. It first removes all inline hints from the target statement, and then copies inline hints from the donor statement.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_rewrite_inline_hints"></a><code>information_schema.crdb_rewrite_inline_hints(statement_fingerprint: <a href="string.html">string</a>, donor_sql: <a href="string.html">string</a>, database: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function adds an inline-hints rewrite rule for a statement fingerprint, scoped to the given database. It returns the hint ID of the newly created rewrite rule. The rewrite rule only applies to matching statement fingerprints when the current database matches the specified database. It first removes all inline hints from the target statement, and then copies inline hints from the donor statement.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_set_session_variable_hint"></a><code>information_schema.crdb_set_session_variable_hint(statement_fingerprint: <a href="string.html">string</a>, variable_name: <a href="string.html">string</a>, variable_value: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function adds a session variable override hint for a statement fingerprint. It returns the hint ID of the newly created hint. The hint only applies to matching statement fingerprints and temporarily overrides the specified session variable for that statement only. Safe variables can be hinted without restrictions. Unsafe variables cannot be hinted when sql_safe_updates is enabled.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="information_schema.crdb_set_session_variable_hint"></a><code>information_schema.crdb_set_session_variable_hint(statement_fingerprint: <a href="string.html">string</a>, variable_name: <a href="string.html">string</a>, variable_value: <a href="string.html">string</a>, database: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>This function adds a session variable override hint for a statement fingerprint, scoped to the given database. It returns the hint ID of the newly created hint. The hint only applies to matching statement fingerprints when the current database matches the specified database, and temporarily overrides the specified session variable for that statement only. Safe variables can be hinted without restrictions. Unsafe variables cannot be hinted when sql_safe_updates is enabled.</p>
 </span></td><td>Volatile</td></tr></tbody>
 </table>
 
@@ -3430,6 +3533,8 @@ may increase either contention or retry errors, or both.</p>
 <table>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
+<tr><td><a name="acldefault"></a><code>acldefault(type: "char", ownerId: oid) &rarr; aclitem[]</code></td><td><span class="funcdesc"><p>Returns the default access privileges for an object of the given type belonging to the given owner.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="col_description"></a><code>col_description(table_oid: oid, column_number: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a table column, which is specified by the OID of its table and its column number. (obj_description cannot be used for table columns, since columns do not have OIDs of their own.)</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="current_setting"></a><code>current_setting(setting_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>System info</p>
@@ -3608,6 +3713,8 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="information_schema._pg_numeric_scale"></a><code>information_schema._pg_numeric_scale(typid: oid, typmod: int4) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the scale of the given type with type modifier</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="makeaclitem"></a><code>makeaclitem(grantee: oid, grantor: oid, privileges: <a href="string.html">string</a>, is_grantable: <a href="bool.html">bool</a>) &rarr; aclitem</code></td><td><span class="funcdesc"><p>Constructs an aclitem from the given grantee, grantor, privileges, and grant option.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="nameconcatoid"></a><code>nameconcatoid(name: <a href="string.html">string</a>, oid: oid) &rarr; name</code></td><td><span class="funcdesc"><p>Used in the information_schema to produce specific_name columns, which are supposed to be unique per schema. The result is the same as ($1::text || ‘_’ || $2::text)::name except that, if it would not fit in 63 characters, we make it do so by truncating the name input (not the oid).</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="obj_description"></a><code>obj_description(object_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a database object specified by its OID alone. This is deprecated since there is no guarantee that OIDs are unique across different system catalogs; therefore, the wrong comment might be returned.</p>
@@ -3616,6 +3723,14 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="oidvectortypes"></a><code>oidvectortypes(vector: oidvector) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Generates a comma seperated string of type names from an oidvector.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="pg_advisory_xact_lock"></a><code>pg_advisory_xact_lock(key1: int4, key2: int4) &rarr; void</code></td><td><span class="funcdesc"><p>Acquires an exclusive transaction-level advisory lock, waiting if necessary. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_advisory_xact_lock"></a><code>pg_advisory_xact_lock(key: <a href="int.html">int</a>) &rarr; void</code></td><td><span class="funcdesc"><p>Acquires an exclusive transaction-level advisory lock, waiting if necessary. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_advisory_xact_lock_shared"></a><code>pg_advisory_xact_lock_shared(key1: int4, key2: int4) &rarr; void</code></td><td><span class="funcdesc"><p>Acquires a shared transaction-level advisory lock, waiting if necessary. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_advisory_xact_lock_shared"></a><code>pg_advisory_xact_lock_shared(key: <a href="int.html">int</a>) &rarr; void</code></td><td><span class="funcdesc"><p>Acquires a shared transaction-level advisory lock, waiting if necessary. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_backend_pid"></a><code>pg_backend_pid() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns a numerical ID attached to this session. This ID is part of the query cancellation key used by the wire protocol. This function was only added for compatibility, and unlike in Postgres, the returned value does not correspond to a real process ID.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_collation_for"></a><code>pg_collation_for(str: anyelement) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the collation of the argument</p>
@@ -3624,7 +3739,15 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(any...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="pg_function_is_visible"></a><code>pg_function_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the function with the given OID belongs to one of the schemas on the search path.</p>
+<tr><td><a name="pg_database_size"></a><code>pg_database_size(database_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of all tables in the named database. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Errors if the database does not exist or if the caller lacks CONNECT on it.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_database_size"></a><code>pg_database_size(database_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of all tables in the database with the given OID. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Errors if the database does not exist or if the caller lacks CONNECT on it.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_function_is_visible"></a><code>pg_function_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the function with the given OID is visible in the search path (its schema is on the search path and no function with the same name and signature shadows it from an earlier schema).</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_constraintdef"></a><code>pg_get_constraintdef(constraint_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the definition of the specified constraint.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_constraintdef"></a><code>pg_get_constraintdef(constraint_oid: oid, pretty_bool: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the definition of the specified constraint.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_function_arg_default"></a><code>pg_get_function_arg_default(func_oid: oid, arg_num: int4) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Get textual representation of a function argument’s default value. The second argument of this function is the argument number among all arguments (i.e. proallargtypes, <em>not</em> proargtypes), starting with 1, because that’s how information_schema.sql uses it.</p>
 </span></td><td>Stable</td></tr>
@@ -3634,6 +3757,8 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_function_result"></a><code>pg_get_function_result(func_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the types of the result of the specified function.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_function_sqlbody"></a><code>pg_get_function_sqlbody(func_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the SQL-standard body of the specified function, or NULL if the function was not defined with the SQL-standard inline body syntax.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_functiondef"></a><code>pg_get_functiondef(func_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>For user-defined functions, returns the definition of the specified function. For builtin functions, returns the name of the function.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_indexdef"></a><code>pg_get_indexdef(index_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Gets the CREATE INDEX command for index</p>
@@ -3641,6 +3766,12 @@ may increase either contention or retry errors, or both.</p>
 <tr><td><a name="pg_get_indexdef"></a><code>pg_get_indexdef(index_oid: oid, column_no: <a href="int.html">int</a>, pretty_bool: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Gets the CREATE INDEX command for index, or definition of just one index column when given a non-zero column number</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_serial_sequence"></a><code>pg_get_serial_sequence(table_name: <a href="string.html">string</a>, column_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the name of the sequence used by the given column_name in the table table_name.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_statisticsobjdef"></a><code>pg_get_statisticsobjdef(statobj_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE STATISTICS command for an extended statistics object.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_triggerdef"></a><code>pg_get_triggerdef(trigger_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE TRIGGER statement for the specified trigger.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_triggerdef"></a><code>pg_get_triggerdef(trigger_oid: oid, pretty_bool: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE TRIGGER statement for the specified trigger.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_viewdef"></a><code>pg_get_viewdef(view_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the CREATE statement for an existing view.</p>
 </span></td><td>Stable</td></tr>
@@ -3658,19 +3789,43 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_has_role"></a><code>pg_has_role(user: oid, role: oid, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the user has privileges for role.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="pg_indexes_size"></a><code>pg_indexes_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the total on-disk size, in bytes, of the secondary indexes attached to the relation with the given OID. The primary index is excluded (it is reported by pg_relation_size and pg_table_size, since CockroachDB stores row data in the primary index). The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists or has no on-disk representation.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_is_other_temp_schema"></a><code>pg_is_other_temp_schema(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the given OID is the OID of another session’s temporary schema. (This can be useful, for example, to exclude other sessions’ temporary tables from a catalog display.)</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_my_temp_schema"></a><code>pg_my_temp_schema() &rarr; oid</code></td><td><span class="funcdesc"><p>Returns the OID of the current session’s temporary schema, or zero if it has none (because it has not created any temporary tables).</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_relation_is_updatable"></a><code>pg_relation_is_updatable(reloid: oid, include_triggers: <a href="bool.html">bool</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the update events the relation supports.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="pg_relation_size"></a><code>pg_relation_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the relation with the given OID. For a table-class relation this is the primary index size (matching PG’s “heap only” semantics, since CockroachDB’s primary index is the row data). For an index this is the size of just that index. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists or has no on-disk representation.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_sequence_last_value"></a><code>pg_sequence_last_value(sequence_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the last value generated by a sequence, or NULL if the sequence has not been used yet.</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_size_bytes"></a><code>pg_size_bytes(size: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Parses a human-readable size string (e.g. ‘1.5 MB’) and returns the size in bytes.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="pg_size_pretty"></a><code>pg_size_pretty(size: <a href="decimal.html">decimal</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts a size in bytes into a human-readable string with units (e.g. ‘1024 bytes’, ‘10 MB’).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="pg_size_pretty"></a><code>pg_size_pretty(size: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Converts a size in bytes into a human-readable string with units (e.g. ‘1024 bytes’, ‘10 MB’).</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="pg_sleep"></a><code>pg_sleep(seconds: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>pg_sleep makes the current session’s process sleep until seconds seconds have elapsed. seconds is a value of type double precision, so fractional-second delays can be specified.</p>
 </span></td><td>Volatile</td></tr>
-<tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID belongs to one of the schemas on the search path.</p>
+<tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID is visible in the search path (its schema is on the search path and no table with the same name shadows it from an earlier schema).</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="pg_type_is_visible"></a><code>pg_type_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the type with the given OID belongs to one of the schemas on the search path.</p>
+<tr><td><a name="pg_table_size"></a><code>pg_table_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the table with the given OID, excluding indexes. In CockroachDB this is the primary index size, since the primary index is the row data. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists or has no on-disk representation.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_total_relation_size"></a><code>pg_total_relation_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the relation with the given OID, including all indexes and any data still occupying the table’s keyspace (such as dropped-index data awaiting garbage collection). The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists or has no on-disk representation.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_trigger_depth"></a><code>pg_trigger_depth() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the current nesting level of PostgreSQL triggers (0 if not called, directly or indirectly, from inside a trigger).</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_try_advisory_xact_lock"></a><code>pg_try_advisory_xact_lock(key1: int4, key2: int4) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Acquires an exclusive transaction-level advisory lock if available. Returns true if the lock was acquired, false if it was not. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_try_advisory_xact_lock"></a><code>pg_try_advisory_xact_lock(key: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Acquires an exclusive transaction-level advisory lock if available. Returns true if the lock was acquired, false if it was not. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_try_advisory_xact_lock_shared"></a><code>pg_try_advisory_xact_lock_shared(key1: int4, key2: int4) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Acquires a shared transaction-level advisory lock if available. Returns true if the lock was acquired, false if it was not. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_try_advisory_xact_lock_shared"></a><code>pg_try_advisory_xact_lock_shared(key: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Acquires a shared transaction-level advisory lock if available. Returns true if the lock was acquired, false if it was not. The lock is released automatically at the end of the current transaction.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="pg_type_is_visible"></a><code>pg_type_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the type with the given OID is visible in the search path (its schema is on the search path and no type with the same name shadows it from an earlier schema).</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="set_config"></a><code>set_config(setting_name: <a href="string.html">string</a>, new_value: <a href="string.html">string</a>, is_local: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>System info</p>
 </span></td><td>Volatile</td></tr>

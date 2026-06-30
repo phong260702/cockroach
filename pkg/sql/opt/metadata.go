@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
@@ -25,7 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -41,6 +42,15 @@ type SchemaID int32
 // that is present in the bitmap is represented by a bit that is shifted by
 // 1 << privilege.Kind, so that multiple privileges can be stored.
 type privilegeBitmap uint64
+
+// privilegeKey identifies a privilege dependency by the data source and the
+// user whose privilege was checked. This allows memo dependency validation to
+// re-check the correct user's privilege (e.g., the view owner for tables
+// accessed through a view) rather than always checking the session user.
+type privilegeKey struct {
+	ID   cat.StableID
+	User username.SQLUsername
+}
 
 type routineDep struct {
 	overload        *tree.Overload
@@ -136,8 +146,10 @@ type Metadata struct {
 	objectRefsByName map[cat.StableID]tree.UnresolvedObjectNameSet
 
 	// privileges stores the privileges needed to access each object that the
-	// query depends on.
-	privileges map[cat.StableID]privilegeBitmap
+	// query depends on, keyed by data source ID and the user whose privileges
+	// were checked. This ensures that memo dependency re-validation checks the
+	// correct user (e.g., the view owner for tables accessed through a view).
+	privileges map[privilegeKey]privilegeBitmap
 
 	// builtinRefsByName stores the names used to reference builtin functions in
 	// the query. This is necessary to handle the case where changes to the search
@@ -152,9 +164,29 @@ type Metadata struct {
 	// hintIDs are the external statement hints that match this statement.
 	hintIDs []int64
 
+	// digest groups fields that are read and written during CheckDependencies,
+	// which can be called concurrently on the same Metadata when the memo is
+	// shared via the query cache. Fields that are immutable after memo
+	// construction (e.g. dataSourceDeps) do not need this protection.
+	// earliestCanaryExpiration lives here (rather than in DependencyDigest)
+	// because DependencyDigest is a catalog-global snapshot, while the
+	// expiration is memo-specific — derived from this memo's table deps.
+	//
+	// TODO(janexing): consider renaming this struct to better reflect that
+	// it holds all mutable CheckDependencies state, not just the digest.
 	digest struct {
 		syncutil.Mutex
 		depDigest cat.DependencyDigest
+		// earliestCanaryExpiration is the earliest timestamp at which any
+		// table's canary window expires. It is used to invalidate cached
+		// stable-execution memos when canary stats ripen: once the window
+		// expires, the stable path returns different stats, so the memo
+		// must be re-optimized. Empty when no tables have active canary
+		// windows or when canary and stable stats are already identical
+		// (no pending transition). This field is set alongside
+		// depDigest during the slow path of CheckDependencies and must
+		// always be updated at the same point to avoid sync hazards.
+		earliestCanaryExpiration hlc.Timestamp
 	}
 
 	// NOTE! When adding fields here, update Init (if reusing allocated
@@ -216,10 +248,10 @@ func (md *Metadata) Init() {
 
 	privileges := md.privileges
 	if privileges == nil {
-		privileges = make(map[cat.StableID]privilegeBitmap)
+		privileges = make(map[privilegeKey]privilegeBitmap)
 	}
-	for id := range md.privileges {
-		delete(md.privileges, id)
+	for key := range md.privileges {
+		delete(md.privileges, key)
 	}
 
 	builtinRefsByName := md.builtinRefsByName
@@ -319,11 +351,11 @@ func (md *Metadata) CopyFrom(from *Metadata, copyScalarFn func(Expr) Expr) {
 		md.objectRefsByName[id] = newNames
 	}
 
-	for id, privilegeSet := range from.privileges {
+	for key, privilegeSet := range from.privileges {
 		if md.privileges == nil {
-			md.privileges = make(map[cat.StableID]privilegeBitmap)
+			md.privileges = make(map[privilegeKey]privilegeBitmap)
 		}
-		md.privileges[id] = privilegeSet
+		md.privileges[key] = privilegeSet
 	}
 
 	for name := range from.builtinRefsByName {
@@ -369,14 +401,18 @@ func DepByID(id cat.StableID) MDDepName {
 }
 
 // AddDependency tracks one of the catalog data sources on which the query
-// depends, as well as the privilege required to access that data source. If
-// the Memo using this metadata is cached, then a call to CheckDependencies can
-// detect if the name resolves to a different data source now, or if changes to
-// schema or permissions on the data source has invalidated the cached metadata.
-func (md *Metadata) AddDependency(name MDDepName, ds cat.DataSource, priv privilege.Kind) {
+// depends, as well as the privilege required to access that data source and
+// the user whose privilege was checked. If the Memo using this metadata is
+// cached, then a call to CheckDependencies can detect if the name resolves to
+// a different data source now, or if changes to schema or permissions on the
+// data source has invalidated the cached metadata.
+func (md *Metadata) AddDependency(
+	name MDDepName, ds cat.DataSource, priv privilege.Kind, user username.SQLUsername,
+) {
 	id := ds.ID()
 	md.dataSourceDeps[id] = ds
-	md.privileges[id] = md.privileges[id] | (1 << priv)
+	key := privilegeKey{ID: id, User: user}
+	md.privileges[key] = md.privileges[key] | (1 << priv)
 	if name.byID == 0 {
 		// This data source was referenced by name.
 		names := md.objectRefsByName[id]
@@ -393,29 +429,43 @@ func (md *Metadata) dependencyDigestEquals(currentDigest *cat.DependencyDigest) 
 	return currentDigest.Equal(&md.digest.depDigest)
 }
 
+// canaryExpirationPassed returns true if the earliest canary window expiration
+// tracked by this metadata has passed. When true, the digest fast path should
+// be skipped so that the slow path can detect stats changes caused by canary
+// window expiration. The current wall clock is used as the reference time;
+// when stats_as_of is set, the caller skips the fast path entirely (analogous
+// to AOST), so this method is only reachable when stats_as_of is empty.
+func (md *Metadata) canaryExpirationPassed() bool {
+	md.digest.Lock()
+	defer md.digest.Unlock()
+	exp := md.digest.earliestCanaryExpiration
+	now := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	return !exp.IsEmpty() && !now.Less(exp)
+}
+
 // leaseObjectsInMetaData ensures that all references within this metadata
 // are leased to prevent schema changes from modifying the underlying objects
 // excessively. Additionally, the metadata version and leased descriptor versions
 // are compared.
 func (md *Metadata) leaseObjectsInMetaData(
 	ctx context.Context, optCatalog cat.Catalog,
-) (leasedVersionMatchesMetadata bool, err error) {
+) (reason string, err error) {
 	for id, ds := range md.dataSourceDeps {
 		ver, err := optCatalog.LeaseByStableID(ctx, id)
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		if ver != ds.Version() {
-			return false, nil
+			return "data source lease version mismatch", nil
 		}
 	}
 	for id, rd := range md.routineDeps {
 		ver, err := optCatalog.LeaseByStableID(ctx, id)
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		if ver != rd.overload.Version {
-			return false, nil
+			return "routine lease version mismatch", nil
 		}
 	}
 	for _, typ := range md.userDefinedTypesSlice {
@@ -426,13 +476,13 @@ func (md *Metadata) leaseObjectsInMetaData(
 		}
 		ver, err := optCatalog.LeaseByStableID(ctx, cat.StableID(id))
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		if ver != uint64(typ.TypeMeta.Version) {
-			return false, nil
+			return "user-defined type lease version mismatch", nil
 		}
 	}
-	return true, nil
+	return "", nil
 }
 
 // CheckDependencies resolves (again) each database object on which this
@@ -442,8 +492,9 @@ func (md *Metadata) leaseObjectsInMetaData(
 //  3. The user still has sufficient privileges to access the object. Note that
 //     this point currently only applies to data sources.
 //
-// If the dependencies are no longer up-to-date, then CheckDependencies returns
-// false.
+// If the dependencies are up-to-date, CheckDependencies returns an empty
+// reason string. If the dependencies are stale, it returns a non-empty string
+// describing why.
 //
 // This function can only swallow "undefined" or "dropped" errors, since these
 // are expected. Other error types must be propagated, since CheckDependencies
@@ -451,26 +502,31 @@ func (md *Metadata) leaseObjectsInMetaData(
 // provided catalog.
 func (md *Metadata) CheckDependencies(
 	ctx context.Context, evalCtx *eval.Context, optCatalog cat.Catalog,
-) (upToDate bool, err error) {
-	// If the query is AOST we must check all the dependencies, since the descriptors
-	// may have been different in the past. Otherwise, the dependency digest
-	// is sufficient.
+) (reason string, err error) {
+	// If the query is AOST or stats_as_of is set we must check all the
+	// dependencies, since the descriptors may have been different in the past
+	// and stats_as_of can change the canary-vs-stable stats perspective
+	// between executions. Otherwise, the dependency digest is sufficient.
 	currentDigest := optCatalog.GetDependencyDigest()
 	if evalCtx.SessionData().CatalogDigestStalenessCheckEnabled &&
-		evalCtx.Settings.Version.IsActive(ctx, clusterversion.V25_1) &&
 		evalCtx.AsOfSystemTime == nil &&
 		!evalCtx.Txn.ReadTimestampFixed() &&
-		md.dependencyDigestEquals(&currentDigest) {
+		evalCtx.SessionData().StatsAsOf.IsEmpty() &&
+		md.dependencyDigestEquals(&currentDigest) &&
+		!md.canaryExpirationPassed() {
 		// Lease the underlying descriptors for this metadata. If we fail to lease
 		// any descriptors attempt to resolve them by name through the more expensive
 		// code path below.
-		upToDate, err = md.leaseObjectsInMetaData(ctx, optCatalog)
+		reason, err = md.leaseObjectsInMetaData(ctx, optCatalog)
 		if err == nil {
-			return upToDate, nil
+			return reason, nil
 		}
 	}
 
-	// Check that no referenced data sources have changed.
+	// Check that no referenced data sources have changed. While iterating,
+	// also track the earliest canary window expiration from the freshly
+	// resolved data sources so that it can be stored alongside the digest.
+	var earliestCanaryExp hlc.Timestamp
 	for id, dataSource := range md.dataSourceDeps {
 		var toCheck cat.DataSource
 		if names, ok := md.objectRefsByName[id]; ok {
@@ -479,14 +535,25 @@ func (md *Metadata) CheckDependencies(
 				tableName := names.Get(i).ToTableName()
 				toCheck, _, err = optCatalog.ResolveDataSource(ctx, cat.Flags{}, &tableName)
 				if err != nil || !dataSource.Equals(toCheck) {
-					return false, maybeSwallowMetadataResolveErr(err)
+					return "data source name resolved to different object",
+						maybeSwallowMetadataResolveErr(err)
 				}
 			}
 		} else {
 			// The data source was only referenced by ID.
 			toCheck, _, err = optCatalog.ResolveDataSourceByID(ctx, cat.Flags{}, dataSource.ID())
 			if err != nil || !dataSource.Equals(toCheck) {
-				return false, maybeSwallowMetadataResolveErr(err)
+				return "data source descriptor changed",
+					maybeSwallowMetadataResolveErr(err)
+			}
+		}
+		// Extract canary expiration from tables to detect when canary
+		// window expiration changes the stats returned by the stable path.
+		if table, ok := toCheck.(cat.Table); ok {
+			if exp := table.CanaryExpiration(); !exp.IsEmpty() {
+				if earliestCanaryExp.IsEmpty() || exp.Less(earliestCanaryExp) {
+					earliestCanaryExp = exp
+				}
 			}
 		}
 	}
@@ -497,15 +564,22 @@ func (md *Metadata) CheckDependencies(
 		if names, ok := md.objectRefsByName[id]; ok {
 			for i, n := 0, names.Len(); i < n; i++ {
 				toCheck, err := optCatalog.ResolveType(ctx, names.Get(i))
-				if err != nil || typ.Oid() != toCheck.Oid() ||
-					typ.TypeMeta.Version != toCheck.TypeMeta.Version {
-					return false, maybeSwallowMetadataResolveErr(err)
+				if err != nil {
+					return "error resolving user-defined type by name",
+						maybeSwallowMetadataResolveErr(err)
+				}
+				if typ.Oid() != toCheck.Oid() {
+					return "user-defined type name resolved to different type", nil
+				}
+				if typ.TypeMeta.Version != toCheck.TypeMeta.Version {
+					return "user-defined type descriptor version changed", nil
 				}
 			}
 		} else {
 			toCheck, err := optCatalog.ResolveTypeByOID(ctx, typ.Oid())
 			if err != nil || typ.TypeMeta.Version != toCheck.TypeMeta.Version {
-				return false, maybeSwallowMetadataResolveErr(err)
+				return "user-defined type descriptor changed",
+					maybeSwallowMetadataResolveErr(err)
 			}
 		}
 	}
@@ -522,53 +596,29 @@ func (md *Metadata) CheckDependencies(
 					&evalCtx.SessionData().SearchPath,
 				)
 				if err != nil {
-					return false, maybeSwallowMetadataResolveErr(err)
+					return "routine name resolution failed",
+						maybeSwallowMetadataResolveErr(err)
 				}
-				routineObj := tree.RoutineObj{
-					FuncName: name.ToRoutineName(),
-					Params:   make(tree.RoutineParams, len(dep.invocationTypes)),
-				}
-				for i := 0; i < len(routineObj.Params); i++ {
-					routineObj.Params[i] = tree.RoutineParam{
-						Type: dep.invocationTypes[i],
-						// Since we're not in the DROP context, it's sufficient
-						// to specify only the input parameters.
-						Class: tree.RoutineParamIn,
-						// Note that we don't need to specify the DefaultVal
-						// here because invocationTypes specifies the argument
-						// schema that was actually used. Instead, we will ask
-						// for matching overloads to use their DEFAULT
-						// expressions if necessary.
-					}
-				}
-				// NOTE: We match for all types of routines here, including
-				// procedures so that if a function has been dropped and a
-				// procedure is created with the same signature, we do not get a
-				// "<func> is not a function" error here. Instead, we'll return
-				// false and attempt to rebuild the statement.
-				routineType := tree.UDFRoutine | tree.BuiltinRoutine | tree.ProcedureRoutine
-				// Always allowing using DEFAULT expressions for input
-				// parameters since the signature of the routine might have
-				// changed even though the invocation remained the same.
-				const tryDefaultExprs = true
-				toCheck, err := definition.MatchOverload(
-					ctx,
-					optCatalog,
-					&routineObj,
-					&evalCtx.SessionData().SearchPath,
-					routineType,
-					false, /* inDropContext */
-					tryDefaultExprs,
+				toCheck, err := matchOverloadByTypes(
+					ctx, optCatalog, definition, name.ToRoutineName(),
+					dep.invocationTypes, &evalCtx.SessionData().SearchPath,
 				)
-				if err != nil || toCheck.Oid != overload.Oid || toCheck.Version != overload.Version {
-					return false, maybeSwallowMetadataResolveErr(err)
+				// We cannot check the version here, because we only resolve the
+				// function signature by name. We will check the version below when
+				// resolving by OID.
+				if err != nil || toCheck == nil || toCheck.Oid != overload.Oid {
+					return "routine name resolved to different overload",
+						maybeSwallowMetadataResolveErr(err)
 				}
 			}
-		} else {
-			_, toCheck, err := optCatalog.ResolveFunctionByOID(ctx, overload.Oid)
-			if err != nil || overload.Version != toCheck.Version {
-				return false, maybeSwallowMetadataResolveErr(err)
-			}
+		}
+		// Resolve the routine by OID regardless of whether it was referenced
+		// by name or by ID. This allows us to check the version using the full
+		// overload, rather than just the signature.
+		_, toCheck, err := optCatalog.ResolveFunctionByOID(ctx, overload.Oid)
+		if err != nil || overload.Version != toCheck.Version {
+			return "routine descriptor changed",
+				maybeSwallowMetadataResolveErr(err)
 		}
 	}
 
@@ -579,11 +629,13 @@ func (md *Metadata) CheckDependencies(
 			ctx, tree.MakeUnresolvedFunctionName(&name), &evalCtx.SessionData().SearchPath,
 		)
 		if err != nil {
-			return false, maybeSwallowMetadataResolveErr(err)
+			// If the builtin can no longer be resolved, the dependency is stale.
+			return "builtin function resolution failed",
+				maybeSwallowMetadataResolveErr(err)
 		}
 		for i := range definition.Overloads {
 			if definition.Overloads[i].Type == tree.UDFRoutine {
-				return false, nil
+				return "builtin function shadowed by UDF", nil
 			}
 		}
 	}
@@ -595,17 +647,17 @@ func (md *Metadata) CheckDependencies(
 	// we may end up returning a privilege error when the memo should have just
 	// been invalidated.
 	if err := md.checkDataSourcePrivileges(ctx, optCatalog); err != nil {
-		return false, err
+		return "", err
 	}
 	for _, dep := range md.routineDeps {
 		if err := optCatalog.CheckExecutionPrivilege(ctx, dep.overload.Oid, optCatalog.GetCurrentUser()); err != nil {
-			return false, err
+			return "", err
 		}
 	}
 
 	// Check for staleness from a row-level security point of view.
-	if upToDate, err := md.checkRLSDependencies(ctx, evalCtx, optCatalog); err != nil || !upToDate {
-		return upToDate, err
+	if reason, err := md.checkRLSDependencies(ctx, evalCtx, optCatalog); err != nil || reason != "" {
+		return reason, err
 	}
 
 	// Check that external statement hints have not changed.
@@ -614,31 +666,97 @@ func (md *Metadata) CheckDependencies(
 		hintIDs = evalCtx.Planner.GetHintIDs()
 	}
 	if !slices.Equal(md.hintIDs, hintIDs) {
-		return false, nil
+		return "statement hints changed", nil
 	}
 
-	// Update the digest after a full dependency check, since our fast
-	// check did not succeed.
+	// Update the digest and canary expiration after a full dependency check,
+	// since our fast check did not succeed. Both must be updated atomically
+	// to avoid sync hazards where the digest is current but the expiration
+	// is stale.
 	if evalCtx.SessionData().CatalogDigestStalenessCheckEnabled {
 		md.digest.Lock()
 		md.digest.depDigest = currentDigest
+		md.digest.earliestCanaryExpiration = earliestCanaryExp
 		md.digest.Unlock()
 	}
-	return true, nil
+	return "", nil
 }
 
-// handleMetadataResolveErr swallows errors that are thrown when a database
-// object is dropped, since such an error potentially only means that the
-// metadata is stale and should be re-resolved.
+// matchOverloadByTypes constructs a tree.RoutineObj from the given routine name
+// and argument types, then calls MatchOverload to find the matching overload.
+// All routine types (UDF, builtin, procedure) are considered, and DEFAULT
+// expressions are tried when matching.
+func matchOverloadByTypes(
+	ctx context.Context,
+	typeRes tree.TypeReferenceResolver,
+	definition *tree.ResolvedFunctionDefinition,
+	routineName tree.RoutineName,
+	argTypes []*types.T,
+	searchPath tree.SearchPath,
+) (*tree.Overload, error) {
+	if len(definition.Overloads) == 0 {
+		return nil, nil
+	} else if len(definition.Overloads) == 1 {
+		// Fast path: if there's only one candidate, check if it's the same as the
+		// one resolved while building the plan.
+		return definition.Overloads[0].Overload, nil
+	}
+	routineObj := tree.RoutineObj{
+		FuncName: routineName,
+		Params:   make(tree.RoutineParams, len(argTypes)),
+	}
+	for i := 0; i < len(routineObj.Params); i++ {
+		routineObj.Params[i] = tree.RoutineParam{
+			Type: argTypes[i],
+			// Since we're not in the DROP context, it's sufficient
+			// to specify only the input parameters.
+			Class: tree.RoutineParamIn,
+			// Note that we don't need to specify the DefaultVal
+			// here because invocationTypes specifies the argument
+			// schema that was actually used. Instead, we will ask
+			// for matching overloads to use their DEFAULT
+			// expressions if necessary.
+		}
+	}
+	// NOTE: We match for all types of routines here, including
+	// procedures so that if a function has been dropped and a
+	// procedure is created with the same signature, we do not get a
+	// "<func> is not a function" error here. Instead, we'll return
+	// false and attempt to rebuild the statement.
+	routineType := tree.UDFRoutine | tree.BuiltinRoutine | tree.ProcedureRoutine
+	// Always allowing using DEFAULT expressions for input
+	// parameters since the signature of the routine might have
+	// changed even though the invocation remained the same.
+	const tryDefaultExprs = true
+	const inDropContext = false
+	ol, err := definition.MatchOverload(
+		ctx, typeRes, &routineObj, searchPath,
+		routineType, inDropContext, tryDefaultExprs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return ol.Overload, nil
+}
+
+// maybeSwallowMetadataResolveErr swallows errors that are thrown when a
+// database object cannot be resolved during a metadata staleness check, since
+// such an error potentially only means that the metadata is stale and should be
+// re-resolved. This includes cases where the object no longer exists, or where
+// the current user lacks privileges to access it (e.g. because the cached memo
+// references objects in a different database context). In both cases, the memo
+// is treated as stale and will be replanned in the correct context, which will
+// surface genuine privilege errors during planning if applicable.
 func maybeSwallowMetadataResolveErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	// Handle when the object no longer exists.
+	// Handle when the object no longer exists or is inaccessible.
 	switch pgerror.GetPGCode(err) {
 	case pgcode.UndefinedObject, pgcode.UndefinedTable, pgcode.UndefinedDatabase,
 		pgcode.UndefinedSchema, pgcode.UndefinedFunction, pgcode.InvalidName,
-		pgcode.InvalidSchemaName, pgcode.InvalidCatalogName:
+		pgcode.InvalidSchemaName, pgcode.InvalidCatalogName,
+		pgcode.InsufficientPrivilege:
 		return nil
 	}
 	if errors.Is(err, catalog.ErrDescriptorDropped) {
@@ -650,9 +768,13 @@ func maybeSwallowMetadataResolveErr(err error) error {
 // checkDataSourcePrivileges checks that none of the privileges required by the
 // query for the referenced data sources have been revoked.
 func (md *Metadata) checkDataSourcePrivileges(ctx context.Context, optCatalog cat.Catalog) error {
-	for _, dataSource := range md.dataSourceDeps {
+	for key, privileges := range md.privileges {
 		err := func() error {
-			privileges := md.privileges[dataSource.ID()]
+			dataSource, ok := md.dataSourceDeps[key.ID]
+			if !ok {
+				// No need to check privileges because ID is not in dataSourceDeps
+				return errors.AssertionFailedf("Data source dependency with ID %d does not exist.", key.ID)
+			}
 
 			// Check if this dependency has the special builtin-allowed privilege.
 			// If so, disable unsafe internal checks for all privilege checks on this data source.
@@ -664,6 +786,15 @@ func (md *Metadata) checkDataSourcePrivileges(ctx context.Context, optCatalog ca
 				defer optCatalog.DisableUnsafeInternalCheck()()
 			}
 
+			// Use the user stored in the dependency key when it is set
+			// (definer context, e.g. view owner or SECURITY DEFINER routine
+			// owner). When the key has an empty user, use the current session
+			// user so that SET ROLE is respected without memo invalidation.
+			privilegeCheckUser := key.User
+			if privilegeCheckUser.Undefined() {
+				privilegeCheckUser = optCatalog.GetCurrentUser()
+			}
+
 			for privs := privileges; privs != 0; {
 				// Strip off each privilege bit and make call to CheckPrivilege for it.
 				// Note that priv == 0 can occur when a dependency was added with
@@ -671,7 +802,7 @@ func (md *Metadata) checkDataSourcePrivileges(ctx context.Context, optCatalog ca
 				// privileges do not need to be checked). Ignore the "zero privilege".
 				priv := privilege.Kind(bits.TrailingZeros32(uint32(privs)))
 				if priv != 0 {
-					if err := optCatalog.CheckPrivilege(ctx, dataSource, optCatalog.GetCurrentUser(), priv); err != nil {
+					if err := optCatalog.CheckPrivilege(ctx, dataSource, privilegeCheckUser, priv); err != nil {
 						return err
 					}
 				}
@@ -775,6 +906,23 @@ func (md *Metadata) AddBuiltin(name *tree.UnresolvedObjectName) {
 	md.builtinRefsByName[*name.ToUnresolvedName()] = struct{}{}
 }
 
+func findUDTRecur(t *types.T) *types.T {
+	if !t.UserDefined() {
+		return nil
+	}
+	switch t.Family() {
+	// Terminal case: if the entry is an enum or a composite type.
+	// We don't recurse inside the tuple since we don't support UDTs
+	// inside composite type.
+	case types.EnumFamily, types.TupleFamily:
+		return t
+	case types.ArrayFamily:
+		return findUDTRecur(t.InternalType.ArrayContents)
+	default:
+		return nil
+	}
+}
+
 // AddTable indexes a new reference to a table within the query. Separate
 // references to the same table are assigned different table ids (e.g.  in a
 // self-join query). All columns are added to the metadata. If mutation columns
@@ -798,6 +946,9 @@ func (md *Metadata) AddTable(tab cat.Table, alias *tree.TableName) TableID {
 	for i := 0; i < colCount; i++ {
 		col := tab.Column(i)
 		colID := md.AddColumn(string(col.ColName()), col.DatumType())
+		if udt := findUDTRecur(col.DatumType()); udt != nil {
+			md.AddUserDefinedType(udt, nil /* name */)
+		}
 		md.ColumnMeta(colID).Table = tabID
 	}
 
@@ -945,6 +1096,21 @@ func (md *Metadata) AllTables() []TableMeta {
 // NumTables returns the number of tables in the metadata.
 func (md *Metadata) NumTables() int {
 	return len(md.tables)
+}
+
+// HasCanaryWindowTables returns true if any table in the metadata has a
+// positive StatsCanaryWindow and genuinely different canary and stable
+// stats. When canary and stable stats are identical (e.g. the canary
+// window has expired or stats have ripened), the canary plan equals the
+// stable plan so memo reuse is safe.
+func (md *Metadata) HasCanaryWindowTables() bool {
+	for i := range md.tables {
+		if md.tables[i].Table.StatsCanaryWindow() > 0 &&
+			md.tables[i].Table.CanaryAndStableStatsDiffer() {
+			return true
+		}
+	}
+	return false
 }
 
 // AddColumn assigns a new unique id to a column within the query and records
@@ -1218,7 +1384,7 @@ func (md *Metadata) TestingObjectRefsByName() map[cat.StableID]tree.UnresolvedOb
 }
 
 // TestingPrivileges exposes the privileges for testing.
-func (md *Metadata) TestingPrivileges() map[cat.StableID]privilegeBitmap {
+func (md *Metadata) TestingPrivileges() map[privilegeKey]privilegeBitmap {
 	return md.privileges
 }
 
@@ -1249,27 +1415,27 @@ func (md *Metadata) GetRLSMeta() *RowLevelSecurityMeta {
 // dependencies to see if it is up to date.
 func (md *Metadata) checkRLSDependencies(
 	ctx context.Context, evalCtx *eval.Context, optCatalog cat.Catalog,
-) (upToDate bool, err error) {
+) (reason string, err error) {
 	// rlsMeta is lazily updated. If we didn't initialize it, then we didn't come
 	// across any RLS enabled tables. So, from a rls point of view the memo is up
 	// to date.
 	if !md.rlsMeta.IsInitialized {
-		return true, nil
+		return "", nil
 	}
 
 	// RLS policies that get applied could differ vastly based on the role. So, if
 	// the user is different, we cannot trust anything in the current memo.
 	if md.rlsMeta.User != evalCtx.SessionData().User() {
-		return false, nil
+		return "RLS user changed", nil
 	}
 
 	// If the role membership changes, resulting in the user gaining or losing
 	// admin privileges, the memo is considered stale. Admins are exempt from
 	// RLS policies.
 	if hasAdminRole, err := optCatalog.HasAdminRole(ctx); err != nil {
-		return false, err
+		return "", err
 	} else if md.rlsMeta.HasAdminRole != hasAdminRole {
-		return false, nil
+		return "RLS admin role changed", nil
 	}
 
 	// Check if the current user has a role option/privilege that changed
@@ -1282,10 +1448,10 @@ func (md *Metadata) checkRLSDependencies(
 		}
 		bypassRLS, err := optCatalog.UserHasGlobalPrivilegeOrRoleOption(ctx, privilege.BYPASSRLS, md.rlsMeta.User)
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		if bypassRLS != policiesApplied.BypassRLS {
-			return false, nil
+			return "RLS BYPASSRLS privilege changed", nil
 		}
 	}
 
@@ -1293,7 +1459,7 @@ func (md *Metadata) checkRLSDependencies(
 	// Any time a policy or table attribute such as forced is modified on a table,
 	// a new version of the table descriptor is created. The metadata dependency
 	// check already accounts for changes in the table descriptor version.
-	return true, nil
+	return "", nil
 }
 
 // SetHintIDs copies the given matching hintIDs into the metadata.

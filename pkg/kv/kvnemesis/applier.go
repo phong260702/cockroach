@@ -123,6 +123,10 @@ func exceptContextCanceled(err error) bool {
 		strings.Contains(err.Error(), "query execution canceled")
 }
 
+func exceptBatchTimestampBeforeGC(err error) bool {
+	return errors.HasType(err, (*kvpb.BatchTimestampBeforeGCError)(nil))
+}
+
 const followerReadsOffset = 2 * time.Second
 
 func makeFollowerReadTimestamp(ts hlc.Timestamp) hlc.Timestamp {
@@ -195,6 +199,9 @@ func (a *Applier) applyOp(ctx context.Context, db *kv.DB, op *Operation) {
 		a.env.ServerController.CrashNode(serverID)
 		a.nodes.setCrashed(int(o.NodeId))
 		o.Result = resultInit(ctx, nil)
+	case *MvccGCOperation:
+		err := a.env.MvccGCController.MvccGCRangeForKey(o.Key)
+		o.Result = resultInit(ctx, err)
 	case *ClosureTxnOperation:
 		// Use a backoff loop to avoid thrashing on txn aborts. Don't wait between
 		// epochs of the same transaction to avoid waiting while holding locks.
@@ -254,9 +261,21 @@ func (a *Applier) applyOp(ctx context.Context, db *kv.DB, op *Operation) {
 					}
 
 					applyClientOp(ctx, txn, op, true /* inTxn */, &spIDToToken)
-					// The KV api disallows use of a txn after an operation on it errors.
+					// The KV API disallows use of a txn after most errors.
+					// ConditionFailedError and LockConflictError are exceptions:
+					// they don't move the txn to the error state, so we can
+					// continue executing subsequent ops. We only do this for
+					// individual (non-batch) ops because batch errors propagate
+					// to all sub-ops and the validator can't distinguish which
+					// sub-ops actually executed.
 					if r := op.Result(); r.Type == ResultType_Error {
-						err = errors.DecodeError(ctx, *r.Err)
+						opErr := errors.DecodeError(ctx, *r.Err)
+						isCFE := errors.HasType(opErr, (*kvpb.ConditionFailedError)(nil))
+						isLCE := errors.HasType(opErr, (*kvpb.LockConflictError)(nil))
+						if op.Batch == nil && (isCFE || isLCE) {
+							continue
+						}
+						err = opErr
 					}
 				}
 			}
@@ -889,6 +908,14 @@ func changeClusterSettingInEnv(ctx context.Context, env *Env, op *ChangeSettingO
 			}
 		default:
 			panic(errors.AssertionFailedf(`unknown LeaseType: %v`, op.LeaseType))
+		}
+	case ChangeSettingType_ToggleVirtualIntentResolution:
+		val := "false"
+		if op.VirEnabled {
+			val = "true"
+		}
+		settings = map[string]string{
+			"kv.concurrency.virtual_intent_resolution.enabled": val,
 		}
 	default:
 		panic(errors.AssertionFailedf(`unknown ChangeSettingType: %v`, op.Type))

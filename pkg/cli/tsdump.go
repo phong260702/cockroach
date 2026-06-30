@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/klauspost/compress/zstd"
 	"github.com/spf13/cobra"
 )
 
@@ -47,7 +49,6 @@ var debugTimeSeriesDumpOpts = struct {
 	format                 tsDumpFormat
 	from, to               timestampValue
 	clusterLabel           string
-	yaml                   string
 	targetURL              string
 	ddApiKey               string
 	ddSite                 string
@@ -65,15 +66,16 @@ var debugTimeSeriesDumpOpts = struct {
 	metricsListFile        string // file containing explicit list of metrics to dump
 	nonVerbose             bool   // dump only essential and support metrics
 	output                 string // output file path; empty means stdout
+	encoding               string // encoding for raw format: zstd (empty means no encoding)
 }{
 	format:                 tsDumpRaw,
 	from:                   timestampValue{},
 	to:                     timestampValue(timeutil.Now().Add(24 * time.Hour)),
 	clusterLabel:           "",
-	yaml:                   "/tmp/tsdump.yaml",
 	retryFailedRequests:    false,
 	disableDeltaProcessing: false, // delta processing enabled by default
 	nonVerbose:             false, // dump all metrics by default
+	encoding:               "",    // default: no encoding
 
 	// default to 10 seconds interval for datadoginit.
 	// This is based on the scrape interval that is currently set accross all managed clusters
@@ -123,6 +125,14 @@ will then convert it to the --format requested in the current invocation.
 			}
 			defer f.Close()
 			output = f
+		}
+
+		// Validate encoding flag is only used with raw format
+		if debugTimeSeriesDumpOpts.encoding != "" && debugTimeSeriesDumpOpts.format != tsDumpRaw {
+			return errors.New("--encoding is only supported with --format=raw")
+		}
+		if debugTimeSeriesDumpOpts.encoding != "" && debugTimeSeriesDumpOpts.encoding != "zstd" {
+			return errors.Errorf("invalid value for --encoding: %s (supported: zstd)", debugTimeSeriesDumpOpts.encoding)
 		}
 
 		var w tsWriter
@@ -278,17 +288,18 @@ will then convert it to the --format requested in the current invocation.
 					return err
 				}
 
-				// Get store-to-node mapping for metadata
-				storeToNodeMap, err := getStoreToNodeMapping(ctx)
+				// Get store-to-node and node-to-region mappings for metadata.
+				storeToNodeMap, nodeToRegionMap, err := getTSDumpMappings(ctx)
 				if err != nil {
 					return err
 				}
 
 				// Create metadata header
 				metadata := tsdumpmeta.Metadata{
-					Version:        build.BinaryVersion(),
-					StoreToNodeMap: storeToNodeMap,
-					CreatedAt:      timeutil.Now(),
+					Version:         build.BinaryVersion(),
+					StoreToNodeMap:  storeToNodeMap,
+					NodeToRegionMap: nodeToRegionMap,
+					CreatedAt:       timeutil.Now(),
 				}
 
 				stream, err := tsClient.DumpRaw(context.Background(), req)
@@ -296,24 +307,22 @@ will then convert it to the --format requested in the current invocation.
 					return errors.Wrapf(err, "connecting to %s", target)
 				}
 
-				// Buffer the writes since we're going to
-				// be writing potentially a lot of data.
-				w := bufio.NewWriterSize(output, 1024*1024)
+				// Create the output writer with optional encoding
+				rawWriter, err := makeRawOutputWriter(output, debugTimeSeriesDumpOpts.encoding)
+				if err != nil {
+					return err
+				}
 
 				// Write embedded metadata first
-				if err := tsdumpmeta.Write(w, metadata); err != nil {
+				if err := tsdumpmeta.Write(rawWriter, metadata); err != nil {
 					return err
 				}
 
-				if err := tsutil.DumpRawTo(stream, w); err != nil {
+				if err := tsutil.DumpRawTo(stream, rawWriter); err != nil {
 					return err
 				}
 
-				if err := w.Flush(); err != nil {
-					return err
-				}
-
-				if err = createYAML(ctx); err != nil {
+				if err := rawWriter.Close(); err != nil {
 					return err
 				}
 
@@ -347,6 +356,9 @@ will then convert it to the --format requested in the current invocation.
 				dec = gob.NewDecoder(f) // Reset decoder to read from beginning
 			} else {
 				fmt.Printf("Found embedded store-to-node mapping with %d entries\n", len(embeddedMetadata.StoreToNodeMap))
+				if len(embeddedMetadata.NodeToRegionMap) > 0 {
+					fmt.Printf("Found embedded node-to-region mapping with %d entries\n", len(embeddedMetadata.NodeToRegionMap))
+				}
 			}
 
 			decodeOne := func() (*tspb.TimeSeriesData, error) {
@@ -581,35 +593,29 @@ type openMetricsWriter struct {
 	labels map[string]string
 }
 
-// createYAML generates and writes tsdump.yaml to default /tmp or to a specified path.
-// This file is used for staging the tsdump data into a local database for debugging
-func createYAML(ctx context.Context) (resErr error) {
-	// Write the YAML file for backward compatibility
-	file, err := os.OpenFile(debugTimeSeriesDumpOpts.yaml, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	mapping, err := getStoreToNodeMapping(ctx)
-	if err != nil {
-		return err
-	}
-
-	for storeID, nodeID := range mapping {
-		_, err := fmt.Fprintf(file, "%s: %s\n", storeID, nodeID)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+// queryRows runs the given query on the provided connection and returns the
+// result rows.
+func queryRows(ctx context.Context, sqlConn clisqlclient.Conn, query string) ([][]string, error) {
+	_, rows, err := sqlExecCtx.RunQuery(
+		ctx, sqlConn, clisqlclient.MakeQuery(query), false)
+	return rows, err
 }
 
-// getStoreToNodeMapping retrieves the store-to-node mapping from the database
-func getStoreToNodeMapping(ctx context.Context) (map[string]string, error) {
-	sqlConn, err := makeSQLClient(ctx, tsDumpAppName, useSystemDb)
+// makeTSDumpSQLConn opens a SQL connection for tsdump operations. The caller
+// is responsible for closing the returned connection.
+func makeTSDumpSQLConn(ctx context.Context) (clisqlclient.Conn, error) {
+	return makeSQLClient(ctx, tsDumpAppName, useSystemDb)
+}
+
+// getTSDumpMappings retrieves the store-to-node and node-to-region mappings
+// using a single SQL connection. Query failures for either mapping are
+// non-fatal; an empty map is returned with a warning so tsdump can proceed.
+func getTSDumpMappings(
+	ctx context.Context,
+) (storeToNode map[string]string, nodeToRegion map[string]string, _ error) {
+	sqlConn, err := makeTSDumpSQLConn(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() {
 		if closeErr := sqlConn.Close(); closeErr != nil {
@@ -617,11 +623,29 @@ func getStoreToNodeMapping(ctx context.Context) (map[string]string, error) {
 		}
 	}()
 
-	_, rows, err := sqlExecCtx.RunQuery(
-		ctx,
-		sqlConn,
-		clisqlclient.MakeQuery(`SELECT store_id, node_id FROM crdb_internal.kv_store_status`), false)
+	// Both mapping queries are non-fatal so tsdump still works when the
+	// underlying virtual tables are inaccessible.
+	storeToNode, err = getStoreToNodeMapping(ctx, sqlConn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to get store-to-node mapping: %v\n", err)
+		storeToNode = make(map[string]string)
+	}
 
+	nodeToRegion, err = getNodeToRegionMapping(ctx, sqlConn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to get node-to-region mapping: %v\n", err)
+		nodeToRegion = make(map[string]string)
+	}
+
+	return storeToNode, nodeToRegion, nil
+}
+
+// getStoreToNodeMapping retrieves the store-to-node mapping from the database.
+func getStoreToNodeMapping(
+	ctx context.Context, sqlConn clisqlclient.Conn,
+) (map[string]string, error) {
+	rows, err := queryRows(ctx, sqlConn,
+		`SELECT store_id, node_id FROM crdb_internal.kv_store_status`)
 	if err != nil {
 		return nil, err
 	}
@@ -635,6 +659,81 @@ func getStoreToNodeMapping(ctx context.Context) (map[string]string, error) {
 		}
 	}
 	return mapping, nil
+}
+
+// getNodeToRegionMapping retrieves the node-to-region mapping from the database
+// by querying gossip_nodes for each node's locality, then anonymizes region
+// names (e.g. "region-1", "region-2") to avoid leaking sensitive locality info.
+func getNodeToRegionMapping(
+	ctx context.Context, sqlConn clisqlclient.Conn,
+) (map[string]string, error) {
+	rows, err := queryRows(ctx, sqlConn,
+		`SELECT node_id, locality FROM crdb_internal.gossip_nodes`)
+	if err != nil {
+		return nil, err
+	}
+
+	return anonymizeNodeRegions(rows), nil
+}
+
+// anonymizeNodeRegions takes rows of [node_id, locality] and produces a mapping
+// from node ID to an anonymized region label. Unique region names are sorted
+// alphabetically and assigned labels "region-1", "region-2", etc. Nodes without
+// a region tier in their locality are omitted from the mapping.
+func anonymizeNodeRegions(rows [][]string) map[string]string {
+	// First pass: collect unique regions.
+	regionSet := make(map[string]struct{})
+	type nodeRegion struct {
+		nodeID string
+		region string
+	}
+	var nodeRegions []nodeRegion
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		nodeID := strings.TrimSpace(row[0])
+		locality := strings.TrimSpace(row[1])
+		region := extractRegionFromLocality(locality)
+		if region == "" {
+			continue
+		}
+		regionSet[region] = struct{}{}
+		nodeRegions = append(nodeRegions, nodeRegion{nodeID: nodeID, region: region})
+	}
+
+	// Sort unique regions alphabetically for deterministic assignment.
+	uniqueRegions := make([]string, 0, len(regionSet))
+	for r := range regionSet {
+		uniqueRegions = append(uniqueRegions, r)
+	}
+	sort.Strings(uniqueRegions)
+
+	// Build region-name to anonymized-label mapping.
+	regionToAnon := make(map[string]string, len(uniqueRegions))
+	for i, r := range uniqueRegions {
+		regionToAnon[r] = fmt.Sprintf("region-%d", i+1)
+	}
+
+	// Second pass: build node-to-anonymized-region mapping.
+	result := make(map[string]string, len(nodeRegions))
+	for _, nr := range nodeRegions {
+		result[nr.nodeID] = regionToAnon[nr.region]
+	}
+	return result
+}
+
+// extractRegionFromLocality parses a locality string like
+// "region=us-west-1,zone=us-west-1a" and returns the value of the "region"
+// tier, or "" if no region tier is found.
+func extractRegionFromLocality(locality string) string {
+	for _, tier := range strings.Split(locality, ",") {
+		parts := strings.SplitN(strings.TrimSpace(tier), "=", 2)
+		if len(parts) == 2 && parts[0] == "region" {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	return ""
 }
 
 func makeOpenMetricsWriter(out io.Writer) *openMetricsWriter {
@@ -819,6 +918,40 @@ func readMetricsListFile(filePath string) ([]serverpb.MetricsFilterEntry, error)
 		return nil, errors.Newf("metrics list file %s contains no valid metric names or patterns", filePath)
 	}
 	return entries, nil
+}
+
+// rawOutputWriter wraps a writer with a buffer that needs flushing on close.
+type rawOutputWriter struct {
+	io.Writer               // embedded - Write() delegated automatically
+	buf       *bufio.Writer // buffer to flush
+	encoder   io.Closer     // encoder to close (may be nil)
+}
+
+// Close closes the encoder (if any) and flushes the buffer.
+func (w *rawOutputWriter) Close() error {
+	if w.encoder != nil {
+		if err := w.encoder.Close(); err != nil {
+			return err
+		}
+	}
+	return w.buf.Flush()
+}
+
+// makeRawOutputWriter creates a buffered writer with optional encoding.
+func makeRawOutputWriter(output io.Writer, encoding string) (*rawOutputWriter, error) {
+	buf := bufio.NewWriterSize(output, 1024*1024)
+
+	if encoding == "zstd" {
+		encoder, err := zstd.NewWriter(buf)
+		if err != nil {
+			return nil, errors.Wrap(err, "creating zstd encoder")
+		}
+		// encoder is used as a Writer and a Closer because it implements both io.Writer and io.Closer
+		return &rawOutputWriter{Writer: encoder, buf: buf, encoder: encoder}, nil
+	}
+
+	// buf is both the Writer and the buffer to flush
+	return &rawOutputWriter{Writer: buf, buf: buf}, nil
 }
 
 type tsDumpFormat int

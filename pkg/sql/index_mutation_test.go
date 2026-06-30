@@ -35,7 +35,7 @@ func TestIndexMutationKVOps(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	var params base.TestServerArgs
+	params := base.TestServerArgs{}
 	// Decrease the adopt loop interval so that retries happen quickly.
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	params.Knobs.SQLEvalContext = &eval.TestingKnobs{
@@ -45,7 +45,7 @@ func TestIndexMutationKVOps(t *testing.T) {
 	datadriven.Walk(t, datapathutils.TestDataPath(t, "index_mutations"), func(t *testing.T, path string) {
 		srv, sqlDB, kvDB := serverutils.StartServer(t, params)
 		defer srv.Stopper().Stop(ctx)
-		defer lease.TestingDisableTableLeases()()
+		lm := srv.LeaseManager().(*lease.Manager)
 		s := srv.ApplicationLayer()
 		_, err := sqlDB.Exec("CREATE DATABASE t; USE t")
 		require.NoError(t, err)
@@ -79,7 +79,7 @@ func TestIndexMutationKVOps(t *testing.T) {
 					return nil
 				}
 				tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, s.Codec(), "t", tableName)
-				err = mutateIndexByName(kvDB, s.Codec(), tableDesc, name, mutFn, state)
+				err = mutateIndexByName(kvDB, s.Codec(), tableDesc, name, mutFn, state, lm)
 				require.NoError(t, err)
 			case "statement":
 				_, err := sqlDB.Exec(td.Input)

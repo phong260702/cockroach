@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -314,6 +315,8 @@ func (db *DB) tryStoreRollup(ctx context.Context, r Resolution, data []rollupDat
 
 func (db *DB) storeKvs(ctx context.Context, kvs []roachpb.KeyValue) error {
 	b := &kv.Batch{}
+	b.Header.WorkloadID = uint64(workloadid.WORKLOAD_ID_TIMESERIES)
+	b.Header.WorkloadType = workloadid.WorkloadTypeSystem.ToUint32()
 	for _, kv := range kvs {
 		b.AddRawRequest(&kvpb.MergeRequest{
 			RequestHeader: kvpb.RequestHeader{
@@ -351,6 +354,13 @@ func (db *DB) PruneThreshold(r Resolution) int64 {
 // Metrics gets the TimeSeriesMetrics structure used by this DB instance.
 func (db *DB) Metrics() *TimeSeriesMetrics {
 	return db.metrics
+}
+
+// runBatch executes a pre-built kv.Batch against the underlying kv.DB. This
+// lets Server run combined read batches without directly accessing the
+// unexported db field.
+func (db *DB) runBatch(ctx context.Context, b *kv.Batch) error {
+	return db.db.Run(ctx, b)
 }
 
 // WriteColumnar returns true if this DB should write data in the newer columnar

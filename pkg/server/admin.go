@@ -15,8 +15,6 @@ import (
 	"time"
 
 	apd "github.com/cockroachdb/apd/v3"
-	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -31,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
@@ -216,7 +213,7 @@ func newAdminServer(
 		),
 		st:             cs,
 		serverIterator: serverIterator,
-		nd:             &nodeDialer{cs: cs, si: serverIterator},
+		nd:             &nodeDialer{useDRPC: rpcCtx.UseDRPC, si: serverIterator},
 		distSender:     distSender,
 		rpcContext:     rpcCtx,
 		clock:          clock,
@@ -1314,7 +1311,7 @@ func (s *adminServer) statsForSpan(
 				var spanResponse *roachpb.SpanStatsResponse
 				err := timeutil.RunWithTimeout(ctx, "request remote stats", 20*time.Second,
 					func(ctx context.Context) error {
-						client, err := serverpb.DialStatusClient(s.nd, ctx, nodeID, s.nd.cs)
+						client, err := serverpb.DialStatusClient(s.nd, ctx, nodeID, s.nd.useDRPC)
 						if err == nil {
 							req := roachpb.SpanStatsRequest{
 								Spans:  []roachpb.Span{span},
@@ -2008,25 +2005,40 @@ func (s *adminServer) Settings(
 				codes.PermissionDenied, "this operation requires the %s or %s system privileges",
 				privilege.VIEWCLUSTERSETTING.DisplayName(), privilege.MODIFYCLUSTERSETTING.DisplayName())
 		}
-		consoleKeys := settings.ConsoleKeys()
-		for _, k := range consoleKeys {
-			if consoleSetting, ok := settings.LookupForLocalAccessByKey(k, s.sqlServer.execCfg.Codec.ForSystemTenant()); ok {
-				if internalKey, found, _ := settings.NameToKey(consoleSetting.Name()); found &&
-					(len(keyFilter) == 0 || keyFilter[string(internalKey)]) {
-					var responseValue serverpb.SettingsResponse_Value
-					responseValue.Name = string(consoleSetting.Name())
-					responseValue.Value = consoleSetting.String(&s.st.SV)
-					responseValue.Type = consoleSetting.Typ()
-					responseValue.Description = consoleSetting.Description()
-					responseValue.Public = consoleSetting.Visibility() == settings.Public
-					if lastUpdated, found := alteredSettings[internalKey]; found {
-						responseValue.LastUpdated = lastUpdated
-					}
-					respSettings[string(internalKey)] = responseValue
-				}
-			}
-		}
+	}
 
+	// Supplement any missing console keys from in-memory settings. The
+	// ConsoleKeys list contains non-sensitive settings required by the DB
+	// Console UI. This covers two cases:
+	// 1. Users with only VIEWACTIVITY (query failed with InsufficientPrivilege,
+	//    all console keys are missing from respSettings).
+	// 2. Users with MODIFYSQLCLUSTERSETTING (query succeeded but only returned
+	//    sql.defaults.* settings, missing console keys like "version").
+	// See: https://github.com/cockroachdb/cockroach/issues/165444
+	for _, k := range settings.ConsoleKeys() {
+		if _, exists := respSettings[string(k)]; exists {
+			continue
+		}
+		consoleSetting, ok := settings.LookupForLocalAccessByKey(
+			k, s.sqlServer.execCfg.Codec.ForSystemTenant(),
+		)
+		if !ok {
+			continue
+		}
+		internalKey, found, _ := settings.NameToKey(consoleSetting.Name())
+		if !found || (len(keyFilter) > 0 && !keyFilter[string(internalKey)]) {
+			continue
+		}
+		var responseValue serverpb.SettingsResponse_Value
+		responseValue.Name = string(consoleSetting.Name())
+		responseValue.Value = consoleSetting.String(&s.st.SV)
+		responseValue.Type = consoleSetting.Typ()
+		responseValue.Description = consoleSetting.Description()
+		responseValue.Public = consoleSetting.Visibility() == settings.Public
+		if lastUpdated, found := alteredSettings[internalKey]; found {
+			responseValue.LastUpdated = lastUpdated
+		}
+		respSettings[string(internalKey)] = responseValue
 	}
 
 	resp.KeyValues = respSettings
@@ -2042,18 +2054,11 @@ func (s *adminServer) Cluster(
 		return nil, grpcstatus.Errorf(codes.Unavailable, "cluster ID not yet available")
 	}
 
-	// Check if enterprise features are enabled.  We currently test for the
-	// feature "BACKUP", although enterprise licenses do not yet distinguish
-	// between different features.
-	enterpriseEnabled := base.CheckEnterpriseEnabled(
-		s.st,
-		"BACKUP") == nil
-
 	return &serverpb.ClusterResponse{
 		// TODO(knz): Respond with the logical cluster ID as well.
 		ClusterID:         storageClusterID.String(),
 		ReportingEnabled:  logcrash.DiagnosticsReportingEnabled.Get(&s.st.SV),
-		EnterpriseEnabled: enterpriseEnabled,
+		EnterpriseEnabled: true,
 	}, nil
 }
 
@@ -2092,7 +2097,7 @@ func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
 		return err
 	}
 
-	if rpcbase.DRPCEnabled(ctx, s.st) {
+	if s.rpcContext.UseDRPC {
 		if err := s.drpc.health(ctx); err != nil {
 			return err
 		}
@@ -2138,7 +2143,7 @@ func (s *systemAdminServer) checkReadinessForHealthCheck(ctx context.Context) er
 		return err
 	}
 
-	if rpcbase.DRPCEnabled(ctx, s.st) {
+	if s.rpcContext.UseDRPC {
 		if err := s.drpc.health(ctx); err != nil {
 			return err
 		}
@@ -2162,11 +2167,7 @@ func (s *systemAdminServer) checkReadinessForHealthCheck(ctx context.Context) er
 func getLivenessResponse(
 	ctx context.Context, nl livenesspb.NodeVitalityInterface,
 ) (*serverpb.LivenessResponse, error) {
-	nodeVitalityMap, err := nl.ScanNodeVitalityFromKV(ctx)
-
-	if err != nil {
-		return nil, srverrors.ServerError(ctx, err)
-	}
+	nodeVitalityMap := nl.ScanAllNodeVitalityFromCache()
 
 	livenesses := make([]livenesspb.Liveness, 0, len(nodeVitalityMap))
 	statusMap := make(map[roachpb.NodeID]livenesspb.NodeLivenessStatus, len(nodeVitalityMap))
@@ -2442,10 +2443,8 @@ func jobHelper(
 		return nil, err
 	}
 
-	// On 25.1+, add any recorded job messages to the response as well.
-	if sqlServer.cfg.Settings.Version.IsActive(ctx, clusterversion.V25_1) {
-		job.Messages = fetchJobMessages(ctx, job.ID, userName, sqlServer)
-	}
+	// Add any recorded job messages to the response as well.
+	job.Messages = fetchJobMessages(ctx, job.ID, userName, sqlServer)
 	return &job, nil
 }
 
@@ -3681,7 +3680,7 @@ func (s *adminServer) queryTableID(
 func (s *adminServer) dialNode(
 	ctx context.Context, nodeID roachpb.NodeID,
 ) (serverpb.RPCAdminClient, error) {
-	return serverpb.DialAdminClient(s.nd, ctx, nodeID, s.nd.cs)
+	return serverpb.DialAdminClient(s.nd, ctx, nodeID, s.nd.useDRPC)
 }
 
 func (s *adminServer) ListTracingSnapshots(

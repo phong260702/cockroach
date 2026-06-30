@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/walkutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -103,7 +104,7 @@ func undroppedElements(b BuildCtx, id catid.DescID) ElementResultSet {
 			// target states by the decomposition logic.
 			switch e.(type) {
 			case *scpb.Database, *scpb.Schema, *scpb.Table, *scpb.Sequence, *scpb.View, *scpb.EnumType, *scpb.AliasType,
-				*scpb.CompositeType:
+				*scpb.CompositeType, *scpb.DomainType:
 				panic(errors.Wrapf(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 					"object state is %s instead of PUBLIC, cannot be targeted by DROP", current),
 					"%s", errMsgPrefix(b, id)))
@@ -138,7 +139,7 @@ func errMsgPrefix(b BuildCtx, id catid.DescID) string {
 			typ = "sequence"
 		case *scpb.View:
 			typ = "view"
-		case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType:
+		case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType, *scpb.DomainType:
 			typ = "type"
 		case *scpb.Namespace:
 			// Set the name either from the first encountered Namespace element, or
@@ -180,6 +181,10 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			if t.IsTemporary {
 				panic(scerrors.NotImplementedErrorf(nil, "dropping a temporary table"))
 			}
+			if ldrJobIDs := undropped.FilterLDRJobIDs().MustGetZeroOrOneElement(); ldrJobIDs != nil && len(ldrJobIDs.JobIDs) > 0 {
+				ns := undropped.FilterNamespace().MustGetOneElement()
+				panic(sqlerrors.NewDisallowedSchemaChangeOnLDRTableErr(ns.Name, ldrJobIDs.JobIDs))
+			}
 		case *scpb.Sequence:
 			if t.IsTemporary {
 				panic(scerrors.NotImplementedErrorf(nil, "dropping a temporary sequence"))
@@ -188,7 +193,7 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			if t.IsTemporary {
 				panic(scerrors.NotImplementedErrorf(nil, "dropping a temporary view"))
 			}
-		case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType:
+		case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType, *scpb.DomainType:
 			break
 		default:
 			return
@@ -209,6 +214,8 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 		case *scpb.EnumType:
 			dropCascadeDescriptor(next, t.ArrayTypeID)
 		case *scpb.CompositeType:
+			dropCascadeDescriptor(next, t.ArrayTypeID)
+		case *scpb.DomainType:
 			dropCascadeDescriptor(next, t.ArrayTypeID)
 		case *scpb.SequenceOwner:
 			dropCascadeDescriptor(next, t.SequenceID)
@@ -232,14 +239,20 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			dropCascadeDescriptor(next, t.TypeID)
 		case *scpb.CompositeType:
 			dropCascadeDescriptor(next, t.TypeID)
+		case *scpb.DomainType:
+			dropCascadeDescriptor(next, t.TypeID)
 		case *scpb.FunctionBody:
+			dropCascadeDescriptor(next, t.FunctionID)
+		case *scpb.FunctionParams:
 			dropCascadeDescriptor(next, t.FunctionID)
 		case *scpb.TriggerFunctionCall:
 			dropCascadeDescriptor(next, t.FuncID)
 		case *scpb.TriggerDeps:
-			dropCascadeDescriptor(next, t.TableID)
+			// Drop only the trigger, not the entire table that owns it.
+			dropTrigger(next, t.TableID, t.TriggerID)
 		case *scpb.PolicyDeps:
-			dropCascadeDescriptor(next, t.TableID)
+			// Drop only the policy, not the entire table that owns it.
+			dropPolicy(next, t.TableID, t.PolicyID)
 		case *scpb.Column, *scpb.ColumnType:
 			// These only have type references.
 			break
@@ -258,7 +271,12 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			*scpb.ForeignKeyConstraint,
 			*scpb.ForeignKeyConstraintUnvalidated,
 			*scpb.SequenceOwner,
-			*scpb.DatabaseRegionConfig:
+			*scpb.DatabaseRegionConfig,
+			*scpb.DomainCheckConstraint,
+			*scpb.DomainCheckConstraintUnvalidated,
+			*scpb.DomainDefault,
+			*scpb.DomainNotNull,
+			*scpb.DomainConstraintName:
 			b.Drop(e)
 		default:
 			panic(errors.AssertionFailedf("un-dropped backref %T (%v) should either be "+
@@ -297,6 +315,48 @@ func constraintElements(
 	) bool {
 		idI, _ := screl.Schema.GetAttribute(screl.ConstraintID, e)
 		return idI != nil && idI.(catid.ConstraintID) == constraintID
+	})
+}
+
+// triggerElements returns all elements for a specific trigger on a table.
+func triggerElements(b BuildCtx, tableID catid.DescID, triggerID catid.TriggerID) ElementResultSet {
+	return b.QueryByID(tableID).Filter(func(
+		current scpb.Status, target scpb.TargetStatus, e scpb.Element,
+	) bool {
+		idI, _ := screl.Schema.GetAttribute(screl.TriggerID, e)
+		return idI != nil && idI.(catid.TriggerID) == triggerID
+	})
+}
+
+// dropTrigger drops all elements for a specific trigger on a table.
+func dropTrigger(b BuildCtx, tableID catid.DescID, triggerID catid.TriggerID) {
+	triggerElems := triggerElements(b, tableID, triggerID)
+	triggerElems.ForEach(func(_ scpb.Status, target scpb.TargetStatus, e scpb.Element) {
+		if target != scpb.ToPublic {
+			return
+		}
+		b.Drop(e)
+	})
+}
+
+// policyElements returns all elements for a specific policy on a table.
+func policyElements(b BuildCtx, tableID catid.DescID, policyID catid.PolicyID) ElementResultSet {
+	return b.QueryByID(tableID).Filter(func(
+		current scpb.Status, target scpb.TargetStatus, e scpb.Element,
+	) bool {
+		idI, _ := screl.Schema.GetAttribute(screl.PolicyID, e)
+		return idI != nil && idI.(catid.PolicyID) == policyID
+	})
+}
+
+// dropPolicy drops all elements for a specific policy on a table.
+func dropPolicy(b BuildCtx, tableID catid.DescID, policyID catid.PolicyID) {
+	policyElems := policyElements(b, tableID, policyID)
+	policyElems.ForEach(func(_ scpb.Status, target scpb.TargetStatus, e scpb.Element) {
+		if target != scpb.ToPublic {
+			return
+		}
+		b.Drop(e)
 	})
 }
 
@@ -364,14 +424,23 @@ func getNonDropColumns(b BuildCtx, tableID catid.DescID) (ret []*scpb.Column) {
 	return ret
 }
 
+// isNonDropIndex returns true if the given target status indicates the index is
+// not being dropped. This mirrors the legacy descriptor's NonDropIndexes
+// semantics: public indexes, indexes being added, and in-progress mutations
+// that are not drops.
+func isNonDropIndex(target scpb.TargetStatus) bool {
+	return target != scpb.ToAbsent
+}
+
 // getColumnIDFromColumnName looks up a column's ID by its name.
 // If no column with this name exists, 0 will be returned.
+// This function does not check for any privileges on the table.
+// The caller check the privileges as needed.
 func getColumnIDFromColumnName(
 	b BuilderState, tableID catid.DescID, columnName tree.Name, required bool,
 ) catid.ColumnID {
 	colElems := b.ResolveColumn(tableID, columnName, ResolveParams{
 		IsExistenceOptional: !required,
-		RequiredPrivilege:   privilege.CREATE,
 	})
 
 	if colElems == nil {
@@ -404,10 +473,12 @@ func mustGetColumnIDFromColumnName(
 // Currently unused.
 var _ = mustGetColumnIDFromColumnName
 
-func mustGetTableIDFromTableName(b BuildCtx, tableName tree.TableName) catid.DescID {
+func mustGetTableIDFromTableName(
+	b BuildCtx, tableName tree.TableName, requiredPrivilege privilege.Kind,
+) catid.DescID {
 	tableElems := b.ResolveTable(tableName.ToUnresolvedObjectName(), ResolveParams{
 		IsExistenceOptional: false,
-		RequiredPrivilege:   privilege.CREATE,
+		RequiredPrivilege:   requiredPrivilege,
 	})
 	_, _, tableElem := scpb.FindTable(tableElems)
 	if tableElem == nil {
@@ -517,7 +588,7 @@ func referencesColumnIDFilter(
 	columnID catid.ColumnID,
 ) func(_ scpb.Status, _ scpb.TargetStatus, _ scpb.Element) bool {
 	return func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) (included bool) {
-		_ = screl.WalkColumnIDs(e, func(id *catid.ColumnID) error {
+		_ = walkutil.Walk(e, func(id *catid.ColumnID) error {
 			if id != nil && *id == columnID {
 				included = true
 			}
@@ -1192,6 +1263,14 @@ func checkTableSchemaChangePrerequisites(
 	maybeCleanupSchemaLockedFn = func() {}
 	hasSchemaLockedChange := tree.HasSetOrResetSchemaLocked(n)
 	if schemaLocked != nil && !hasSchemaLockedChange {
+		// Check if auto-unlock is allowed.
+		if !sqlclustersettings.SchemaLockedAutoUnlockEnabled.Get(&b.ClusterSettings().SV) {
+			_, _, ns := scpb.FindNamespace(tableElements)
+			if ns == nil {
+				panic(errors.AssertionFailedf("programming error: Namespace element not found"))
+			}
+			panic(sqlerrors.NewSchemaChangeOnLockedTableErr(ns.Name))
+		}
 		// If the user is not explicitly setting schema_locked, then we should
 		// use the auto-unset logic.
 		b.DropTransient(schemaLocked)
@@ -1238,6 +1317,16 @@ func panicIfSystemColumn(column *scpb.Column, columnName tree.Name) {
 // by row and any of the regions on the database of the table are currently
 // being modified by another schema change job.
 func panicIfRegionChangeUnderwayOnRBRTable(b BuildCtx, op redact.SafeString, tableID catid.DescID) {
+	rbrString := redact.SafeString("on a REGIONAL BY ROW table ")
+	panicIfRegionChangeUnderway(b, op, rbrString, tableID)
+}
+
+// panicIfRegionChangeUnderway panics if any of the regions on the database
+// of the table are currently being modified by another schema change job.
+// the given table must either be or transitioning to/from regional by row.
+func panicIfRegionChangeUnderway(
+	b BuildCtx, op, rbrString redact.SafeString, tableID catid.DescID,
+) {
 	tableElems := b.QueryByID(tableID)
 	_, _, rbrElem := scpb.FindTableLocalityRegionalByRow(tableElems)
 	if rbrElem == nil {
@@ -1257,8 +1346,9 @@ func panicIfRegionChangeUnderwayOnRBRTable(b BuildCtx, op redact.SafeString, tab
 			errors.WithHintf(
 				pgerror.Newf(
 					pgcode.ObjectNotInPrerequisiteState,
-					"cannot %s on a REGIONAL BY ROW table while a region is being added or dropped on the database",
+					"cannot %s %swhile a region is being added or dropped on the database",
 					op,
+					rbrString,
 				),
 				"cancel the job which is adding or dropping the region or try again later",
 			),
@@ -1266,6 +1356,13 @@ func panicIfRegionChangeUnderwayOnRBRTable(b BuildCtx, op redact.SafeString, tab
 			r.TransitioningRegions()[0],
 		))
 	}
+}
+
+// isTableLocalityRegionalByRow returns true if the table has LOCALITY REGIONAL BY ROW.
+func isTableLocalityRegionalByRow(b BuildCtx, tableID catid.DescID) bool {
+	tableElems := b.QueryByID(tableID)
+	rbrElem := tableElems.FilterTableLocalityRegionalByRow().MustGetZeroOrOneElement()
+	return rbrElem != nil
 }
 
 // haveSameIndexColsByKind returns true if two indexes have the same index
@@ -1293,6 +1390,46 @@ func haveSameIndexCols(b BuildCtx, tableID catid.DescID, indexID1, indexID2 cati
 	return haveSameIndexColsByKind(b, tableID, indexID1, indexID2, scpb.IndexColumn_KEY) &&
 		haveSameIndexColsByKind(b, tableID, indexID1, indexID2, scpb.IndexColumn_KEY_SUFFIX) &&
 		haveSameIndexColsByKind(b, tableID, indexID1, indexID2, scpb.IndexColumn_STORED)
+}
+
+func haveSameIndexPartitioning(spec1, spec2 indexSpec) bool {
+	// First, check if both specs have partitioning.
+	if spec1.partitioning == nil {
+		return spec2.partitioning == nil
+	} else if spec2.partitioning == nil {
+		return false
+	}
+	// Then, check if partitioning descriptors are the same.
+	if !spec1.partitioning.PartitioningDescriptor.Equal(spec2.partitioning.PartitioningDescriptor) {
+		return false
+	}
+	// Finally, check if the partitioning column IDs are the same.
+	numPartCols := int(spec1.partitioning.NumColumns)
+	// Get KEY columns from both specs.
+	keyCols1 := make([]*scpb.IndexColumn, 0, len(spec1.columns))
+	keyCols2 := make([]*scpb.IndexColumn, 0, len(spec2.columns))
+	for _, col := range spec1.columns {
+		if col.Kind == scpb.IndexColumn_KEY {
+			keyCols1 = append(keyCols1, col)
+		}
+	}
+	for _, col := range spec2.columns {
+		if col.Kind == scpb.IndexColumn_KEY {
+			keyCols2 = append(keyCols2, col)
+		}
+	}
+	if numPartCols > min(len(keyCols1), len(keyCols2)) {
+		panic(errors.AssertionFailedf(
+			"number of partition columns greater than number of index key columns"))
+	}
+	// Compare the first numPartCols column IDs.
+	for i := 0; i < numPartCols; i++ {
+		if keyCols1[i].ColumnID != keyCols2[i].ColumnID ||
+			keyCols1[i].OrdinalInKind != keyCols2[i].OrdinalInKind {
+			return false
+		}
+	}
+	return true
 }
 
 // compareNumOfIndexCols compares the number of columns of `kind` in two indexes.
@@ -1669,14 +1806,6 @@ func (pic *primaryIndexChain) deflate(b BuildCtx) {
 		redundants = append(redundants, idxSpec)
 		redundantIDs[idxSpec] = true
 	}
-	hasRedundantID := func(id catid.IndexID) bool {
-		for _, r := range redundants {
-			if r.indexID() == id {
-				return true
-			}
-		}
-		return false
-	}
 
 	if haveSameIndexCols(b, tableID, pic.oldSpec.primary.IndexID, pic.inter1Spec.primary.IndexID) {
 		markAsRedundant(&pic.inter1Spec)
@@ -1686,6 +1815,7 @@ func (pic *primaryIndexChain) deflate(b BuildCtx) {
 		markAsRedundant(&pic.inter2Spec)
 		markAsRedundant(&pic.inter2TempSpec)
 	}
+	// If the index chain elements have the same index columns, check for partitioning changes as well.
 	if haveSameIndexCols(b, tableID, pic.inter1Spec.primary.IndexID, pic.inter2Spec.primary.IndexID) {
 		if _, exist := redundantIDs[&pic.inter2Spec]; !exist {
 			markAsRedundant(&pic.inter2Spec)
@@ -1693,7 +1823,7 @@ func (pic *primaryIndexChain) deflate(b BuildCtx) {
 		} else if _, exist = redundantIDs[&pic.inter1Spec]; !exist {
 			markAsRedundant(&pic.inter1Spec)
 			markAsRedundant(&pic.inter1TempSpec)
-		} else {
+		} else if haveSameIndexPartitioning(pic.finalSpec, pic.oldSpec) {
 			// We've inflated the chain but end up needing to drop all new primary
 			// indexes (e.g. adding a column that has no default value and no
 			// computed expression). When we inflate a chain, we mark `old` as
@@ -1718,24 +1848,12 @@ func (pic *primaryIndexChain) deflate(b BuildCtx) {
 	// primary index will cause us to fail to retrieve the element to drop).
 	for _, redundant := range redundants {
 		// For new replacement secondary indexes we need to select the index to
-		// publish this index with. The source index ID is an excellent candidate
-		// as long as its not the old primary index (i.e. we folded all earlier
-		// primary indexes).
-		recreateTargetID := redundant.SourceIndexID()
-		if recreateTargetID == pic.oldSpec.primary.IndexID || hasRedundantID(recreateTargetID) {
-			// Otherwise, we need to select the next valid index in the chain, that
-			// follows the redundant one.
-			firstMatch := false
-			specs := pic.allPrimaryIndexSpecs(func(spec *indexSpec) bool {
-				if spec.indexID() == recreateTargetID {
-					firstMatch = true
-					return false
-				}
-				return !redundantIDs[spec] && firstMatch
-			})
-			if len(specs) > 0 {
-				recreateTargetID = specs[0].indexID()
-			}
+		// publish this index with. The final index ID is an excellent candidate
+		// because it is guaranteed to have the new key columns. If the final index
+		// is also redundant, we can use old primary index ID as the replacement.
+		recreateTargetID := pic.finalSpec.indexID()
+		if redundantIDs[&pic.finalSpec] {
+			recreateTargetID = pic.oldSpec.indexID()
 		}
 		updateElementsToDependOnNewFromOld(b, tableID,
 			redundant.indexID(), redundant.SourceIndexID(), recreateTargetID, catid.IndexSet{} /* excludes */)
@@ -2136,7 +2254,7 @@ func retrieveColumnComment(
 func mustRetrievePartitioningFromIndexPartitioning(
 	b BuildCtx, tableID catid.DescID, indexID catid.IndexID,
 ) catalog.Partitioning {
-	idxPart := b.QueryByID(tableID).FilterIndexPartitioning().
+	idxPart := b.QueryByID(tableID).Filter(notFilter(ghostElementFilter)).FilterIndexPartitioning().
 		Filter(func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.IndexPartitioning) bool {
 			return e.IndexID == indexID
 		}).MustGetZeroOrOneElement()
@@ -2158,6 +2276,8 @@ func failIfSafeUpdates(b BuildCtx, n tree.NodeFormatter) {
 				"for certain type conversions or when applying a USING clause")
 		case *tree.DropIndex:
 			errorWithMessage = errors.New("DROP INDEX")
+		case *tree.AlterTableDropConstraint:
+			errorWithMessage = errors.New("ALTER TABLE DROP CONSTRAINT")
 		default:
 			panic(errors.AssertionFailedf("programming error: unexpected node type %T", n))
 		}

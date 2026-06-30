@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
 	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -31,6 +32,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/hintpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/hints"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -40,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/prep"
 	"github.com/cockroachdb/cockroach/pkg/sql/regions"
@@ -47,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionmutator"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
@@ -54,6 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxlog"
@@ -291,7 +297,7 @@ func (ex *connExecutor) execPortal(
 	defer func() {
 		if portal.isPausable() {
 			if !portal.pauseInfo.exhaustPortal.cleanup.isComplete {
-				portal.pauseInfo.exhaustPortal.cleanup.appendFunc(func(_ context.Context) {
+				portal.pauseInfo.exhaustPortal.cleanup.appendFunc(func(context.Context) {
 					ex.exhaustPortal(portal.Name)
 				})
 				portal.pauseInfo.exhaustPortal.cleanup.isComplete = true
@@ -340,6 +346,59 @@ func (ex *connExecutor) execPortal(
 	default:
 		return ex.execStmt(ctx, portal.Stmt.Statement, &portal, pinfo, stmtRes, canAutoCommit)
 	}
+}
+
+func (ex *connExecutor) checkUDTStaleness(
+	ctx context.Context, prep *prep.Statement,
+) (stale bool, staleEnumNames []string, err error) {
+	if len(prep.UDTs) == 0 {
+		return false, nil, nil
+	}
+	staleEnumNames = make([]string, 0)
+	for i, typ := range prep.UDTs {
+		toCheck, err := ex.planner.ResolveTypeByOID(ctx, typ.Oid())
+		if err != nil {
+			return stale, nil, err
+		}
+		if typ.TypeMeta.Version != toCheck.TypeMeta.Version {
+			stale = true
+			prep.UDTs[i] = toCheck
+			staleEnumNames = append(staleEnumNames, typ.Name())
+		}
+	}
+	return stale, staleEnumNames, nil
+}
+
+// maybeReparsePrepStmt is to reparse the prepared statement so that the
+// stored udt datum is up-to-date. The reparse is needed because AST can
+// be modified at type chekcing, with tree.StrVal component replaced
+// with a versioned tree.DEnum. If the UDT's version changed, this
+// tree.DEnum would be outdated.
+func (ex *connExecutor) maybeReparsePrepStmt(
+	ctx context.Context, prep *prep.Statement, name string,
+) error {
+	stale, staleEnumNames, err := ex.checkUDTStaleness(ctx, prep)
+	if err != nil {
+		return err
+	}
+	if !stale {
+		return nil
+	}
+	log.Eventf(ctx, "reparsing prepared statament %q for the user defined types are stale: %s", name, staleEnumNames)
+	newStmt, err := parser.ParseOne(prep.SQL)
+	if err != nil {
+		return err
+	}
+	prep.Statement = newStmt
+	prep.AST = newStmt.AST
+	// Since the udt is outdated, the stored memo will be stale and we will need to
+	// regenerate the memo anyways, so we just reset all the memo related fields as well.
+	prep.BaseMemo = nil
+	prep.GenericMemo = nil
+	prep.IdealGenericPlan = false
+	prep.Costs.Reset()
+	prep.HintsGeneration = 0
+	return nil
 }
 
 // execStmtInOpenState executes one statement in the context of the session's
@@ -393,9 +452,9 @@ func (ex *connExecutor) execStmtInOpenState(
 
 	var stmt Statement
 	if isExtendedProtocol {
-		stmt = makeStatementFromPrepared(ctx, prepared, queryID, stmtFingerprintFmtMask, statementHintsCache)
+		stmt = makeStatementFromPrepared(ctx, prepared, queryID, stmtFingerprintFmtMask, statementHintsCache, ex.sessionData().Database)
 	} else {
-		stmt = makeStatement(ctx, parserStmt, queryID, stmtFingerprintFmtMask, statementHintsCache)
+		stmt = makeStatement(ctx, parserStmt, queryID, stmtFingerprintFmtMask, statementHintsCache, ex.sessionData().Database)
 	}
 
 	if len(stmt.QueryTags) > 0 {
@@ -460,6 +519,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
 	p.sessionDataMutatorIterator.ParamStatusUpdater = res
 	p.noticeSender = res
+	p.stmtResultBuffering = res
 	ih := &p.instrumentation
 
 	if ex.executorType != executorTypeInternal {
@@ -555,6 +615,10 @@ func (ex *connExecutor) execStmtInOpenState(
 			return makeErrEvent(newPreparedStmtDNEError(ex.sessionData(), name))
 		}
 
+		if err := ex.maybeReparsePrepStmt(ctx, ps, name); err != nil {
+			return makeErrEvent(err)
+		}
+
 		var err error
 		pinfo, err = ex.planner.fillInPlaceholders(ctx, ps, name, e.Params)
 		if err != nil {
@@ -571,8 +635,15 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmt.HintIDs = ps.HintIDs
 		stmt.HintsGeneration = ps.HintsGeneration
 		stmt.ASTWithInjectedHints = ps.ASTWithInjectedHints
-		stmt.ReloadHintsIfStale(ctx, stmtFingerprintFmtMask, statementHintsCache)
-		res.ResetStmtType(ps.AST)
+		stmt.ReloadHintsIfStale(ctx, stmtFingerprintFmtMask, statementHintsCache, ex.sessionData().Database)
+		// Don't reset the statement type if we're within EXPLAIN ANALYZE, as this
+		// would break the special case handling in GetFormatCode that relies on
+		// cmdCompleteTag being "EXPLAIN". For EXPLAIN ANALYZE EXECUTE, the format
+		// codes are set up for the EXPLAIN output (1 column), but the inner query
+		// may have more columns. See issue #161382.
+		if ih.outputMode == unmodifiedOutput {
+			res.ResetStmtType(ps.AST)
+		}
 
 		if e.DiscardRows {
 			ih.SetDiscardRows()
@@ -589,6 +660,18 @@ func (ex *connExecutor) execStmtInOpenState(
 	// txnState.mu.autoRetryCounter, so we don't need to get a mutex here.
 	ctx = ih.Setup(ctx, ex, p, &stmt, os.ImplicitTxn.Get(),
 		ex.state.mu.priority, ex.state.mu.autoRetryCounter)
+
+	// Set workload ID and app name ID for ASH sampling. ih.Setup
+	// already computed the statement fingerprint ID, so reuse it here.
+	p.extendedEvalCtx.WorkloadID = uint64(ih.fingerprintId)
+	appNameID := ash.GetOrStoreAppNameID(p.SessionData().ApplicationName)
+	p.extendedEvalCtx.AppNameID = appNameID
+	p.extendedEvalCtx.WorkloadType = workloadid.WorkloadTypeStatement
+	if p.txn != nil {
+		p.txn.SetWorkloadInfo(
+			uint64(ih.fingerprintId), appNameID, workloadid.WorkloadTypeStatement,
+		)
+	}
 
 	// Note that here we always unconditionally defer a function that takes care
 	// of finishing the instrumentation helper. This is needed since in order to
@@ -828,6 +911,7 @@ func (ex *connExecutor) execStmtInOpenState(
 
 	}(ctx, res)
 
+	// Handle transaction control statements.
 	switch s := ast.(type) {
 	case *tree.BeginTransaction:
 		// BEGIN is only allowed if we are in an implicit txn.
@@ -870,8 +954,15 @@ func (ex *connExecutor) execStmtInOpenState(
 	case *tree.ShowCommitTimestamp:
 		ev, payload := ex.execShowCommitTimestampInOpenState(ctx, s, res, canAutoCommit)
 		return ev, payload, nil
+	}
 
-	case *tree.Prepare:
+	// Apply session variable hints after the transaction control switch. This
+	// ensures hints don't interact with BEGIN/COMMIT/SAVEPOINT stack operations.
+	// The cleanup function pops the pushed hint session data frame on return.
+	hintCleanup := ex.applySessionVariableHints(ctx, p, &stmt)
+	defer hintCleanup()
+
+	if s, ok := ast.(*tree.Prepare); ok {
 		// This is handling the SQL statement "PREPARE". See execPrepare for
 		// handling of the protocol-level command for preparing statements.
 		name := s.Name.String()
@@ -923,6 +1014,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			ex.server.cfg.GenerateID(),
 			tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV)),
 			statementHintsCache,
+			ex.sessionData().Database,
 		)
 		var rawTypeHints []oid.Oid
 
@@ -970,76 +1062,20 @@ func (ex *connExecutor) execStmtInOpenState(
 	// set / RETURNING can be used instead. However this is not relevant
 	// here.)
 
-	// We first ensure stepping mode is enabled.
-	//
-	// This ought to be done just once when a txn gets initialized;
-	// unfortunately, there are too many places where the txn object
-	// is re-configured, re-set etc without using NewTxnWithSteppingEnabled().
-	//
-	// Manually hunting them down and calling ConfigureStepping() each
-	// time would be error prone (and increase the chance that a future
-	// change would forget to add the call).
-	//
-	// TODO(andrei): really the code should be rearchitected to ensure
-	// that all uses of SQL execution initialize the kv.Txn using a
-	// single/common function. That would be where the stepping mode
-	// gets enabled once for all SQL statements executed "underneath".
-	prevSteppingMode := ex.state.mu.txn.ConfigureStepping(ctx, kv.SteppingEnabled)
-	prevSeqNum := ex.state.mu.txn.GetReadSeqNum()
-	delegatedUnderOuterTxn := ex.executorType == executorTypeInternal && ex.extraTxnState.underOuterTxn
-	var origTs hlc.Timestamp
-	defer func() {
-		_ = ex.state.mu.txn.ConfigureStepping(ctx, prevSteppingMode)
-
-		// If this is an internal executor that is running on behalf of an outer
-		// txn, then we need to step back the txn so that the outer executor uses
-		// the proper sequence number.
-		if delegatedUnderOuterTxn {
-			if err := ex.state.mu.txn.SetReadSeqNum(prevSeqNum); err != nil {
-				retEv, retPayload, retErr = makeErrEvent(err)
-			}
-		}
-	}()
-
-	// Then we create a sequencing point.
-	//
-	// This is not the only place where a sequencing point is placed. There are
-	// also sequencing point after every stage of constraint checks and cascading
-	// actions at the _end_ of a statement's execution.
-	//
-	// If this is an internal executor running on behalf of an outer txn, then we
-	// also need to make sure the external read timestamp is not bumped. Normally,
-	// that happens whenever a READ COMMITTED txn is stepped.
-	//
-	// Under test builds, we add a few extra assertions to ensure that the
-	// external read timestamp does not change if it shouldn't, and that we use
-	// the correct isolation level for internal operations.
-	if buildutil.CrdbTestBuild {
-		if delegatedUnderOuterTxn {
-			origTs = ex.state.mu.txn.ReadTimestamp()
-		} else if ex.executorType == executorTypeInternal {
-			if level := ex.state.mu.txn.IsoLevel(); level != isolation.Serializable {
-				return nil, nil, errors.AssertionFailedf(
-					"internal operation is not using SERIALIZABLE isolation; found=%s",
-					level,
-				)
-			}
-		}
-	}
-	if err := ex.state.mu.txn.Step(ctx, !delegatedUnderOuterTxn /* allowReadTimestampStep */); err != nil {
+	// Create a sequencing point on the txn so this statement reads a
+	// consistent snapshot of writes done by prior statements. This is not
+	// the only place where a sequencing point is placed; there are also
+	// sequencing points after every stage of constraint checks and
+	// cascading actions at the _end_ of a statement's execution.
+	cleanup, err := ex.stepReadSequenceWithRestore(ctx)
+	if err != nil {
 		return makeErrEvent(err)
 	}
-	if buildutil.CrdbTestBuild && delegatedUnderOuterTxn {
-		newTs := ex.state.mu.txn.ReadTimestamp()
-		if newTs != origTs {
-			// This should never happen. If it does, it means that the internal
-			// executor incorrectly moved the txn's read timestamp forward.
-			return nil, nil, errors.AssertionFailedf(
-				"internal executor advanced the txn read timestamp. origTs=%s, newTs=%s",
-				origTs, newTs,
-			)
+	defer func() {
+		if err := cleanup(); err != nil {
+			retEv, retPayload, retErr = makeErrEvent(err)
 		}
-	}
+	}()
 
 	// Auto-commit is disallowed during statement execution if we previously
 	// executed any DDL. This is because may potentially create jobs and do other
@@ -1201,7 +1237,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 		if !portal.isPausable() {
 			f()
 		} else if !portal.pauseInfo.execStmtInOpenState.cleanup.isComplete {
-			portal.pauseInfo.execStmtInOpenState.cleanup.appendFunc(func(_ context.Context) {
+			portal.pauseInfo.execStmtInOpenState.cleanup.appendFunc(func(context.Context) {
 				f()
 				// Some cleanup steps modify the retErr and retPayload. We need to
 				// ensure that cleanup after them can see the update.
@@ -1280,9 +1316,9 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	}
 
 	if isExtendedProtocol {
-		vars.stmt = makeStatementFromPrepared(ctx, portal.Stmt, queryID, stmtFingerprintFmtMask, statementHintsCache)
+		vars.stmt = makeStatementFromPrepared(ctx, portal.Stmt, queryID, stmtFingerprintFmtMask, statementHintsCache, ex.sessionData().Database)
 	} else {
-		vars.stmt = makeStatement(ctx, parserStmt, queryID, stmtFingerprintFmtMask, statementHintsCache)
+		vars.stmt = makeStatement(ctx, parserStmt, queryID, stmtFingerprintFmtMask, statementHintsCache, ex.sessionData().Database)
 	}
 
 	var queryTimeoutTicker *time.Timer
@@ -1365,6 +1401,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
 	p.sessionDataMutatorIterator.ParamStatusUpdater = res
 	p.noticeSender = res
+	p.stmtResultBuffering = res
 	ih := &p.instrumentation
 
 	if ex.executorType != executorTypeInternal {
@@ -1460,6 +1497,10 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 			return makeErrEvent(newPreparedStmtDNEError(ex.sessionData(), name))
 		}
 
+		if err := ex.maybeReparsePrepStmt(ctx, ps, name); err != nil {
+			return makeErrEvent(err)
+		}
+
 		var err error
 		pinfo, err = ex.planner.fillInPlaceholders(ctx, ps, name, e.Params)
 		if err != nil {
@@ -1476,8 +1517,15 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 		vars.stmt.HintIDs = ps.HintIDs
 		vars.stmt.HintsGeneration = ps.HintsGeneration
 		vars.stmt.ASTWithInjectedHints = ps.ASTWithInjectedHints
-		vars.stmt.ReloadHintsIfStale(ctx, stmtFingerprintFmtMask, statementHintsCache)
-		res.ResetStmtType(ps.AST)
+		vars.stmt.ReloadHintsIfStale(ctx, stmtFingerprintFmtMask, statementHintsCache, ex.sessionData().Database)
+		// Don't reset the statement type if we're within EXPLAIN ANALYZE, as this
+		// would break the special case handling in GetFormatCode that relies on
+		// cmdCompleteTag being "EXPLAIN". For EXPLAIN ANALYZE EXECUTE, the format
+		// codes are set up for the EXPLAIN output (1 column), but the inner query
+		// may have more columns. See issue #161382.
+		if ih.outputMode == unmodifiedOutput {
+			res.ResetStmtType(ps.AST)
+		}
 
 		if e.DiscardRows {
 			ih.SetDiscardRows()
@@ -1650,6 +1698,18 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	p.semaCtx.Placeholders.Assign(pinfo, vars.stmt.NumPlaceholders)
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 
+	// Set workload ID and app name ID for ASH sampling. ih.Setup
+	// already computed the statement fingerprint ID, so reuse it here.
+	p.extendedEvalCtx.WorkloadID = uint64(ih.fingerprintId)
+	appNameID2 := ash.GetOrStoreAppNameID(p.SessionData().ApplicationName)
+	p.extendedEvalCtx.AppNameID = appNameID2
+	p.extendedEvalCtx.WorkloadType = workloadid.WorkloadTypeStatement
+	if p.txn != nil {
+		p.txn.SetWorkloadInfo(
+			uint64(ih.fingerprintId), appNameID2, workloadid.WorkloadTypeStatement,
+		)
+	}
+
 	if buildutil.CrdbTestBuild {
 		// Ensure that each statement is formatted regardless of logging
 		// settings.
@@ -1811,6 +1871,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 
 	}(ctx, res)
 
+	// Handle transaction control statements.
 	switch s := vars.ast.(type) {
 	case *tree.BeginTransaction:
 		// BEGIN is only allowed if we are in an implicit txn.
@@ -1853,8 +1914,16 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	case *tree.ShowCommitTimestamp:
 		ev, payload := ex.execShowCommitTimestampInOpenState(ctx, s, res, canAutoCommit)
 		return ev, payload, nil
+	}
 
-	case *tree.Prepare:
+	// Apply session variable hints after the transaction control switch.
+	// Use a regular defer (not processCleanupFunc) because the pushed session
+	// data must be popped on every execution return, not deferred until portal
+	// close. Each invocation pushes/pops its own frame.
+	hintCleanup := ex.applySessionVariableHints(ctx, p, &vars.stmt)
+	defer hintCleanup()
+
+	if s, ok := vars.ast.(*tree.Prepare); ok {
 		// This is handling the SQL statement "PREPARE". See execPrepare for
 		// handling of the protocol-level command for preparing statements.
 		name := s.Name.String()
@@ -1906,6 +1975,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 			ex.server.cfg.GenerateID(),
 			tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV)),
 			statementHintsCache,
+			ex.sessionData().Database,
 		)
 		var rawTypeHints []oid.Oid
 
@@ -1958,76 +2028,20 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	// set / RETURNING can be used instead. However this is not relevant
 	// here.)
 
-	// We first ensure stepping mode is enabled.
-	//
-	// This ought to be done just once when a txn gets initialized;
-	// unfortunately, there are too many places where the txn object
-	// is re-configured, re-set etc without using NewTxnWithSteppingEnabled().
-	//
-	// Manually hunting them down and calling ConfigureStepping() each
-	// time would be error prone (and increase the chance that a future
-	// change would forget to add the call).
-	//
-	// TODO(andrei): really the code should be rearchitected to ensure
-	// that all uses of SQL execution initialize the kv.Txn using a
-	// single/common function. That would be where the stepping mode
-	// gets enabled once for all SQL statements executed "underneath".
-	prevSteppingMode := ex.state.mu.txn.ConfigureStepping(ctx, kv.SteppingEnabled)
-	prevSeqNum := ex.state.mu.txn.GetReadSeqNum()
-	delegatedUnderOuterTxn := ex.executorType == executorTypeInternal && ex.extraTxnState.underOuterTxn
-	var origTs hlc.Timestamp
-	defer func() {
-		_ = ex.state.mu.txn.ConfigureStepping(ctx, prevSteppingMode)
-
-		// If this is an internal executor that is running on behalf of an outer
-		// txn, then we need to step back the txn so that the outer executor uses
-		// the proper sequence number.
-		if delegatedUnderOuterTxn {
-			if err := ex.state.mu.txn.SetReadSeqNum(prevSeqNum); err != nil {
-				retEv, retPayload, retErr = makeErrEvent(err)
-			}
-		}
-	}()
-
-	// Then we create a sequencing point.
-	//
-	// This is not the only place where a sequencing point is placed. There are
-	// also sequencing point after every stage of constraint checks and cascading
-	// actions at the _end_ of a statement's execution.
-	//
-	// If this is an internal executor running on behalf of an outer txn, then we
-	// also need to make sure the external read timestamp is not bumped. Normally,
-	// that happens whenever a READ COMMITTED txn is stepped.
-	//
-	// Under test builds, we add a few extra assertions to ensure that the
-	// external read timestamp does not change if it shouldn't, and that we use
-	// the correct isolation level for internal operations.
-	if buildutil.CrdbTestBuild {
-		if delegatedUnderOuterTxn {
-			origTs = ex.state.mu.txn.ReadTimestamp()
-		} else if ex.executorType == executorTypeInternal {
-			if level := ex.state.mu.txn.IsoLevel(); level != isolation.Serializable {
-				return nil, nil, errors.AssertionFailedf(
-					"internal operation is not using SERIALIZABLE isolation; found=%s",
-					level,
-				)
-			}
-		}
-	}
-	if err := ex.state.mu.txn.Step(ctx, !delegatedUnderOuterTxn /* allowReadTimestampStep */); err != nil {
+	// Create a sequencing point on the txn so this statement reads a
+	// consistent snapshot of writes done by prior statements. This is not
+	// the only place where a sequencing point is placed; there are also
+	// sequencing points after every stage of constraint checks and
+	// cascading actions at the _end_ of a statement's execution.
+	cleanup, err := ex.stepReadSequenceWithRestore(ctx)
+	if err != nil {
 		return makeErrEvent(err)
 	}
-	if buildutil.CrdbTestBuild && delegatedUnderOuterTxn {
-		newTs := ex.state.mu.txn.ReadTimestamp()
-		if newTs != origTs {
-			// This should never happen. If it does, it means that the internal
-			// executor incorrectly moved the txn's read timestamp forward.
-			return nil, nil, errors.AssertionFailedf(
-				"internal executor advanced the txn read timestamp. origTs=%s, newTs=%s",
-				origTs, newTs,
-			)
+	defer func() {
+		if err := cleanup(); err != nil {
+			retEv, retPayload, retErr = makeErrEvent(err)
 		}
-	}
+	}()
 
 	if portal.isPausable() {
 		p.pausablePortal = portal
@@ -2168,6 +2182,74 @@ func (ex *connExecutor) stepReadSequence(ctx context.Context) error {
 	return nil
 }
 
+// stepReadSequenceWithRestore creates a sequencing point on the current txn,
+// returning a cleanup function the caller MUST defer.
+//
+// The cleanup always restores the prior stepping mode. If this connExecutor is
+// an internal executor running under an outer user txn, the cleanup also
+// restores the read sequence number so that outer executor uses the proper
+// sequence number. The Step itself is also instructed not to advance the read
+// timestamp in that case — the parent owns timestamp advancement.
+//
+// When the connExecutor is not in stateOpen the call is a no-op and the
+// returned cleanup does nothing.
+//
+// The cleanup may itself return an error from restoring the read sequence
+// number.
+func (ex *connExecutor) stepReadSequenceWithRestore(ctx context.Context) (func() error, error) {
+	if _, isOpen := ex.machine.CurState().(stateOpen); !isOpen {
+		return func() error { return nil }, nil
+	}
+
+	prevSteppingMode := ex.state.mu.txn.ConfigureStepping(ctx, kv.SteppingEnabled)
+	prevSeqNum := ex.state.mu.txn.GetReadSeqNum()
+	delegatedUnderOuterTxn := ex.executorType == executorTypeInternal && ex.extraTxnState.underOuterTxn
+	cleanup := func() error {
+		_ = ex.state.mu.txn.ConfigureStepping(ctx, prevSteppingMode)
+		if delegatedUnderOuterTxn {
+			return ex.state.mu.txn.SetReadSeqNum(prevSeqNum)
+		}
+		return nil
+	}
+
+	// Under test builds, assert that an internal executor running
+	// under an outer txn does not advance the read timestamp and
+	// that any other internal operation runs at SERIALIZABLE
+	// isolation.
+	var origTs hlc.Timestamp
+	if buildutil.CrdbTestBuild {
+		if delegatedUnderOuterTxn {
+			origTs = ex.state.mu.txn.ReadTimestamp()
+		} else if ex.executorType == executorTypeInternal {
+			if level := ex.state.mu.txn.IsoLevel(); level != isolation.Serializable {
+				_ = cleanup()
+				return nil, errors.AssertionFailedf(
+					"internal operation is not using SERIALIZABLE isolation; found=%s",
+					level,
+				)
+			}
+		}
+	}
+
+	if err := ex.state.mu.txn.Step(ctx, !delegatedUnderOuterTxn /* allowReadTimestampStep */); err != nil {
+		_ = cleanup()
+		return nil, err
+	}
+
+	if buildutil.CrdbTestBuild && delegatedUnderOuterTxn {
+		newTs := ex.state.mu.txn.ReadTimestamp()
+		if newTs != origTs {
+			_ = cleanup()
+			return nil, errors.AssertionFailedf(
+				"internal executor advanced the txn read timestamp. origTs=%s, newTs=%s",
+				origTs, newTs,
+			)
+		}
+	}
+
+	return cleanup, nil
+}
+
 // handleAOST gets the AsOfSystemTime clause from the statement, and sets
 // the timestamps of the transaction accordingly.
 func (ex *connExecutor) handleAOST(ctx context.Context, stmt tree.Statement) error {
@@ -2186,6 +2268,18 @@ func (ex *connExecutor) handleAOST(ctx context.Context, stmt tree.Statement) err
 	}
 	if asOf == nil {
 		return nil
+	}
+
+	// On a PCR reader tenant, explicit AOST is not allowed unless the session
+	// variable bypass_pcr_reader_catalog_aost is set.
+	if ex.isPCRReaderCatalog && !ex.sessionData().BypassPCRReaderCatalogAOST {
+		return errors.WithHint(
+			pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"explicit AS OF SYSTEM TIME is not allowed on a physical cluster replication reader virtual cluster",
+			),
+			"use SET bypass_pcr_reader_catalog_aost = true to override, after reaching out to support for guidance",
+		)
 	}
 
 	// Implicit transactions can have multiple statements, so we need to check
@@ -2337,6 +2431,36 @@ func (ex *connExecutor) resetTransactionOnSchemaChangeRetry(ctx context.Context)
 	return nil
 }
 
+// getChainTxnModes returns a non-nil chainedTransactionModes if the given
+// statement is a COMMIT AND CHAIN or ROLLBACK AND CHAIN. The returned modes
+// capture the current transaction's isolation level, priority, and read/write
+// mode so they can be applied to the new chained transaction.
+func (ex *connExecutor) getChainTxnModes(ast tree.Statement) *chainedTransactionModes {
+	var chain bool
+	switch s := ast.(type) {
+	case *tree.CommitTransaction:
+		chain = s.Chain
+	case *tree.RollbackTransaction:
+		chain = s.Chain
+	}
+	if !chain {
+		return nil
+	}
+	ex.state.mu.RLock()
+	pri := ex.state.mu.priority
+	isoLevel := ex.state.mu.isolationLevel
+	ex.state.mu.RUnlock()
+	readOnly := tree.ReadWrite
+	if ex.state.readOnly.Load() {
+		readOnly = tree.ReadOnly
+	}
+	return &chainedTransactionModes{
+		pri:      pri,
+		readOnly: readOnly,
+		isoLevel: isoLevel,
+	}
+}
+
 // commitSQLTransaction executes a commit after the execution of a
 // stmt, which can be any statement when executing a statement with an
 // implicit transaction, or a COMMIT statement when using an explicit
@@ -2355,6 +2479,10 @@ func (ex *connExecutor) commitSQLTransaction(
 			return ex.makeErrEvent(retryErr, ast)
 		}
 	}
+
+	// Capture chain modes before commit while the txnState is still alive.
+	chainModes := ex.getChainTxnModes(ast)
+
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartTransactionCommit, crtime.NowMono())
 	if err := commitFn(ctx); err != nil {
 		// For certain retryable errors, we should turn them into client visible
@@ -2373,6 +2501,7 @@ func (ex *connExecutor) commitSQLTransaction(
 	}); err != nil {
 		return ex.makeErrEvent(err, ast)
 	}
+	ex.extraTxnState.chainTxnModes = chainModes
 	return eventTxnFinishCommitted{}, nil
 }
 
@@ -2469,13 +2598,37 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) (retEr
 			return err
 		}
 
-		if err := ex.checkDescriptorTwoVersionInvariant(ctx); err != nil {
+		// Apply the statement timeout so the wait for older descriptor leases
+		// to drain (inside CheckTwoVersionInvariant's retry loop) cannot hang
+		// indefinitely. The schema-change KV writes are rolled back inside
+		// CheckTwoVersionInvariant before the wait begins, so timing out here
+		// does not leave anything in flight; the user can simply retry.
+		err := ex.runWithStatementTimeout(ctx, func(ctx context.Context) error {
+			return ex.checkDescriptorTwoVersionInvariant(ctx)
+		}, func() error {
+			return ex.planner.noticeSender.SendNotice(ex.Ctx(), pgnotice.Newf(
+				"The statement has timed out while waiting for older descriptor "+
+					"leases to be released. The schema change was not applied."),
+				true /* immediateFlush */)
+		})
+		if err != nil {
 			return err
 		}
 	}
 
 	if err := ex.extraTxnState.descCollection.EmitDescriptorUpdatesKey(ctx, ex.state.mu.txn); err != nil {
 		return err
+	}
+
+	// For explicit transactions, attribute the commit's deferred KV work
+	// to the transaction fingerprint, otherwise it will be attributed to
+	// the last statement's fingerprint which is misleading.
+	if !ex.implicitTxn() {
+		txnFingerprintID := ex.extraTxnState.transactionStatementsHash.Sum()
+		appNameID := ash.GetOrStoreAppNameID(ex.sessionData().ApplicationName)
+		ex.state.mu.txn.SetWorkloadInfo(
+			txnFingerprintID, appNameID, workloadid.WorkloadTypeCommit,
+		)
 	}
 
 	if err := ex.state.mu.txn.Commit(ctx); err != nil {
@@ -2547,6 +2700,9 @@ func (ex *connExecutor) rollbackSQLTransaction(
 	ex.extraTxnState.idleLatency += ex.statsCollector.PhaseTimes().
 		GetIdleLatency(ex.statsCollector.PreviousPhaseTimes())
 
+	// Capture chain modes before rollback while the txnState is still alive.
+	chainModes := ex.getChainTxnModes(stmt)
+
 	if err := ex.extraTxnState.sqlCursors.closeAll(&ex.planner, cursorCloseForTxnRollback); err != nil {
 		return ex.makeErrEvent(err, stmt)
 	}
@@ -2580,6 +2736,7 @@ func (ex *connExecutor) rollbackSQLTransaction(
 		return ex.makeErrEvent(err, stmt)
 	}
 	// We're done with this txn.
+	ex.extraTxnState.chainTxnModes = chainModes
 	return eventTxnFinishAborted{}, nil
 }
 
@@ -2730,23 +2887,79 @@ func (ex *connExecutor) dispatchReadCommittedStmtToExecutionEngine(
 func (ex *connExecutor) dispatchToExecutionEngine(
 	ctx context.Context, planner *planner, res RestrictedCommandResult,
 ) (retErr error) {
+	pausablePortalInfo := getPausablePortalInfo(planner)
+	if pausablePortalInfo != nil {
+		// This is ugly, but we need to override the execMon to the specific one
+		// owned by the pausable portals.
+		planner.execMon = ex.ppExecMon
+	} else {
+		// Guarantee that we use the global execMon in case we had some pausable
+		// portal executions in between.
+		planner.execMon = ex.execMon
+		planner.execMon.StartNoReserved(ctx, planner.txnMon)
+	}
 	defer func() {
 		if ppInfo := getPausablePortalInfo(planner); ppInfo != nil {
 			if !ppInfo.dispatchToExecutionEngine.cleanup.isComplete {
+				ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(func(context.Context) {
+					// Restore the original execMon since we overrode it.
+					planner.execMon = ex.execMon
+				})
 				ppInfo.dispatchToExecutionEngine.cleanup.isComplete = true
 			}
 			if retErr != nil || res.Err() != nil {
 				ppInfo.resumableFlow.cleanup.run(ctx)
 				ppInfo.dispatchToExecutionEngine.cleanup.run(ctx)
 			}
+		} else {
+			planner.execMon.Stop(ctx)
 		}
 	}()
+
+	var cpuProvider admission.SQLCPUProvider
+	if server := ex.server.cfg.DistSQLSrv; server != nil {
+		cpuProvider = server.SQLCPUProvider
+	}
+	// TODO(yuzefovich): support CPU reporting for pausable portal execution,
+	// which does not call Flow.Wait, which we rely on below for closing the
+	// cpuHandle.
+	if cpuProvider != nil && pausablePortalInfo == nil {
+		var cpuHandle *admission.SQLCPUHandle
+		var mainGoroutineCPUHandle *admission.GoroutineCPUHandle
+		var err error
+		ctx, cpuHandle, mainGoroutineCPUHandle, err = flowinfra.MakeCPUHandle(
+			ctx, cpuProvider, planner.extendedEvalCtx.Codec.TenantID, planner.txn, true, /* atGateway */
+			planner.extendedEvalCtx.WorkloadID,
+			planner.extendedEvalCtx.AppNameID,
+			roachpb.NodeID(planner.extendedEvalCtx.NodeID.SQLInstanceID()),
+		)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			// Close the main goroutine's CPU handle at the flow boundary. This must
+			// happen before cpuHandle.Close() which will pool the GoroutineCPUHandle.
+			mainGoroutineCPUHandle.Close(ctx)
+			// Close the SQLCPUHandle after all GoroutineCPUHandles are closed.
+			// At this point, all flow goroutines have exited (Wait() was called in
+			// flow.Cleanup), and the main goroutine's handle was just closed above.
+			// NB: there isn't a memory safety issue if some GoroutineCPUHandles are not
+			// yet closed, in that the pooling logic only returns closed GoroutineCPUHandles
+			// to the pool. But it is preferable for performance, and for full accounting
+			// of cpu consumtion.
+			cpuHandle.Close()
+		}()
+	}
 
 	stmt := planner.stmt
 	ex.sessionTracing.TracePlanStart(ctx, stmt.AST.StatementTag())
 	// TODO(sql-sessions): fix the phase time for pausable portals.
 	// https://github.com/cockroachdb/cockroach/issues/99410
 	ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.PlannerStartLogicalPlan, crtime.NowMono())
+
+	// Start measuring goroutine CPU time for SQL CPU measurement.
+	var cpuStopWatch timeutil.CPUStopWatch
+	cpuStopWatch.Start()
 
 	if execinfra.IncludeRUEstimateInExplainAnalyze.Get(ex.server.cfg.SV()) {
 		if server := ex.server.cfg.DistSQLSrv; server != nil {
@@ -2820,6 +3033,14 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 					}
 					// This stmt is not supported via the pausable portals model
 					// - set it back to an un-pausable (normal) portal.
+					//
+					// But before we do that, we need to set the right execMon.
+					// Note that we might have made reservations against the
+					// pausable portal execMon when creating the logical plan,
+					// and that's ok - those will be released when the plan is
+					// closed in a defer below.
+					planner.execMon = ex.execMon
+					planner.execMon.StartNoReserved(ctx, planner.txnMon)
 					ex.disablePortalPausability(planner.pausablePortal)
 					planner.pausablePortal = nil
 					err = res.RevokePortalPausability()
@@ -2832,9 +3053,9 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 				} else {
 					ppInfo.dispatchToExecutionEngine.planTop = planner.curPlan
 					defer func() {
-						ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(func(ctx context.Context) {
-							ppInfo.dispatchToExecutionEngine.planTop.close(ctx)
-						})
+						ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(
+							ppInfo.dispatchToExecutionEngine.planTop.close,
+						)
 					}()
 				}
 			} else {
@@ -2979,6 +3200,11 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.extraTxnState.rowsWritten += stats.rowsWritten
 	ex.extraTxnState.kvCPUTimeNanos += stats.kvCPUTimeNanos
 
+	// Add gateway goroutine grunning to the accumulated remote grunning. The
+	// corrected SQL CPU time is computed on demand via stats.sqlCPUTime(),
+	// which subtracts localKVCPUTime.
+	stats.rawSQLCPUTime += cpuStopWatch.Stop()
+
 	if ppInfo := getPausablePortalInfo(planner); ppInfo != nil && !ppInfo.dispatchToExecutionEngine.cleanup.isComplete {
 		// We need to ensure that we're using the planner bound to the first-time
 		// execution of a portal.
@@ -3049,6 +3275,17 @@ func populateQueryLevelStats(
 		}
 		log.Dev.VInfof(ctx, 1, msg, ih.fingerprint, err)
 	} else {
+		// Use the always-on SQL CPU measurement if it exceeds the trace-derived
+		// value. This ensures always-on accuracy even when tracing provides a
+		// partial picture. The trace-derived value is already deterministic
+		// when DeterministicExplain is set (see ComponentStats.MakeDeterministic),
+		// so we skip the always-on override in that case to keep test output
+		// stable.
+		if !cfg.TestingKnobs.DeterministicExplain {
+			if sqlCPU := topLevelStats.sqlCPUTime(); sqlCPU > ih.queryLevelStatsWithErr.Stats.SQLCPUTime {
+				ih.queryLevelStatsWithErr.Stats.SQLCPUTime = sqlCPU
+			}
+		}
 		// If this query is being run by a tenant, record the RUs consumed by CPU
 		// usage and network egress to the client.
 		if execinfra.IncludeRUEstimateInExplainAnalyze.Get(cfg.SV()) && cfg.DistSQLSrv != nil {
@@ -3066,6 +3303,13 @@ func populateQueryLevelStats(
 			// is non-deterministic, so if we need deterministic EXPLAIN, then
 			// we need to zero it out.
 			ih.queryLevelStatsWithErr.Stats.AdmissionWaitTime = 0
+		}
+		if p.ExecMon().MaximumBytes() > ih.queryLevelStatsWithErr.Stats.MaxMemUsage {
+			// For the query-level stats, for MaxMemUsage we want to include the
+			// memory usage during the logical planning, so we check whether the
+			// exec monitor (which includes that in addition to the gateway
+			// flow's memory usage) has higher watermark than any of the flows.
+			ih.queryLevelStatsWithErr.Stats.MaxMemUsage = p.execMon.MaximumBytes()
 		}
 	}
 	if ih.traceMetadata != nil && ih.explainPlan != nil {
@@ -3164,7 +3408,6 @@ func (ex *connExecutor) handleTxnRowsGuardrails(
 	if shouldLog {
 		commonSQLEventDetails := ex.planner.getCommonSQLEventDetails()
 		var event logpb.EventPayload
-		var migrator log.StructuredEventMigrator
 		if ex.executorType == executorTypeInternal {
 			if isRead {
 				event = &eventpb.TxnRowsReadLimitInternal{
@@ -3177,9 +3420,6 @@ func (ex *connExecutor) handleTxnRowsGuardrails(
 					CommonTxnRowsLimitDetails: commonTxnRowsLimitDetails,
 				}
 			}
-			migrator = log.NewStructuredEventMigrator(func() bool {
-				return log.ShouldMigrateEvent(ex.planner.ExecCfg().SV())
-			}, logpb.Channel_SQL_INTERNAL_PERF)
 		} else {
 			if isRead {
 				event = &eventpb.TxnRowsReadLimit{
@@ -3192,11 +3432,8 @@ func (ex *connExecutor) handleTxnRowsGuardrails(
 					CommonTxnRowsLimitDetails: commonTxnRowsLimitDetails,
 				}
 			}
-			migrator = log.NewStructuredEventMigrator(func() bool {
-				return log.ShouldMigrateEvent(ex.planner.ExecCfg().SV())
-			}, logpb.Channel_SQL_PERF)
 		}
-		migrator.StructuredEvent(ctx, severity.INFO, event)
+		log.StructuredEvent(ctx, severity.INFO, event)
 		logCounter.Inc(1)
 	}
 	if shouldErr {
@@ -3259,10 +3496,14 @@ func (ex *connExecutor) makeExecPlan(
 		return ctx, err
 	}
 
-	// For each non-internal query, we roll the dice to decide to use
-	// canary stats or stable stats for planning.
+	// For each non-internal query, roll the dice to determine the canary
+	// stats rollout path. The result is one of three states:
+	//   - StatsRolloutDefault: experiment off, use default stats
+	//   - StatsRolloutCanary:  experiment on, use canary (newest) stats
+	//   - StatsRolloutStable:  experiment on, use stable (second-newest) stats
 	if !planner.SessionData().Internal {
-		planner.EvalContext().UseCanaryStats = canaryRollDice(planner.EvalContext(), ex.rng.internal)
+		planner.EvalContext().StatsRollout =
+			canaryRollDice(ctx, planner.EvalContext(), ex.rng.internal)
 	}
 
 	if err := planner.makeOptimizerPlan(ctx); err != nil {
@@ -3293,6 +3534,10 @@ func (ex *connExecutor) makeExecPlan(
 			}
 		}
 		ex.metrics.EngineMetrics.FullTableOrIndexScanCount.Inc(1, ex.sessionData().Database, ex.sessionData().ApplicationName)
+	}
+
+	if flags.IsSet(planFlagUsesRLS) {
+		ex.metrics.EngineMetrics.RLSPoliciesAppliedCount.Inc(1)
 	}
 
 	// TODO(knz): Remove this accounting if/when savepoint rollbacks
@@ -3373,6 +3618,16 @@ type topLevelQueryStats struct {
 	clientTime time.Duration
 	// kvCPUTimeNanos is the CPU time consumed by KV operations during query execution.
 	kvCPUTimeNanos time.Duration
+	// localKVCPUTime is the SQL goroutine CPU time spent inside KV calls, as
+	// measured by the grunning library. This is the portion of SQL goroutine
+	// CPU that overlapped with KV work (not the CPU consumed on KV servers);
+	// it is subtracted from raw goroutine grunning to derive SQL-only CPU.
+	localKVCPUTime time.Duration
+	// rawSQLCPUTime accumulates raw goroutine grunning time from remote flows
+	// (via Metrics.RawSQLCPUTime metadata) and from the gateway. The corrected
+	// SQL CPU time is exposed via the sqlCPUTime() helper, which subtracts
+	// localKVCPUTime.
+	rawSQLCPUTime time.Duration
 	// NB: when adding another field here, consider whether
 	// forwardInnerQueryStats method needs an adjustment.
 }
@@ -3386,6 +3641,18 @@ func (s *topLevelQueryStats) add(other *topLevelQueryStats) {
 	s.networkEgressEstimate += other.networkEgressEstimate
 	s.clientTime += other.clientTime
 	s.kvCPUTimeNanos += other.kvCPUTimeNanos
+	s.localKVCPUTime += other.localKVCPUTime
+	s.rawSQLCPUTime += other.rawSQLCPUTime
+}
+
+// sqlCPUTime returns the corrected SQL CPU time: raw goroutine grunning
+// minus the portion spent inside KV calls. Returns zero if the result would
+// be negative (which can happen when grunning measurements race).
+func (s *topLevelQueryStats) sqlCPUTime() time.Duration {
+	if d := s.rawSQLCPUTime - s.localKVCPUTime; d > 0 {
+		return d
+	}
+	return 0
 }
 
 // execWithDistSQLEngine converts a plan to a distributed SQL physical plan and
@@ -3453,7 +3720,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	}
 
 	if err == nil && res.Err() == nil {
-		recv.maybeLogMisestimates(ctx, planner)
+		recv.handleMisestimates(ctx, planner)
 	}
 	return recv.stats, err
 }
@@ -3482,6 +3749,10 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	now := ex.server.cfg.Clock.PhysicalTime()
 	p := &ex.planner
 	ex.resetPlanner(ctx, p, nil, now)
+	// Note that here we don't use the txnMon (we use its parent) given that
+	// we're in the NoTxn txn state, so the txnMon hasn't been started yet.
+	ex.execMon.StartNoReserved(ctx, ex.sessionMon)
+	defer ex.execMon.Stop(ctx)
 	var modes tree.TransactionModes
 	if s != nil {
 		modes = s.Modes
@@ -3497,6 +3768,17 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 			}
 		}
 		return rwMode, now, nil, nil
+	}
+	// On a PCR reader tenant, explicit AOST is not allowed unless the session
+	// variable bypass_pcr_reader_catalog_aost is set.
+	if ex.isPCRReaderCatalog && !ex.sessionData().BypassPCRReaderCatalogAOST {
+		return 0, time.Time{}, nil, errors.WithHint(
+			pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"explicit AS OF SYSTEM TIME is not allowed on a physical cluster replication reader virtual cluster",
+			),
+			"use SET bypass_pcr_reader_catalog_aost = true to override, after reaching out to support for guidance",
+		)
 	}
 	ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 	asOf, err := p.EvalAsOfTimestamp(ctx, asOfClause)
@@ -3542,6 +3824,7 @@ func (ex *connExecutor) execStmtInNoTxnState(
 			ctx, parserStmt, ex.server.cfg.GenerateID(),
 			tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(&ex.server.cfg.Settings.SV)),
 			nil, /* statementHintsCache */
+			ex.sessionData().Database,
 		)
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
@@ -3582,6 +3865,11 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				ex.incrementExecutedStmtCounter(ast)
 			}
 		}()
+		// The implicit-CALL+DDL upgrade override (forceNextTxnSerializable)
+		// is meant for the very next implicit txn; an intervening explicit
+		// BEGIN discards it so it can't silently upgrade an unrelated
+		// future implicit txn.
+		ex.forceNextTxnSerializable = false
 		mode, sqlTs, historicalTs, err := ex.beginTransactionTimestampsAndReadMode(ctx, s)
 		if err != nil {
 			return ex.makeErrEvent(err, s)
@@ -3595,9 +3883,10 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				historicalTs,
 				ex.transitionCtx,
 				ex.QualityOfService(),
+				ex.sessionResourceGroupID(),
 				ex.txnIsolationLevelToKV(ctx, s.Modes.Isolation),
 				ex.omitInRangefeeds(),
-				ex.bufferedWritesEnabled(ctx),
+				ex.bufferedWritesEnabled(explicitTxn),
 				ex.rng.internal,
 			)
 	case *tree.ShowCommitTimestamp:
@@ -3630,9 +3919,10 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				historicalTs,
 				ex.transitionCtx,
 				ex.QualityOfService(),
-				ex.txnIsolationLevelToKV(ctx, tree.UnspecifiedIsolation),
+				ex.sessionResourceGroupID(),
+				ex.implicitTxnIsoLevel(ctx),
 				ex.omitInRangefeeds(),
-				ex.bufferedWritesEnabled(ctx),
+				ex.bufferedWritesEnabled(implicitTxn),
 				ex.rng.internal,
 			)
 	}
@@ -3665,9 +3955,10 @@ func (ex *connExecutor) beginImplicitTxn(
 			historicalTs,
 			ex.transitionCtx,
 			qos,
-			ex.txnIsolationLevelToKV(ctx, tree.UnspecifiedIsolation),
+			ex.sessionResourceGroupID(),
+			ex.implicitTxnIsoLevel(ctx),
 			ex.omitInRangefeeds(),
-			ex.bufferedWritesEnabled(ctx),
+			ex.bufferedWritesEnabled(implicitTxn),
 			ex.rng.internal,
 		)
 }
@@ -4258,6 +4549,7 @@ func (ex *connExecutor) recordTransactionStart(txnID uuid.UUID) {
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionMostRecentStartExecTransaction,
 		ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionFirstStartExecTransaction))
 	ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
+	ex.state.txnInstrumentationHelper.txnFingerprintHash = &ex.extraTxnState.transactionStatementsHash
 	ex.extraTxnState.transactionStatementFingerprintIDs = nil
 	ex.extraTxnState.numRows = 0
 	ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
@@ -4422,7 +4714,7 @@ func (ex *connExecutor) maybeRecordRetrySerializableContention(
 			contentionEvent := contentionpb.ExtendedContentionEvent{
 				ContentionType: contentionpb.ContentionType_SERIALIZATION_CONFLICT,
 				BlockingEvent: kvpb.ContentionEvent{
-					Key:     retryErr.ConflictingTxn.Key,
+					Key:     retryErr.ConflictKey,
 					TxnMeta: *retryErr.ConflictingTxn,
 					// Duration is not relevant for SERIALIZATION conflicts.
 				},
@@ -4483,7 +4775,7 @@ func (ex *connExecutor) execWithProfiling(
 		}
 		// Compute fingerprint ID here since ih.Setup hasn't been called yet.
 		fingerprintID := appstatspb.ConstructStatementFingerprintID(
-			stmtNoConstants, ex.implicitTxn(), ex.sessionData().Database,
+			stmtNoConstants, ex.sessionData().Database,
 		)
 		labels := make([]string, 0, 12)
 		labels = append(labels,
@@ -4520,4 +4812,74 @@ func isSQLOkayToThrottle(ast tree.Statement) bool {
 	default:
 		return true
 	}
+}
+
+// applySessionVariableHints pushes statement-level session data and applies all
+// enabled session variable hints. Returns a cleanup function that pops the
+// statement-level overlay. If no hints need applying, returns a no-op cleanup
+// function.
+//
+// The cache should have already resolved any duplicate hints. If applying a
+// hint fails, the error is logged and the hint is skipped, but the other hints
+// are still applied and statement execution continues.
+func (ex *connExecutor) applySessionVariableHints(
+	ctx context.Context, p *planner, stmt *Statement,
+) func() {
+	var pushedSessionData bool
+	for i := range stmt.Hints {
+		hint := &stmt.Hints[i]
+		if !hint.Enabled() || hint.SessionVariable == nil {
+			continue
+		}
+		varHint := hint.SessionVariable
+		if !pushedSessionData {
+			ex.sessionDataStack.PushStmtLevel()
+			pushedSessionData = true
+		}
+		if err := ex.applySessionVariableHint(ctx, p, varHint); err != nil {
+			p.instrumentation.recordHintError(i, err)
+			log.Eventf(ctx, "skipping session variable hint for %s: %v",
+				redact.Safe(varHint.VariableName), err)
+		} else {
+			log.Eventf(ctx, "applied session variable hint: %s = %s",
+				redact.Safe(varHint.VariableName), varHint.VariableValue)
+		}
+	}
+	if !pushedSessionData {
+		return func() {}
+	}
+	return func() {
+		ex.sessionDataStack.PopStmtLevel()
+	}
+}
+
+// applySessionVariableHint applies a single session variable change from a
+// statement hint.
+func (ex *connExecutor) applySessionVariableHint(
+	ctx context.Context, p *planner, hint *hintpb.SessionVariableHint,
+) error {
+	varName := hint.VariableName
+	varValue := hint.VariableValue
+
+	v, ok := varGen[varName]
+	if !ok {
+		return errors.New("unknown session variable")
+	}
+
+	// Skip GetStringVal normalization for hints. GetStringVal is designed for
+	// the SET var = <expr> path where the SQL parser produces typed datums
+	// (e.g. DInt for integers, DBool for booleans). Hint values are always
+	// strings, and wrapping them as DString breaks GetStringVal functions that
+	// expect non-string datum types (e.g. makeIntGetStringValFn expects DInt).
+	// The Set method already accepts a plain string and handles its own parsing.
+	if v.Set != nil {
+		return ex.dataMutatorIterator.ApplyOnStmtScopedMutator(
+			func(m sessionmutator.SessionDataMutator) error {
+				return v.Set(ctx, m, varValue)
+			},
+		)
+	} else if v.SetWithPlanner != nil {
+		return v.SetWithPlanner(ctx, p, setScopeStmt, varValue)
+	}
+	return errors.New("cannot set session variable")
 }

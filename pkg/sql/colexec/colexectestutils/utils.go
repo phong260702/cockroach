@@ -891,6 +891,16 @@ func newOpTestSelInput(
 	return ret
 }
 
+type AllocatorHolder interface {
+	SetAllocator(allocator *colmem.Allocator)
+}
+
+var _ AllocatorHolder = &opTestInput{}
+
+func (s *opTestInput) SetAllocator(allocator *colmem.Allocator) {
+	s.allocator = allocator
+}
+
 func (s *opTestInput) Init(context.Context) {
 	if s.typs == nil {
 		if len(s.tuples) == 0 {
@@ -1226,7 +1236,10 @@ func GetTupleFromBatch(batch coldata.Batch, tupleIdx int) Tuple {
 			var val reflect.Value
 			family := vec.CanonicalTypeFamily()
 			if colBytes, ok := vec.Col().(*coldata.Bytes); ok {
-				val = reflect.ValueOf(append([]byte(nil), colBytes.Get(tupleIdx)...))
+				origVal := colBytes.Get(tupleIdx)
+				valBytes := make([]byte, len(origVal))
+				copy(valBytes, origVal)
+				val = reflect.ValueOf(valBytes)
 			} else if family == types.DecimalFamily {
 				colDec := vec.Decimal()
 				var newDec apd.Decimal
@@ -1456,6 +1469,18 @@ func tupleEquals(ctx context.Context, expected Tuple, actual Tuple, evalCtx *eva
 					continue
 				}
 				return false
+			}
+			// Special case for empty strings. types.Bytes is represented as
+			// []uint8.
+			if b1, ok := expected[i].([]uint8); ok {
+				if b2, ok2 := actual[i].([]uint8); ok2 {
+					if len(b1) == 0 && len(b2) == 0 {
+						// We might have a DeepEqual mismatch when one argument
+						// is nil and another is zero-length slice, yet they
+						// should be considered equal.
+						continue
+					}
+				}
 			}
 			// Default case.
 			if !reflect.DeepEqual(

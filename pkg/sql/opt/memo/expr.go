@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -734,7 +735,8 @@ type UDFDefinition struct {
 	Params opt.ColList
 
 	// Body contains a relational expression for each statement in the function
-	// body. It is unset during construction of a recursive UDF.
+	// body. It is nil during construction of a recursive UDF, and when body
+	// building is deferred to execution time (see BodyBuilder).
 	Body []RelExpr
 
 	// BodyProps contains the physical properties with which each body statement
@@ -777,6 +779,22 @@ type UDFDefinition struct {
 	// results to the same buffer. This is used to implement the PL/pgsql
 	// RETURN NEXT and RETURN QUERY statements.
 	ResultBufferID RoutineResultBufferID
+
+	// BodyBuilder, when non-nil, defers body building to execution time.
+	// When set, Body and BodyProps are nil at plan time; they will be
+	// populated by calling BodyBuilder.Build() at execution time.
+	BodyBuilder RoutineBodyBuilder
+
+	// SecurityMode is RoutineDefiner when this routine was declared SECURITY
+	// DEFINER. It is consumed at runtime in pkg/sql/routine.go to push the
+	// routine owner onto the eval context's effective-user stack for the
+	// duration of the body's execution, so privilege checks, ownership
+	// assignments, and the current_user builtin all resolve to RoutineOwner.
+	SecurityMode tree.RoutineSecurity
+
+	// RoutineOwner is the owner of the routine, populated only when
+	// SecurityMode is RoutineDefiner. See SecurityMode for how it is used.
+	RoutineOwner username.SQLUsername
 }
 
 // ExceptionBlock contains the information needed to match and handle errors in
@@ -1440,6 +1458,60 @@ type PostQueryBuilder interface {
 		bindingProps *props.Relational,
 		colMap opt.ColMap,
 	) (RelExpr, error)
+}
+
+// RoutineBodyBuilder defers building of SQL routine body statements to
+// execution time. At plan time, the builder captures metadata (parameter
+// types, privilege context, statement tree state). At execution time,
+// Build constructs the body RelExprs in a fresh memo.
+//
+// Like PostQueryBuilder, Build does not mutate captured state; it is
+// safe to call concurrently if the plan is cached and reused.
+//
+// Note: factory is always *norm.Factory; declared as interface{} to
+// avoid circular package dependencies.
+type RoutineBodyBuilder interface {
+	// Build constructs all body statements at once into the single provided
+	// factory, for callers that do not interleave building with execution. It
+	// produces the same per-statement RelExprs as BuildStmt over
+	// [0, NumStmts()), but with all statements sharing one factory and one set
+	// of parameter columns. (BuildStmt requires a fresh factory per call to
+	// keep parameter column IDs stable; see BuildStmt.)
+	Build(
+		ctx context.Context,
+		semaCtx *tree.SemaContext,
+		evalCtx *eval.Context,
+		catalog cat.Catalog,
+		factory interface{},
+	) (body []RelExpr, bodyProps []*physical.Required, params opt.ColList, err error)
+
+	// NumStmts returns the number of body statements that will be built,
+	// including any synthetic statement appended for a VOID-returning
+	// routine. It is stable for the lifetime of the builder.
+	NumStmts() int
+
+	// BuildStmt builds the body statement at stmtIdx into a RelExpr using the
+	// provided catalog and factory. The caller may refresh the catalog
+	// between calls so that a statement can resolve names introduced by DDL
+	// executed in an earlier statement.
+	//
+	// The caller must pass a fresh, empty factory on each call. Parameter
+	// columns are then synthesized with identical column IDs across calls, so
+	// one argument-to-parameter mapping serves every statement.
+	//
+	// TODO(janexing): think about the mutation detection with interleaving
+	// model. Unlike the lump-sum Build path, where all statements share one
+	// statementTree and a later body statement sees mutations registered by
+	// earlier ones, BuildStmt re-inits the tree per call, so cross-statement
+	// conflict detection within a body no longer happens here.
+	BuildStmt(
+		ctx context.Context,
+		semaCtx *tree.SemaContext,
+		evalCtx *eval.Context,
+		catalog cat.Catalog,
+		factory interface{},
+		stmtIdx int,
+	) (stmt RelExpr, props *physical.Required, params opt.ColList, err error)
 }
 
 // GroupingOrderType is the grouping column order type for group by and distinct

@@ -719,6 +719,10 @@ func (s *vectorizedFlowCreator) accumulateAsyncComponent(run runFn) {
 		flowinfra.StartableFn(func(ctx context.Context, wg *sync.WaitGroup, flowCtxCancel context.CancelFunc) {
 			wg.Add(1)
 			go func() {
+				if cpuHandle := admission.SQLCPUHandleFromContext(ctx); cpuHandle != nil {
+					gh := cpuHandle.RegisterGoroutine()
+					defer gh.Close(ctx)
+				}
 				growstack.Grow()
 				defer wg.Done()
 				run(ctx, flowCtxCancel)
@@ -1274,10 +1278,10 @@ var _ flowinfra.InboundStreamHandler = vectorizedInboundStreamHandler{}
 func (s vectorizedInboundStreamHandler) Run(
 	ctx context.Context,
 	stream execinfrapb.RPCDistSQL_FlowStreamStream,
-	_ *execinfrapb.ProducerMessage,
+	firstMsg *execinfrapb.ProducerMessage,
 	_ *flowinfra.FlowBase,
 ) error {
-	return s.RunWithStream(ctx, stream)
+	return s.RunWithStream(ctx, stream, firstMsg.Header)
 }
 
 // Timeout is part of the flowinfra.InboundStreamHandler interface.

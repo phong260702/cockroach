@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
 )
 
@@ -135,8 +134,20 @@ func ShowCreateView(
 			f.WriteRune(',')
 		}
 	}
-	f.WriteString(") AS ")
+	f.WriteString(")")
 
+	// Add view options if any exist
+	viewOptions, err := desc.GetViewOptions(true /* spaceBetweenEqual */)
+	if err != nil {
+		return "", err
+	}
+	if len(viewOptions) > 0 {
+		f.WriteString(" WITH (")
+		f.WriteString(strings.Join(viewOptions, ", "))
+		f.WriteString(")")
+	}
+
+	f.WriteString(" AS ")
 	cfg := tree.DefaultPrettyCfg()
 	cfg.UseTabs = true
 	cfg.LineWidth = 100 - cfg.TabWidth
@@ -175,11 +186,7 @@ func formatViewQueryForDisplay(
 		}
 		var prettyErr error
 		query, prettyErr = cfg.Pretty(parsed.AST)
-		if errors.Is(prettyErr, pretty.ErrPrettyMaxRecursionDepthExceeded) {
-			// Use simple printing if pretty-printing fails.
-			query = tree.AsStringWithFlags(parsed.AST, tree.FmtParsable)
-			return
-		} else if prettyErr != nil {
+		if prettyErr != nil {
 			err = prettyErr
 			return
 		}
@@ -189,7 +196,7 @@ func formatViewQueryForDisplay(
 	if err != nil {
 		log.Dev.Warningf(ctx, "error deserializing user defined types for view %s (%v): %+v",
 			desc.GetName(), desc.GetID(), err)
-		return desc.GetViewQuery(), nil
+		return string(desc.GetViewQuery()), nil
 	}
 
 	// Convert sequences referenced by ID in the view back to their names.
@@ -361,7 +368,7 @@ func formatViewQueryTypesForDisplay(
 			return true, expr, nil
 		}
 		formattedExpr, err := schemaexpr.FormatExprForDisplay(
-			ctx, desc, expr.String(), evalCtx, semaCtx, sessionData, tree.FmtParsable,
+			ctx, desc, catpb.Expression(expr.String()), evalCtx, semaCtx, sessionData, tree.FmtParsable,
 		)
 		if err != nil {
 			return false, expr, err
@@ -374,7 +381,7 @@ func formatViewQueryTypesForDisplay(
 	}
 
 	viewQuery := desc.GetViewQuery()
-	stmt, err := parser.ParseOne(viewQuery)
+	stmt, err := parser.ParseOne(string(viewQuery))
 	if err != nil {
 		return "", err
 	}

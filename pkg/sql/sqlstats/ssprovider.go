@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlcommenter"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
@@ -63,7 +64,6 @@ type RecordedStmtStats struct {
 	Query                    string
 	App                      string
 	DistSQL                  bool
-	ImplicitTxn              bool
 	Vec                      bool
 	FullScan                 bool
 	Database                 string
@@ -101,6 +101,13 @@ type RecordedStmtStats struct {
 	Indexes                  []string
 	QueryTags                []sqlcommenter.QueryTag
 	UnderOuterTxn            bool
+	StatsRollout             eval.StatsRolloutSelection
+
+	// AggregatedTs and AggInterval, when non-zero, override the Container's
+	// own computation so that all statements in a transaction share the same
+	// aggregation window as the transaction itself.
+	AggregatedTs time.Time
+	AggInterval  time.Duration
 }
 
 var recordedStmtStatsSize = int64(unsafe.Sizeof(RecordedStmtStats{}))
@@ -175,6 +182,12 @@ type RecordedTxnStats struct {
 	// Normalized user name.
 	UserNormalized   string
 	InternalExecutor bool
+
+	// AggregatedTs and AggInterval, when non-zero, override the Container's
+	// own computation so that all statements in a transaction share the same
+	// aggregation window as the transaction itself.
+	AggregatedTs time.Time
+	AggInterval  time.Duration
 }
 
 // SSDrainer is the interface for draining or resetting sql stats.
@@ -235,7 +248,7 @@ func NewRecordedStatementStatsBuilder(
 }
 
 func (b *RecordedStatementStatsBuilder) PlanMetadata(
-	generic bool, distSQL bool, vectorized bool, implicitTxn bool, fullScan bool,
+	generic bool, distSQL bool, vectorized bool, fullScan bool,
 ) *RecordedStatementStatsBuilder {
 	if b == nil {
 		return b
@@ -243,7 +256,6 @@ func (b *RecordedStatementStatsBuilder) PlanMetadata(
 	b.stmtStats.Generic = generic
 	b.stmtStats.DistSQL = distSQL
 	b.stmtStats.Vec = vectorized
-	b.stmtStats.ImplicitTxn = implicitTxn
 	b.stmtStats.FullScan = fullScan
 	b.planMetadataSet = true
 	return b
@@ -410,6 +422,16 @@ func (b *RecordedStatementStatsBuilder) AppliedStatementHints() *RecordedStateme
 		return b
 	}
 	b.stmtStats.AppliedStmtHints = true
+	return b
+}
+
+func (b *RecordedStatementStatsBuilder) CanaryStatsRollout(
+	sel eval.StatsRolloutSelection,
+) *RecordedStatementStatsBuilder {
+	if b == nil {
+		return b
+	}
+	b.stmtStats.StatsRollout = sel
 	return b
 }
 

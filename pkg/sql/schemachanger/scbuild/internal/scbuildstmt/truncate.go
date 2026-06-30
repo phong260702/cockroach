@@ -13,10 +13,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/walkutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,11 +40,14 @@ func Truncate(b BuildCtx, stmt *tree.Truncate) {
 	for i := range stmt.Tables {
 		tblName := &stmt.Tables[i]
 		elts := b.ResolveTable(tblName.ToUnresolvedObjectName(), ResolveParams{
-			RequiredPrivilege: privilege.DROP,
-			WithOffline:       stmt.ImportRollback,
+			WithOffline: stmt.ImportRollback,
 		})
 		tbl := elts.FilterTable().MustGetOneElement()
 		tblName.ObjectNamePrefix = b.NamePrefix(tbl)
+		// Accept either TRUNCATE or DROP privilege for backward compatibility.
+		if err := b.CheckPrivilege(tbl, privilege.TRUNCATE, privilege.DROP); err != nil {
+			panic(err)
+		}
 		tablesToTruncate.Add(tbl.TableID)
 	}
 
@@ -67,8 +70,8 @@ func Truncate(b BuildCtx, stmt *tree.Truncate) {
 			// Queue this table to process dependencies.
 			truncatesToProcess = append(truncatesToProcess, referencingTableID)
 		}
-		// Validate we have permission to drop this table.
-		if err := b.CheckPrivilege(refElts.FilterTable().MustGetOneElement(), privilege.DROP); err != nil {
+		// Accept either TRUNCATE or DROP privilege for backward compatibility.
+		if err := b.CheckPrivilege(refElts.FilterTable().MustGetOneElement(), privilege.TRUNCATE, privilege.DROP); err != nil {
 			panic(err)
 		}
 	}
@@ -143,7 +146,7 @@ func truncateTable(b BuildCtx, n *tree.Truncate, elts ElementResultSet) {
 		newPrimaryIndexID = newIndexID
 		newSpec.primary.ConstraintID = b.NextTableConstraintID(e.TableID)
 		newSpec.apply(func(e scpb.Element) {
-			_ = screl.WalkIndexIDs(e, func(id *catid.IndexID) error {
+			_ = walkutil.Walk(e, func(id *catid.IndexID) error {
 				*id = newIndexID
 				return nil
 			})
@@ -186,7 +189,7 @@ func truncateTable(b BuildCtx, n *tree.Truncate, elts ElementResultSet) {
 		newSpec.secondary.TemporaryIndexID = 0
 		newSpec.temporary = nil
 		newSpec.apply(func(e scpb.Element) {
-			_ = screl.WalkIndexIDs(e, func(id *catid.IndexID) error {
+			_ = walkutil.Walk(e, func(id *catid.IndexID) error {
 				*id = newIndexID
 				return nil
 			})

@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
@@ -570,14 +572,14 @@ func TestStoreRangeSplitAtRangeBounds(t *testing.T) {
 	rngID := store.LookupReplica(roachpb.RKey(key)).RangeID
 	h := kvpb.Header{RangeID: rngID}
 	args := adminSplitArgs(key)
-	if _, pErr := kv.SendWrappedWith(ctx, store, h, args); pErr != nil {
+	if _, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), h, args); pErr != nil {
 		t.Fatal(pErr)
 	}
 	replCount := store.ReplicaCount()
 
 	// An AdminSplit request sent to the end of the old range should be re-routed
 	// to the start of the new range, succeeding but without creating any new ranges.
-	if _, pErr := kv.SendWrappedWith(ctx, store, h, args); pErr != nil {
+	if _, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), h, args); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -591,7 +593,7 @@ func TestStoreRangeSplitAtRangeBounds(t *testing.T) {
 	// should succeed but no new ranges should be created.
 	newRng := store.LookupReplica(roachpb.RKey(key))
 	h.RangeID = newRng.RangeID
-	if _, pErr := kv.SendWrappedWith(ctx, store, h, args); pErr != nil {
+	if _, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), h, args); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -1401,7 +1403,7 @@ func fillRange(
 		}
 		val := randutil.RandBytes(src, 200000)
 		pArgs := putArgs(key, val)
-		_, pErr := kv.SendWrappedWith(context.Background(), store, kvpb.Header{
+		_, pErr := kv.SendWrappedWith(context.Background(), kvserver.ToSenderForTesting(store), kvpb.Header{
 			RangeID: rangeID,
 		}, pArgs)
 		// When the split occurs in the background, our writes may start failing.
@@ -1582,7 +1584,16 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var activateSplitFilter int32
 			splitKey := roachpb.RKey(bootstrap.TestingUserTableDataMin(keys.SystemSQLCodec))
-			splitPending, blockSplits := make(chan struct{}), make(chan struct{})
+			// splitPending is buffered so the request filter doesn't block
+			// indefinitely if the test fails before reading the signal.
+			splitPending, blockSplits := make(chan struct{}, 1), make(chan struct{})
+			// backpressureRegistered receives one signal per write that
+			// successfully registered a backpressure callback with the split
+			// queue. This lets the test wait until both writes are registered
+			// before unblocking the split, avoiding a time-based coordination
+			// race on slow hardware (e.g. s390x). Buffered so the knob never
+			// blocks if the test stops listening early.
+			backpressureRegistered := make(chan roachpb.RangeID, 8)
 
 			// Set maxBytes to something small so we can exceed the maximum split
 			// size without adding 2x64MB of data.
@@ -1624,6 +1635,12 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 						DisableMergeQueue:              true,
 						DisableSplitQueue:              true,
 						TestingRequestFilter:           testingRequestFilter,
+						TestingBackpressureCallbackRegistered: func(id roachpb.RangeID) {
+							select {
+							case backpressureRegistered <- id:
+							default:
+							}
+						},
 					},
 				},
 			})
@@ -1662,7 +1679,11 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 				}); err != nil {
 					t.Fatal(err)
 				}
-				<-splitPending
+				select {
+				case <-splitPending:
+				case <-time.After(testutils.DefaultSucceedsSoonDuration):
+					t.Fatal("timed out waiting for split filter to trigger")
+				}
 			} else if tc.splitImpossible {
 				store.TestingSetSplitQueueActive(true)
 				if err := store.ForceSplitScanAndProcess(); err != nil {
@@ -1699,17 +1720,29 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 				})
 			}()
 
-			// Make sure the write doesn't return while a split is ongoing. If no
-			// split is ongoing, the write will return an error immediately.
+			// Wait for both writes to register a backpressure callback before
+			// unblocking the split. This ensures both writes will observe the
+			// split's outcome via their registered callbacks, avoiding a race
+			// where the split completes (and removes the range from the split
+			// queue's tracked replicas) before a slow goroutine calls
+			// MaybeAddCallback. While waiting, also fail fast if either write
+			// returns prematurely.
 			if tc.splitOngoing {
-				select {
-				case err := <-putRes:
-					close(blockSplits)
-					t.Fatalf("put was not blocked on split, returned err %v", err)
-				case err := <-delRes:
-					close(blockSplits)
-					t.Fatalf("delete was not blocked on split, returned err %v", err)
-				case <-time.After(100 * time.Millisecond):
+				timeout := time.After(testutils.DefaultSucceedsSoonDuration)
+				for registered := 0; registered < 2; {
+					select {
+					case err := <-putRes:
+						close(blockSplits)
+						t.Fatalf("put was not blocked on split, returned err %v", err)
+					case err := <-delRes:
+						close(blockSplits)
+						t.Fatalf("delete was not blocked on split, returned err %v", err)
+					case <-backpressureRegistered:
+						registered++
+					case <-timeout:
+						close(blockSplits)
+						t.Fatalf("timed out waiting for backpressure callbacks to register (got %d/2)", registered)
+					}
 				}
 
 				// Let split through. Write should follow.
@@ -1721,7 +1754,13 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 				"put":    putRes,
 				"delete": delRes,
 			} {
-				if err := <-resCh; tc.expErr == "" {
+				var err error
+				select {
+				case err = <-resCh:
+				case <-time.After(testutils.DefaultSucceedsSoonDuration):
+					t.Fatalf("timed out waiting for %s to return", op)
+				}
+				if tc.expErr == "" {
 					if err != nil {
 						t.Fatalf("%s returned err %v, expected success", op, err)
 					}
@@ -2891,7 +2930,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 	// Split at "b".
 	rhsKey := roachpb.Key("b")
 	args = adminSplitArgs(rhsKey)
-	if _, pErr := kv.SendWrappedWith(context.Background(), store, kvpb.Header{
+	if _, pErr := kv.SendWrappedWith(context.Background(), kvserver.ToSenderForTesting(store), kvpb.Header{
 		RangeID: lhs.RangeID,
 	}, args); pErr != nil {
 		t.Fatalf("split at %q: %s", rhsKey, pErr)
@@ -2932,7 +2971,7 @@ func TestDistributedTxnCleanup(t *testing.T) {
 						PushType:  kvpb.PUSH_ABORT,
 						Force:     true,
 					})
-					_, pErr := store.Send(ctx, ba)
+					_, pErr := kvserver.ToSenderForTesting(store).Send(ctx, ba)
 					if pErr != nil {
 						t.Fatalf("failed to abort the txn: %s", pErr)
 					}
@@ -3186,7 +3225,7 @@ func TestTxnWaitQueueDependencyCycleWithRangeSplit(t *testing.T) {
 
 		// Split at "b".
 		args = adminSplitArgs(rhsKey)
-		if _, pErr := kv.SendWrappedWith(ctx, store, kvpb.Header{
+		if _, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), kvpb.Header{
 			RangeID: lhs.RangeID,
 		}, args); pErr != nil {
 			t.Fatalf("split at %q: %s", rhsKey, pErr)
@@ -3533,7 +3572,7 @@ func TestStoreSplitRangeLookupRace(t *testing.T) {
 
 		// Don't use s.DistSenderI().(kv.Sender) so that we don't disturb the RangeDescriptorCache.
 		rangeID := store.LookupReplica(roachpb.RKey(splitKey)).RangeID
-		_, pErr := kv.SendWrappedWith(context.Background(), store, kvpb.Header{
+		_, pErr := kv.SendWrappedWith(context.Background(), kvserver.ToSenderForTesting(store), kvpb.Header{
 			RangeID: rangeID,
 		}, args)
 		if pErr != nil {
@@ -3978,7 +4017,7 @@ func TestSplitBlocksReadsToRHS(t *testing.T) {
 			g.GoCtx(func(ctx context.Context) error {
 				// Send directly to repl to avoid racing with the
 				// split and routing requests to the post-split RHS.
-				_, pErr := kv.SendWrappedWith(ctx, repl, h, args)
+				_, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(repl), h, args)
 				errCh <- pErr.GoError()
 				return nil
 			})
@@ -4014,6 +4053,14 @@ func TestSplitBlocksReadsToRHS(t *testing.T) {
 func TestStoreRangeSplitAndMergeWithGlobalReads(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	// Under duress, the merge transaction's SubsumeRequest processing can take
+	// longer than the global reads lead time (~800ms), causing the clock to
+	// advance past the pushed write timestamp before
+	// maybeCommitWaitBeforeCommitTrigger runs. This makes the commit-wait metric
+	// assertion flaky. The correctness invariant (WriteTimestamp < Now() at
+	// trigger time) still holds, but the explicit sleep is skipped.
+	skip.UnderDuressWithIssue(t, 167522)
 
 	// Detect splits and merges over the global read ranges. Assert that the split
 	// and merge transactions commit with pushed write timestamps, and that the
@@ -4643,4 +4690,188 @@ func TestStoreRangeSplitRaftSnapshotAfterRHSRebalanced(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestGCRequestStraddlingSplit verifies that a GCRequest that targets keys in
+// the post split RHS correctly receives a RangeKeyMismatchError, even when the
+// request header is constrainted to the LHS. This serves as a regression test
+// for https://github.com/cockroachdb/cockroach/issues/162085, to ensure erroneous
+// GC requests as a result of that issue are gracefully rejected, instead of
+// silently working and causing potential data loss.
+func TestGCRequestStraddlingSplit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	scratch := tc.ScratchRange(t)
+	store := tc.GetFirstStoreFromServer(t, 0)
+
+	// Create a split key within the scratch range.
+	splitKey := testutils.MakeKey(scratch, roachpb.Key("b"))
+	tc.SplitRangeOrFatal(t, splitKey)
+	lhsDesc := store.LookupReplica(roachpb.RKey(scratch)).Desc()
+	rhsDesc := store.LookupReplica(roachpb.RKey(splitKey)).Desc()
+
+	testCases := []struct {
+		name  string
+		gcReq *kvpb.GCRequest
+	}{
+		{
+			name: "clear range straddling split",
+			gcReq: &kvpb.GCRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    lhsDesc.StartKey.AsRawKey(),
+					EndKey: lhsDesc.EndKey.AsRawKey(),
+				},
+				ClearRange: &kvpb.GCRequest_GCClearRange{
+					StartKey: lhsDesc.StartKey.AsRawKey(),
+					EndKey:   rhsDesc.EndKey.AsRawKey(), // Extends beyond the LHS into RHS
+				},
+			},
+		},
+		{
+			name: "range keys straddling split",
+			gcReq: &kvpb.GCRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    lhsDesc.StartKey.AsRawKey(),
+					EndKey: lhsDesc.EndKey.AsRawKey(),
+				},
+				RangeKeys: []kvpb.GCRequest_GCRangeKey{
+					{
+						StartKey: lhsDesc.StartKey.AsRawKey(),
+						EndKey:   rhsDesc.EndKey.AsRawKey(), // Extends beyond the LHS into RHS
+					},
+				},
+			},
+		},
+		{
+			name: "point key in RHS",
+			gcReq: &kvpb.GCRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    lhsDesc.StartKey.AsRawKey(),
+					EndKey: lhsDesc.EndKey.AsRawKey(),
+				},
+				Keys: []kvpb.GCRequest_GCKey{
+					{Key: rhsDesc.StartKey.AsRawKey()}, // Point key in the RHS
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Send the GC request. It should fail with a RangeKeyMismatchError
+			// because the keys being targeted extend beyond the LHS range, into
+			// the RHS.
+			_, pErr := kv.SendWrapped(ctx, store.TestSender(), tc.gcReq)
+			require.NotNil(t, pErr, "expected RangeKeyMismatchError but got success")
+			_, ok := pErr.GetDetail().(*kvpb.RangeKeyMismatchError)
+			require.True(t, ok, "expected RangeKeyMismatchError, got %v", pErr)
+		})
+	}
+}
+
+// TestSplitWithConcurrentLockAcquisitionOnRHS is a regression test for #155318,
+// which was a bug caused by the fact that, during a split, a Replica becomes
+// available for requests before the end of the application of the EndTxn that
+// creates the replica.
+func TestSplitWithConcurrentLockAcquisitionOnRHS(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Create a key that will be on the RHS after the split.
+	rhsKey := roachpb.Key("z")
+	splitKey := roachpb.Key("m")
+
+	// We install a BeforeSplitAcquiresLocksOnRHS testing hook that will pause the
+	// split we issue for splitKey during application so that we can then send a
+	// request targeted to the new RHS replica.
+	splitPaused := make(chan roachpb.RangeID)
+	splitResume := make(chan struct{})
+	requestFailedOnce := &sync.Once{}
+	requestFailed := make(chan struct{})
+
+	st := cluster.MakeTestingClusterSettings()
+	concurrency.UnreplicatedLockReliabilitySplit.Override(ctx, &st.SV, true)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Settings: st,
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableMergeQueue: true,
+				DisableSplitQueue: true,
+				BeforeSplitAcquiresLocksOnRHS: func(ctx context.Context, rhsRepl *kvserver.Replica) {
+					startKey := rhsRepl.Desc().StartKey.AsRawKey()
+					if !startKey.Equal(splitKey) {
+						return
+					}
+
+					t.Logf("pausing split for RHS %d: %s", rhsRepl.RangeID, startKey)
+					splitPaused <- rhsRepl.RangeID
+					<-splitResume
+					t.Logf("split resumed for RHS %d", rhsRepl.RangeID)
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+	db := s.DB()
+	require.NoError(t, db.Put(ctx, rhsKey, "initial value"))
+
+	// Acquire a lock on rhsKey via txn1.
+	txn1 := kv.NewTxn(ctx, db, s.NodeID())
+	_, err = txn1.GetForUpdate(ctx, rhsKey, kvpb.BestEffort)
+	require.NoError(t, err)
+
+	// Split the range. This blocks until we explicitly unblock it below.
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		_, _, err := s.SplitRange(splitKey)
+		return err
+	})
+	rID := <-splitPaused
+
+	// Send a Put to rhsKey targeted at the new range ID. While ReadyToServe()
+	// is false, each attempt returns NLHE. We retry until the request either
+	// succeeds or returns a non-NLHE error.
+	g.GoCtx(func(ctx context.Context) error {
+		txn2 := db.NewTxn(ctx, "test-txn-2")
+		header := kvpb.Header{
+			Txn:     txn2.TestingCloneTxn(),
+			RangeID: rID,
+		}
+		for {
+			req := putArgs(rhsKey, []byte("hello"))
+			t.Logf("sending: %v", req)
+			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), header, req)
+			if pErr == nil {
+				return nil
+			}
+			if _, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError); ok {
+				requestFailedOnce.Do(func() { close(requestFailed) })
+				time.Sleep(1 * time.Millisecond)
+				continue
+			}
+			return pErr.GoError()
+		}
+	})
+
+	// Let the split proceed.
+	<-requestFailed
+	t.Logf("resuming split")
+	close(splitResume)
+
+	// Rollback txn1 so that txn2 can proceed. The lock from txn1 was
+	// transferred to the RHS during the split, so txn2 waits on it.
+	require.NoError(t, txn1.Rollback(ctx))
+	require.NoError(t, g.Wait())
 }

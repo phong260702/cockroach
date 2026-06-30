@@ -41,10 +41,11 @@ import (
 type sampleAggregator struct {
 	execinfra.ProcessorBase
 
-	spec    *execinfrapb.SampleAggregatorSpec
-	input   execinfra.RowSource
-	inTypes []*types.T
-	sr      stats.SampleReservoir
+	spec         *execinfrapb.SampleAggregatorSpec
+	input        execinfra.RowSource
+	inTypes      []*types.T
+	sr           stats.SampleReservoir
+	collationEnv tree.CollationEnvironment
 
 	// memAcc accounts for memory accumulated throughout the life of the
 	// sampleAggregator.
@@ -244,7 +245,8 @@ func (s *sampleAggregator) mainLoop(
 		// If it changed by less than 1%, just check for cancellation (which is more
 		// efficient).
 		if fractionCompleted < 1.0 && fractionCompleted < lastReportedFractionCompleted+0.01 {
-			return job.NoTxn().CheckState(ctx)
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			return job.DeprecatedNoTxn().CheckState(ctx)
 		}
 		lastReportedFractionCompleted = fractionCompleted
 		return s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -430,7 +432,7 @@ func (s *sampleAggregator) sampleRow(
 	ctx context.Context, sr *stats.SampleReservoir, sampleRow rowenc.EncDatumRow, rank uint64,
 ) error {
 	prevCapacity := sr.Cap()
-	if err := sr.SampleRow(ctx, s.FlowCtx.EvalCtx, sampleRow, rank); err != nil {
+	if err := sr.SampleRow(ctx, &s.collationEnv, sampleRow, rank); err != nil {
 		if code := pgerror.GetPGCode(err); code != pgcode.OutOfMemory {
 			return err
 		}
@@ -507,17 +509,15 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 				if !ok {
 					return errors.Errorf("no associated inverted sketch")
 				}
-				// GenerateHistogram is false for sketches
-				// with inverted index columns. Instead, the
-				// presence of those histograms is indicated
-				// by the existence of an inverted sketch on
-				// the column.
+				// GenerateHistogram is false for sketches with inverted index
+				// columns. Instead, the presence of those histograms is
+				// indicated by the existence of an inverted sketch on the
+				// column.
 
 				invDistinctCount := s.getDistinctCount(invSketch, false /* includeNulls */)
-				// Use 0 for the colIdx here because it refers
-				// to the column index of the samples, which
-				// only has a single bytes column with the
-				// inverted keys.
+				// Use 0 for the colIdx here because it refers to the column
+				// index of the samples, which only has a single bytes column
+				// with the inverted keys.
 				h, err := s.generateHistogram(
 					ctx,
 					s.FlowCtx.EvalCtx,
@@ -540,23 +540,8 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 				columnIDs[i] = s.sampledCols[c]
 			}
 
-			// Delete old stats that have been superseded, if the new statistic
-			// is not partial.
-			if si.spec.PartialPredicate == "" {
-				if err := stats.DeleteOldStatsForColumns(
-					ctx,
-					txn,
-					s.tableID,
-					columnIDs,
-				); err != nil {
-					return err
-				}
-			}
-
-			// Insert the new stat.
-			if err := stats.InsertNewStat(
+			if err := stats.WriteStatsWithOldDeleted(
 				ctx,
-				s.FlowCtx.Cfg.Settings,
 				txn,
 				s.tableID,
 				si.spec.StatName,
@@ -568,6 +553,9 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 				histogram,
 				si.spec.PartialPredicate,
 				si.spec.FullStatisticID,
+				"", /* createdAt */
+				0,  /* statisticID */
+				s.spec.CanaryStatsEnabled,
 			); err != nil {
 				return err
 			}

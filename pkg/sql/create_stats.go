@@ -8,11 +8,14 @@ package sql
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -25,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
@@ -33,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -108,11 +113,23 @@ var automaticStatsJobUseLocksTable = settings.RegisterBoolSetting(
 	true,
 )
 
+const (
+	// defaultConcurrencyVCPURequirement determines the scaling factor for the
+	// concurrency limit of auto full stats collections. It should be used as a
+	// divisor, This number was chosen so that on 4 vCPU nodes we'd get _some_
+	// concurrency.
+	defaultConcurrencyVCPURequirement = 2
+	// We don't recommend running on fewer than 4 vCPUs, but we do have clusters
+	// with 2 vCPUs.
+	minViableProcs = 2
+)
+
 var automaticFullStatsConcurrencyLimit = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
 	"sql.stats.automatic_full_concurrency_limit",
-	"determines the maximum number of concurrent automatic full table statistics collection jobs",
-	1,
+	"determines the maximum number of concurrent automatic full table statistics collection jobs. "+
+		"The default value is computed as the number of vCPUs in a node divided by 2.",
+	max(minViableProcs, int64(runtime.GOMAXPROCS(0)))/defaultConcurrencyVCPURequirement,
 	settings.WithPublic,
 	settings.IntWithMinimum(1),
 )
@@ -155,6 +172,10 @@ type createStatsNode struct {
 
 	// whereIndexID is the index to use to collect statistics with a WHERE clause.
 	whereIndexID descpb.IndexID
+
+	// statsCanaryWindow is set during makeJobRecord to the table's canary
+	// window duration so that runJob can emit a notice for manual collections.
+	statsCanaryWindow time.Duration
 }
 
 func (n *createStatsNode) startExec(params runParams) error {
@@ -171,6 +192,22 @@ func (*createStatsNode) Values() tree.Datums   { return nil }
 
 func (n *createStatsNode) isAuto() bool {
 	return n.Name == jobspb.AutoStatsName || n.Name == jobspb.AutoPartialStatsName
+}
+
+func (n *createStatsNode) handleConcurrentStatsErr(ctx context.Context, tableID descpb.ID) {
+	if !n.isAuto() {
+		// Only auto full stats jobs might need to be rescheduled.
+		return
+	}
+	if n.Name == jobspb.AutoPartialStatsName {
+		// Simply ignore this error since it's most likely due to an auto stats
+		// collection job (either full or partial) on the same table started by
+		// another node.
+		return
+	}
+	// Another full stats job was already running. Attempt to reschedule
+	// this refresh.
+	n.p.ExecCfg().StatsRefresher.RescheduleRefresh(ctx, tableID)
 }
 
 // runJob starts a CreateStats job synchronously to plan and execute
@@ -193,15 +230,27 @@ func (n *createStatsNode) runJob(ctx context.Context) error {
 				ctx, nil /* job */, n.p, n.Name == jobspb.AutoPartialStatsName, n.p.ExecCfg().JobRegistry,
 				details.Table.ID,
 			); err != nil {
-				if !errorOnConcurrentCreateStats.Get(n.p.ExecCfg().SV()) && errors.Is(err, stats.ConcurrentCreateStatsError) {
-					log.Dev.Infof(ctx, "concurrent create stats job found, skipping")
-					return nil
+				if errors.Is(err, stats.ConcurrentCreateStatsError) {
+					n.handleConcurrentStatsErr(ctx, details.Table.ID)
+					if !errorOnConcurrentCreateStats.Get(n.p.ExecCfg().SV()) {
+						log.Dev.Infof(ctx, "concurrent create stats job found, skipping")
+						return nil
+					}
 				}
 				return err
 			}
 		}
 	} else {
 		telemetry.Inc(sqltelemetry.CreateStatisticsUseCounter)
+		if n.statsCanaryWindow > 0 &&
+			stats.CanaryFraction.Get(n.p.ExecCfg().SV()) > 0 &&
+			!n.Options.UsingExtremes && n.Options.Where == nil {
+			n.p.BufferClientNotice(ctx, pgnotice.Newf(
+				"this table has a canary window of %s; newly collected statistics "+
+					"will not take effect for all queries until the canary window passes",
+				n.statsCanaryWindow,
+			))
+		}
 	}
 
 	var job *jobs.StartableJob
@@ -209,7 +258,7 @@ func (n *createStatsNode) runJob(ctx context.Context) error {
 	if err := n.p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) (err error) {
 		if n.isAuto() {
 			if details.UseLocksTable {
-				if err := n.checkConcurrencyLimit(ctx, txn, details.Table.ID, jobID); err != nil {
+				if err := n.checkConcurrencyLimit(ctx, txn, details, jobID); err != nil {
 					return err
 				}
 			} else if !jobCheckBefore {
@@ -229,9 +278,12 @@ func (n *createStatsNode) runJob(ctx context.Context) error {
 				log.Dev.Warningf(ctx, "failed to cleanup StartableJob: %v", cleanupErr)
 			}
 		}
-		if !errorOnConcurrentCreateStats.Get(n.p.ExecCfg().SV()) && errors.Is(err, stats.ConcurrentCreateStatsError) {
-			log.Dev.Infof(ctx, "concurrent create stats job found, skipping")
-			return nil
+		if errors.Is(err, stats.ConcurrentCreateStatsError) {
+			n.handleConcurrentStatsErr(ctx, details.Table.ID)
+			if !errorOnConcurrentCreateStats.Get(n.p.ExecCfg().SV()) {
+				log.Dev.Infof(ctx, "concurrent create stats job found, skipping")
+				return nil
+			}
 		}
 		return err
 	}
@@ -244,6 +296,7 @@ func (n *createStatsNode) runJob(ctx context.Context) error {
 			if delErr := n.p.ExecCfg().JobRegistry.DeleteTerminalJobByID(ctx, job.ID()); delErr != nil {
 				log.Dev.Warningf(ctx, "failed to delete job: %v", delErr)
 			}
+			n.handleConcurrentStatsErr(ctx, details.Table.ID)
 			if !errorOnConcurrentCreateStats.Get(n.p.ExecCfg().SV()) {
 				return nil
 			}
@@ -258,15 +311,18 @@ func (n *createStatsNode) runJob(ctx context.Context) error {
 	return err
 }
 
-func getAutoStatsKind(name string) int {
-	switch name {
+func getAutoStatsKind(details jobspb.CreateStatsDetails) int {
+	switch details.Name {
 	case jobspb.AutoStatsName:
 		return 1
 	case jobspb.AutoPartialStatsName:
-		return 2
+		if details.UsingExtremes {
+			return 2
+		}
+		fallthrough
 	default:
 		if buildutil.CrdbTestBuild {
-			panic(errors.AssertionFailedf("getAutoStatsKind shouldn't have been called for %s stats job", name))
+			panic(errors.AssertionFailedf("getAutoStatsKind shouldn't have been called for %s stats job", details.Name))
 		}
 		return 0
 	}
@@ -305,12 +361,13 @@ var checkGlobalStatsJobsQuery = fmt.Sprintf(checkStatsJobsQuery, " = $2")
 // system.table_statistics_locks have been acquired and the caller / the new
 // stats job is responsible for releasing them when job reaches terminal state).
 func (n *createStatsNode) checkConcurrencyLimit(
-	ctx context.Context, txn isql.Txn, tableID descpb.ID, jobID jobspb.JobID,
+	ctx context.Context, txn isql.Txn, details jobspb.CreateStatsDetails, jobID jobspb.JobID,
 ) error {
 	if !n.isAuto() {
 		// We don't apply any concurrency limits to manual stats jobs.
 		return nil
 	}
+	tableID := details.Table.ID
 	var tableLimitQuery string
 	var globalLimit int
 	switch n.Name {
@@ -321,7 +378,7 @@ func (n *createStatsNode) checkConcurrencyLimit(
 		tableLimitQuery = checkExtremesStatsJobsQuery
 		globalLimit = int(automaticExtremesStatsConcurrencyLimit.Get(n.p.ExecCfg().SV()))
 	}
-	kind := getAutoStatsKind(string(n.Name))
+	kind := getAutoStatsKind(details)
 
 	// First, limit the concurrency on the target table to at most one.
 	row, err := txn.QueryRowEx(
@@ -375,16 +432,16 @@ func (n *createStatsNode) checkConcurrencyLimit(
 // release the locks that were acquired for the given JobID. The method assumes
 // that it's called on behalf of an auto stats job.
 func releaseAutoStatsConcurrencyLocks(
-	ctx context.Context, txn isql.Txn, tableID descpb.ID, jobID jobspb.JobID, statsJobName string,
+	ctx context.Context, txn isql.Txn, details jobspb.CreateStatsDetails, jobID jobspb.JobID,
 ) error {
-	kind := getAutoStatsKind(statsJobName)
+	kind := getAutoStatsKind(details)
 
 	// Simply overwrite the table-specific row to have empty job_ids since we
 	// allow at most one auto stats job on any table.
 	_, err := txn.ExecEx(
 		ctx, "create-stats-release-table-lock", txn.KV(), sessiondata.InternalExecutorOverride{},
 		"UPSERT INTO system.table_statistics_locks (table_id, kind, job_ids) VALUES ($1, $2, '{}')",
-		tableID, kind,
+		details.Table.ID, kind,
 	)
 	if err != nil {
 		return err
@@ -464,9 +521,17 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		whereClause = tree.AsString(n.Options.Where.Expr)
 	}
 
-	if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
-		return nil, err
+	// ANALYZE requires MAINTAIN or SELECT privilege on the table. In a future
+	// release, we could require only MAINTAIN and remove the SELECT fallback.
+	// The SELECT check is kept for backwards compatibility with pre-26.2
+	// behavior.
+	if maintainErr := n.p.CheckPrivilege(ctx, tableDesc, privilege.MAINTAIN); maintainErr != nil {
+		if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
+			return nil, maintainErr
+		}
 	}
+
+	n.statsCanaryWindow = tableDesc.TableDesc().StatsCanaryWindow
 
 	var colStats []jobspb.CreateStatsDetails_ColStat
 	var deleteOtherStats bool
@@ -618,10 +683,10 @@ const maxNonIndexCols = 100
 // If nonIndexJsonHistograms is true, 2-bucket histograms are collected for
 // non-indexed JSON columns.
 //
-// If partialStats is true, we only collect statistics on single columns that
-// are prefixes of forward indexes, and skip over partial, sharded, and
-// implicitly partitioned indexes. Partial statistic creation only supports
-// these columns.
+// If partialStatsUsingExtremes is true, we only collect statistics on
+// single columns that are prefixes of forward indexes, and skip over
+// partial, sharded, and implicitly partitioned indexes. Partial
+// statistic creation only supports these columns.
 //
 // In addition to the index columns, we collect stats on up to maxNonIndexCols
 // other columns from the table. We only collect histograms for index columns,
@@ -629,7 +694,7 @@ const maxNonIndexCols = 100
 func createStatsDefaultColumns(
 	ctx context.Context,
 	desc catalog.TableDescriptor,
-	virtColEnabled, multiColEnabled, nonIndexJSONHistograms, partialStats bool,
+	virtColEnabled, multiColEnabled, nonIndexJSONHistograms, partialStatsUsingExtremes bool,
 	defaultHistogramBuckets uint32,
 	evalCtx *eval.Context,
 ) ([]jobspb.CreateStatsDetails_ColStat, error) {
@@ -682,6 +747,18 @@ func createStatsDefaultColumns(
 		return false
 	}
 
+	// nonIndexColHasHistogram returns whether a non-indexed column should
+	// have a histogram collected.
+	nonIndexColHasHistogram := func(col catalog.Column) bool {
+		if colinfo.ColumnTypeIsOnlyInvertedIndexable(col.GetType()) {
+			return false
+		}
+		if col.GetType().Family() == types.JsonFamily {
+			return nonIndexJSONHistograms
+		}
+		return true
+	}
+
 	// addIndexColumnStatsIfNotExists appends column stats for the given column
 	// ID if they have not already been added. Histogram stats are collected for
 	// every indexed column.
@@ -729,10 +806,10 @@ func createStatsDefaultColumns(
 		return nil
 	}
 
-	// Only collect statistics on single columns that are prefixes of forward
-	// indexes for partial statistics, and skip over partial, sharded, and
-	// implicitly partitioned indexes.
-	if partialStats {
+	// Only collect statistics on single columns that are prefixes of
+	// forward indexes for USING EXTREMES partial statistics, and skip over
+	// partial, sharded, and implicitly partitioned indexes.
+	if partialStatsUsingExtremes {
 		for _, idx := range desc.ActiveIndexes() {
 			if idx.GetType() != idxtype.FORWARD ||
 				idx.IsPartial() ||
@@ -859,8 +936,11 @@ func createStatsDefaultColumns(
 		}
 
 		// Add columns referenced in partial index predicate expressions.
+		// These columns are not directly indexed, so they should not get
+		// inverted index stats, and json type columns should respect the
+		// sql.stats.non_indexed_json_histograms.enabled cluster setting.
 		if idx.IsPartial() {
-			expr, err := parser.ParseExpr(idx.GetPredicate())
+			expr, err := parser.ParseExpr(string(idx.GetPredicate()))
 			if err != nil {
 				return nil, err
 			}
@@ -877,10 +957,21 @@ func createStatsDefaultColumns(
 				if err != nil {
 					return nil, err
 				}
-				isInverted := colinfo.ColumnTypeIsOnlyInvertedIndexable(col.GetType())
-				if err := addIndexColumnStatsIfNotExists(colID, isInverted); err != nil {
-					return nil, err
+				if !col.Public() {
+					continue
 				}
+				if isUnsupportedVirtual(col) {
+					continue
+				}
+				cIDs := []descpb.ColumnID{colID}
+				if ok := sortAndTrackStatsExists(cIDs); ok {
+					continue
+				}
+				colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
+					ColumnIDs:           cIDs,
+					HasHistogram:        nonIndexColHasHistogram(col),
+					HistogramMaxBuckets: defaultHistogramBuckets,
+				})
 			}
 		}
 	}
@@ -910,13 +1001,9 @@ func createStatsDefaultColumns(
 		if col.GetType().Family() == types.BoolFamily || col.GetType().Family() == types.EnumFamily {
 			maxHistBuckets = defaultHistogramBuckets
 		}
-		hasHistogram := !colinfo.ColumnTypeIsOnlyInvertedIndexable(col.GetType())
-		if col.GetType().Family() == types.JsonFamily {
-			hasHistogram = nonIndexJSONHistograms
-		}
 		colStats = append(colStats, jobspb.CreateStatsDetails_ColStat{
 			ColumnIDs:           colIDs,
-			HasHistogram:        hasHistogram,
+			HasHistogram:        nonIndexColHasHistogram(col),
 			HistogramMaxBuckets: maxHistBuckets,
 		})
 		nonIdxCols++
@@ -928,8 +1015,7 @@ func createStatsDefaultColumns(
 // createStatsResumer implements the jobs.Resumer interface for CreateStats
 // jobs. A new instance is created for each job.
 type createStatsResumer struct {
-	job     *jobs.Job
-	tableID descpb.ID
+	job *jobs.Job
 }
 
 var _ jobs.Resumer = &createStatsResumer{}
@@ -950,7 +1036,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) (r
 		defer func() {
 			if retErr == nil {
 				retErr = jobsPlanner.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-					return releaseAutoStatsConcurrencyLocks(ctx, txn, r.tableID, r.job.ID(), details.Name)
+					return releaseAutoStatsConcurrencyLocks(ctx, txn, details, r.job.ID())
 				})
 				if retErr != nil {
 					log.Dev.Warningf(ctx, "failed to release auto stats concurrency locks: %v", retErr)
@@ -975,8 +1061,6 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) (r
 		}
 	}
 
-	r.tableID = details.Table.ID
-
 	if err := jobsPlanner.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// We create a third "inner planner" associated with this txn in order to
 		// have (a) use of the txn during type checking of any virtual computed
@@ -989,6 +1073,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) (r
 			&MemoryMetrics{},
 			jobsPlanner.ExecCfg(),
 			jobsPlanner.SessionData(),
+			WithWorkloadInfo(kv.WorkloadInfoFromContext(ctx)),
 		)
 		defer cleanup()
 		innerP := innerPlanner.(*planner)
@@ -1046,7 +1131,9 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) (r
 			// job progress to coerce out the correct error type. If the update succeeds
 			// then return the original error, otherwise return this error instead so
 			// it can be cleaned up at a higher level.
-			if jobErr := r.job.NoTxn().FractionProgressed(ctx, func(
+			//
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			if jobErr := r.job.DeprecatedNoTxn().FractionProgressed(ctx, func(
 				ctx context.Context, _ jobspb.ProgressDetails,
 			) float32 {
 				// The job failed so the progress value here doesn't really matter.
@@ -1059,7 +1146,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) (r
 		}
 
 		return nil
-	}); err != nil {
+	}, isql.WithPriority(admissionpb.BulkLowPri)); err != nil {
 		return err
 	}
 
@@ -1216,7 +1303,7 @@ func (r *createStatsResumer) OnFailOrCancel(
 		return nil
 	}
 	return execCtx.(JobExecContext).ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		return releaseAutoStatsConcurrencyLocks(ctx, txn, r.tableID, r.job.ID(), details.Name)
+		return releaseAutoStatsConcurrencyLocks(ctx, txn, details, r.job.ID())
 	})
 }
 

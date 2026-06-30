@@ -20,11 +20,10 @@ func (s StmtFingerprintID) String() string {
 }
 
 // ConstructStatementFingerprintID constructs an ID by hashing query with
-// constants redacted, its database, and if it was part of an
-// implicit txn. At the time of writing, these are the axis' we use to bucket
-// queries for stats collection (see stmtKey).
+// constants redacted and its database. At the time of writing, these are
+// the axes we use to bucket queries for stats collection (see stmtKey).
 var ConstructStatementFingerprintID = func(
-	stmtNoConstants string, implicitTxn bool, database string,
+	stmtNoConstants string, database string,
 ) StmtFingerprintID {
 	fnv := util.MakeFNV64()
 	for _, c := range stmtNoConstants {
@@ -32,11 +31,6 @@ var ConstructStatementFingerprintID = func(
 	}
 	for _, c := range database {
 		fnv.Add(uint64(c))
-	}
-	if implicitTxn {
-		fnv.Add('I')
-	} else {
-		fnv.Add('E')
 	}
 	return StmtFingerprintID(fnv.Sum())
 }
@@ -147,7 +141,6 @@ func (t *TransactionStatistics) Add(other *TransactionStatistics) {
 func (s *AggregatedStatementMetadata) Add(other *CollectedStatementStatistics) {
 	// Only set the value if it hasn't already been set.
 	if s.Query == "" || s.QuerySummary == "" {
-		s.ImplicitTxn = other.Key.ImplicitTxn
 		s.Query = other.Key.Query
 		s.QuerySummary = other.Key.QuerySummary
 		s.StmtType = other.Stats.SQLType
@@ -228,6 +221,9 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 	s.FailureCount += other.FailureCount
 	s.GenericCount += other.GenericCount
 	s.StmtHintsCount += other.StmtHintsCount
+
+	s.CanaryStats.Add(other.CanaryStats)
+	s.StableStats.Add(other.StableStats)
 }
 
 // AlmostEqual compares two StatementStatistics and their contained NumericStats
@@ -246,10 +242,30 @@ func (s *StatementStatistics) AlmostEqual(other *StatementStatistics, eps float6
 		s.SensitiveInfo.Equal(other.SensitiveInfo) &&
 		s.BytesRead.AlmostEqual(other.BytesRead, eps) &&
 		s.RowsRead.AlmostEqual(other.RowsRead, eps) &&
-		s.RowsWritten.AlmostEqual(other.RowsWritten, eps)
+		s.RowsWritten.AlmostEqual(other.RowsWritten, eps) &&
+		s.CanaryStats.AlmostEqual(other.CanaryStats, eps) &&
+		s.StableStats.AlmostEqual(other.StableStats, eps)
 	// s.ExecStats are deliberately ignored since they are subject to sampling
 	// probability and are not fully deterministic (e.g. the number of network
 	// messages depends on the range cache state).
+}
+
+// Add combines other into this ExperimentStatsInfo.
+func (e *ExperimentStatsInfo) Add(other ExperimentStatsInfo) {
+	statsCount := e.Count
+	if statsCount == 0 && other.Count == 0 {
+		statsCount = 1
+	}
+	e.RunLat.Add(other.RunLat, statsCount, other.Count)
+	e.PlanLat.Add(other.PlanLat, statsCount, other.Count)
+	e.Count += other.Count
+}
+
+// AlmostEqual compares two ExperimentStatsInfo within a window of size eps.
+func (e *ExperimentStatsInfo) AlmostEqual(other ExperimentStatsInfo, eps float64) bool {
+	return e.Count == other.Count &&
+		e.RunLat.AlmostEqual(other.RunLat, eps) &&
+		e.PlanLat.AlmostEqual(other.PlanLat, eps)
 }
 
 // Add combines other into this ExecStats.

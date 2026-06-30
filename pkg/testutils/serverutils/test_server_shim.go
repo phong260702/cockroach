@@ -114,23 +114,30 @@ func ShouldStartDefaultTestTenant(
 		return baseArg
 	}
 
-	if globalDefaultSelectionOverride.isSet {
-		override := globalDefaultSelectionOverride.value
-		if override.TestTenantNoDecisionMade() {
-			panic("programming error: global override does not contain a final decision")
-		}
-		if override.TestTenantAlwaysDisabled() {
-			if issueNum, label := override.IssueRef(); issueNum != 0 && t != nil {
-				t.Logf("cluster virtualization disabled in global scope due to issue: #%d (expected label: %s)", issueNum, label)
-			}
-		} else {
-			if t != nil {
-				t.Log(defaultTestTenantMessage(override.SharedProcessMode()) + "\n(via override from TestingSetDefaultTenantSelectionOverride)")
-			}
-		}
-		return override
+	// Determine if the default test tenant should be run as a shared process.
+	var shared bool
+	switch {
+	case baseArg.SharedProcessMode():
+		shared = true
+	case baseArg.ExternalProcessMode():
+		shared = false
+	default:
+		// If no explicit process mode was selected, then randomly select one.
+		rng, _ := randutil.NewTestRand()
+		shared = rng.Intn(2) == 0
 	}
 
+	// Check environment variable override.
+	if decision, override := testTenantDecisionFromEnvironment(baseArg, shared); override {
+		if decision.TestTenantAlwaysEnabled() {
+			if t != nil {
+				t.Log(defaultTestTenantMessage(decision.SharedProcessMode()) + "\n(override via COCKROACH_TEST_TENANT)")
+			}
+		}
+		return decision
+	}
+
+	// Check factory defaults.
 	if factoryDefaultTenant != nil {
 		defaultArg := *factoryDefaultTenant
 		// If factory default made a decision, return it.
@@ -147,32 +154,10 @@ func ShouldStartDefaultTestTenant(
 		}
 	}
 
-	// Determine if the default test tenant should be run as a shared process.
-	var shared bool
-	switch {
-	case baseArg.SharedProcessMode():
-		shared = true
-	case baseArg.ExternalProcessMode():
-		shared = false
-	default:
-		// If no explicit process mode was selected, then randomly select one.
-		rng, _ := randutil.NewTestRand()
-		shared = rng.Intn(2) == 0
-	}
-
 	// Explicit case for enabling the default test tenant, but with a
 	// probabilistic selection made for running as a shared or external process.
 	if baseArg.TestTenantAlwaysEnabled() {
 		return base.InternalNonDefaultDecision(baseArg, true /* enabled */, shared /* shared */)
-	}
-
-	if decision, override := testTenantDecisionFromEnvironment(baseArg, shared); override {
-		if decision.TestTenantAlwaysEnabled() {
-			if t != nil {
-				t.Log(defaultTestTenantMessage(decision.SharedProcessMode()) + "\n(override via COCKROACH_TEST_TENANT)")
-			}
-		}
-		return decision
 	}
 
 	// Note: we ask the metamorphic framework for a "disable" value, instead
@@ -239,36 +224,6 @@ func testTenantDecisionFromEnvironment(
 	return baseArg, false
 }
 
-var globalDefaultDRPCOptionOverride struct {
-	isSet bool
-	value base.DefaultTestDRPCOption
-}
-
-// TestingGlobalDRPCOption sets the package-level DefaultTestDRPCOption.
-func TestingGlobalDRPCOption(v base.DefaultTestDRPCOption) func() {
-	globalDefaultDRPCOptionOverride.isSet = true
-	globalDefaultDRPCOptionOverride.value = v
-	return func() {
-		globalDefaultDRPCOptionOverride.isSet = false
-	}
-}
-
-// globalDefaultSelectionOverride is used when an entire package needs
-// to override the probabilistic behavior.
-var globalDefaultSelectionOverride struct {
-	isSet bool
-	value base.DefaultTestTenantOptions
-}
-
-// TestingSetDefaultTenantSelectionOverride changes the global selection override.
-func TestingSetDefaultTenantSelectionOverride(v base.DefaultTestTenantOptions) func() {
-	globalDefaultSelectionOverride.isSet = true
-	globalDefaultSelectionOverride.value = v
-	return func() {
-		globalDefaultSelectionOverride.isSet = false
-	}
-}
-
 var srvFactoryImpl TestServerFactory
 var factoryDefaultDRPC *base.DefaultTestDRPCOption
 var factoryDefaultTenant *base.DefaultTestTenantOptions
@@ -327,7 +282,7 @@ func StartServerOnlyE(t TestLogger, params base.TestServerArgs) (TestServerInter
 
 	// Update the flags with the actual decisions for test configuration.
 	// Priority of these Should* functions:
-	// Test explicit value > global override > factory defaults > env vars > metamorphic.
+	// Test explicit value > env vars > factory defaults > metamorphic.
 	params.DefaultTestTenant = ShouldStartDefaultTestTenant(t, params.DefaultTestTenant)
 	params.DefaultDRPCOption = ShouldEnableDRPC(ctx, t, params.DefaultDRPCOption)
 
@@ -430,13 +385,20 @@ func NewServer(params base.TestServerArgs) (TestServerInterface, error) {
 	// such, we have to disable yield AC if we want background work to run at all.
 	if params.DisableElasticCPUAdmission {
 		kvadmission.ElasticAdmission.Override(context.Background(), &srv.(TestServerInterfaceRaw).ClusterSettings().SV, false)
-		// Also disable the SQL-layer elastic CPU control for internally submitted
-		// low-priority reads. We use Lookup to avoid import cycles with pkg/sql/row.
-		if s, ok := settings.LookupForLocalAccessByKey(
-			settings.InternalKey("sqladmission.low_pri_read_response_elastic_control.enabled"),
-			true, /* forSystemTenant */
-		); ok {
-			s.(*settings.BoolSetting).Override(context.Background(), &srv.(TestServerInterfaceRaw).ClusterSettings().SV, false)
+		// Disable elastic CPU control settings that can cause bulk operations and
+		// reads to be throttled. We use Lookup to avoid import cycles.
+		for _, key := range []string{
+			"sqladmission.low_pri_read_response_elastic_control.enabled",
+			"bulkio.index_backfill.elastic_control.enabled",
+			"bulkio.ingest.sst_batcher_elastic_control.enabled",
+			"bulkio.import.elastic_control.enabled",
+			"bulkio.backup.file_sst_sink_elastic_control.enabled",
+		} {
+			if s, ok := settings.LookupForLocalAccessByKey(
+				settings.InternalKey(key), true, /* forSystemTenant */
+			); ok {
+				s.(*settings.BoolSetting).Override(context.Background(), &srv.(TestServerInterfaceRaw).ClusterSettings().SV, false)
+			}
 		}
 	}
 	admission.YieldForElasticCPU.Override(context.Background(), &srv.(TestServerInterfaceRaw).ClusterSettings().SV, false)
@@ -633,31 +595,23 @@ func parseDefaultTestDRPCOptionFromEnv() base.DefaultTestDRPCOption {
 	return base.TestDRPCUnset
 }
 
-// ShouldEnableDRPC determines the final DRPC option based on the input
-// option, resolving random choices to a concrete enabled/disabled state.
+// ShouldEnableDRPC determines the final DRPC enablement decision based on the
+// input option, resolving random choices to a concrete TestDRPCEnabled or
+// TestDRPCDisabled value.
 func ShouldEnableDRPC(
 	ctx context.Context, t TestLogger, option base.DefaultTestDRPCOption,
 ) base.DefaultTestDRPCOption {
-	if skip.UnderBench() {
-		// Microbenchmarks exercise specific parts of the database and we
-		// want to remove any non-deterministic factors that could affect the
-		// numbers, so we disable the dRPC option until it becomes the default.
-		return base.TestDRPCDisabled
-	}
 	var logSuffix string
 
 	if option == base.TestDRPCUnset {
 		if envOption := parseDefaultTestDRPCOptionFromEnv(); envOption != base.TestDRPCUnset {
 			option = envOption
 			logSuffix = " (via COCKROACH_TEST_DRPC environment variable)"
-		} else if globalDefaultDRPCOptionOverride.isSet {
-			option = globalDefaultDRPCOptionOverride.value
-			logSuffix = " (via override by TestingGlobalDRPCOption)"
 		} else if factoryDefaultDRPC != nil {
 			option = *factoryDefaultDRPC
 			logSuffix = " (via testserver factory defaults)"
 		} else {
-			return base.TestDRPCUnset
+			return base.TestDRPCDisabled
 		}
 	} else {
 		logSuffix = " (via test explicit setting)"
@@ -668,10 +622,14 @@ func ShouldEnableDRPC(
 	case base.TestDRPCEnabled:
 		enableDRPC = true
 	case base.TestDRPCEnabledRandomly:
+		if skip.UnderBench() {
+			// Benchmarks need deterministic behavior; skip random DRPC selection.
+			return base.TestDRPCDisabled
+		}
 		rng, _ := randutil.NewTestRand()
 		enableDRPC = rng.Intn(2) == 0
 	case base.TestDRPCUnset:
-		return base.TestDRPCUnset
+		return base.TestDRPCDisabled
 	}
 
 	if enableDRPC {
@@ -680,7 +638,6 @@ func ShouldEnableDRPC(
 		}
 		return base.TestDRPCEnabled
 	}
-
 	return base.TestDRPCDisabled
 }
 

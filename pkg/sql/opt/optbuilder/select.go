@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -27,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -344,15 +347,45 @@ func (b *Builder) buildView(
 		b.factory.Metadata().AddView(view)
 	}
 
-	// When building the view, we don't want to check for the SELECT privilege
-	// on the underlying tables, just on the view itself. Checking on the
-	// underlying tables as well would defeat the purpose of having separate
-	// SELECT privileges on the view, which is intended to allow for exposing
-	// some subset of a restricted table's data to less privileged users.
-	if !b.skipSelectPrivilegeChecks {
-		b.skipSelectPrivilegeChecks = true
-		defer func() { b.skipSelectPrivilegeChecks = false }()
+	skipUnderlyingPrivilegeChecks := sqlclustersettings.SkipUnderlyingViewPrivilegeChecks.Get(&b.evalCtx.Settings.SV)
+	isActive := b.evalCtx.Settings.Version.ActiveVersion(b.ctx).IsActive(clusterversion.V26_2)
+	// When building the view, we don't want to check the SELECT privilege of
+	// the invoker on the underlying tables. Checking the invoker would defeat
+	// the purpose of having separate SELECT privileges on the view, which is
+	// intended to allow exposing some subset of a restricted table's data to
+	// less privileged users.
+	//
+	// For user-created views, we check the SELECT privilege of the view owner
+	// (definer) on the underlying tables to ensure the view owner still has
+	// access. This also means that the definer's RLS policies are enforced
+	// rather than the invoker's. Additionaly, we check for indirect unsafe
+	// access to crdb_internals through the view.
+	//
+	// For system views (e.g. pg_catalog.pg_description,
+	// crdb_internal.transaction_statistics), we skip SELECT privilege checks
+	// entirely since they are system-defined and always valid.
+	//
+	// The SkipUnderlyingViewPrivilegeChecks cluster setting can be used to revert
+	// to the pre-v26.2 behavior where no privilege checks were performed on the
+	// underlying tables, and the invoker RLS is enforced.
+	if !isActive || skipUnderlyingPrivilegeChecks || view.IsSystemView() {
+		if !b.skipSelectPrivilegeChecks {
+			b.skipSelectPrivilegeChecks = true
+			defer func() { b.skipSelectPrivilegeChecks = false }()
+		}
+	} else {
+		if !view.IsSecurityInvoker() {
+			defer func(dataSourcePrivilegeUserOverride username.SQLUsername) {
+				b.dataSourcePrivilegeUserOverride = dataSourcePrivilegeUserOverride
+			}(b.dataSourcePrivilegeUserOverride)
+			b.dataSourcePrivilegeUserOverride = view.Owner()
+		}
+		if b.skipSelectPrivilegeChecks {
+			b.skipSelectPrivilegeChecks = false
+			defer func() { b.skipSelectPrivilegeChecks = true }()
+		}
 	}
+
 	// We are only interested in the direct dependency on this view descriptor.
 	// Any further dependency by the view's query should not be tracked.
 	trackViewDep := b.trackSchemaDeps
@@ -395,13 +428,12 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 	if as.Alias != "" {
 		colAlias := as.Cols
 
-		// Special case for Postgres compatibility: if a data source does not
-		// currently have a name, and it is a set-generating function or a scalar
-		// function with just one column, and the AS clause doesn't specify column
-		// names, then use the specified table name both as the column name and
-		// table name.
+		// Special case for Postgres compatibility: if a set-generating function
+		// or a scalar function has just one column, and the AS clause doesn't
+		// specify column names, then use the specified table name both as the
+		// column name and table name.
 		noColNameSpecified := len(colAlias) == 0
-		if scope.isAnonymousTable() && noColNameSpecified && scope.singleSRFColumn {
+		if noColNameSpecified && scope.singleSRFColumn {
 			colAlias = tree.ColumnDefList{tree.ColumnDef{Name: as.Alias}}
 		}
 
@@ -492,6 +524,18 @@ func (b *Builder) buildScanFromTableRef(
 func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta {
 	md := b.factory.Metadata()
 	tabID := md.AddTable(tab, alias)
+	// If this is a canary execution and any of the referenced tables has
+	// a canary window with genuinely different canary and stable stats,
+	// disable memo reuse so the canary-built memo is never written to the
+	// query cache or prepared-statement cache. When stats don't actually
+	// differ (e.g., the canary window has expired), the canary plan
+	// equals the stable plan, so caching it is safe.
+	if !b.DisableMemoReuse &&
+		tab.StatsCanaryWindow() > 0 &&
+		tab.CanaryAndStableStatsDiffer() &&
+		b.evalCtx.StatsRollout == eval.StatsRolloutCanary {
+		b.DisableMemoReuse = true
+	}
 	return md.TableMeta(tabID)
 }
 
@@ -592,14 +636,36 @@ func (b *Builder) buildScan(
 	}
 	if tab.IsVirtualTable() {
 		if indexFlags != nil {
-			panic(pgerror.Newf(pgcode.Syntax,
-				"index flags not allowed with virtual tables"))
+			// Only the primary index hint is allowed for virtual tables. It forces
+			// a full scan instead of a virtual table lookup join, which is important
+			// for tables like pg_class and pg_attribute whose virtual indexes are
+			// incomplete.
+			if !indexFlags.IndexOnlyHint() {
+				panic(pgerror.Newf(pgcode.Syntax,
+					"%q hint not allowed with virtual tables, only hinting primary index is allowed",
+					tree.ErrString(indexFlags),
+				))
+			}
+			primaryIdxName := tab.Index(cat.PrimaryIndex).Name()
+			isPrimary := indexFlags.Index == tabledesc.LegacyPrimaryKeyIndexName ||
+				tree.Name(indexFlags.Index) == primaryIdxName
+			if !isPrimary {
+				panic(pgerror.Newf(pgcode.Syntax,
+					"%q hint not allowed with virtual tables, only hinting primary index is allowed",
+					tree.ErrString(indexFlags),
+				))
+			}
 		}
 		if locking.isSet() {
 			panic(pgerror.Newf(pgcode.Syntax,
 				"%s not allowed with virtual tables", locking.get().Strength))
 		}
 		private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
+		if indexFlags != nil {
+			// Force primary index to prevent virtual index lookup joins.
+			private.Flags.ForceIndex = true
+			private.Flags.Index = cat.PrimaryIndex
+		}
 		outScope.expr = b.factory.ConstructScan(&private)
 
 		// Add the partial indexes after constructing the scan so we can use the
@@ -1165,7 +1231,15 @@ func (b *Builder) buildSelectStmtWithoutParens(
 		}
 		orderByScope := b.analyzeOrderBy(orderBy, outScope, projectionsScope, exprKindOrderBy,
 			tree.RejectGenerators|tree.RejectAggregates|tree.RejectWindowApplications)
+		preProjectionScope := b.buildOrderByPreProjection(outScope, projectionsScope, orderByScope)
 		b.buildOrderBy(outScope, projectionsScope, orderByScope)
+
+		// Construct the pre-projection for the ordering expressions.
+		if preProjectionScope != nil {
+			b.constructProjectForScope(outScope, preProjectionScope)
+			outScope.expr = preProjectionScope.expr
+		}
+
 		b.constructProjectForScope(outScope, projectionsScope)
 		outScope = projectionsScope
 	}
@@ -1240,6 +1314,7 @@ func (b *Builder) buildSelectClause(
 	}
 
 	b.buildProjectionList(fromScope, projectionsScope, nil /* colRefs */)
+	preProjectionScope := b.buildOrderByPreProjection(fromScope, projectionsScope, orderByScope)
 	b.buildOrderBy(fromScope, projectionsScope, orderByScope)
 	b.buildDistinctOnArgs(fromScope, projectionsScope, distinctOnScope)
 	b.buildLockArgs(fromScope, projectionsScope, lockScope)
@@ -1256,6 +1331,12 @@ func (b *Builder) buildSelectClause(
 
 	b.buildWindow(outScope, fromScope)
 	b.validateLockingInFrom(sel, lockCtx.locking, fromScope)
+
+	if preProjectionScope != nil {
+		// Construct the pre-projection for the ordering expressions.
+		b.constructProjectForScope(outScope, preProjectionScope)
+		outScope.expr = preProjectionScope.expr
+	}
 
 	// Construct the projection.
 	b.constructProjectForScope(outScope, projectionsScope)

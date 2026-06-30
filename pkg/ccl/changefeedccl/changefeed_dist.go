@@ -13,13 +13,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvfollowerreadsccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobfrontier"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -57,17 +56,15 @@ const (
 )
 
 // computeDistChangefeedTimestamps computes the initialHighWater and schemaTS
-// for a changefeed run, and mutates localState.progress when appropriate
-// (e.g., to set the high-water if initial scan should be skipped). It also
-// invokes testing knobs that observe the initial high-water.
+// for a changefeed run. It also invokes testing knobs that observe the initial
+// high-water.
 func computeDistChangefeedTimestamps(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
 	details jobspb.ChangefeedDetails,
-	localState *cachedState,
+	progress jobspb.Progress,
 ) (initialHighWater hlc.Timestamp, schemaTS hlc.Timestamp, _ error) {
 	opts := changefeedbase.MakeStatementOptions(details.Opts)
-	progress := localState.progress
 
 	// NB: A non-empty high water indicates that we have checkpointed a resolved
 	// timestamp. Skipping the initial scan is equivalent to starting the
@@ -226,15 +223,18 @@ func startDistChangefeed(
 	details jobspb.ChangefeedDetails,
 	description string,
 	initialHighWater hlc.Timestamp,
-	localState *cachedState,
+	progress jobspb.Progress,
+	resolvedSpans []jobspb.ResolvedSpan,
+	prevResult flowResult,
 	resultsCh chan<- tree.Datums,
 	onTracingEvent func(ctx context.Context, meta *execinfrapb.TracingAggregatorEvents),
 	targets changefeedbase.Targets,
-) error {
+) (flowResult, error) {
+	var result flowResult
 	execCfg := execCtx.ExecCfg()
 	tableDescs, err := fetchTableDescriptors(ctx, execCfg, targets, schemaTS)
 	if err != nil {
-		return err
+		return flowResult{}, err
 	}
 
 	if schemaTS.IsEmpty() {
@@ -242,29 +242,33 @@ func startDistChangefeed(
 	}
 	trackedSpans, err := fetchSpansForTables(ctx, execCtx, tableDescs, details, schemaTS)
 	if err != nil {
-		return err
+		return flowResult{}, err
 	}
 	if log.ExpensiveLogEnabled(ctx, 2) {
 		log.Changefeed.Infof(ctx, "tracked spans: %s", trackedSpans)
 	}
-	localState.trackedSpans = trackedSpans
 
 	// Changefeed flows handle transactional consistency themselves.
 	var noTxn *kv.Txn
 
 	dsp := execCtx.DistSQLPlanner()
 
+	// TODO(#163256): Delete this code once MinSupported = 26.2.
 	var spanLevelCheckpoint *jobspb.TimestampSpansMap
-	if progress := localState.progress.GetChangefeed(); progress != nil && progress.SpanLevelCheckpoint != nil {
-		spanLevelCheckpoint = progress.SpanLevelCheckpoint
-		if log.V(2) {
-			log.Changefeed.Infof(ctx, "span-level checkpoint: %s", spanLevelCheckpoint)
-		}
+	if cfProgress := progress.GetChangefeed(); cfProgress != nil {
+		spanLevelCheckpoint = cfProgress.SpanLevelCheckpoint
 	}
+
 	p, planCtx, err := makePlan(execCtx, jobID, details, description, initialHighWater,
-		trackedSpans, spanLevelCheckpoint, localState.drainingNodes, schemaTS)(ctx, dsp)
+		trackedSpans, spanLevelCheckpoint, resolvedSpans, schemaTS)(ctx, dsp)
 	if err != nil {
-		return err
+		return flowResult{}, err
+	}
+	// For core changefeeds (no job), create in-memory progress state and
+	// set it on the eval context so the changeFrontier processor can access it.
+	if jobID == 0 {
+		result.coreProgress = &coreProgress{progress: progress}
+		execCtx.ExtendedEvalContext().CoreChangefeedState = result.coreProgress
 	}
 
 	execPlan := func(ctx context.Context) error {
@@ -273,19 +277,9 @@ func startDistChangefeed(
 		ctx, cancel := execCtx.ExecCfg().DistSQLSrv.Stopper.WithCancelOnQuiesce(ctx)
 		defer cancel()
 
-		// clear out previous drain/shutdown information.
-		localState.drainingNodes = localState.drainingNodes[:0]
-		localState.aggregatorFrontier = localState.aggregatorFrontier[:0]
-
 		resultRows := sql.NewMetadataCallbackWriter(
-			makeChangefeedResultWriter(resultsCh, cancel),
+			newChangefeedResultWriter(resultsCh, cancel),
 			func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error {
-				if meta.Changefeed != nil {
-					if meta.Changefeed.DrainInfo != nil {
-						localState.drainingNodes = append(localState.drainingNodes, meta.Changefeed.DrainInfo.NodeID)
-					}
-					localState.aggregatorFrontier = append(localState.aggregatorFrontier, meta.Changefeed.Checkpoint...)
-				}
 				if meta.AggregatorEvents != nil && onTracingEvent != nil {
 					onTracingEvent(ctx, meta.AggregatorEvents)
 				}
@@ -326,7 +320,7 @@ func startDistChangefeed(
 		// prevent a race between the connection that started the changefeed
 		// closing (which closes the current planner's monitor) and changefeed
 		// DistSQL flow being cleaned up.
-		planCtx.OverridePlannerMon = execCfg.DistSQLSrv.ChangefeedMonitor
+		planCtx.OverridePlannerExecMon = execCfg.DistSQLSrv.ChangefeedMonitor
 		// Copy the eval.Context, as dsp.Run() might change it.
 		evalCtxCopy := execCtx.ExtendedEvalContext().Context.Copy()
 		// p is the physical plan, recv is the DistSQLReceiver.
@@ -334,7 +328,7 @@ func startDistChangefeed(
 		return resultRows.Err()
 	}
 
-	return ctxgroup.GoAndWait(ctx, execPlan)
+	return result, ctxgroup.GoAndWait(ctx, execPlan)
 }
 
 // The bin packing choice gives preference to leaseholder replicas if possible.
@@ -388,7 +382,7 @@ func makePlan(
 	initialHighWater hlc.Timestamp,
 	trackedSpans []roachpb.Span,
 	spanLevelCheckpoint *jobspb.TimestampSpansMap,
-	drainingNodes []roachpb.NodeID,
+	resolvedSpans []jobspb.ResolvedSpan,
 	schemaTS hlc.Timestamp,
 ) func(context.Context, *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
 	return func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
@@ -414,7 +408,7 @@ func makePlan(
 		if useBulkOracle.Get(&evalCtx.Settings.SV) {
 			log.Changefeed.Infof(ctx, "using bulk oracle for DistSQL planning")
 			var err error
-			oracle, err = kvfollowerreadsccl.NewLocalityFilteringBulkOracle(dsp.ReplicaOracleConfig(evalCtx.Locality), sql.SingleLocalityFilter(locFilter))
+			oracle, err = followerreads.NewLocalityFilteringBulkOracle(dsp.ReplicaOracleConfig(evalCtx.Locality), sql.SingleLocalityFilter(locFilter))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -469,13 +463,6 @@ func makePlan(
 			)
 		}
 
-		if haveKnobs && maybeCfKnobs.FilterDrainingNodes != nil && len(drainingNodes) > 0 {
-			spanPartitions, err = maybeCfKnobs.FilterDrainingNodes(spanPartitions, drainingNodes)
-			if err != nil {
-				return nil, nil, err
-			}
-		}
-
 		if haveKnobs && maybeCfKnobs.SpanPartitionsCallback != nil {
 			maybeCfKnobs.SpanPartitionsCallback(spanPartitions)
 		}
@@ -493,22 +480,6 @@ func makePlan(
 				// the per table pts records will be rewritten in the new format when the
 				// highwater mark is updated in manageProtectedTimestamps.
 				PerTableProtectedTimestamps: perTableTrackingEnabled && perTableProtectedTimestampsEnabled,
-			}
-		}
-
-		var resolvedSpans []jobspb.ResolvedSpan
-		if jobID != 0 {
-			if err := execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-				spans, ok, err := jobfrontier.GetAllResolvedSpans(ctx, txn, jobID)
-				if err != nil {
-					return err
-				}
-				if ok {
-					resolvedSpans = spans
-				}
-				return nil
-			}); err != nil {
-				return nil, nil, err
 			}
 		}
 
@@ -537,6 +508,7 @@ func makePlan(
 				ProgressConfig:      progressConfig,
 				ResolvedSpans:       resolvedSpans,
 				SchemaTS:            &schemaTS,
+				AggregatorID:        int32(i),
 			}
 		}
 
@@ -554,6 +526,7 @@ func makePlan(
 			ProgressConfig:      progressConfig,
 			ResolvedSpans:       resolvedSpans,
 			SchemaTS:            &schemaTS,
+			NumAggregators:      int32(len(aggregatorSpecs)),
 		}
 
 		if haveKnobs && maybeCfKnobs.OnDistflowSpec != nil {
@@ -609,7 +582,7 @@ type changefeedResultWriter struct {
 	cancel       context.CancelFunc
 }
 
-func makeChangefeedResultWriter(
+func newChangefeedResultWriter(
 	rowsCh chan<- tree.Datums, cancel context.CancelFunc,
 ) *changefeedResultWriter {
 	return &changefeedResultWriter{rowsCh: rowsCh, cancel: cancel}
@@ -632,15 +605,24 @@ func (w *changefeedResultWriter) SetRowsAffected(ctx context.Context, n int) {
 }
 func (w *changefeedResultWriter) SetError(err error) {
 	w.err = err
-	switch {
-	case errors.Is(err, changefeedbase.ErrNodeDraining):
-		// Let drain signal proceed w/out cancellation.
-		// We want to make sure change frontier processor gets a chance
-		// to send out cancellation to the aggregator so that everything
-		// transitions to "drain metadata" stage.
-	default:
-		w.cancel()
-	}
+	// In theory, we shouldn't need to cancel the changefeed flow context
+	// since any error from either a change aggregator or the change frontier
+	// itself will cause the frontier to move to draining. Any remaining
+	// aggregators should then notice that on their next push to the frontier
+	// and move to draining. However, it might be a while before the aggregator
+	// needs to push again (e.g. the conditions for sending resolved spans
+	// to the frontier haven't been met yet) or the aggregator could become stuck
+	// (e.g. waiting for a KV event, sink backpressure, admission control).
+	// The now-removed aggregator heartbeat mechanism helped with the former
+	// since it forced a periodic push to the frontier, but it wouldn't help
+	// in the latter since it can only push a heartbeat if it isn't stuck.
+	// Thus, we cancel the changefeed flow context here so that all remaining
+	// aggregators observe a context cancellation and subsequently begin draining.
+	//
+	// NB: When this hard cancellation fires, the trailing metadata callback for
+	// any remaining processors (including the frontier) will either not be called
+	// or their already-generated trailing metadata will be discarded.
+	w.cancel()
 }
 
 func (w *changefeedResultWriter) Err() error {

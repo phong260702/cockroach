@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/mmaintegration"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -687,7 +689,7 @@ func (rq *replicateQueue) shouldQueue(
 ) (shouldQueue bool, priority float64) {
 	// TODO(baptist): Change to Replica.SpanConfig() once the refactor is done to
 	// have that use the confReader.
-	conf, _, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
+	conf, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
 	if err != nil {
 		return false, 0
 	}
@@ -705,6 +707,11 @@ func (rq *replicateQueue) shouldQueue(
 func (rq *replicateQueue) process(
 	ctx context.Context, repl *Replica, confReader spanconfig.StoreReader, priorityAtEnqueue float64,
 ) (processed bool, err error) {
+	ctx = kv.ContextWithWorkloadInfo(
+		ctx,
+		uint64(workloadid.WORKLOAD_ID_REPLICATE_QUEUE),
+		workloadid.WorkloadTypeSystem,
+	)
 	if tokenErr := repl.allocatorToken.TryAcquire(ctx, rq.name); tokenErr != nil {
 		log.KvDistribution.VEventf(ctx,
 			1, "unable to acquire allocator token to process range: %v", tokenErr)
@@ -720,7 +727,7 @@ func (rq *replicateQueue) process(
 	}
 	// TODO(baptist): Change to Replica.SpanConfig() once the refactor is done to
 	// have that use the confReader.
-	conf, _, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
+	conf, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
 	if err != nil {
 		return false, err
 	}
@@ -1150,6 +1157,7 @@ func (rq *replicateQueue) TransferLease(
 		rq.store.StoreID(),
 		rlm.Desc(),
 		rangeUsageInfo,
+		(*mmaStore)(rq.store).amplificationFactors(),
 		source,
 		target,
 	)
@@ -1196,6 +1204,7 @@ func (rq *replicateQueue) changeReplicas(
 		rq.store.StoreID(),
 		desc,
 		rangeUsageInfo,
+		(*mmaStore)(rq.store).amplificationFactors(),
 		chgs,
 		repl.StoreID(),
 	)

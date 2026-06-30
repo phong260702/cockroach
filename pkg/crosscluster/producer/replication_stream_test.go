@@ -16,8 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"     // Ensure changefeed init hooks run.
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl" // Ensure we can start tenant.
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl" // Ensure changefeed init hooks run.
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationtestutils"
@@ -46,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -306,14 +306,46 @@ func encodeSpec(
 	tables ...string,
 ) []byte {
 	spans := spansForTables(h.SysServer.DB(), srcTenant.Codec, tables...)
-	return encodeSpecForSpans(t, initialScanTime, previousReplicatedTime, spans)
+	return encodeSpecForSpansMetamorphic(t, initialScanTime, previousReplicatedTime, spans, false)
+}
+
+func encodeSpecForSpansMetamorphic(
+	t *testing.T,
+	initialScanTime hlc.Timestamp,
+	previousReplicatedTime hlc.Timestamp,
+	spans []roachpb.Span,
+	withDiff bool,
+) []byte {
+	useTransactionalMode := metamorphic.ConstantWithTestBool("use-transactional-ldr-spec", true)
+	return encodeSpecForSpansWithOpts(
+		t, initialScanTime, previousReplicatedTime, spans, withDiff, useTransactionalMode,
+	)
 }
 
 func encodeSpecForSpans(
 	t *testing.T,
 	initialScanTime hlc.Timestamp,
 	previousReplicatedTime hlc.Timestamp,
+	useTransactionalMode bool,
 	spans []roachpb.Span,
+) []byte {
+	return encodeSpecForSpansWithOpts(
+		t,
+		initialScanTime,
+		previousReplicatedTime,
+		spans,
+		false,                /* withDiff */
+		useTransactionalMode, /* useTransactionalMode */
+	)
+}
+
+func encodeSpecForSpansWithOpts(
+	t *testing.T,
+	initialScanTime hlc.Timestamp,
+	previousReplicatedTime hlc.Timestamp,
+	spans []roachpb.Span,
+	withDiff bool,
+	useTransactionMode bool,
 ) []byte {
 	var progress []jobspb.ResolvedSpan
 	for _, span := range spans {
@@ -325,9 +357,12 @@ func encodeSpecForSpans(
 		Spans:                       spans,
 		Progress:                    progress,
 		WrappedEvents:               true,
-		Config: streampb.StreamPartitionSpec_ExecutionConfig{
-			MinCheckpointFrequency: 10 * time.Millisecond,
-		},
+		WithDiff:                    withDiff,
+		Config:                      streampb.StreamPartitionSpec_ExecutionConfig{MinCheckpointFrequency: 10 * time.Millisecond},
+	}
+	if useTransactionMode {
+		spec.Type = streampb.ReplicationType_LOGICAL
+		spec.WithMvccOrdering = true
 	}
 
 	opaqueSpec, err := protoutil.Marshal(spec)
@@ -646,7 +681,9 @@ USE d;
 	// Only subscribe to table t1 and t2, not t3.
 	// We start the stream at a resume timestamp to avoid any initial scan.
 	spans := spansForTables(h.SysServer.DB(), srcTenant.Codec, "t1", "t2")
-	spec := encodeSpecForSpans(t, initialScanTimestamp, streamResumeTimestamp, spans)
+	// Do not use useTransactionalMode because SSTable discovery is async and races
+	// with frontier advancement.
+	spec := encodeSpecForSpans(t, initialScanTimestamp, streamResumeTimestamp, false, spans)
 
 	source, feed := startReplication(ctx, t, h, makePartitionStreamDecoder,
 		streamPartitionQuery, streamID, spec)
@@ -983,4 +1020,80 @@ func (a sortedSpanConfigUpdates) Len() int      { return len(a) }
 func (a sortedSpanConfigUpdates) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a sortedSpanConfigUpdates) Less(i, j int) bool {
 	return a[i].Target.GetSpan().Key.Compare(a[j].Target.GetSpan().Key) < 0
+}
+
+// TestStreamPartitionWithDiffCatchUpScan verifies that PrevValue is populated
+// during catch-up scans when WithDiff is enabled.
+func TestStreamPartitionWithDiffCatchUpScan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	h, cleanup := replicationtestutils.NewReplicationHelper(t,
+		base.TestServerArgs{
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		})
+	defer cleanup()
+
+	testTenantName := roachpb.TenantName("test-tenant")
+	srcTenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
+	defer cleanupTenant()
+
+	srcTenant.SQL.Exec(t, `
+CREATE DATABASE d;
+CREATE TABLE d.t1(i int primary key, a string, b string);
+INSERT INTO d.t1 (i, a, b) VALUES (42, 'hello', 'world');
+USE d;
+`)
+
+	ctx := context.Background()
+	replicationProducerSpec := h.StartReplicationStream(t, testTenantName)
+	streamID := replicationProducerSpec.StreamID
+	initialScanTimestamp := replicationProducerSpec.ReplicationStartTime
+
+	const streamPartitionQuery = `SELECT * FROM crdb_internal.stream_partition($1, $2)`
+
+	t1Descr := desctestutils.TestingGetPublicTableDescriptor(h.SysServer.DB(), srcTenant.Codec, "d", "t1")
+	tableSpans := []roachpb.Span{t1Descr.PrimaryIndexSpan(srcTenant.Codec)}
+
+	// Record the timestamp before the update - we'll use this as the cursor.
+	beforeUpdateTS := h.SysServer.Clock().Now()
+
+	// Update the row - this creates a new version with a previous value.
+	srcTenant.SQL.Exec(t, `UPDATE d.t1 SET a = 'updated', b = 'value' WHERE i = 42`)
+
+	// Start stream with WithDiff=true and a cursor (PreviousReplicatedTimestamp).
+	// This should trigger a catch-up scan where PrevValue should be populated.
+	spec := encodeSpecForSpansMetamorphic(t, initialScanTimestamp, beforeUpdateTS, tableSpans, true /* withDiff */)
+	_, feed := startReplication(ctx, t, h, makePartitionStreamDecoder, streamPartitionQuery, streamID, spec)
+	defer feed.Close(ctx)
+
+	// Observe the update event - it should have PrevValue populated.
+	expected := replicationtestutils.EncodeKV(t, srcTenant.Codec, t1Descr, 42, "updated", "value")
+
+	// Consume events until we find our key.
+	var foundEvent streampb.StreamEvent_KV
+	feed.ObserveGeneric(ctx, func(msg crosscluster.Event) bool {
+		if msg.Type() != crosscluster.KVEvent {
+			return false
+		}
+		for _, kv := range msg.GetKVs() {
+			if kv.KeyValue.Key.Equal(expected.Key) {
+				foundEvent = kv
+				return true
+			}
+		}
+		return false
+	})
+
+	// Verify the KeyValue matches.
+	require.Equal(t, expected.Value.RawBytes, foundEvent.KeyValue.Value.RawBytes,
+		"KeyValue should match the updated row")
+
+	// Verify PrevValue is populated with the previous row value.
+	// This is the key assertion - on master (without the fix), PrevValue will be empty
+	// for events delivered via onValues during catch-up scans.
+	require.NotEmpty(t, foundEvent.PrevValue.RawBytes,
+		"PrevValue should be populated during catch-up scan with WithDiff=true")
+
+	t.Logf("PrevValue.RawBytes length: %d", len(foundEvent.PrevValue.RawBytes))
 }

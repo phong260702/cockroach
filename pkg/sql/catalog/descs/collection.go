@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -150,6 +151,17 @@ type Collection struct {
 	// txn. This guarantees the generation for long-running transactions
 	// this value stays the same for the life of the transaction.
 	leaseGeneration int64
+
+	// forceStorageLookupIDs contains descriptor IDs that must bypass all
+	// non-storage layers (leased, cached, uncommitted, synthetic) and be
+	// resolved directly from KV. This is used when a fresh Collection is
+	// created for parallel check worker goroutines: the parent (planner's)
+	// Collection has uncommitted descriptors that are only visible via KV
+	// within the same transaction. Without this, a leased or cached descriptor
+	// with a stale version could be returned.
+	// When set, the collection is implicitly read-only to avoid multiple sources
+	// of uncommitted descriptor state.
+	forceStorageLookupIDs catalog.DescriptorIDSet
 }
 
 // FromTxn is a convenience function to extract a descs.Collection which is
@@ -226,19 +238,21 @@ func (tc *Collection) ReleaseSpecifiedLeases(ctx context.Context, descs []lease.
 // locked lease timestamp gets bumped.
 func (tc *Collection) MaybeWaitForLeaseTimestampBump(
 	ctx context.Context, commitTime hlc.Timestamp,
-) {
+) error {
 	// This transaction does not require any leased timestamp bump.
 	if !tc.waitForLockedLeaseBump {
-		return
+		return nil
 	}
 	// Confirm the lease manager is leasing out any new descriptor versions
 	// at the commit time.
 	r := retry.StartWithCtx(ctx, retry.Options{})
 	for r.Next() {
 		if !tc.leased.lm.GetSafeReplicationTS().Less(commitTime) {
-			break
+			return nil
 		}
 	}
+	// Otherwise, the context has timed out or has been cancelled.
+	return ctx.Err()
 }
 
 // ReleaseLeases releases all leases. Errors are logged but ignored.
@@ -288,18 +302,6 @@ func (tc *Collection) GetLeaseGeneration() int64 {
 	return tc.leaseGeneration
 }
 
-// HasUncommittedTables returns true if the Collection contains uncommitted
-// tables.
-func (tc *Collection) HasUncommittedTables() (has bool) {
-	_ = tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
-		if _, has = desc.(catalog.TableDescriptor); has {
-			return iterutil.StopIteration()
-		}
-		return nil
-	})
-	return has
-}
-
 // HasUncommittedDescriptors returns true if the collection contains any
 // uncommitted descriptors.
 func (tc *Collection) HasUncommittedDescriptors() bool {
@@ -331,6 +333,16 @@ func (tc *Collection) CountUncommittedNewOrDroppedDescriptors() int {
 		return nil
 	})
 	return count
+}
+
+// GetUncommittedDescriptorIDs returns the IDs of all uncommitted descriptors.
+func (tc *Collection) GetUncommittedDescriptorIDs() catalog.DescriptorIDSet {
+	var ids catalog.DescriptorIDSet
+	_ = tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
+		ids.Add(desc.GetID())
+		return nil
+	})
+	return ids
 }
 
 // HasUncommittedTypes returns true if the Collection contains uncommitted
@@ -514,10 +526,13 @@ func (tc *Collection) EmitDescriptorUpdatesKey(ctx context.Context, txn *kv.Txn)
 	// This key is only emitted for 25.4 and above. Additionally, PCR
 	// reader catalog can update a large number of descriptors in a transaction,
 	// and are exempt from this logic.
+	// Starting 26.2, we will stop generating these special update keys,
+	// and the lease manager will use Export to get the same information.
 	if !tc.settings.Version.IsActive(ctx, clusterversion.V25_4) ||
 		tc.readerCatalogSetup ||
 		tc.uncommitted.uncommitted.Len() == 0 ||
-		!lease.GetLockedLeaseTimestampEnabled(ctx, tc.settings) {
+		!lease.GetLockedLeaseTimestampEnabled(ctx, tc.settings) ||
+		tc.settings.Version.IsActive(ctx, clusterversion.V26_2_DescriptorTxnKeyGeneration) {
 		return nil
 	}
 	updates := &descpb.DescriptorUpdates{}
@@ -525,8 +540,8 @@ func (tc *Collection) EmitDescriptorUpdatesKey(ctx context.Context, txn *kv.Txn)
 	// Add all the descriptors that have been modified in this transaction.
 	if err := tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
 		// Dropped / Offline descriptors can be ignored, since these can no longer be leased.
-		// Note: We still emit a record, but that is to allow the timestamp to move
-		// forward.
+		// Note: We will detect these descriptors instantly in the lease manager, so the locked
+		// timestamp does not need to move forward. See takenOfflineAt in descriptorState.
 		if desc.Dropped() || desc.Offline() {
 			return nil
 		}
@@ -538,6 +553,15 @@ func (tc *Collection) EmitDescriptorUpdatesKey(ctx context.Context, txn *kv.Txn)
 		return nil
 	}); err != nil {
 		return err
+	}
+	// Descriptors updated in this batch were either all offline or dropped,
+	// so nothing to inform the lease manager about.
+	if len(updates.DescriptorIDs) == 0 {
+		return nil
+	}
+	// On test builds confirm we are always selecting a valid ID.
+	if buildutil.CrdbTestBuild && descUpdateID == descpb.InvalidID {
+		return errors.AssertionFailedf("low descriptor key has invalid ID (descriptorIDs=%v)", updates.DescriptorIDs)
 	}
 	descUpdateKey := catalogkeys.MakeDescUpdateKey(tc.codec(), descUpdateID)
 	return txn.Put(ctx, descUpdateKey, updates)
@@ -552,6 +576,11 @@ func (tc *Collection) WriteDescToBatch(
 	b *kv.Batch,
 	opts ...WriteDescOption,
 ) error {
+	if !tc.forceStorageLookupIDs.Empty() {
+		return errors.AssertionFailedf("descriptor collection with " +
+			"forceStorageLookupIDs set is read-only, should not be used to write " +
+			"descriptors")
+	}
 	if desc.GetID() == descpb.InvalidID {
 		return errors.AssertionFailedf("cannot write descriptor with an empty ID: %v", desc)
 	}
@@ -1580,6 +1609,11 @@ func (tc *Collection) GetTypeComment(typeID descpb.ID) (comment string, ok bool)
 	return tc.GetComment(catalogkeys.MakeCommentKey(uint32(typeID), 0, catalogkeys.TypeCommentType))
 }
 
+// GetFunctionComment implements the scdecomp.CommentGetter interface.
+func (tc *Collection) GetFunctionComment(funcID descpb.ID) (comment string, ok bool) {
+	return tc.GetComment(catalogkeys.MakeCommentKey(uint32(funcID), 0, catalogkeys.FunctionCommentType))
+}
+
 // GetColumnComment implements the scdecomp.CommentGetter interface.
 func (tc *Collection) GetColumnComment(
 	tableID descpb.ID, pgAttrNum catid.PGAttributeNum,
@@ -1609,6 +1643,15 @@ func (tc *Collection) MaybeSetReplicationSafeTS(ctx context.Context, txn *kv.Txn
 		return nil
 	}
 	return txn.SetFixedTimestamp(ctx, tc.leased.lm.GetSafeReplicationTS())
+}
+
+// GetLatestLeaseReadTimestamp returns the latest timestamp from the lease manager.
+func (tc *Collection) GetLatestLeaseReadTimestamp(
+	ctx context.Context, now hlc.Timestamp,
+) hlc.Timestamp {
+	readTS := tc.leased.lm.GetReadTimestamp(ctx, now)
+	defer readTS.Release(ctx)
+	return readTS.GetTimestamp()
 }
 
 // GetConstraintComment implements the scdecomp.CommentGetter interface.
@@ -1659,6 +1702,25 @@ func (tc *Collection) LockDescriptorWithLease(
 		return 0, ErrDescCannotBeLeased{id: id}
 	}
 	return uint64(desc.GetVersion()), err
+}
+
+// GetLookupContextFallbackFn returns a fallback function if leased descriptors
+// are being used for GetAll.*
+func (tc *Collection) GetLookupContextFallbackFn(
+	ctx context.Context, txn *kv.Txn,
+) func(id descpb.ID) (catalog.Descriptor, error) {
+	// Without leased descriptors everything should be fully resolved
+	// within a look up context.
+	if !getAllowLeasedDescriptorsInCatalogViews(ctx, tc.settings) {
+		return nil
+	}
+	// If we are in a concurrent drop scenario, then GetAll will miss
+	// entiries that don't currently have a namespace entry. The locked
+	// descriptor leasing could pick an earlier timestamp, so we still
+	// need some type of look up
+	return func(id descpb.ID) (catalog.Descriptor, error) {
+		return tc.ByIDWithLeased(txn).Get().Desc(ctx, id)
+	}
 }
 
 // MakeTestCollection makes a Collection that can be used for tests.

@@ -6,7 +6,6 @@
 package storage
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -16,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -204,7 +204,7 @@ var UnhealthyWriteDuration = settings.RegisterDurationSetting(
 // useDeprecatedCompensatedScore is a temporary setting that provides a
 // mechanism for reverting Pebble's compaction picking heuristic to the previous
 // (25.3 and earlier) behavior for deciding when a level is eligible for
-// compaction. See the pebble.Options Experimental UseDeprecatedCompensatedScore
+// compaction. See the pebble.Options UseDeprecatedCompensatedScore
 // setting for details.
 //
 // We anticipate not needing to use this setting, but it's provided as an escape
@@ -406,7 +406,6 @@ var CompressionAlgorithmBackupStorage = settings.RegisterEnumSetting[SSTableComp
 	// TODO(radu,jackson): use a metamorphic constant.
 	SSTableCompressionFastest.String(),
 	sstableCompressionProfileToString,
-	settings.WithPublic,
 )
 
 // CompressionAlgorithmBackupTransport determines the compression algorithm used
@@ -423,7 +422,6 @@ var CompressionAlgorithmBackupTransport = settings.RegisterEnumSetting[SSTableCo
 	// TODO(radu,jackson): use a metamorphic constant.
 	SSTableCompressionFastest.String(),
 	sstableCompressionProfileToString,
-	settings.WithPublic,
 )
 
 var walFailoverUnhealthyOpThreshold = settings.RegisterDurationSetting(
@@ -675,7 +673,7 @@ func initPebbleOptions() *pebble.Options {
 		BlockPropertyCollectors:     cockroachkvs.BlockPropertyCollectors,
 		FormatMajorVersion:          MinimumSupportedFormatVersion,
 	}
-	opts.Experimental.L0CompactionConcurrency = l0SubLevelCompactionConcurrency
+	opts.L0CompactionConcurrency = l0SubLevelCompactionConcurrency
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
 	// activity on the database generating flushes.
@@ -684,13 +682,13 @@ func initPebbleOptions() *pebble.Options {
 	// This ensures that range keys are quickly flushed, allowing use of lazy
 	// combined iteration within Pebble.
 	opts.FlushDelayRangeKey = 10 * time.Second
-	opts.Experimental.ShortAttributeExtractor = shortAttributeExtractorForValues
+	opts.ShortAttributeExtractor = shortAttributeExtractorForValues
 
-	opts.Experimental.UserKeyCategories = userKeyCategories
+	opts.UserKeyCategories = userKeyCategories
 
 	// Every 5 minutes, log iterators that have been open for more than 1 minute.
-	opts.Experimental.IteratorTracking.PollInterval = 5 * time.Minute
-	opts.Experimental.IteratorTracking.MaxAge = time.Minute
+	opts.IteratorTracking.PollInterval = 5 * time.Minute
+	opts.IteratorTracking.MaxAge = time.Minute
 
 	opts.Levels[0] = pebble.LevelOptions{
 		BlockSize:         32 << 10,  // 32 KB
@@ -733,59 +731,82 @@ func DefaultPebbleOptions() *pebble.Options {
 	return opts
 }
 
-var (
-	spanPolicyLocalRangeIDEndKey = EncodeMVCCKey(MVCCKey{Key: keys.LocalRangeIDPrefix.AsRawKey().PrefixEnd()})
-	spanPolicyLockTableStartKey  = EncodeMVCCKey(MVCCKey{Key: keys.LocalRangeLockTablePrefix})
-	spanPolicyLockTableEndKey    = EncodeMVCCKey(MVCCKey{Key: keys.LocalRangeLockTablePrefix.PrefixEnd()})
-	spanPolicyLocalEndKey        = EncodeMVCCKey(MVCCKey{Key: keys.LocalPrefix.PrefixEnd()})
+type localKeyPolicyKind uint8
+
+const (
+	localKeyPolicyDefault localKeyPolicyKind = iota
+	localKeyPolicyLatencyTolerant
+	localKeyPolicyLowReadLatency
 )
 
-// spanPolicyFuncFactory returns a pebble.SpanPolicyFunc that applies special policies for
-// the CockroachDB keyspace.
-func spanPolicyFuncFactory(sv *settings.Values) func([]byte) (pebble.SpanPolicy, []byte, error) {
-	return func(startKey []byte) (policy pebble.SpanPolicy, endKey []byte, _ error) {
-		// There's no special policy for non-local keys.
-		if !bytes.HasPrefix(startKey, keys.LocalPrefix) {
-			return pebble.SpanPolicy{}, nil, nil
-		}
-		// Prefer fast compression for all local keys, since they shouldn't take up
-		// a significant part of the space.
-		policy.PreferFastCompression = true
-
+var localKeyRegions = []struct {
+	endKey []byte
+	kind   localKeyPolicyKind
+}{
+	{
 		// The first section of the local keyspace is the Range-ID keyspace. It
 		// extends from the beginning of the keyspace to the Range Local keys. The
 		// Range-ID keyspace includes the raft log, which is rarely read and
 		// receives ~half the writes.
-		if cockroachkvs.Compare(startKey, spanPolicyLocalRangeIDEndKey) < 0 {
-			if !bytes.HasPrefix(startKey, keys.LocalRangeIDPrefix) {
-				return pebble.SpanPolicy{}, nil, errors.AssertionFailedf("startKey %s is not a Range-ID key", startKey)
+		endKey: EncodeMVCCKey(MVCCKey{Key: keys.LocalRangeIDPrefix.AsRawKey().PrefixEnd()}),
+		kind:   localKeyPolicyLatencyTolerant,
+	},
+	{
+		endKey: EncodeMVCCKey(MVCCKey{Key: keys.LocalRangeLockTablePrefix}),
+		kind:   localKeyPolicyDefault,
+	},
+	{
+		// Lock keys are latency sensitive.
+		endKey: EncodeMVCCKey(MVCCKey{Key: keys.LocalRangeLockTablePrefix.PrefixEnd()}),
+		kind:   localKeyPolicyLowReadLatency,
+	},
+	{
+		endKey: EncodeMVCCKey(MVCCKey{Key: keys.LocalPrefix.PrefixEnd()}),
+		kind:   localKeyPolicyDefault,
+	},
+}
+
+// spanPolicyFuncFactory returns a pebble.SpanPolicyFunc that applies special
+// policies for the CockroachDB keyspace.
+func spanPolicyFuncFactory(sv *settings.Values) pebble.SpanPolicyFunc {
+	return func(bounds pebble.UserKeyBounds) (pebble.SpanPolicy, error) {
+		if cockroachkvs.Compare(bounds.Start, localKeyRegions[len(localKeyRegions)-1].endKey) >= 0 {
+			// No special policy for non-local keys.
+			policy := pebble.SpanPolicy{
+				KeyRange: pebble.KeyRange{
+					Start: localKeyRegions[len(localKeyRegions)-1].endKey,
+					End:   nil,
+				},
 			}
+			return policy, nil
+		}
+
+		regionIdx := sort.Search(len(localKeyRegions)-1, func(i int) bool {
+			return cockroachkvs.Compare(bounds.Start, localKeyRegions[i].endKey) < 0
+		})
+
+		var policy pebble.SpanPolicy
+		// Prefer fast compression for all local keys, since they shouldn't take
+		// up a significant part of the space.
+		policy.PreferFastCompression = true
+		if regionIdx > 0 {
+			policy.KeyRange.Start = localKeyRegions[regionIdx-1].endKey
+		}
+		policy.KeyRange.End = localKeyRegions[regionIdx].endKey
+		switch localKeyRegions[regionIdx].kind {
+		case localKeyPolicyLowReadLatency:
+			policy.ValueStoragePolicy = pebble.ValueStorageLowReadLatency
+		case localKeyPolicyLatencyTolerant:
 			if sv != nil {
 				policy.ValueStoragePolicy = pebble.ValueStoragePolicyAdjustment{
 					OverrideBlobSeparationMinimumSize: int(valueSeparationLatencyTolerantMinimumSize.Get(sv)),
 				}
 			} else {
+				// TODO(radu): use valueSeparationLatencyTolerantMinimumSize.Default() instead.
 				policy.ValueStoragePolicy = pebble.ValueStorageLatencyTolerant
 			}
-			return policy, spanPolicyLocalRangeIDEndKey, nil
 		}
-
-		// We also disable value separation for lock keys.
-		if cockroachkvs.Compare(startKey, spanPolicyLockTableEndKey) >= 0 {
-			// Not a lock key, so use default value separation within sstable (by
-			// suffix) and into blob files.
-			// NB: there won't actually be a suffix in these local keys.
-			return policy, spanPolicyLocalEndKey, nil
-		}
-		if cockroachkvs.Compare(startKey, spanPolicyLockTableStartKey) < 0 {
-			// Not a lock key, so use default value separation within sstable (by
-			// suffix) and into blob files.
-			// NB: there won't actually be a suffix in these local keys.
-			return policy, spanPolicyLockTableStartKey, nil
-		}
-		// Lock key. Disable value separation.
-		policy.ValueStoragePolicy = pebble.ValueStorageLowReadLatency
-		return policy, spanPolicyLockTableEndKey, nil
+		return policy, nil
 	}
 }
 
@@ -1010,7 +1031,7 @@ type remoteStorageAdaptor struct {
 }
 
 func (r remoteStorageAdaptor) CreateStorage(locator remote.Locator) (remote.Storage, error) {
-	es, err := r.factory.OpenURL(r.ctx, string(locator))
+	es, err := r.factory.OpenURL(r.ctx, locator.RawRedactableString.StripMarkers())
 	return &externalStorageWrapper{p: r.p, ctx: r.ctx, es: es}, err
 }
 
@@ -1078,15 +1099,17 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 	cfg.opts.DeletionPacing.BaselineRate = func() uint64 {
 		return uint64(baselineDeletionRate.Get(sv))
 	}
-	cfg.opts.Experimental.TombstoneDenseCompactionThreshold = func() float64 {
+	cfg.opts.TombstoneDenseCompactionThreshold = func() float64 {
 		return 0.01 * float64(tombstoneDenseCompactionThreshold.Get(sv))
 	}
-	if cfg.opts.Experimental.UseDeprecatedCompensatedScore == nil {
-		cfg.opts.Experimental.UseDeprecatedCompensatedScore = func() bool {
+	if cfg.opts.UseDeprecatedCompensatedScore == nil {
+		cfg.opts.UseDeprecatedCompensatedScore = func() bool {
 			return useDeprecatedCompensatedScore.Get(sv)
 		}
 	}
-	cfg.opts.Experimental.SpanPolicyFunc = spanPolicyFuncFactory(sv)
+	if cfg.opts.SpanPolicyFunc == nil {
+		cfg.opts.SpanPolicyFunc = spanPolicyFuncFactory(sv)
+	}
 
 	cfg.opts.EnsureDefaults()
 
@@ -1115,8 +1138,8 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 	cfg.opts.WALMinSyncInterval = func() time.Duration {
 		return minWALSyncInterval.Get(&cfg.settings.SV)
 	}
-	cfg.opts.Experimental.EnableValueBlocks = func() bool { return true }
-	cfg.opts.Experimental.DisableIngestAsFlushable = func() bool {
+	cfg.opts.EnableValueBlocks = func() bool { return true }
+	cfg.opts.DisableIngestAsFlushable = func() bool {
 		// Disable flushable ingests if shared storage is enabled. This is because
 		// flushable ingests currently do not support Excise operations.
 		//
@@ -1125,13 +1148,13 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 		// Pebble has better guards against this.
 		return cfg.sharedStorage != nil || !IngestAsFlushable.Get(&cfg.settings.SV)
 	}
-	cfg.opts.Experimental.IngestSplit = func() bool {
+	cfg.opts.IngestSplit = func() bool {
 		return IngestSplitEnabled.Get(&cfg.settings.SV)
 	}
-	cfg.opts.Experimental.EnableDeleteOnlyCompactionExcises = func() bool {
+	cfg.opts.EnableDeleteOnlyCompactionExcises = func() bool {
 		return deleteCompactionsCanExcise.Get(&cfg.settings.SV)
 	}
-	cfg.opts.Experimental.ValueSeparationPolicy = func() pebble.ValueSeparationPolicy {
+	cfg.opts.ValueSeparationPolicy = func() pebble.ValueSeparationPolicy {
 		if !valueSeparationEnabled.Get(&cfg.settings.SV) {
 			return pebble.ValueSeparationPolicy{}
 		}
@@ -1150,7 +1173,7 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 			GarbageRatioHighPriority: highPri,
 		}
 	}
-	cfg.opts.Experimental.MultiLevelCompactionHeuristic = func() pebble.MultiLevelHeuristic {
+	cfg.opts.MultiLevelCompactionHeuristic = func() pebble.MultiLevelHeuristic {
 		if enableMultiLevelWriteAmpHeuristic.Get(&cfg.settings.SV) {
 			// Use the default write amp heuristic, which adds no propensity towards
 			// multi-level compactions and disallows multi-level compactions involving L0.
@@ -1277,7 +1300,7 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 		}
 	} else {
 		if cfg.remoteStorageFactory != nil {
-			cfg.opts.Experimental.RemoteStorage = remoteStorageAdaptor{p: p, ctx: logCtx, factory: cfg.remoteStorageFactory}
+			cfg.opts.RemoteStorage = remoteStorageAdaptor{p: p, ctx: logCtx, factory: cfg.remoteStorageFactory}
 		}
 	}
 	// If the store cluster version is not empty, it means that we initialized
@@ -1406,6 +1429,10 @@ func (p *Pebble) makeMetricEtcEventListener(ctx context.Context) pebble.EventLis
 			// persistent.
 		},
 		DataCorruption: func(info pebble.DataCorruptionInfo) {
+			if corruptBlockData := info.FormatBlockDataAsHex(); corruptBlockData != "" {
+				// Note: the block data is considered PII; the string value will be redacted.
+				log.Dev.Errorf(ctx, "corrupt block data:\n%s", corruptBlockData)
+			}
 			if !info.IsRemote {
 				p.writePreventStartupFile(ctx, info.Details)
 				log.Dev.Fatalf(ctx, "local corruption detected: %+v", info.Details)
@@ -1724,6 +1751,14 @@ func (p *Pebble) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
 	return p.clear(MVCCKey{Key: key}, opts)
 }
 
+// SingleClearUnversioned implements the Engine interface.
+func (p *Pebble) SingleClearUnversioned(key roachpb.Key) error {
+	if len(key) == 0 {
+		return emptyKeyError()
+	}
+	return p.db.SingleDelete(EncodeMVCCKey(MVCCKey{Key: key}), pebble.Sync)
+}
+
 // ClearEngineKey implements the Engine interface.
 func (p *Pebble) ClearEngineKey(key EngineKey, opts ClearOptions) error {
 	if len(key.Key) == 0 {
@@ -2040,6 +2075,16 @@ func (p *Pebble) Capacity() (roachpb.StoreCapacity, error) {
 		Available: available,
 		Used:      totalUsedBytes,
 	}, nil
+}
+
+// WALFailoverDiskUsage implements the Engine interface.
+func (p *Pebble) WALFailoverDiskUsage() (vfs.DiskUsage, error) {
+	if p.cfg.opts.WALFailover == nil {
+		return vfs.DiskUsage{}, vfs.ErrUnsupported
+	}
+	return p.cfg.opts.WALFailover.Secondary.FS.GetDiskUsage(
+		p.cfg.opts.WALFailover.Secondary.Dirname,
+	)
 }
 
 // auxiliaryDirSize computes the size of the auxiliary directory. There are
@@ -2544,6 +2589,7 @@ func (p *Pebble) CreateCheckpoint(dir string, spans []roachpb.Span) error {
 // named version, it can be assumed all *nodes* have ratcheted to the pebble
 // version associated with it, since they did so during the fence version.
 var pebbleFormatVersionMap = map[clusterversion.Key]pebble.FormatMajorVersion{
+	clusterversion.V26_3: pebble.FormatRowblkMarkedForCompaction,
 	clusterversion.V26_1: pebble.FormatMarkForCompactionInVersionEdit,
 	clusterversion.V25_4: pebble.FormatV2BlobFiles,
 }
@@ -3004,6 +3050,10 @@ func (p *pebbleReadOnly) ClearMVCC(key MVCCKey, opts ClearOptions) error {
 }
 
 func (p *pebbleReadOnly) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
+	return errors.AssertionFailedf("not implemented")
+}
+
+func (p *pebbleReadOnly) SingleClearUnversioned(key roachpb.Key) error {
 	return errors.AssertionFailedf("not implemented")
 }
 

@@ -22,10 +22,10 @@ import (
 )
 
 func registerMultiRegionSystemDatabase(r registry.Registry) {
-	clusterSpec := r.MakeClusterSpec(3, spec.Geo(), spec.GatherCores(), spec.GCEZones("us-east1-b,us-west1-b,us-central1-b"))
+	clusterSpec := r.MakeClusterSpec(3, spec.Geo(), spec.GatherCores(), spec.GCEZones("us-east1-b,us-west1-c,us-central1-b"))
 	r.Add(registry.TestSpec{
 		Name:             "schemachange/multiregion/system-database",
-		Owner:            registry.OwnerSQLFoundations,
+		Owner:            registry.OwnerSQLQueries,
 		Timeout:          time.Hour * 1,
 		Cluster:          clusterSpec,
 		CompatibleClouds: registry.OnlyGCE,

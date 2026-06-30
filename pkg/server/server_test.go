@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ui"
@@ -214,16 +215,15 @@ func TestPlainHTTPServer(t *testing.T) {
 	if !strings.HasPrefix(url, "http://") {
 		t.Fatalf("expected insecure admin url to start with http://, but got %s", url)
 	}
-	if resp, err := httputil.Get(context.Background(), url); err != nil {
-		t.Error(err)
-	} else {
-		func() {
-			defer resp.Body.Close()
-			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-				t.Error(err)
-			}
-		}()
-	}
+	testutils.SucceedsSoon(t, func() error {
+		resp, err := httputil.Get(context.Background(), url)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		_, err = io.Copy(io.Discard, resp.Body)
+		return err
+	})
 
 	// Attempting to connect to the insecure server with HTTPS doesn't work.
 	secureURL := strings.Replace(url, "http://", "https://", 1)
@@ -719,17 +719,11 @@ func TestServeIndexHTML(t *testing.T) {
 			require.NoError(t, err)
 
 			respString := string(respBytes)
-			// Since server test package links ccl, build.GetInfo() says that we
-			// think we're using CCL distribution (even though this test file is
-			// in `server` and not in `server_test`). However, serverutils
-			// doesn't link ccl, so it says it uses OSS distribution. Reconcile
-			// this mismatch.
-			buildInfo := strings.Replace(build.GetInfo().Short().StripMarkers(), "CockroachDB CCL", "CockroachDB OSS", 1)
 			expected := fmt.Sprintf(`<!DOCTYPE html>
 <title>CockroachDB</title>
 Binary built without web UI.
 <hr>
-<em>%s</em>`, buildInfo)
+<em>%s</em>`, build.GetInfo().Short().StripMarkers())
 			require.Equal(t, expected, respString)
 		})
 
@@ -755,7 +749,7 @@ Binary built without web UI.
 			respBytes, err = io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			expected := fmt.Sprintf(
-				`{"Insecure":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"OSS","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
+				`{"Insecure":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"Log in with your OIDC provider","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"None","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
 				build.GetInfo().Tag,
 				version,
 				1,
@@ -783,7 +777,7 @@ Binary built without web UI.
 			{
 				loggedInClient,
 				fmt.Sprintf(
-					`{"Insecure":false,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"OSS","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
+					`{"Insecure":false,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"Log in with your OIDC provider","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"None","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
 					build.GetInfo().Tag,
 					version,
 					1,
@@ -792,7 +786,7 @@ Binary built without web UI.
 			{
 				loggedOutClient,
 				fmt.Sprintf(
-					`{"Insecure":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"OSS","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
+					`{"Insecure":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"Log in with your OIDC provider","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false,"LicenseType":"None","SecondsUntilLicenseExpiry":0,"IsManaged":false}`,
 					build.GetInfo().Tag,
 					version,
 					1,
@@ -968,8 +962,7 @@ func TestSQLDecommissioned(t *testing.T) {
 	tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 		ServerArgs: base.TestServerArgs{
-			DefaultDRPCOption: base.TestDRPCDisabled,
-			Insecure:          true, // to set up a simple SQL client
+			Insecure: true, // to set up a simple SQL client
 		},
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -1035,6 +1028,8 @@ func TestAssertEnginesEmpty(t *testing.T) {
 
 	require.NoError(t, storage.MVCCPutProto(ctx, eng, keys.DeprecatedStoreClusterVersionKey(),
 		hlc.Timestamp{}, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}, storage.MVCCWriteOptions{}))
+	require.Error(t, assertEnginesEmpty(engs))
+	require.NoError(t, removeDeprecatedStoreClusterVersionKey(ctx, engs))
 	require.NoError(t, assertEnginesEmpty(engs))
 
 	batch := eng.NewBatch()
@@ -1048,6 +1043,62 @@ func TestAssertEnginesEmpty(t *testing.T) {
 	require.NoError(t, batch.PutMVCC(key, value))
 	require.NoError(t, batch.Commit(false))
 	require.Error(t, assertEnginesEmpty(engs))
+}
+
+func TestDeprecatedStoreClusterVersionKeyCleanup(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Create sticky VFS registry for in-memory storage.
+	vfsRegistry := fs.NewStickyRegistry()
+	storeSpec := base.DefaultTestStoreSpec
+	storeSpec.StickyVFSID = "deprecated-key-cleanup-test"
+
+	// Open engine and write deprecated key before server startup.
+	env, err := fs.InitEnvFromStoreSpec(ctx, storeSpec,
+		fs.EnvConfig{}, vfsRegistry, nil /* diskWriteStats */)
+	require.NoError(t, err)
+	eng, err := storage.Open(ctx, env, cluster.MakeTestingClusterSettings())
+	require.NoError(t, err)
+
+	// TODO(pav-kv): rm this test when DeprecatedStoreClusterVersionKey is gone.
+	deprecatedKey := keys.DeprecatedStoreClusterVersionKey()
+	require.NoError(t, storage.MVCCPutProto(ctx, eng, deprecatedKey,
+		hlc.Timestamp{}, &roachpb.Version{Major: 22, Minor: 2, Internal: 0},
+		storage.MVCCWriteOptions{}))
+
+	// Verify key exists before server startup.
+	val, err := storage.MVCCGet(ctx, eng, deprecatedKey,
+		hlc.Timestamp{}, storage.MVCCGetOptions{})
+	require.NoError(t, err)
+	require.True(t, val.Value.IsPresent(), "deprecated key should exist before cleanup")
+
+	eng.Close()
+
+	// Start TestServer with the pre-populated engine.
+	// Server startup calls inspectEngines() which triggers cleanup.
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		StoreSpecs: []base.StoreSpec{storeSpec},
+		Knobs: base.TestingKnobs{
+			Server: &TestingKnobs{
+				StickyVFSRegistry: vfsRegistry,
+			},
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	// Access the store's engine and verify the key has been removed.
+	storeID := srv.StorageLayer().GetFirstStoreID()
+	store, err := srv.StorageLayer().GetStores().(*kvserver.Stores).GetStore(storeID)
+	require.NoError(t, err)
+
+	// Verify the key has been removed by reading from the engine.
+	val, err = storage.MVCCGet(ctx, store.LogEngine(), deprecatedKey,
+		hlc.Timestamp{}, storage.MVCCGetOptions{})
+	require.NoError(t, err)
+	require.False(t, val.Value.IsPresent(), "deprecated key present after server init")
 }
 
 // TestAssertExternalStorageInitializedBeforeJobSchedulerStart is a
@@ -1151,7 +1202,7 @@ func TestStorageBlockLoadConcurrencyLimit(t *testing.T) {
 
 			check := func(expected int64) error {
 				return s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-					metrics := s.TODOEngine().GetMetrics()
+					metrics := s.TODOBothEngines().GetMetrics()
 					if metrics.BlockLoadConcurrencyLimit != expected {
 						return fmt.Errorf("expected %d, got %d", expected, metrics.BlockLoadConcurrencyLimit)
 					}

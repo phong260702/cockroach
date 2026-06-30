@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -96,6 +97,11 @@ func newEventConsumer(
 	sliMetrics *sliMetrics,
 	knobs TestingKnobs,
 ) (eventConsumer, EventSink, error) {
+	if knobs.EventConsumerError != nil {
+		if err := knobs.EventConsumerError(); err != nil {
+			return nil, nil, err
+		}
+	}
 	encodingOpts, err := feed.Opts.GetEncodingOptions()
 	if err != nil {
 		return nil, nil, err
@@ -147,6 +153,7 @@ func newEventConsumer(
 			if !ok {
 				tenantID = roachpb.SystemTenantID
 			}
+			wid, wtype := kv.WorkloadInfoFromContext(ctx)
 
 			pacer = cfg.AdmissionPacerFactory.NewPacer(
 				pacerRequestUnit,
@@ -155,6 +162,8 @@ func newEventConsumer(
 					Priority:        admissionpb.BulkNormalPri,
 					CreateTime:      timeutil.Now().UnixNano(),
 					BypassAdmission: false,
+					WorkloadID:      wid,
+					WorkloadType:    wtype,
 				},
 			)
 		}
@@ -357,45 +366,45 @@ func (c *kvEventToRowConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Even
 		prevSchemaTimestamp = schemaTimestamp.Prev()
 	}
 
-	updatedRow, err := c.decoder.DecodeKV(ctx, ev.KV(), cdcevent.CurrentRow, schemaTimestamp, keyOnly)
+	updatedRow, status, err := c.decoder.DecodeKV(ctx, ev.KV(), cdcevent.CurrentRow, schemaTimestamp, keyOnly)
 	if err != nil {
+		// On decode errors, return immediately without releasing the allocation.
+		// The allocation is managed elsewhere for error cases.
+		return err
+	}
+	if status != cdcevent.DecodeOK {
 		// Column families are stored contiguously, so we'll get
 		// events for each one even if we're not watching them all.
-		if errors.Is(err, cdcevent.ErrUnwatchedFamily) {
-			// Release the event's allocation since we're not processing it.
-			a := ev.DetachAlloc()
-			a.Release(ctx)
-			return nil
-		}
-		if errors.Is(err, cdcevent.ErrTableOffline) {
-			// An event on an offline table should be silently dropped for db
-			// level changefeeds. Since the descriptor is offline, we can't
-			// safely decode the event.
-			// Release the event's allocation since we're not processing it.
-			a := ev.DetachAlloc()
-			a.Release(ctx)
-			return nil
-		}
-		return err
+		// An event on an offline table should be silently dropped for db
+		// level changefeeds. Since the descriptor is offline, we can't
+		// safely decode the event.
+		// Release the event's allocation since we're skipping this event.
+		// Note: We only release on skip conditions (non-OK status), not on errors.
+		a := ev.DetachAlloc()
+		a.Release(ctx)
+		return nil
 	}
 
 	// Get prev value, if necessary.
-	prevRow, err := func() (cdcevent.Row, error) {
+	prevRow, prevStatus, err := func() (cdcevent.Row, cdcevent.DecodeStatus, error) {
 		if !c.details.Opts.GetFilters().WithDiff {
-			return cdcevent.Row{}, nil
+			return cdcevent.Row{}, cdcevent.DecodeOK, nil
 		}
 		return c.decoder.DecodeKV(ctx, ev.PrevKeyValue(), cdcevent.PrevRow, prevSchemaTimestamp, keyOnly)
 	}()
 	if err != nil {
+		// On decode errors, return immediately without releasing the allocation.
+		// The allocation is managed elsewhere for error cases.
+		return err
+	}
+	if prevStatus != cdcevent.DecodeOK {
 		// Column families are stored contiguously, so we'll get
 		// events for each one even if we're not watching them all.
-		if errors.Is(err, cdcevent.ErrUnwatchedFamily) {
-			// Release the event's allocation since we're not processing it.
-			a := ev.DetachAlloc()
-			a.Release(ctx)
-			return nil
-		}
-		return err
+		// Release the event's allocation since we're skipping this event.
+		// Note: We only release on skip conditions (non-OK status), not on errors.
+		a := ev.DetachAlloc()
+		a.Release(ctx)
+		return nil
 	}
 
 	if c.evaluator != nil {
@@ -479,9 +488,18 @@ func (c *kvEventToRowConsumer) encodeAndEmit(
 	}
 	c.scratch, valueCopy = c.scratch.Copy(encodedValue)
 
+	// Encode the CSV header row if the csv_header option is set.
+	var csvColumnHeader []byte
+	if c.encodingOpts.CsvHeader && c.encodingOpts.Format == changefeedbase.OptFormatCSV {
+		csvColumnHeader, err = c.encodeCSVHeaderRow(ctx, updatedRow)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Since we're done processing/converting this event, and will not use much more
 	// than len(key)+len(bytes) worth of resources, adjust allocation to match.
-	alloc.AdjustBytesToTarget(ctx, int64(len(keyCopy)+len(valueCopy)))
+	alloc.AdjustBytesToTarget(ctx, int64(len(keyCopy)+len(valueCopy)+len(csvColumnHeader)))
 	timer.End()
 
 	headers, err := c.makeRowHeaders(ctx, updatedRow)
@@ -491,7 +509,7 @@ func (c *kvEventToRowConsumer) encodeAndEmit(
 
 	c.metrics.Timers.EmitRow.Time(func() {
 		err = c.sink.EmitRow(
-			ctx, topic, keyCopy, valueCopy, schemaTS, updatedRow.MvccTimestamp, alloc, headers,
+			ctx, topic, keyCopy, valueCopy, csvColumnHeader, schemaTS, updatedRow.MvccTimestamp, alloc, headers,
 		)
 	})
 	if err != nil {
@@ -589,6 +607,22 @@ func (c *kvEventToRowConsumer) encodeForParquet(
 		return err
 	}
 	return nil
+}
+
+func (c *kvEventToRowConsumer) encodeCSVHeaderRow(
+	ctx context.Context, updatedRow cdcevent.Row,
+) ([]byte, error) {
+	hEnc, ok := c.encoder.(*csvEncoder)
+	if !ok {
+		return nil, errors.AssertionFailedf("expected csv encoder for csv format with %s", changefeedbase.OptCsvHeader)
+	}
+	hdr, err := hEnc.EncodeCSVHeaderRow(ctx, updatedRow)
+	if err != nil {
+		return nil, err
+	}
+	var csvColumnHeader []byte
+	c.scratch, csvColumnHeader = c.scratch.Copy(hdr)
+	return csvColumnHeader, nil
 }
 
 // Flush is a noop for the kvEventToRowConsumer because it does not buffer any events.

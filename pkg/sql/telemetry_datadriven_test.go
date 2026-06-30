@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtestutils"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logtestutils/telemetrylogtestutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
@@ -92,15 +93,20 @@ func TestTelemetryLoggingDataDriven(t *testing.T) {
 		stmtSpy.Reset()
 		txnsSpy.Reset()
 
-		st := logtestutils.StubTime{}
+		st := telemetrylogtestutils.StubTime{}
 		st.SetTime(timeutil.FromUnixMicros(0))
-		sts := logtestutils.StubTracingStatus{}
+		sts := telemetrylogtestutils.StubTracingStatus{}
 		stubTimeOnRestart := int64(0)
 		telemetryKnobs := &TelemetryLoggingTestingKnobs{
 			getTimeNow:       st.TimeNow,
 			getTracingStatus: sts.TracingStatus,
 		}
-		tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		// NB: use a single-node cluster so that the leaseholder for any
+		// user table is always the gateway. With multiple nodes, the
+		// leaseholder can land on a non-gateway node and the physical
+		// planner will distribute the flow, making the Distribution field
+		// in telemetry log events nondeterministic. See #169735.
+		tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					SQLExecutor: &ExecutorTestingKnobs{
@@ -152,7 +158,7 @@ func TestTelemetryLoggingDataDriven(t *testing.T) {
 				d.MaybeScanArgs(t, "stubStatementFingerprintId", &stubStatementFingerprintId)
 				if stubStatementFingerprintId != "" {
 					defer testutils.TestingHook(&appstatspb.ConstructStatementFingerprintID,
-						func(stmtNoConstants string, implicitTxn bool, database string) appstatspb.StmtFingerprintID {
+						func(stmtNoConstants string, database string) appstatspb.StmtFingerprintID {
 							parseUint, e := strconv.ParseUint(stubStatementFingerprintId, 10, 64)
 							if e != nil {
 								panic(e.Error())
@@ -208,13 +214,13 @@ func TestTelemetryLoggingDataDriven(t *testing.T) {
 				}
 
 				newStmtLogCount := stmtSpy.Count()
-				sb.WriteString(strings.Join(stmtSpy.GetLastNLogs(getSampleQueryLoggingChannel(&s.ClusterSettings().SV), newStmtLogCount-stmtLogCount), "\n"))
+				sb.WriteString(strings.Join(stmtSpy.GetLastNLogs(getSampleQueryLoggingChannel(), newStmtLogCount-stmtLogCount), "\n"))
 				if newStmtLogCount > stmtLogCount {
 					sb.WriteString("\n")
 				}
 
 				newTxnLogCount := txnsSpy.Count()
-				sb.WriteString(strings.Join(txnsSpy.GetLastNLogs(getSampleQueryLoggingChannel(&s.ClusterSettings().SV), newTxnLogCount-txnLogCount), "\n"))
+				sb.WriteString(strings.Join(txnsSpy.GetLastNLogs(getSampleQueryLoggingChannel(), newTxnLogCount-txnLogCount), "\n"))
 				return sb.String()
 			case "reset-last-sampled":
 				telemetryLogging.resetLastSampledTime()
@@ -282,7 +288,7 @@ func TestTelemetryLoggingDecision(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	cs := cluster.MakeTestingClusterSettings()
-	st := logtestutils.StubTime{}
+	st := telemetrylogtestutils.StubTime{}
 	testingKnobs := NewTelemetryLoggingTestingKnobs(st.TimeNow, nil, nil)
 	telemetryLogging := newTelemetryLoggingMetrics(testingKnobs, cs)
 	ctx := context.Background()

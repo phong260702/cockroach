@@ -13,7 +13,6 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/clusterversion",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/closedts",
         "//pkg/kv/kvserver/closedts/ctpb",
@@ -64,6 +63,9 @@ go_test(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
         "@io_storj_drpc//:drpc",
+        "@io_storj_drpc//drpcconn",
+        "@io_storj_drpc//drpcmux",
+        "@io_storj_drpc//drpcserver",
         "@org_golang_google_grpc//:grpc",
     ],
 )

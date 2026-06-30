@@ -127,7 +127,7 @@ func doTestDrain(tt *testing.T, secondaryTenants bool) {
 	// Now expect the server to be shut down.
 	testutils.SucceedsSoon(t, func() error {
 		_, err := t.c.Drain(context.Background(), &serverpb.DrainRequest{Shutdown: false})
-		if grpcutil.IsClosedConnection(err) {
+		if err != nil && grpcutil.IsClosedConnection(err) { //nolint:returnerrcheck
 			return nil
 		}
 		// It is incorrect to use errors.Wrap since that will result in a nil
@@ -223,7 +223,6 @@ func newTestDrainContext(t *testing.T, drainSleepCallCount *int) *testDrainConte
 			// We need to start the cluster insecure in order to not
 			// care about TLS settings for the RPC client connection.
 			ServerArgs: base.TestServerArgs{
-				DefaultDRPCOption: base.TestDRPCDisabled,
 				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{

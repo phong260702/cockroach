@@ -7,16 +7,16 @@ package backfill
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/errors"
 )
 
@@ -52,7 +52,11 @@ var DistributedMergeIndexBackfillMode = settings.RegisterEnumSetting(
 	settings.ApplicationLevel,
 	"bulkio.index_backfill.distributed_merge.mode",
 	"controls when the distributed merge pipeline powers index backfills: disabled/off/false, legacy, declarative, or enabled/on/true",
-	"disabled",
+	metamorphic.ConstantWithTestChoice(
+		"bulkio.index_backfill.distributed_merge.mode",
+		"disabled", /* default value */
+		"enabled",  /* other value */
+	),
 	map[distributedMergeIndexBackfillMode]string{
 		distributedMergeModeDisabled:    "disabled",
 		distributedMergeModeEnabled:     "enabled",
@@ -66,40 +70,46 @@ var DistributedMergeIndexBackfillMode = settings.RegisterEnumSetting(
 	settings.WithRetiredName("bulkio.index_backfill.distributed_merge.enabled"),
 )
 
-// DistributedMergeIterations controls the number of merge iterations to perform
-// during index backfills using the distributed merge pipeline.
-var DistributedMergeIterations = settings.RegisterIntSetting(
-	settings.ApplicationLevel,
-	"bulkio.index_backfill.distributed_merge.iterations",
-	"number of merge iterations to perform during index backfills",
-	1,
-	settings.IntWithMinimum(1),
-)
-
-// shouldEnableDistributedMergeIndexBackfill determines whether the specified
-// backfill consumer should opt into the distributed merge pipeline based on the
-// current cluster setting and version state.
+// shouldEnableDistributedMergeIndexBackfill determines the distributed merge
+// mode for the specified backfill consumer based on the current cluster setting
+// and version state.
 func shouldEnableDistributedMergeIndexBackfill(
 	ctx context.Context, st *cluster.Settings, consumer DistributedMergeConsumer,
-) (bool, error) {
+) (jobspb.IndexBackfillDistributedMergeMode, error) {
 	mode := DistributedMergeIndexBackfillMode.Get(&st.SV)
-	var enable bool
+	var result jobspb.IndexBackfillDistributedMergeMode
 	switch mode {
 	case distributedMergeModeDisabled, distributedMergeModeAliasFalse, distributedMergeModeAliasOff:
-		enable = false
+		return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
 	case distributedMergeModeLegacy:
-		enable = consumer == DistributedMergeConsumerLegacy
+		if consumer != DistributedMergeConsumerLegacy {
+			return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
+		}
+		result = jobspb.IndexBackfillDistributedMergeMode_Enabled
 	case distributedMergeModeDeclarative:
-		enable = consumer == DistributedMergeConsumerDeclarative
+		if consumer != DistributedMergeConsumerDeclarative {
+			return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
+		}
+		// Explicit opt-in skips the sorted-data optimization.
+		result = jobspb.IndexBackfillDistributedMergeMode_Force
 	case distributedMergeModeEnabled, distributedMergeModeAliasTrue, distributedMergeModeAliasOn:
-		enable = true
+		// The legacy schema changer's distributed merge implementation is not
+		// functional, so only enable for the declarative schema changer.
+		if consumer != DistributedMergeConsumerDeclarative {
+			return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
+		}
+		result = jobspb.IndexBackfillDistributedMergeMode_Enabled
 	default:
-		return false, errors.AssertionFailedf("unrecognized distributed merge index backfill mode %d", mode)
+		return jobspb.IndexBackfillDistributedMergeMode_Disabled,
+			errors.AssertionFailedf("unrecognized distributed merge index backfill mode %d", mode)
 	}
-	if enable && !st.Version.IsActive(ctx, clusterversion.V26_1) {
-		return false, pgerror.New(pgcode.FeatureNotSupported, "distributed merge requires cluster version 26.1")
+	if !st.Version.IsActive(ctx, clusterversion.V26_1) {
+		// Distributed merge is not available before 26.1. Fall back to
+		// the legacy backfill path gracefully so that callers during
+		// bootstrap or rolling upgrades are not blocked.
+		return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
 	}
-	return enable, nil
+	return result, nil
 }
 
 // EnableDistributedMergeIndexBackfillSink updates the backfiller spec to use the
@@ -107,7 +117,7 @@ func shouldEnableDistributedMergeIndexBackfill(
 // processor constructs the full nodelocal URI using its own node ID at runtime.
 func EnableDistributedMergeIndexBackfillSink(jobID jobspb.JobID, spec *execinfrapb.BackfillerSpec) {
 	spec.UseDistributedMergeSink = true
-	spec.DistributedMergeFilePrefix = fmt.Sprintf("job/%d/map", jobID)
+	spec.DistributedMergeFilePrefix = bulkutil.NewDistMergePaths(jobID).MapPath()
 }
 
 // DetermineDistributedMergeMode evaluates the cluster setting to decide
@@ -119,61 +129,39 @@ func DetermineDistributedMergeMode(
 	if st == nil {
 		return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
 	}
-	useDistributedMerge, err := shouldEnableDistributedMergeIndexBackfill(ctx, st, consumer)
-	if err != nil {
-		return jobspb.IndexBackfillDistributedMergeMode_Disabled, err
-	}
-	if useDistributedMerge {
-		return jobspb.IndexBackfillDistributedMergeMode_Enabled, nil
-	}
-	return jobspb.IndexBackfillDistributedMergeMode_Disabled, nil
+	return shouldEnableDistributedMergeIndexBackfill(ctx, st, consumer)
 }
 
-// StatementAllowsDistributedMerge reports whether this statement may use the
-// distributed merge pipeline. This only checks statement-level eligibility. It
-// does not decide whether the statement actually runs an index backfill.
+// IsBackfillDataSorted reports whether the data produced by scanning
+// sourceIndex will be sorted in the key order of destIndex. When data
+// is sorted, SSTs from different PK ranges are non-overlapping in the
+// destination index key space, making distributed merge unnecessary.
 //
-// TODO(156934): everything is allowed except statements that create new unique
-// indexes. Unique index creation is blocked until the distributed merge path
-// supports enforcing uniqueness.
-func StatementAllowsDistributedMerge(stmt tree.Statement) bool {
-	switch s := stmt.(type) {
-	case *tree.CreateIndex:
-		if s.Unique {
+// The check compares leading key columns of both indexes. If every
+// overlapping column (up to the shorter index's key column count)
+// shares the same column ID, the data is considered sorted. Direction
+// is intentionally ignored: matching column IDs means the data is
+// ordered in the destination key space regardless of sort direction.
+//
+// Non-forward indexes always return false because their key encoding
+// expands each row into multiple entries.
+func IsBackfillDataSorted(sourceIndex, destIndex catalog.Index) bool {
+	if destIndex.GetType() != idxtype.FORWARD {
+		return false
+	}
+	srcCols := sourceIndex.NumKeyColumns()
+	dstCols := destIndex.NumKeyColumns()
+	if srcCols == 0 || dstCols == 0 {
+		return false
+	}
+	n := srcCols
+	if dstCols < n {
+		n = dstCols
+	}
+	for i := 0; i < n; i++ {
+		if sourceIndex.GetKeyColumnID(i) != destIndex.GetKeyColumnID(i) {
 			return false
-		}
-	case *tree.AlterTable:
-		for _, cmd := range s.Cmds {
-			if alterTableCmdIntroducesUniqueness(cmd) {
-				return false
-			}
 		}
 	}
 	return true
-}
-
-// alterTableCmdIntroducesUniqueness reports whether this command adds a new
-// uniqueness requirement.
-func alterTableCmdIntroducesUniqueness(cmd tree.AlterTableCmd) bool {
-	switch c := cmd.(type) {
-	case *tree.AlterTableAddColumn:
-		col := c.ColumnDef
-		if col == nil {
-			return false
-		}
-		if col.PrimaryKey.IsPrimaryKey {
-			return true
-		}
-		if col.Unique.IsUnique && !col.Unique.WithoutIndex {
-			return true
-		}
-	case *tree.AlterTableAddConstraint:
-		if u, ok := c.ConstraintDef.(*tree.UniqueConstraintTableDef); ok {
-			return !u.WithoutIndex
-		}
-	case *tree.AlterTableAlterPrimaryKey:
-		// Primary keys are unique and always backed by an index.
-		return true
-	}
-	return false
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
@@ -215,6 +216,16 @@ func validateZipFile(zipFilePath string, zr *zipReporter) error {
 func runDebugZip(cmd *cobra.Command, args []string) (retErr error) {
 	if err := zipCtx.files.validate(); err != nil {
 		return err
+	}
+
+	// Validate excluded log severities.
+	for _, name := range zipCtx.excludeLogSeverities {
+		if _, ok := logpb.SeverityByName(name); !ok {
+			return errors.Newf(
+				"unknown log severity %q; valid values are INFO, WARNING, ERROR, FATAL",
+				name,
+			)
+		}
 	}
 
 	timeout := 60 * time.Second
@@ -559,8 +570,7 @@ func (zc *debugZipContext) dumpTableDataForZip(
 	ctx := context.Background()
 	fileName := sanitizeFilename(table)
 	baseName := path.Join(base, fileName)
-	fileNameWithExtension := fileName + "." + zc.clusterPrinter.sqlOutputFilenameExtension
-	if !zipCtx.files.shouldIncludeFile(fileNameWithExtension) {
+	if !zipCtx.files.shouldIncludeFile(baseName + "." + zc.clusterPrinter.sqlOutputFilenameExtension) {
 		zr.info("skipping table data for %s due to file filters", table)
 		return nil
 	}

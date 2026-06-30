@@ -15,6 +15,7 @@ import (
 	"os/user"
 	"regexp"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -52,6 +53,11 @@ const (
 	// Note: This error masks the actual roachtest status i.e. this error can
 	// occur with any of the other exit codes.
 	ExitCodeGithubPostFailed = 12
+
+	// ExitCodeStorageInvariantViolation is the exit code indicating that a
+	// storage invariant violation (e.g., raft log corruption, Pebble checksum
+	// mismatch) was detected during a roachtest run.
+	ExitCodeStorageInvariantViolation = 13
 
 	// runnerLogsDir is the dir under the artifacts root where the test runner log
 	// and other runner-related logs (i.e. cluster creation logs) will be written.
@@ -125,6 +131,20 @@ Examples:
 			specs, hint := filter.FilterWithHint(r.AllTests())
 			if len(specs) == 0 {
 				return errors.Newf("%s", filter.NoMatchesHintString(hint))
+			}
+
+			if roachtestflags.ListDetails {
+				tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(tw, "NAME\tOWNER\tTIMEOUT\tRANDOMIZED\tSKIP-POST-VALIDATIONS\tSKIP")
+				for _, s := range specs {
+					timeout := "-"
+					if s.Timeout != 0 {
+						timeout = s.Timeout.String()
+					}
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%t\t%s\t%s\n",
+						s.Name, s.Owner, timeout, s.Randomized, s.SkipPostValidations, s.Skip)
+				}
+				return tw.Flush()
 			}
 
 			for _, s := range specs {
@@ -225,7 +245,7 @@ Check --parallelism, --run-forever and --wait-before-next-execution flags`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nRunning operation %s on %s.\n\n", args[1], args[0])
 			cmd.SilenceUsage = true
-			return runOperations(operations.RegisterOperations, args[1], args[0])
+			return runOperations(operations.RegisterOperations, args[1], roachtestflags.SkipOperations, args[0])
 		},
 	}
 	roachtestflags.AddRunOpsFlags(runOperationCmd.Flags())
@@ -246,12 +266,21 @@ Example:
 
    roachtest list-operations
    roachtest list-operations node-kill/.*m$
+   roachtest list-operations --skip disk-stall
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r := makeTestRegistry()
 			operations.RegisterOperations(&r)
 
-			ops := r.FilteredOperations(registry.MergeRegEx(args))
+			var skipRegex *regexp.Regexp
+			if roachtestflags.SkipOperations != "" {
+				var err error
+				skipRegex, err = regexp.Compile(roachtestflags.SkipOperations)
+				if err != nil {
+					return err
+				}
+			}
+			ops := r.FilteredOperations(registry.MergeRegEx(args), skipRegex, roachtestflags.Cloud)
 			for _, op := range ops {
 				fmt.Printf("%s\n", op.Name)
 			}
@@ -259,6 +288,7 @@ Example:
 			return nil
 		},
 	}
+	roachtestflags.AddRunOpsFlags(listOperationCmd.Flags())
 	rootCmd.AddCommand(listOperationCmd)
 
 	var err error
@@ -277,7 +307,9 @@ Example:
 
 	if err := rootCmd.Execute(); err != nil {
 		code := 1
-		if errors.Is(err, errGithubPostFailed) {
+		if errors.Is(err, errStorageInvariantViolation) {
+			code = ExitCodeStorageInvariantViolation
+		} else if errors.Is(err, errGithubPostFailed) {
 			code = ExitCodeGithubPostFailed
 		} else if errors.Is(err, errSomeClusterProvisioningFailed) {
 			code = ExitCodeClusterProvisioningFailed
@@ -382,7 +414,37 @@ func updateSpecForSelectiveTests(
 	allTests, err := testselector.CategoriseTests(ctx,
 		testselector.NewDefaultSelectTestsReq(roachtestflags.Cloud, roachtestflags.Suite))
 	if err != nil {
-		logFunc("running all tests! error selecting tests: %v\n", err)
+		// Snowflake is unavailable. Instead of running all tests (which risks
+		// timeouts), randomly select a subset using the same percentage that the
+		// selector would use for stable tests. This keeps the run size in the
+		// same ballpark as a normal selective run. Already-skipped tests are
+		// left untouched and don't count toward the selection budget.
+		fallbackPct := roachtestflags.SuccessfulTestsSelectPct
+		logFunc("error selecting tests: %v\n", err)
+		rand.Shuffle(len(specs), func(i, j int) {
+			specs[i], specs[j] = specs[j], specs[i]
+		})
+		eligible := 0
+		for i := range specs {
+			if specs[i].Skip != "" {
+				continue
+			}
+			eligible++
+		}
+		fallbackCount := int(math.Ceil(float64(eligible) * fallbackPct))
+		selected := 0
+		for i := range specs {
+			if specs[i].Skip != "" {
+				continue
+			}
+			selected++
+			if selected > fallbackCount {
+				specs[i].Skip = "test selector"
+				specs[i].SkipDetails = "test skipped: selector unavailable, random fallback"
+			}
+		}
+		logFunc("falling back to random selection: %d out of %d eligible tests (%.0f%%)\n",
+			fallbackCount, eligible, fallbackPct*100)
 		return
 	}
 
@@ -455,12 +517,19 @@ func testShouldBeSkipped(
 	return td != nil && !td.Selected
 }
 
-func opsToRun(r testRegistryImpl, filter string) ([]registry.OperationSpec, error) {
+func opsToRun(r testRegistryImpl, filter string, skip string) ([]registry.OperationSpec, error) {
 	regex, err := regexp.Compile(filter)
 	if err != nil {
 		return nil, err
 	}
-	filteredOps := r.FilteredOperations(regex)
+	var skipRegex *regexp.Regexp
+	if skip != "" {
+		skipRegex, err = regexp.Compile(skip)
+		if err != nil {
+			return nil, err
+		}
+	}
+	filteredOps := r.FilteredOperations(regex, skipRegex, roachtestflags.Cloud)
 	if len(filteredOps) == 0 {
 		return nil, errors.New("no matching operations to run")
 	}

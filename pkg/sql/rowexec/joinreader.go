@@ -9,6 +9,7 @@ import (
 	"context"
 	"math"
 	"sort"
+	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -595,6 +596,8 @@ func newJoinReader(
 			&jr.streamerInfo.txnKVStreamerMemAcc,
 			spec.FetchSpec.External,
 			row.FetchSpecRequiresRawMVCCValues(spec.FetchSpec),
+			flowCtx.EvalCtx.WorkloadID,
+			flowCtx.EvalCtx.WorkloadType,
 		)
 	} else {
 		// When not using the Streamer API, we want to limit the batch size hint
@@ -624,6 +627,7 @@ func newJoinReader(
 			TraceKV:                    flowCtx.TraceKV,
 			ForceProductionKVBatchSize: flowCtx.EvalCtx.TestingKnobs.ForceProductionValues,
 			SpansCanOverlap:            jr.spansCanOverlap,
+			WorkloadID:                 flowCtx.EvalCtx.WorkloadID,
 		},
 	); err != nil {
 		return nil, err
@@ -1318,7 +1322,7 @@ func (jr *joinReader) execStatsForTrace() *execinfrapb.ComponentStats {
 			LockWaitTime:        optional.MakeTimeValue(jr.contentionEventsListener.GetLockWaitTime()),
 			LatchWaitTime:       optional.MakeTimeValue(jr.contentionEventsListener.GetLatchWaitTime()),
 			BatchRequestsIssued: optional.MakeUint(uint64(jr.fetcher.GetBatchRequestsIssued())),
-			KVCPUTime:           optional.MakeTimeValue(fis.kvCPUTime),
+			LocalKVCPUTime:      optional.MakeTimeValue(time.Duration(jr.fetcher.GetLocalKVCPUTime())),
 			UsedStreamer:        jr.usesStreamer,
 		},
 		Output: jr.OutputHelper.Stats(),
@@ -1351,6 +1355,7 @@ func (jr *joinReader) generateMeta() []execinfrapb.ProducerMetadata {
 	meta.Metrics.RowsRead = jr.rowsRead
 	meta.Metrics.BytesRead = jr.fetcher.GetBytesRead()
 	meta.Metrics.KVCPUTime = jr.fetcher.GetKVCPUTime()
+	meta.Metrics.LocalKVCPUTime = jr.fetcher.GetLocalKVCPUTime()
 	if tfs := execinfra.GetLeafTxnFinalState(jr.Ctx(), jr.txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}

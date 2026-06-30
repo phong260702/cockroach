@@ -8,10 +8,16 @@ package bulkmerge
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/blobs"
+	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/bulksst"
@@ -24,7 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/taskset"
 	"github.com/cockroachdb/errors"
@@ -35,17 +43,27 @@ var (
 	_ execinfra.RowSource = &bulkMergeProcessor{}
 )
 
-// So long as bulkingest is using AddSSTable(), we need to ensure that
-// merged SSTables can be applied within raft's 64MB limit, including
-// RPC overhead.
-var (
-	targetFileSize = settings.RegisterByteSizeSetting(
-		settings.ApplicationLevel,
-		"bulkio.merge.file_size",
-		"target size for individual data files produced during merge phase",
-		60<<20,
-		settings.WithPublic)
+// rpcInflightFraction is the estimated fraction of remote SST files that are
+// actively streaming at any time during a merge. This is used to reserve memory
+// for the RPC transport buffers that accumulate in-flight chunks.
+var rpcInflightFraction = settings.RegisterFloatSetting(
+	settings.ApplicationLevel,
+	"bulkio.merge.rpc_inflight_fraction",
+	"estimated fraction of remote SST files that are actively streaming "+
+		"during a merge; used to reserve memory for RPC transport buffers",
+	0.50,
+	settings.FloatInRange(0.0, 1.0),
 )
+
+// targetFileSize controls the target SST size for non-final merge iterations
+// (local merges). Larger files reduce the number of SSTs that the final
+// iteration must process, improving efficiency.
+var targetFileSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
+	"bulkio.merge.file_size",
+	"target size for individual data files produced during local only merge phases",
+	1<<30, // 1GB
+	settings.WithPublic)
 
 // Output row format for the bulk merge processor. The third column contains
 // a marshaled BulkMergeSpec_Output protobuf with the list of output SSTs.
@@ -70,6 +88,19 @@ type bulkMergeProcessor struct {
 	flowCtx    *execinfra.FlowCtx
 	storageMux *bulkutil.ExternalStorageMux
 	iter       storage.SimpleMVCCIterator
+	// usingSuffixedIter tracks whether the iterator has suffixed keys.
+	// This is set during iterator creation in Start() and used by
+	// processMergedData to decide whether to strip suffixes and check
+	// for cross-SST duplicates.
+	usingSuffixedIter bool
+	// rpcMemAcct reserves memory for estimated in-flight RPC transport
+	// buffers when streaming remote SST files.
+	rpcMemAcct mon.BoundAccount
+	// kvIngestSummary accumulates the BulkOpSummary from the SSTBatcher
+	// during the final merge iteration. This tracks the actual number of
+	// rows ingested into KV (excluding skipped duplicates) and is emitted
+	// as metadata when the processor finishes draining.
+	kvIngestSummary kvpb.BulkOpSummary
 }
 
 type mergeProcessorInput struct {
@@ -136,6 +167,17 @@ func (m *bulkMergeProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMe
 		switch {
 		case row == nil && meta == nil:
 			m.MoveToDraining(nil /* err */)
+			// All input consumed. If this was the final iteration, emit
+			// the accumulated KV ingest summary as metadata so the caller
+			// can use the actual ingested row count rather than the
+			// map-phase count (which includes skipped duplicates).
+			if m.isFinalIteration() {
+				return nil, &execinfrapb.ProducerMetadata{
+					BulkProcessorProgress: &execinfrapb.RemoteProducerMetadata_BulkProcessorProgress{
+						BulkSummary: m.kvIngestSummary,
+					},
+				}
+			}
 		case meta != nil && meta.Err != nil:
 			m.MoveToDraining(meta.Err)
 		case meta != nil:
@@ -155,6 +197,10 @@ func (m *bulkMergeProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMe
 	return nil, m.DrainHelper()
 }
 
+func (m *bulkMergeProcessor) isFinalIteration() bool {
+	return m.spec.Iteration == m.spec.MaxIterations
+}
+
 func (m *bulkMergeProcessor) handleRow(row rowenc.EncDatumRow) (rowenc.EncDatumRow, error) {
 	input, err := parseMergeProcessorInput(row, m.input.OutputTypes())
 	if err != nil {
@@ -163,7 +209,7 @@ func (m *bulkMergeProcessor) handleRow(row rowenc.EncDatumRow) (rowenc.EncDatumR
 
 	if knobs, ok := m.flowCtx.Cfg.TestingKnobs.BulkMergeTestingKnobs.(*TestingKnobs); ok {
 		if knobs.RunBeforeMergeTask != nil {
-			if err := knobs.RunBeforeMergeTask(m.Ctx(), m.flowCtx.ID, input.taskID); err != nil {
+			if err := knobs.RunBeforeMergeTask(m.Ctx(), m.flowCtx, input.taskID, m.spec); err != nil {
 				return nil, err
 			}
 		}
@@ -191,18 +237,99 @@ func (m *bulkMergeProcessor) Start(ctx context.Context) {
 	ctx = m.StartInternal(ctx, "bulkMergeProcessor")
 	m.input.Start(ctx)
 
+	// Non-final iterations only merge local SSTs to reduce cross-node traffic.
+	// This creates larger merged files locally before the final cross-node merge.
 	var err error
-	m.iter, err = m.createIter(ctx)
+	if !m.isFinalIteration() {
+		localInstanceID := m.flowCtx.NodeID.SQLInstanceID()
+		log.Dev.Infof(ctx, "local iteration %d: filtering to local SSTs from instance %d",
+			m.spec.Iteration, localInstanceID)
+		m.iter, err = m.createIterLocalOnly(ctx, localInstanceID)
+	} else {
+		if err := m.reserveRPCMemory(ctx); err != nil {
+			m.MoveToDraining(err)
+			return
+		}
+		log.Dev.Infof(ctx, "final iteration %d: opening iterator for %d SSTs",
+			m.spec.Iteration, len(m.spec.SSTs))
+		m.iter, err = m.createIter(ctx)
+	}
 	if err != nil {
 		m.MoveToDraining(err)
 		return
 	}
 }
 
+// reserveRPCMemory estimates the memory used by in-flight RPC transport
+// buffers for remote SST streams and reserves it from the memory monitor.
+// Each remote stream can buffer up to window * ChunkSize bytes in gRPC;
+// we estimate the number of concurrently active streams using the
+// rpcInflightFraction setting.
+func (m *bulkMergeProcessor) reserveRPCMemory(ctx context.Context) error {
+	sv := &m.flowCtx.EvalCtx.Settings.SV
+	window := blobs.FlowControlWindow.Get(sv)
+	if window == 0 {
+		// Flow control is disabled, so per-stream buffering is unbounded and
+		// we cannot produce a reliable memory reservation. Enable flow control
+		// (bulkio.blob.flow_control_window > 0) to make per-stream memory
+		// deterministic and accountable.
+		return nil
+	}
+
+	localInstanceID := m.flowCtx.NodeID.SQLInstanceID()
+	var remoteFiles int
+	for _, sst := range m.spec.SSTs {
+		sourceID, err := nodelocal.ParseInstanceID(sst.URI)
+		if err != nil {
+			return err
+		}
+		if sourceID != localInstanceID {
+			remoteFiles++
+		}
+	}
+	if remoteFiles == 0 {
+		return nil
+	}
+
+	fraction := rpcInflightFraction.Get(sv)
+	inflight := int64(math.Ceil(float64(remoteFiles) * fraction))
+	rpcMemory := inflight * window * int64(blobs.ChunkSize)
+
+	memMon := resolveMemoryMonitor(m.flowCtx, m.spec.MemoryMonitor)
+	m.rpcMemAcct = memMon.MakeBoundAccount()
+	if err := m.rpcMemAcct.Grow(ctx, rpcMemory); err != nil {
+		fileSz := targetFileSize.Get(sv)
+		detail := fmt.Sprintf(
+			"Memory for distributed merge could not be reserved. "+
+				"Consider: (1) increasing --max-sql-memory, "+
+				"(2) reducing bulkio.merge.rpc_inflight_fraction (currently %.2f), "+
+				"(3) reducing bulkio.blob.flow_control_window (currently %d, "+
+				"each stream buffers %s), or "+
+				"(4) increasing bulkio.merge.file_size (currently %s) to reduce "+
+				"the number of remote files.",
+			fraction, window, humanizeutil.IBytes(window*int64(blobs.ChunkSize)),
+			humanizeutil.IBytes(fileSz))
+		// Note: since this error is consumed by the jobs framework, adding the
+		// extra detail as a hint gets lost. Include the extra detail in the main
+		// error message to account for this.
+		return errors.Wrapf(err,
+			"reserving %s for RPC transport buffers (%d remote files, %d estimated inflight); %s",
+			humanizeutil.IBytes(rpcMemory), remoteFiles, inflight, detail)
+	}
+	log.Dev.Infof(ctx,
+		"reserved %d bytes for RPC transport buffers (%d remote files, %d estimated inflight)",
+		rpcMemory, remoteFiles, inflight)
+	if metrics := m.flowCtx.Cfg.BulkMergeMetrics; metrics != nil {
+		metrics.RPCMemoryReservedBytes.RecordValue(rpcMemory)
+	}
+	return nil
+}
+
 func (m *bulkMergeProcessor) Close(ctx context.Context) {
 	if m.iter != nil {
 		m.iter.Close()
 	}
+	m.rpcMemAcct.Close(ctx)
 	err := m.storageMux.Close()
 	if err != nil {
 		log.Dev.Errorf(ctx, "failed to close external storage mux: %v", err)
@@ -219,6 +346,7 @@ func (m *bulkMergeProcessor) mergeSSTs(
 	}
 
 	mergeSpan := m.spec.Spans[taskID]
+	log.Dev.Infof(ctx, "merge processor starting task %d with span %s", taskID, mergeSpan)
 
 	// Seek the iterator if it's not positioned within the current task's span.
 	// The spans are disjoint, so the only way the iterator would be contained
@@ -227,7 +355,7 @@ func (m *bulkMergeProcessor) mergeSSTs(
 		m.iter.SeekGE(storage.MVCCKey{Key: mergeSpan.Key})
 	}
 
-	if m.spec.Iteration == m.spec.MaxIterations {
+	if m.isFinalIteration() {
 		return m.ingestFinalIteration(ctx, m.iter, mergeSpan)
 	}
 
@@ -238,7 +366,7 @@ func (m *bulkMergeProcessor) mergeSSTs(
 	}
 	defer destStore.Close()
 	destFileAllocator := bulksst.NewExternalFileAllocator(destStore, m.spec.OutputStorage.URI,
-		m.flowCtx.Cfg.DB.KV().Clock())
+		m.flowCtx.Cfg.DB.KV().Clock(), m.flowCtx.NodeID.SQLInstanceID())
 
 	writer, err := newExternalStorageWriter(
 		ctx,
@@ -251,16 +379,35 @@ func (m *bulkMergeProcessor) mergeSSTs(
 	}
 	defer writer.Close(ctx)
 
-	return processMergedData(ctx, m.iter, mergeSpan, writer)
+	return m.processMergedData(ctx, m.iter, mergeSpan, writer)
 }
 
-// processMergedData is a unified function for iterating over merged data and
-// writing it using a mergeWriter implementation. The iterator must already be
-// positioned at or before the start of mergeSpan.
-func processMergedData(
+// processMergedData iterates over merged data and writes it using the provided
+// mergeWriter. The iterator must already be positioned at or before the start
+// of mergeSpan.
+//
+// When EnforceUniqueness is true, this function detects duplicate keys by
+// comparing consecutive base keys and returns DuplicateKeyError if found. For
+// suffixed iterators (multiple SSTs), suffixes are stripped before comparison;
+// for non-suffixed iterators, keys are compared directly.
+func (m *bulkMergeProcessor) processMergedData(
 	ctx context.Context, iter storage.SimpleMVCCIterator, mergeSpan roachpb.Span, writer mergeWriter,
 ) (execinfrapb.BulkMergeSpec_Output, error) {
+	knobs, _ := m.flowCtx.Cfg.TestingKnobs.BulkMergeTestingKnobs.(*TestingKnobs)
 	var endKey roachpb.Key
+	duplicateInjected := false
+
+	// When enforcing uniqueness with multiple SSTs, keys are suffixed to prevent
+	// shadowing. Track previous base key and value for duplicate detection.
+	var prevBaseKeyBuf []byte
+	var prevValBuf []byte
+	var baseKey roachpb.Key
+	var keyToWrite storage.MVCCKey
+	// injectedVal holds a value from the InjectDuplicateKey testing hook.
+	// When non-nil, it replaces the iterator value for the replayed key so
+	// the duplicate carries the test-specified value.
+	var injectedVal []byte
+
 	for {
 		ok, err := iter.Valid()
 		if err != nil {
@@ -271,26 +418,43 @@ func processMergedData(
 		}
 
 		key := iter.UnsafeKey()
-		if mergeSpan.EndKey.Compare(key.Key) <= 0 {
-			// We've reached the end of the span.
-			break
-		}
-
 		val, err := iter.UnsafeValue()
 		if err != nil {
 			return execinfrapb.BulkMergeSpec_Output{}, err
 		}
+		if injectedVal != nil {
+			val = injectedVal
+			injectedVal = nil
+		}
+
+		// Extract base key and check for duplicates when using suffixed iterators.
+		var skip bool
+		baseKey, keyToWrite, prevBaseKeyBuf, prevValBuf, skip, err =
+			m.extractKeyAndCheckDuplicate(key, val, prevBaseKeyBuf, prevValBuf)
+		if err != nil {
+			return execinfrapb.BulkMergeSpec_Output{}, err
+		}
+		if skip {
+			iter.NextKey()
+			continue
+		}
+
+		// Check span boundary using the base key (without suffix).
+		if mergeSpan.EndKey.Compare(baseKey) <= 0 {
+			// We've reached the end of the span.
+			break
+		}
 
 		// If we've selected an endKey and this key is at or beyond that point,
 		// complete the current output unit before adding this key.
-		if endKey != nil && key.Key.Compare(endKey) >= 0 {
+		if endKey != nil && baseKey.Compare(endKey) >= 0 {
 			if _, err := writer.Complete(ctx, endKey); err != nil {
 				return execinfrapb.BulkMergeSpec_Output{}, err
 			}
 			endKey = nil
 		}
 
-		shouldSplit, err := writer.Add(ctx, key, val)
+		shouldSplit, err := writer.Add(ctx, keyToWrite, val)
 		if err != nil {
 			return execinfrapb.BulkMergeSpec_Output{}, err
 		}
@@ -298,17 +462,79 @@ func processMergedData(
 		// If the writer wants to split and we haven't selected an endKey yet,
 		// pick a safe split point after the current key.
 		if shouldSplit && endKey == nil {
-			safeKey, err := keys.EnsureSafeSplitKey(key.Key)
+			safeKey, err := keys.EnsureSafeSplitKey(baseKey)
 			if err != nil {
 				return execinfrapb.BulkMergeSpec_Output{}, err
 			}
 			endKey = safeKey.PrefixEnd()
 		}
 
+		// Testing hook: if duplicate requested and not already injected for this
+		// key, skip advancing the iterator so the key is processed again with
+		// the hook-provided value.
+		if !duplicateInjected && knobs != nil && knobs.InjectDuplicateKey != nil {
+			if v := knobs.InjectDuplicateKey(m.spec.Iteration, m.spec.MaxIterations); v != nil {
+				duplicateInjected = true
+				injectedVal = v
+				continue
+			}
+		}
+
 		iter.NextKey()
+		duplicateInjected = false
 	}
 
 	return writer.Finish(ctx, mergeSpan.EndKey)
+}
+
+// extractKeyAndCheckDuplicate extracts the base key from a potentially
+// suffixed key and checks for duplicates when enforcing uniqueness.
+//
+// When a duplicate base key is found, the value is compared with the previous
+// entry. Identical duplicates (same key and value) are benign — they arise
+// from checkpoint-and-resume overlap where some input rows are re-processed,
+// producing SSTs that partially overlap with previously checkpointed SSTs.
+// These are signaled by returning skip=true so the caller can advance past
+// them. A true uniqueness violation (same key, different value) returns a
+// DuplicateKeyError.
+func (m *bulkMergeProcessor) extractKeyAndCheckDuplicate(
+	key storage.MVCCKey, val []byte, prevBaseKeyBuf []byte, prevValBuf []byte,
+) (roachpb.Key, storage.MVCCKey, []byte, []byte, bool, error) {
+	if !m.spec.EnforceUniqueness {
+		return key.Key, key, prevBaseKeyBuf, prevValBuf, false, nil
+	}
+
+	var baseKey roachpb.Key
+	var keyToWrite storage.MVCCKey
+
+	if m.usingSuffixedIter {
+		// Remove suffix to get base key.
+		var err error
+		baseKey, err = removeKeySuffix(key.Key)
+		if err != nil {
+			return nil, storage.MVCCKey{}, prevBaseKeyBuf, prevValBuf, false, err
+		}
+		keyToWrite = storage.MVCCKey{Key: baseKey, Timestamp: key.Timestamp}
+	} else {
+		baseKey = key.Key
+		keyToWrite = key
+	}
+
+	// Check for duplicates.
+	if len(prevBaseKeyBuf) > 0 && baseKey.Equal(prevBaseKeyBuf) {
+		if bytes.Equal(val, prevValBuf) {
+			// Identical duplicate from checkpoint-and-resume overlap. The same
+			// input row was processed in both the previous and current run,
+			// producing identical KVs in separate SSTs. Safe to skip.
+			return nil, storage.MVCCKey{}, prevBaseKeyBuf, prevValBuf, true, nil
+		}
+		return nil, storage.MVCCKey{}, prevBaseKeyBuf, prevValBuf, false,
+			kvserverbase.NewDuplicateKeyError(baseKey, val)
+	}
+
+	prevBaseKeyBuf = append(prevBaseKeyBuf[:0], baseKey...)
+	prevValBuf = append(prevValBuf[:0], val...)
+	return baseKey, keyToWrite, prevBaseKeyBuf, prevValBuf, false, nil
 }
 
 func (m *bulkMergeProcessor) ingestFinalIteration(
@@ -319,6 +545,15 @@ func (m *bulkMergeProcessor) ingestFinalIteration(
 		writeTS = m.flowCtx.Cfg.DB.KV().Clock().Now()
 	}
 
+	// For unique indexes, enable duplicate detection by setting
+	// disallowShadowingBelow to the write timestamp. This catches conflicts
+	// with pre-existing KV data. Cross-SST duplicates within the same merge
+	// are detected earlier in processMergedData using suffixed iterators.
+	disallowShadowingBelow := hlc.Timestamp{}
+	if m.spec.EnforceUniqueness {
+		disallowShadowingBelow = writeTS
+	}
+
 	// Use SSTBatcher directly instead of BufferingAdder since the data is
 	// already sorted from the merge iterator. This avoids the unnecessary
 	// sorting overhead in BufferingAdder.
@@ -327,10 +562,10 @@ func (m *bulkMergeProcessor) ingestFinalIteration(
 		"bulk-merge-final",
 		m.flowCtx.Cfg.DB.KV(),
 		m.flowCtx.EvalCtx.Settings,
-		hlc.Timestamp{}, // disallowShadowingBelow
-		false,           // writeAtBatchTs
-		false,           // scatterSplitRanges
-		m.flowCtx.Cfg.BackupMonitor.MakeConcurrentBoundAccount(),
+		disallowShadowingBelow,
+		false, // writeAtBatchTs
+		true,  // scatterSplitRanges
+		resolveMemoryMonitor(m.flowCtx, m.spec.MemoryMonitor).MakeConcurrentBoundAccount(),
 		m.flowCtx.Cfg.BulkSenderLimiter,
 		nil, // range cache
 	)
@@ -340,14 +575,31 @@ func (m *bulkMergeProcessor) ingestFinalIteration(
 
 	writer := newKVStorageWriter(batcher, writeTS)
 	defer writer.Close(ctx)
-	return processMergedData(ctx, iter, mergeSpan, writer)
+	output, err := m.processMergedData(ctx, iter, mergeSpan, writer)
+	if err != nil {
+		return output, err
+	}
+	m.kvIngestSummary.Add(batcher.GetSummary())
+	return output, nil
 }
 
-// createIter builds an iterator over all input SSTs. Actual access to the SSTs
-// is deferred until the iterator seeks to one based on the merge span used for
-// a given task ID.
+// resolveMemoryMonitor returns the BytesMonitor indicated by the given
+// MemoryMonitor enum.
+func resolveMemoryMonitor(
+	flowCtx *execinfra.FlowCtx, m execinfrapb.BulkMergeSpec_MemoryMonitor,
+) *mon.BytesMonitor {
+	switch m {
+	case execinfrapb.BulkMergeSpec_BACKFILL_MONITOR:
+		return flowCtx.Cfg.BackfillerMonitor
+	default: // execinfrapb.BulkMergeSpec_BULK_MONITOR
+		return flowCtx.Cfg.BulkMonitor
+	}
+}
+
+// createIter builds an iterator over all input SSTs. When EnforceUniqueness
+// is true with multiple SSTs, individual iterators are wrapped with suffixes
+// and merged using a custom iterator to ensure duplicate keys are surfaced.
 func (m *bulkMergeProcessor) createIter(ctx context.Context) (storage.SimpleMVCCIterator, error) {
-	// If there are no SSTs, there's nothing to merge.
 	if len(m.spec.SSTs) == 0 {
 		return nil, nil
 	}
@@ -355,10 +607,27 @@ func (m *bulkMergeProcessor) createIter(ctx context.Context) (storage.SimpleMVCC
 		return nil, errors.AssertionFailedf("no spans specified for merge processor")
 	}
 
-	var storeFiles []storageccl.StoreFile
+	iterOpts := storage.IterOptions{
+		KeyTypes: storage.IterKeyTypePointsAndRanges,
+		// Bounds are required by iterator validation. Use full span range.
+		LowerBound: m.spec.Spans[0].Key,
+		UpperBound: m.spec.Spans[len(m.spec.Spans)-1].EndKey,
+	}
 
-	// Create store files for all SSTs. We access the ones needed for each task
-	// in mergeSSTs.
+	// Use suffixed iterators for cross-SST duplicate detection.
+	if m.spec.EnforceUniqueness && len(m.spec.SSTs) > 1 {
+		return m.createSuffixedIter(ctx, m.spec.SSTs, iterOpts)
+	}
+
+	// Standard merged iterator for non-unique indexes or single SST.
+	return m.createStandardIter(ctx, iterOpts)
+}
+
+// createStandardIter creates a standard merged iterator over all SSTs.
+func (m *bulkMergeProcessor) createStandardIter(
+	ctx context.Context, iterOpts storage.IterOptions,
+) (storage.SimpleMVCCIterator, error) {
+	var storeFiles []storage.StoreFile
 	for _, sst := range m.spec.SSTs {
 		file, err := m.storageMux.StoreFile(ctx, sst.URI)
 		if err != nil {
@@ -366,21 +635,104 @@ func (m *bulkMergeProcessor) createIter(ctx context.Context) (storage.SimpleMVCC
 		}
 		storeFiles = append(storeFiles, file)
 	}
+	return storage.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
+}
+
+// createSuffixedIter creates individual iterators for each SST, wraps them
+// with suffixing iterators, and merges them using a custom iterator to ensure
+// duplicate keys are surfaced. This is used when EnforceUniqueness is true.
+func (m *bulkMergeProcessor) createSuffixedIter(
+	ctx context.Context, ssts []execinfrapb.BulkMergeSpec_SST, iterOpts storage.IterOptions,
+) (storage.SimpleMVCCIterator, error) {
+	var iters []storage.SimpleMVCCIterator
+
+	// Cleanup any opened iterators on error.
+	cleanup := func() {
+		for _, it := range iters {
+			it.Close()
+		}
+	}
+
+	for _, sstSpec := range ssts {
+		file, err := m.storageMux.StoreFile(ctx, sstSpec.URI)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+
+		// Create iterator for single SST.
+		baseIter, err := storage.ExternalSSTReader(
+			ctx, []storage.StoreFile{file}, nil, iterOpts,
+		)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+
+		// Wrap with suffix adder using SST URI (globally unique).
+		iters = append(iters, newSuffixingIterator(baseIter, sstSpec.URI))
+	}
+
+	m.usingSuffixedIter = true
+
+	// Merge all suffixed iterators using our custom merging iterator
+	// that surfaces all keys (including duplicates).
+	return newMergingIterator(iters, iterOpts), nil
+}
+
+// createIterLocalOnly builds an iterator over only the SSTs from the specified
+// local instance. This is used for non-final iterations. When
+// EnforceUniqueness is true and multiple local SSTs are present, a suffixed
+// iterator is used so cross-SST duplicate detection works correctly.
+func (m *bulkMergeProcessor) createIterLocalOnly(
+	ctx context.Context, localInstanceID base.SQLInstanceID,
+) (storage.SimpleMVCCIterator, error) {
+	if len(m.spec.SSTs) == 0 {
+		return nil, nil
+	}
+	if len(m.spec.Spans) == 0 {
+		return nil, errors.AssertionFailedf("no spans specified for merge processor")
+	}
+
+	var localSSTs []execinfrapb.BulkMergeSpec_SST
+	for _, sst := range m.spec.SSTs {
+		sourceID, err := nodelocal.ParseInstanceID(sst.URI)
+		if err != nil {
+			return nil, err
+		}
+		if sourceID != localInstanceID {
+			continue
+		}
+		localSSTs = append(localSSTs, sst)
+	}
+
+	log.Dev.Infof(ctx, "local-only iterator: selected %d/%d SSTs from instance %d",
+		len(localSSTs), len(m.spec.SSTs), localInstanceID)
+
+	if len(localSSTs) == 0 {
+		return nil, nil
+	}
 
 	iterOpts := storage.IterOptions{
-		KeyTypes: storage.IterKeyTypePointsAndRanges,
-		// We don't really need bounds here because the merge iterator covers the
-		// entire input data set, but the iterator has validation ensuring they
-		// are set. These bounds work because the spans are non-overlapping and
-		// sorted.
+		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		LowerBound: m.spec.Spans[0].Key,
 		UpperBound: m.spec.Spans[len(m.spec.Spans)-1].EndKey,
 	}
-	iter, err := storageccl.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
-	if err != nil {
-		return nil, err
+
+	// Use suffixed iterators for cross-SST duplicate detection when needed.
+	if m.spec.EnforceUniqueness && len(localSSTs) > 1 {
+		return m.createSuffixedIter(ctx, localSSTs, iterOpts)
 	}
-	return iter, nil
+
+	var storeFiles []storage.StoreFile
+	for _, sst := range localSSTs {
+		file, err := m.storageMux.StoreFile(ctx, sst.URI)
+		if err != nil {
+			return nil, err
+		}
+		storeFiles = append(storeFiles, file)
+	}
+	return storage.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
 }
 
 // containsKey returns true if the given key is within the mergeSpan.

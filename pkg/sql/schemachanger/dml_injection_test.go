@@ -8,6 +8,7 @@ package schemachanger_test
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
@@ -144,6 +146,11 @@ type testCase struct {
 	// Optional: If you want a query to run at each stage, you can include it here.
 	// We don't evaluate the results; we simply assert that the query executes without errors.
 	query string
+	// expectedDMLErr, when non-empty, is a regexp that matches DML errors
+	// (INSERT/DELETE/UPDATE against the original columns) that are tolerated
+	// during schema change stages. Errors not matching this pattern still
+	// fail the test.
+	expectedDMLErr string
 }
 
 // Captures testCase before t.Parallel is called.
@@ -192,6 +199,14 @@ func TestAlterTableDMLInjection(t *testing.T) {
 			setup:        []string{"CREATE SEQUENCE seq"},
 			schemaChange: "ALTER TABLE tbl ADD COLUMN new_col INT NOT NULL DEFAULT nextval('seq')",
 			expectedErr:  "cannot evaluate scalar expressions containing sequence operations in this context",
+		},
+		{
+			// The REGCLASS default requires a catalog lookup during backfill, which
+			// fails. During rollback the column transitions WRITE_ONLY → DELETE_ONLY
+			// → ABSENT; concurrent DML must succeed throughout.
+			desc:         "add column default regclass",
+			schemaChange: "ALTER TABLE tbl ADD COLUMN new_col INT NOT NULL DEFAULT ('tbl'::REGCLASS)::INT",
+			expectedErr:  "cannot evaluate scalar expressions using table lookups in this context",
 		},
 		{
 			desc:         "add column default serial rowid",
@@ -299,9 +314,10 @@ func TestAlterTableDMLInjection(t *testing.T) {
 			schemaChange: "ALTER TABLE tbl DROP COLUMN new_col",
 		},
 		{
-			desc:         "add column virtual NOT NULL",
-			schemaChange: "ALTER TABLE tbl ADD COLUMN new_col TEXT NOT NULL AS (NULL::TEXT) VIRTUAL",
-			expectedErr:  "validation of column \"new_col\" NOT NULL failed on row: insert_phase_ordinal='pre-schema-change', operation_phase_ordinal='n/a', operation='n/a', val=1, new_col=NULL",
+			desc:           "add column virtual NOT NULL",
+			schemaChange:   "ALTER TABLE tbl ADD COLUMN new_col TEXT NOT NULL AS (NULL::TEXT) VIRTUAL",
+			expectedErr:    "validation of column \"new_col\" NOT NULL failed on row: insert_phase_ordinal='pre-schema-change', operation_phase_ordinal='n/a', operation='n/a', val=1, new_col=NULL",
+			expectedDMLErr: "NOT NULL",
 		},
 		{
 			desc:         "add column virtual",
@@ -600,6 +616,10 @@ func TestAlterTableDMLInjection(t *testing.T) {
 			currentPOForBackFill.Store(phaseOrdinal{})
 			var beforeBackfillCallbackDone, afterBackfillCallbackDone atomic.Bool
 			var backfillCallback func(isAfter bool)
+			var expectedDMLRe *regexp.Regexp
+			if tc.expectedDMLErr != "" {
+				expectedDMLRe = regexp.MustCompile(tc.expectedDMLErr)
+			}
 			testCluster := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 				ServerArgs: base.TestServerArgs{
 					Knobs: base.TestingKnobs{
@@ -638,8 +658,46 @@ func TestAlterTableDMLInjection(t *testing.T) {
 									return nil
 								}
 
-								// Cannot verify DML injection for unsupported schema changes.
+								// For schema changes expected to error we cannot run the
+								// full DML-verification matrix, but we still inject basic
+								// DML to ensure concurrent operations do not get unexpected
+								// errors during failure/rollback.
 								if tc.expectedErr != "" {
+									s := p.Stages[stageIdx]
+									isRollback := p.InRollback || p.CurrentState.InRollback
+									stageDesc := fmt.Sprintf(
+										"%s:%d(rollback=%t)",
+										s.Phase, s.Ordinal, isRollback,
+									)
+									reportDMLErr := func(op string, err error) {
+										if err == nil {
+											return
+										}
+										if expectedDMLRe != nil && expectedDMLRe.MatchString(err.Error()) {
+											t.Logf("%s: %s failed (expected): %v", stageDesc, op, err)
+											return
+										}
+										// Log as t.Errorf to fail the test, but continue running
+										// this goroutine to prevent hangs.
+										t.Errorf("%s: %s failed: %v", stageDesc, op, err)
+									}
+									dmlKey := fmt.Sprintf("err-dml-%s", stageDesc)
+									_, insertErr := sqlDB.DB.ExecContext(
+										ctx, insert, dmlKey, na, na, valInitial,
+									)
+									reportDMLErr("INSERT", insertErr)
+									_, deleteErr := sqlDB.DB.ExecContext(
+										ctx,
+										`DELETE FROM tbl WHERE insert_phase_ordinal = $1`,
+										dmlKey,
+									)
+									reportDMLErr("DELETE", deleteErr)
+									_, updateErr := sqlDB.DB.ExecContext(
+										ctx,
+										`UPDATE tbl SET val = val + 1 WHERE insert_phase_ordinal = $1`,
+										dmlKey,
+									)
+									reportDMLErr("UPDATE", updateErr)
 									return nil
 								}
 
@@ -801,5 +859,85 @@ func TestAlterTableDMLInjection(t *testing.T) {
 				require.ErrorContains(t, err, expectedErr)
 			}
 		}))
+	}
+}
+
+// TestDropNotNullColumnPlaceholderLeak verifies that DROP COLUMN CASCADE
+// of a column with a dependent CHECK constraint does not surface the
+// column's placeholder name in errors from concurrent INSERTs that trip
+// the CHECK. The leak occurs when the CHECK is still being enforced
+// after ColumnName has transitioned to ABSENT and rewritten the
+// predicate to reference the placeholder name.
+func TestDropNotNullColumnPlaceholderLeak(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	var sqlDB *sqlutils.SQLRunner
+	var setupDone atomic.Bool
+	// Replace the column ID with \d+ to match any column.
+	placeholderRe := regexp.MustCompile(
+		strings.Replace(regexp.QuoteMeta(tabledesc.ColumnNamePlaceholder(0)), "0", `\d+`, 1))
+	var leakedErrors, unexpectedErrors []string
+	var insertAttempts int
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+				BeforeStage: func(p scplan.Plan, stageIdx int) error {
+					if !setupDone.Load() {
+						return nil
+					}
+					if len(p.TargetState.Statements) == 0 ||
+						!strings.Contains(p.TargetState.Statements[0].Statement, "DROP COLUMN") {
+						return nil
+					}
+					// Sequence-backed key avoids PK conflicts across stages.
+					insertAttempts++
+					_, err := sqlDB.DB.ExecContext(ctx,
+						`INSERT INTO t (k) VALUES (nextval('seq'))`)
+					stage := p.Stages[stageIdx]
+					switch {
+					case err == nil:
+					case placeholderRe.MatchString(err.Error()):
+						leakedErrors = append(leakedErrors,
+							fmt.Sprintf("stage=%s:%d err=%v", stage.Phase, stage.Ordinal, err))
+					default:
+						unexpectedErrors = append(unexpectedErrors,
+							fmt.Sprintf("stage=%s:%d err=%v", stage.Phase, stage.Ordinal, err))
+					}
+					// Returning a non-nil error here would be injected into the
+					// schema-change executor and fail the DROP. Record observations
+					// instead and let the DROP run to completion.
+					return nil
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	sqlDB = sqlutils.MakeSQLRunner(s.ApplicationLayer().SQLConn(t))
+
+	sqlDB.Exec(t, `CREATE SEQUENCE seq`)
+	sqlDB.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, i INT)`)
+	sqlDB.Exec(t, `INSERT INTO t (k, i) VALUES (-1, 1)`)
+	sqlDB.Exec(t, `ALTER TABLE t ADD CONSTRAINT c CHECK (i IS NOT NULL)`)
+
+	setupDone.Store(true)
+	_, err := sqlDB.DB.ExecContext(ctx, `ALTER TABLE t DROP COLUMN i CASCADE`)
+	require.NoError(t, err)
+
+	// Ensure the hook fires.
+	require.Greater(t, insertAttempts, 0)
+
+	if len(unexpectedErrors) > 0 {
+		t.Logf("note: %d INSERT(s) failed with non-placeholder errors:\n  %s",
+			len(unexpectedErrors), strings.Join(unexpectedErrors, "\n  "))
+	}
+
+	if len(leakedErrors) > 0 {
+		t.Fatalf("placeholder column name leaked into %d error(s):\n  %s",
+			len(leakedErrors), strings.Join(leakedErrors, "\n  "))
 	}
 }

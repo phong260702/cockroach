@@ -129,6 +129,15 @@ func (wb *writeBatch) clear(key MVCCKey, opts ClearOptions) error {
 	return wb.batch.DeleteSized(wb.buf, opts.ValueSize, nil)
 }
 
+// SingleClearUnversioned implements the Writer interface.
+func (wb *writeBatch) SingleClearUnversioned(key roachpb.Key) error {
+	if len(key) == 0 {
+		return emptyKeyError()
+	}
+	wb.buf = EncodeMVCCKeyToBuf(wb.buf[:0], MVCCKey{Key: key})
+	return wb.batch.SingleDelete(wb.buf, nil)
+}
+
 // SingleClearEngineKey implements the Writer interface.
 func (wb *writeBatch) SingleClearEngineKey(key EngineKey) error {
 	if len(key.Key) == 0 {
@@ -401,14 +410,10 @@ func (wb *writeBatch) SyncWait() error {
 	}
 	err := wb.batch.SyncWait()
 	if err != nil {
-		// TODO(storage): ensure that these errors are only ever due to invariant
-		// violations and never due to unrecoverable Pebble states. Then switch to
-		// returning the error instead of panicking.
-		//
-		// Once we do that, document on the storage.Batch interface the meaning of
-		// an error returned from this method and the guarantees that callers have
-		// or don't have after they receive an error from this method.
-		panic(err)
+		// SyncWait can fail due to environmental causes such as permission
+		// denied or disk I/O errors. See the WriteBatch.SyncWait interface
+		// doc for error semantics.
+		return err
 	}
 	wb.batchStatsReporter.aggregateBatchCommitStats(
 		BatchCommitStats{wb.batch.CommitStats()})

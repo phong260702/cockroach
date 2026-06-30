@@ -16,11 +16,11 @@ import (
 
 const (
 	// rulesVersion version of elements that can be appended to rel rule names.
-	rulesVersion = "-26.2"
+	rulesVersion = "-26.3"
 )
 
 // rulesVersionKey version of elements used by this rule set.
-var rulesVersionKey = clusterversion.V26_2
+var rulesVersionKey = clusterversion.V26_3
 
 // descriptorIsNotBeingDropped creates a clause which leads to the outer clause
 // failing to unify if the passed element is part of a descriptor and
@@ -68,7 +68,7 @@ var descriptorDataIsNotBeingAdded = screl.Schema.DefNotJoin1(
 func isDescriptor(e scpb.Element) bool {
 	switch e.(type) {
 	case *scpb.Database, *scpb.Schema, *scpb.Table, *scpb.View, *scpb.Sequence,
-		*scpb.AliasType, *scpb.EnumType, *scpb.CompositeType, *scpb.Function:
+		*scpb.AliasType, *scpb.EnumType, *scpb.CompositeType, *scpb.DomainType, *scpb.Function:
 		return true
 	}
 	return false
@@ -81,15 +81,59 @@ func IsDescriptor(e scpb.Element) bool {
 }
 
 func isSubjectTo2VersionInvariant(e scpb.Element) bool {
-	// TODO(ajwerner): This should include constraints and enum values but it
-	// currently does not because we do not support dropping them unless we're
-	// dropping the descriptor and we do not support adding them.
-	if isIndex(e) || isColumn(e) {
+	// Unvalidated constraints don't have intermediate states and can be
+	// added without a backfill.
+	if isUnvalidatedConstraint(e) {
+		return false
+	}
+
+	if isTypeDescriptorChildElement(e) {
+		return true
+	}
+
+	if isTableDescriptorChildElement(e) {
+		return true
+	}
+
+	return false
+}
+
+func isTableDescriptorChildElement(e scpb.Element) bool {
+	if isColumn(e) || isTableConstraint(e) {
+		return true
+	}
+
+	switch e.(type) {
+	case *scpb.TableSchemaLocked:
+		return true
+	}
+	return false
+}
+
+// isTypeDescriptorChildElement returns true for child elements of a type
+// descriptor.
+func isTypeDescriptorChildElement(e scpb.Element) bool {
+	// TODO(bghal): Add composites here when they are added to
+	// isSubjectTo2VersionInvariant.
+	if isTypeConstraint(e) {
 		return true
 	}
 	switch e.(type) {
-	case *scpb.CheckConstraint, *scpb.UniqueWithoutIndexConstraint, *scpb.ForeignKeyConstraint,
-		*scpb.ColumnNotNull, *scpb.TableSchemaLocked:
+	case *scpb.EnumTypeValue:
+		return true
+	case *scpb.DomainDefault:
+		return true
+	}
+	return false
+}
+
+// isTypeConstraint returns true for constraints that belong to a type
+// descriptor.
+func isTypeConstraint(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.DomainCheckConstraint, *scpb.DomainCheckConstraintUnvalidated:
+		return true
+	case *scpb.DomainNotNull:
 		return true
 	}
 	return false
@@ -146,19 +190,6 @@ func isWithTypeT(element scpb.Element) bool {
 	return err == nil
 }
 
-// isWithExpressionOrHasReferences returns true if `element` has an embedded
-// type or has references to types inside.
-func isWithTypeTOrHasReferences(element scpb.Element) bool {
-	if isWithTypeT(element) {
-		return true
-	}
-	switch element.(type) {
-	case *scpb.TriggerDeps:
-		return true
-	}
-	return false
-}
-
 func getExpression(element scpb.Element) (*scpb.Expression, error) {
 	switch e := element.(type) {
 	case *scpb.ColumnComputeExpression:
@@ -211,6 +242,21 @@ func getExpression(element scpb.Element) (*scpb.Expression, error) {
 			return nil, nil
 		}
 		return e.Predicate, nil
+	case *scpb.DomainDefault:
+		if e == nil {
+			return nil, nil
+		}
+		return &e.Expression, nil
+	case *scpb.DomainCheckConstraint:
+		if e == nil {
+			return nil, nil
+		}
+		return &e.Expression, nil
+	case *scpb.DomainCheckConstraintUnvalidated:
+		if e == nil {
+			return nil, nil
+		}
+		return &e.Expression, nil
 	}
 	return nil, errors.AssertionFailedf("element %T does not have an embedded scpb.Expression", element)
 }
@@ -220,22 +266,9 @@ func isWithExpression(element scpb.Element) bool {
 	return err == nil
 }
 
-// isWithExpressionOrHasReferences returns true if `element` has an embedded
-// expression or has references to either types, functions or relations.
-func isWithExpressionOrHasReferences(element scpb.Element) bool {
-	if isWithExpression(element) {
-		return true
-	}
-	switch element.(type) {
-	case *scpb.TriggerDeps:
-		return true
-	}
-	return false
-}
-
 func isTypeDescriptor(element scpb.Element) bool {
 	switch element.(type) {
-	case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType:
+	case *scpb.EnumType, *scpb.AliasType, *scpb.CompositeType, *scpb.DomainType:
 		return true
 	default:
 		return false
@@ -289,21 +322,45 @@ func isIndexDependent(e scpb.Element) bool {
 	return false
 }
 
-// CRDB supports five constraints of two categories:
-// - PK, Unique (index-backed)
-// - Check, UniqueWithoutIndex, FK (non-index-backed)
-func isConstraint(e scpb.Element) bool {
-	return isIndex(e) || isNonIndexBackedConstraint(e)
-}
-
-// isNonIndexBackedConstraint returns true if `e` is a non-index-backed constraint.
-func isNonIndexBackedConstraint(e scpb.Element) bool {
+// isTableConstraint returns true for constraints that belong to a table
+// descriptor.
+func isTableConstraint(e scpb.Element) bool {
 	switch e.(type) {
 	case *scpb.CheckConstraint, *scpb.UniqueWithoutIndexConstraint, *scpb.ForeignKeyConstraint,
 		*scpb.ColumnNotNull:
 		return true
 	case *scpb.CheckConstraintUnvalidated, *scpb.UniqueWithoutIndexConstraintUnvalidated,
 		*scpb.ForeignKeyConstraintUnvalidated:
+		return true
+	}
+	return isIndex(e)
+}
+
+// CRDB supports constraints of two categories:
+// - PK, Unique (index-backed)
+// - Check, UniqueWithoutIndex, FK, DomainCheck, DomainNotNull (non-index-backed)
+func isConstraint(e scpb.Element) bool {
+	return isIndex(e) || isNonIndexBackedConstraint(e)
+}
+
+// isNonIndexBackedConstraint returns true if `e` is a non-index-backed constraint.
+func isNonIndexBackedConstraint(e scpb.Element) bool {
+	return isValidatedNonIndexBackedConstraint(e) || isUnvalidatedConstraint(e)
+}
+
+func isValidatedNonIndexBackedConstraint(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.CheckConstraint, *scpb.UniqueWithoutIndexConstraint, *scpb.ForeignKeyConstraint,
+		*scpb.ColumnNotNull, *scpb.DomainCheckConstraint, *scpb.DomainNotNull:
+		return true
+	}
+	return false
+}
+
+func isUnvalidatedConstraint(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.CheckConstraintUnvalidated, *scpb.UniqueWithoutIndexConstraintUnvalidated,
+		*scpb.ForeignKeyConstraintUnvalidated, *scpb.DomainCheckConstraintUnvalidated:
 		return true
 	}
 	return false
@@ -340,6 +397,8 @@ func isConstraintDependent(e scpb.Element) bool {
 		return true
 	case *scpb.TableLocalityRegionalByRowUsingConstraint:
 		return true
+	case *scpb.DomainConstraintName:
+		return true
 	}
 	return false
 }
@@ -350,6 +409,22 @@ func isConstraintWithoutIndexName(e scpb.Element) bool {
 		return true
 	}
 	return false
+}
+
+func isConstraintName(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.ConstraintWithoutIndexName, *scpb.DomainConstraintName:
+		return true
+	}
+	return false
+}
+
+func isTriggerOrDependent(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.Trigger:
+		return true
+	}
+	return isTriggerDependent(e)
 }
 
 func isTriggerDependent(e scpb.Element) bool {

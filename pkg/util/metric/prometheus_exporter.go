@@ -38,18 +38,30 @@ type PrometheusExporter struct {
 	muScrapeAndPrint syncutil.Mutex
 	families         map[string]*prometheusgo.MetricFamily
 	selection        map[string]struct{}
+
+	// childCounts tracks the number of child instances produced by each
+	// PrometheusIterable parent metric during the current scrape cycle.
+	// Accumulated across ScrapeRegistry calls and cleared in clearMetrics.
+	childCounts map[string]int64
 }
 
 // MakePrometheusExporter returns an initialized prometheus exporter.
 func MakePrometheusExporter() PrometheusExporter {
-	return PrometheusExporter{families: map[string]*prometheusgo.MetricFamily{}}
+	return PrometheusExporter{
+		families:    map[string]*prometheusgo.MetricFamily{},
+		childCounts: map[string]int64{},
+	}
 }
 
 // MakePrometheusExporterForSelectedMetrics returns an initialized prometheus
 // exporter. It would only consider selected metrics when scraping. The caller
 // should not modify the map after the call.
 func MakePrometheusExporterForSelectedMetrics(selection map[string]struct{}) PrometheusExporter {
-	return PrometheusExporter{families: map[string]*prometheusgo.MetricFamily{}, selection: selection}
+	return PrometheusExporter{
+		families:    map[string]*prometheusgo.MetricFamily{},
+		selection:   selection,
+		childCounts: map[string]int64{},
+	}
 }
 
 // find the family for the passed-in metric, or create and return it if not found.
@@ -82,6 +94,8 @@ type scrapeOptions struct {
 	includeAggregateMetrics      bool
 	useStaticLabels              bool
 	reinitialisableBugFixEnabled bool
+	minVisibility                Metadata_MetricVisibility
+	hasVisibilityFilter          bool
 }
 
 // ScrapeOption is a function that modifies scrapeOptions
@@ -115,6 +129,17 @@ func WithReinitialisableBugFixEnabled(enabled bool) ScrapeOption {
 	}
 }
 
+// WithMinVisibility returns an option that filters out metrics whose
+// visibility is below the given threshold. The proto enum values are
+// INTERNAL=0, SUPPORT=1, ESSENTIAL=2, so a metric is included when
+// metadata.Visibility >= minVisibility.
+func WithMinVisibility(level Metadata_MetricVisibility) ScrapeOption {
+	return func(o *scrapeOptions) {
+		o.minVisibility = level
+		o.hasVisibilityFilter = true
+	}
+}
+
 // applyScrapeOptions creates a new scrapeOptions with the given options applied
 func applyScrapeOptions(options ...ScrapeOption) *scrapeOptions {
 	opts := &scrapeOptions{
@@ -130,11 +155,18 @@ func applyScrapeOptions(options ...ScrapeOption) *scrapeOptions {
 // family map, holding on only to the scraped data (which is no longer
 // connected to the registry and metrics within) when returning from the
 // call. It creates new families as needed.
-func (pm *PrometheusExporter) ScrapeRegistry(registry *Registry, options ...ScrapeOption) {
+func (pm *PrometheusExporter) ScrapeRegistry(registry RegistryReader, options ...ScrapeOption) {
 	o := applyScrapeOptions(options...)
 	labels := registry.GetLabels()
 
 	f := func(name string, v interface{}) {
+		if o.hasVisibilityFilter {
+			if iterable, ok := v.(Iterable); ok {
+				if iterable.GetMetadata().Visibility < o.minVisibility {
+					return
+				}
+			}
+		}
 		switch prom := v.(type) {
 		case PrometheusVector:
 			for _, m := range prom.ToPrometheusMetrics() {
@@ -159,11 +191,23 @@ func (pm *PrometheusExporter) ScrapeRegistry(registry *Registry, options ...Scra
 
 				promIter, ok := v.(PrometheusIterable)
 				numChildren := 0
+				childWeight := int64(0)
 				if ok && o.includeChildMetrics {
 					promIter.Each(m.Label, func(metric *prometheusgo.Metric) {
 						family.Metric = append(family.Metric, metric)
-						numChildren += 1
+						numChildren++
+						if metric.Histogram != nil {
+							// +Inf bucket, _count, _sum = 3 lines beyond explicit buckets.
+							childWeight += int64(len(metric.Histogram.Bucket)) + 3
+						} else {
+							childWeight++
+						}
 					})
+				}
+
+				if numChildren > 0 {
+					metricName := prom.GetName(o.useStaticLabels)
+					pm.childCounts[metricName] += childWeight
 				}
 
 				// PrometheusReinitialisable metrics (like SQLMetric) dynamically
@@ -187,9 +231,22 @@ func (pm *PrometheusExporter) ScrapeRegistry(registry *Registry, options ...Scra
 				if o.includeAggregateMetrics {
 					family.Metric = append(family.Metric, m)
 				}
+				numChildren := 0
+				childWeight := int64(0)
 				promIter.Each(m.Label, func(metric *prometheusgo.Metric) {
 					family.Metric = append(family.Metric, metric)
+					numChildren++
+					if metric.Histogram != nil {
+						// +Inf bucket, _count, _sum = 3 lines beyond explicit buckets.
+						childWeight += int64(len(metric.Histogram.Bucket)) + 3
+					} else {
+						childWeight++
+					}
 				})
+				if numChildren > 0 {
+					metricName := prom.GetName(o.useStaticLabels)
+					pm.childCounts[metricName] += childWeight
+				}
 				return
 			}
 
@@ -207,6 +264,12 @@ func (pm *PrometheusExporter) ScrapeRegistry(registry *Registry, options ...Scra
 	} else {
 		registry.Select(pm.selection, f)
 	}
+}
+
+// ChildCounts returns the per-metric child instance counts accumulated
+// during the current scrape cycle. The caller must not modify the map.
+func (pm *PrometheusExporter) ChildCounts() map[string]int64 {
+	return pm.childCounts
 }
 
 // printAsText writes all metrics in the families map to the io.Writer in
@@ -262,5 +325,8 @@ func (pm *PrometheusExporter) clearMetrics() {
 	for _, family := range pm.families {
 		// Set to nil to avoid allocation if the family never gets any metrics.
 		family.Metric = nil
+	}
+	for k := range pm.childCounts {
+		delete(pm.childCounts, k)
 	}
 }

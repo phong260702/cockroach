@@ -16,27 +16,31 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/hintpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/parserutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/memzipper"
-	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -167,6 +171,7 @@ func buildStatementBundle(
 	b.addTrace()
 	b.addInFlightTrace(c)
 	b.addEnv(ctx)
+	b.addDescriptors(ctx)
 	b.addErrors(queryErr, payloadErr, commErr)
 
 	buf, err := b.finalize()
@@ -274,15 +279,7 @@ func (b *stmtBundleBuilder) buildPrettyStatement(stmtRawSQL string) error {
 		cfg.ValueRedaction = b.flags.RedactValues
 		var err error
 		b.stmt, err = cfg.Pretty(b.plan.stmt.AST)
-		if errors.Is(err, pretty.ErrPrettyMaxRecursionDepthExceeded) {
-			// Use the raw statement string if pretty-printing fails.
-			b.stmt = stmtRawSQL
-			// If we're collecting a redacted bundle, redact the raw SQL
-			// completely.
-			if b.flags.RedactValues && b.stmt != "" {
-				b.stmt = string(redact.RedactedMarker())
-			}
-		} else if err != nil {
+		if err != nil {
 			return err
 		}
 
@@ -555,6 +552,85 @@ var stmtBundleIncludeAllFKReferences = settings.RegisterBoolSetting(
 	false,
 )
 
+// getStmtHintRecreateStmts returns the SQL statements that can be used to
+// recreate all the statement hints bound to the target statement. The returned
+// statements are sorted in ascending order by the original hints' creation time.
+func (c *stmtEnvCollector) getStmtHintRecreateStmts(
+	ctx context.Context, stmt string, sv *settings.Values,
+) (recreateStmts []string, err error) {
+	// Catch panics from unmarshaling protobuf below.
+	defer errorutil.MaybeCatchPanic(&err, nil /* errCallback */)
+	fingerprint, err := parserutils.FingerprintStatement(
+		parserutils.FingerprintTagStatement, stmt,
+		tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+			sv,
+		)))
+	if err != nil {
+		return nil, err
+	}
+
+	versionHasDBCol := c.p.execCfg.Settings.Version.IsActive(
+		ctx, clusterversion.V26_2_StatementHintsTypeNameEnabledColumnsAdded,
+	)
+	var query string
+	if versionHasDBCol {
+		query = `SELECT hint, database FROM system.statement_hints WHERE fingerprint = $1 ORDER BY created_at`
+	} else {
+		query = `SELECT hint, NULL::STRING AS database FROM system.statement_hints WHERE fingerprint = $1 ORDER BY created_at`
+	}
+	rows, err := c.ie.QueryBufferedEx(
+		ctx,
+		"stmtEnvCollector",
+		nil, /* txn */
+		c.ieo,
+		query,
+		fingerprint,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	recreateStmts = make([]string, 0, len(rows))
+	for _, row := range rows {
+		if len(row) != 2 {
+			return nil, errors.AssertionFailedf("expected 2 columns in row, got %d", len(row))
+		}
+		if row[0] == tree.DNull {
+			continue
+		}
+		// Deserialize from the protobuf.
+		hint, err := hintpb.FromBytes([]byte(tree.MustBeDBytes(row[0])))
+		if err != nil {
+			return nil, errors.Wrap(err, "deserializing statement hint")
+		}
+		recreateSQL, ok := hint.RecreateStmt(stmt, row[1])
+		if !ok {
+			continue
+		}
+		recreateStmts = append(recreateStmts, recreateSQL)
+	}
+	return recreateStmts, nil
+}
+
+// PrintStmtHints writes the SQL statements needed to recreate the statement
+// hints for the given statement to w.
+func (c *stmtEnvCollector) PrintStmtHints(
+	ctx context.Context, stmt string, sv *settings.Values, w io.Writer,
+) error {
+	recreateStmts, err := c.getStmtHintRecreateStmts(ctx, stmt, sv)
+	if err != nil {
+		return err
+	}
+	for _, s := range recreateStmts {
+		fmt.Fprintf(w, "%s\n", s)
+	}
+	return nil
+}
+
+// stmtBundleStatsFileRE is a regex that matches all "complex" characters that
+// might not be safe when used in file names on some systems.
+var stmtBundleStatsFileRE = regexp.MustCompile(`[^a-zA-Z0-9_.\-]`)
+
 func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	c := makeStmtEnvCollector(ctx, b.p, b.ie, b.requesterUsername)
 
@@ -598,8 +674,16 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	// TODO(#27611): when we support stats on virtual tables, we'll need to
 	// update this logic to not include virtual tables into schema.sql but still
 	// create stats files for them.
+	type triggerInfo struct {
+		tableName tree.TableName
+		name      string
+	}
 	var tables, sequences, views []tree.TableName
 	var addFKs, skipFKs []*tree.AlterTable
+	var triggerInfos []triggerInfo
+	var triggerFuncIDs intsets.Fast
+	var triggerDepTypeOIDs intsets.Fast
+	isProcedure := make(map[oid.Oid]bool)
 	err := b.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Catalog objects can show up multiple times in our lists, so
 		// deduplicate them.
@@ -778,6 +862,62 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 				include = hasDelete || hasUpdate || hasUpsert
 			},
 		)
+		// Collect trigger information from all referenced tables. For each
+		// trigger, we record its name (for CREATE TRIGGER output later),
+		// the trigger function, and any tables/types/routines it depends on.
+		// We iterate using an index because refTables may grow during
+		// iteration as we discover trigger-dependent tables.
+		// TODO(sql-queries): consider skipping trigger collection for SELECT
+		// statements, since triggers only fire on INSERT/UPDATE/DELETE.
+		for i := 0; i < len(refTables); i++ {
+			table := refTables[i]
+			desc, err := getDescForDataSource(table)
+			if err != nil {
+				return err
+			}
+			triggers := desc.GetTriggers()
+			for j := range triggers {
+				trig := &triggers[j]
+				triggerFuncIDs.Add(int(trig.FuncID))
+				for _, depID := range trig.DependsOnRoutines {
+					triggerFuncIDs.Add(int(depID))
+					funcOid := catid.FuncIDToOID(depID)
+					_, ol, err := b.plan.catalog.ResolveFunctionByOID(ctx, funcOid)
+					if err != nil {
+						return err
+					}
+					isProcedure[funcOid] = ol.Type == tree.ProcedureRoutine
+				}
+				for _, depID := range trig.DependsOn {
+					if !refTableIncluded.Contains(int(depID)) {
+						ds, _, err := b.plan.catalog.ResolveDataSourceByID(ctx, cat.Flags{}, cat.StableID(depID))
+						if err != nil {
+							return err
+						}
+						t, ok := ds.(cat.Table)
+						if !ok || t.IsVirtualTable() {
+							continue
+						}
+						refTables = append(refTables, t)
+						refTableIncluded.Add(int(depID))
+					}
+				}
+				for _, depID := range trig.DependsOnTypes {
+					triggerDepTypeOIDs.Add(int(catid.TypeIDToOID(depID)))
+				}
+				tn, err := b.plan.catalog.fullyQualifiedNameWithTxn(ctx, table, txn)
+				if err != nil {
+					return err
+				}
+				triggerInfos = append(triggerInfos, triggerInfo{
+					tableName: tn,
+					name:      trig.Name,
+				})
+			}
+		}
+
+		// Collect FK constraints after the trigger loop so that tables
+		// discovered via trigger dependencies are included.
 		addFKs, skipFKs = opt.GetAllFKs(
 			ctx,
 			b.plan.catalog,
@@ -785,6 +925,7 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 			func(t cat.Table) (tree.TableName, error) {
 				return b.plan.catalog.fullyQualifiedNameWithTxn(ctx, t, txn)
 			})
+
 		var err error
 		tables, err = getNames(len(refTables), func(i int) cat.DataSource {
 			return refTables[i]
@@ -853,13 +994,24 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 		}
 	}
 	// Get all relevant user-defined types.
+	var printedTypeOIDs intsets.Fast
 	for _, t := range mem.Metadata().AllUserDefinedTypes() {
 		blankLine()
+		printedTypeOIDs.Add(int(t.Oid()))
 		if err = c.PrintCreateUDT(&buf, t.Oid(), b.flags.RedactValues); err != nil {
 			b.printError(fmt.Sprintf("-- error getting schema for type %s: %v", t.SQLStringForError(), err), &buf)
 		}
 	}
-	if mem.Metadata().HasUserDefinedRoutines() {
+	// Also print UDTs referenced by triggers.
+	triggerDepTypeOIDs.ForEach(func(id int) {
+		if !printedTypeOIDs.Contains(id) {
+			blankLine()
+			if err = c.PrintCreateUDT(&buf, oid.Oid(id), b.flags.RedactValues); err != nil {
+				b.printError(fmt.Sprintf("-- error getting schema for type with OID %d: %v", id, err), &buf)
+			}
+		}
+	})
+	{
 		// Get all relevant user-defined routines.
 		//
 		// Note that we first populate fast int set so that we add routines in
@@ -868,10 +1020,21 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 		// smaller Oid would indicate an older routine which makes it less
 		// likely to depend on another routine.
 		var ids intsets.Fast
-		isProcedure := make(map[oid.Oid]bool)
-		mem.Metadata().ForEachUserDefinedRoutine(func(ol *tree.Overload) {
-			ids.Add(int(ol.Oid))
-			isProcedure[ol.Oid] = ol.Type == tree.ProcedureRoutine
+		if mem.Metadata().HasUserDefinedRoutines() {
+			mem.Metadata().ForEachUserDefinedRoutine(func(ol *tree.Overload) {
+				ids.Add(int(ol.Oid))
+				isProcedure[ol.Oid] = ol.Type == tree.ProcedureRoutine
+			})
+		}
+		// Also include trigger functions and routines they depend on.
+		// Trigger functions (trig.FuncID) are always functions, but
+		// DependsOnRoutines entries may be procedures, so we use
+		// isProcedure which was populated during collection.
+		triggerFuncIDs.ForEach(func(descID int) {
+			funcOid := catid.FuncIDToOID(descpb.ID(descID))
+			if !ids.Contains(int(funcOid)) {
+				ids.Add(int(funcOid))
+			}
 		})
 		ids.ForEach(func(id int) {
 			blankLine()
@@ -902,23 +1065,133 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 			}
 		}
 	}
+	for i := range triggerInfos {
+		blankLine()
+		if err = c.PrintCreateTrigger(&buf, &triggerInfos[i].tableName, triggerInfos[i].name, b.flags.RedactValues); err != nil {
+			b.printError(fmt.Sprintf("-- error getting trigger %s on table %s: %v",
+				triggerInfos[i].name, triggerInfos[i].tableName.FQString(), err), &buf)
+		}
+	}
 	for i := range views {
 		blankLine()
 		if err = c.PrintCreateView(&buf, &views[i], b.flags.RedactValues); err != nil {
 			b.printError(fmt.Sprintf("-- error getting schema for view %s: %v", views[i].FQString(), err), &buf)
 		}
 	}
+
+	if !b.flags.RedactValues {
+		blankLine()
+		if err := c.PrintStmtHints(ctx, b.stmt, b.sv, &buf); err != nil {
+			b.printError(fmt.Sprintf("-- error getting statement hints: %v", err), &buf)
+		}
+	}
+
 	if buf.Len() == 0 {
 		buf.WriteString("-- there were no objects used in this query\n")
 	}
 	b.z.AddFile("schema.sql", buf.String())
+	// statsFileNames is a map from the main part of the stats file name to the
+	// number of times it has been used.
+	var statsFileNames = make(map[string]int)
 	for i := range tables {
 		buf.Reset()
 		hideHistograms := b.flags.RedactValues
 		if err = c.PrintTableStats(&buf, &tables[i], hideHistograms); err != nil {
 			b.printError(fmt.Sprintf("-- error getting statistics for table %s: %v", tables[i].FQString(), err), &buf)
 		}
-		b.z.AddFile(fmt.Sprintf("stats-%s.sql", tables[i].FQString()), buf.String())
+		// We use fully-qualified string for the table name as the main part of
+		// the file name that guarantees uniqueness within the bundle. Yet, in
+		// order to ensure that the file names interact well with different
+		// systems (e.g. Windows is particularly picky), we also replace many
+		// special characters with underscores - which might lose the uniqueness
+		// property. Thus, we additionally might append a count to guarantee
+		// uniqueness again. We also convert everything to the lower case since
+		// Windows is case-insensitive by default.
+		fileName := strings.ToLower(stmtBundleStatsFileRE.ReplaceAllString(tables[i].FQString(), `_`))
+		statsFileNames[fileName]++
+		if statsFileNames[fileName] > 1 { // don't touch the first occurrency of this file name
+			fileName = fileName + "_" + strconv.Itoa(statsFileNames[fileName])
+		}
+		b.z.AddFile(fmt.Sprintf("stats-%s.sql", fileName), buf.String())
+	}
+}
+
+// addDescriptors writes two files into the bundle that capture the state of
+// each schema object referenced by the statement: descriptors.json contains
+// the pretty-printed descriptor JSON, and schema_changes.txt contains the
+// schema-change jobs that targeted those descriptors. Together they help
+// disambiguate plan or execution surprises that are actually caused by
+// schema-state interactions.
+func (b *stmtBundleBuilder) addDescriptors(ctx context.Context) {
+	var descBuf, scBuf bytes.Buffer
+	defer func() {
+		b.z.AddFile("descriptors.json", descBuf.String())
+		b.z.AddFile("schema_changes.txt", scBuf.String())
+	}()
+
+	mem := b.plan.mem
+	if mem == nil {
+		descBuf.WriteString("-- no descriptors collected\n")
+		scBuf.WriteString("-- no schema changes collected\n")
+		return
+	}
+	if b.flags.RedactValues {
+		// Descriptor JSON and schema-change job descriptions can contain user
+		// data via function bodies, trigger expressions, computed columns,
+		// check constraints, and DDL literals. pb_to_json's emit_redacted flag
+		// only redacts fields explicitly tagged in the proto, which doesn't
+		// cover those text fields - so omit both files entirely under REDACT.
+		descBuf.WriteString("-- descriptors omitted in redacted bundle\n")
+		scBuf.WriteString("-- schema changes omitted in redacted bundle\n")
+		return
+	}
+	c := makeStmtEnvCollector(ctx, b.p, b.ie, b.requesterUsername)
+
+	// Collect the descriptor ID of every schema object referenced by the
+	// query, deduplicating along the way.
+	var seen intsets.Fast
+	var ids []descpb.ID
+	add := func(id descpb.ID) {
+		if seen.Contains(int(id)) {
+			return
+		}
+		seen.Add(int(id))
+		ids = append(ids, id)
+	}
+	for _, tm := range mem.Metadata().AllTables() {
+		add(descpb.ID(tm.Table.ID()))
+	}
+	for _, seq := range mem.Metadata().AllSequences() {
+		add(descpb.ID(seq.ID()))
+	}
+	for _, view := range mem.Metadata().AllViews() {
+		add(descpb.ID(view.ID()))
+	}
+	for _, typ := range mem.Metadata().AllUserDefinedTypes() {
+		add(catid.UserDefinedOIDToID(typ.Oid()))
+	}
+	// TODO(170491): also include user-defined routines reachable via trigger
+	// dependencies. See addEnv's triggerFuncIDs traversal.
+
+	if len(ids) == 0 {
+		descBuf.WriteString("-- no objects used in this query\n")
+		scBuf.WriteString("-- no objects used in this query\n")
+		return
+	}
+	descLen, scLen := descBuf.Len(), scBuf.Len()
+	for _, id := range ids {
+		if err := c.PrintDescriptorJSON(&descBuf, id, b.flags.RedactValues); err != nil {
+			b.printError(fmt.Sprintf("-- error getting descriptor for id %d: %v", id, err), &descBuf)
+		}
+		if err := c.PrintSchemaChanges(&scBuf, id); err != nil {
+			b.printError(fmt.Sprintf("-- error getting schema changes for id %d: %v", id, err), &scBuf)
+		}
+	}
+	if descBuf.Len() == descLen {
+		descBuf.WriteString("-- no descriptors found in system.descriptor\n")
+	}
+	if scBuf.Len() == scLen {
+		scBuf.WriteString("-- no schema-change history found for the objects used in this query\n")
 	}
 }
 
@@ -1277,18 +1550,22 @@ func (c *stmtEnvCollector) PrintCreateSequence(w io.Writer, tn *tree.TableName) 
 func (c *stmtEnvCollector) PrintCreateUDT(w io.Writer, id oid.Oid, redactValues bool) error {
 	descID := catid.UserDefinedOIDToID(id)
 	// Use "".crdb_internal to allow for cross-DB lookups.
-	query := fmt.Sprintf(`SELECT database_name, create_statement FROM "".crdb_internal.create_type_statements WHERE descriptor_id = %d::OID`, descID)
+	query := fmt.Sprintf(`SELECT database_name, schema_name, create_statement FROM "".crdb_internal.create_type_statements WHERE descriptor_id = %d::OID`, descID)
 	if redactValues {
-		query = fmt.Sprintf("SELECT database_name, crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM (%s)", query)
+		query = fmt.Sprintf("SELECT database_name, schema_name, crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM (%s)", query)
 	}
 	// Implicit crdb_internal_region type won't be found via the vtable, so we
 	// allow empty result.
-	res, err := c.queryEx(query, 2 /* numCols */, true /* emptyOk */)
+	res, err := c.queryEx(query, 3 /* numCols */, true /* emptyOk */)
 	if err != nil {
 		return err
 	}
-	if res[0] != "" {
-		printCreateStatement(w, tree.Name(res[0]) /* dbName */, res[1] /* createStatement */)
+	if dbStr := res[0]; dbStr != "" {
+		if schemaStr := res[1]; schemaStr != "" && schemaStr != "public" {
+			schemaName := tree.Name(schemaStr)
+			printCreateStatement(w, tree.Name(dbStr) /* dbName */, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaName.String()))
+		}
+		printCreateStatement(w, tree.Name(dbStr) /* dbName */, res[2] /* createStatement */)
 	}
 	return nil
 }
@@ -1299,7 +1576,7 @@ func (c *stmtEnvCollector) PrintCreateRoutine(
 	var createRoutineQuery string
 	descID := catid.UserDefinedOIDToID(id)
 	// Use "".crdb_internal to allow for cross-DB lookups.
-	queryTemplate := `SELECT database_name, create_statement FROM "".crdb_internal.create_%[1]s_statements WHERE %[1]s_id = %[2]d::OID`
+	queryTemplate := `SELECT database_name, schema_name, create_statement FROM "".crdb_internal.create_%[1]s_statements WHERE %[1]s_id = %[2]d::OID`
 	if procedure {
 		createRoutineQuery = fmt.Sprintf(queryTemplate, "procedure", descID)
 	} else {
@@ -1307,11 +1584,46 @@ func (c *stmtEnvCollector) PrintCreateRoutine(
 	}
 	if redactValues {
 		createRoutineQuery = fmt.Sprintf(
-			"SELECT database_name, crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM (%s)",
+			"SELECT database_name, schema_name, crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM (%s)",
 			createRoutineQuery,
 		)
 	}
-	res, err := c.queryEx(createRoutineQuery, 2 /* numCols */, false /* emptyOk */)
+	res, err := c.queryEx(createRoutineQuery, 3 /* numCols */, false /* emptyOk */)
+	if err != nil {
+		return err
+	}
+	if dbStr := res[0]; dbStr != "" {
+		if schemaStr := res[1]; schemaStr != "" && schemaStr != "public" {
+			schemaName := tree.Name(schemaStr)
+			printCreateStatement(w, tree.Name(dbStr), fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", schemaName.String()))
+		}
+		printCreateStatement(w, tree.Name(dbStr) /* dbName */, res[2] /* createStatement */)
+	}
+
+	return nil
+}
+
+// PrintCreateTrigger outputs the CREATE TRIGGER statement for the named
+// trigger on the given table.
+func (c *stmtEnvCollector) PrintCreateTrigger(
+	w io.Writer, tn *tree.TableName, triggerName string, redactValues bool,
+) error {
+	// Use "".crdb_internal to allow for cross-DB lookups.
+	query := fmt.Sprintf(
+		`SELECT database_name, create_statement FROM "".crdb_internal.create_trigger_statements `+
+			`WHERE database_name = %s AND schema_name = %s AND table_name = %s AND trigger_name = %s`,
+		lexbase.EscapeSQLString(string(tn.CatalogName)),
+		lexbase.EscapeSQLString(string(tn.SchemaName)),
+		lexbase.EscapeSQLString(string(tn.ObjectName)),
+		lexbase.EscapeSQLString(triggerName),
+	)
+	if redactValues {
+		query = fmt.Sprintf(
+			"SELECT database_name, crdb_internal.redact(crdb_internal.redactable_sql_constants(create_statement)) FROM (%s)",
+			query,
+		)
+	}
+	res, err := c.queryEx(query, 2 /* numCols */, false /* emptyOk */)
 	if err != nil {
 		return err
 	}
@@ -1333,6 +1645,84 @@ func (c *stmtEnvCollector) PrintCreateView(
 		return err
 	}
 	printCreateStatement(w, tn.CatalogName, createStatement)
+	return nil
+}
+
+// PrintDescriptorJSON writes the pretty-printed descriptor JSON for the
+// descriptor with the given ID. Empty result (descriptor not found) is
+// tolerated so that descriptors dropped between planning and bundle
+// collection don't fail the whole bundle.
+func (c *stmtEnvCollector) PrintDescriptorJSON(w io.Writer, id descpb.ID, redactValues bool) error {
+	query := fmt.Sprintf(`SELECT coalesce(jsonb_pretty(crdb_internal.pb_to_json(
+'cockroach.sql.sqlbase.Descriptor', descriptor, false /* emit_defaults */, %t /* emit_redacted */
+)), '') FROM system.public.descriptor WHERE id = %d`, redactValues, id)
+	res, err := c.queryEx(query, 1 /* numCols */, true /* emptyOk */)
+	if err != nil {
+		return err
+	}
+	if res[0] == "" {
+		return nil
+	}
+	fmt.Fprintf(w, "-- Descriptor %d:\n%s\n\n", id, res[0])
+	return nil
+}
+
+// PrintSchemaChanges writes the schema-change jobs that targeted the
+// descriptor with the given ID, most-recent first. It includes the schema,
+// new schema, and type schema change job types; SCHEMA CHANGE GC is omitted
+// because it's GC bookkeeping rather than a schema mutation.
+func (c *stmtEnvCollector) PrintSchemaChanges(w io.Writer, id descpb.ID) error {
+	// Schema-change jobs hide their target descriptors inside the payload
+	// protobuf; we decode it via crdb_internal.pb_to_json and check whether
+	// descriptorIds contains the requested ID. That catches legacy schema
+	// changes, but the declarative schema changer progressively drains
+	// descriptorIds from the payload as targets complete (see
+	// scexec/exec_deferred_mutation.go), so its completed jobs would be
+	// missed. Fall back to matching the descriptor's fully-qualified name
+	// against the job's description text, which both schema changers
+	// populate consistently. Use "".crdb_internal to allow cross-DB lookups.
+	query := fmt.Sprintf(`SELECT id::STRING, status, job_type, created::STRING,
+       coalesce(payload_json->>'description', '')
+FROM (
+  SELECT id, status, job_type, created,
+         crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload,
+                                  false /* emit_defaults */, false /* emit_redacted */) AS payload_json
+  FROM "".crdb_internal.system_jobs
+  WHERE job_type IN ('SCHEMA CHANGE', 'NEW SCHEMA CHANGE', 'TYPE SCHEMA CHANGE')
+)
+WHERE payload_json->'descriptorIds' @> %s::JSONB
+   OR payload_json->>'description' ILIKE
+      '%%' || (SELECT db.name || '.' || sc.name || '.' || obj.name
+               FROM "".crdb_internal.kv_catalog_namespace obj
+               JOIN "".crdb_internal.kv_catalog_namespace sc
+                 ON sc.id = obj.parent_schema_id
+               JOIN "".crdb_internal.kv_catalog_namespace db
+                 ON db.id = obj.parent_id
+               WHERE obj.id = %d
+               LIMIT 1) || '%%'
+ORDER BY created DESC`, lexbase.EscapeSQLString(fmt.Sprintf("[%d]", id)), id)
+
+	rows, err := c.ie.QueryBufferedEx(c.ctx, "stmtEnvCollector", nil /* txn */, c.ieo, query)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	fmt.Fprintf(w, "-- Schema-change jobs for descriptor %d:\n", id)
+	for _, row := range rows {
+		strs := make([]string, len(row))
+		for i, d := range row {
+			s, ok := d.(*tree.DString)
+			if !ok {
+				return errors.AssertionFailedf(
+					"expected schema-change query to return DString, got %T", d)
+			}
+			strs[i] = string(*s)
+		}
+		fmt.Fprintf(w, "%s | %s | %s | %s | %s\n", strs[0], strs[1], strs[2], strs[3], strs[4])
+	}
+	fmt.Fprintln(w)
 	return nil
 }
 

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -268,10 +269,14 @@ func TestHintCacheMultiNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Skip secondary tenants when running under race to avoid flakes.
+	var serverArgs base.TestServerArgs
+	if util.RaceEnabled {
+		serverArgs.DefaultTestTenant = base.TestSkipSecondaryTenantsUnderDuress
+	}
+
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{},
-	})
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{ServerArgs: serverArgs})
 	defer tc.Stopper().Stop(ctx)
 
 	// Use node 0 as the primary node for the cache.
@@ -494,11 +499,11 @@ func TestHintCacheGeneration(t *testing.T) {
 	generationAfterDeleteAll := getGenerationAssertNoChange()
 
 	// Query for hints (cache access) should NOT increment generation.
-	hc.MaybeGetStatementHints(ctx, fingerprint2, fingerprintFlags)
+	hc.MaybeGetStatementHints(ctx, fingerprint2, fingerprintFlags, "" /* currentDB */)
 	getGenerationAssertNoChange()
 
 	// Accessing a non-existent fingerprint should also NOT increment generation.
-	hc.MaybeGetStatementHints(ctx, "SELECT nonexistent FROM t", fingerprintFlags)
+	hc.MaybeGetStatementHints(ctx, "SELECT nonexistent FROM t", fingerprintFlags, "" /* currentDB */)
 	getGenerationAssertNoChange()
 
 	// Delete all remaining hints.
@@ -533,7 +538,7 @@ func waitForUpdateOnFingerprintHash(
 		if hasHints := hc.TestingHashHasHints(hash); (expected > 0) != hasHints {
 			return errors.Errorf("expected hash %d with hasHints=%t, got hasHints=%t", hash, expected > 0, hasHints)
 		}
-		hints, ids := hc.MaybeGetStatementHints(ctx, fingerprint, fingerprintFlags)
+		hints, ids := hc.MaybeGetStatementHints(ctx, fingerprint, fingerprintFlags, "" /* currentDB */)
 		if len(hints) != expected {
 			return errors.Errorf("expected %d hints for fingerprint %q, got %d", expected, fingerprint, len(hints))
 		}
@@ -551,7 +556,7 @@ func requireHintsCount(
 	fingerprintFlags tree.FmtFlags,
 	expectedCount int,
 ) {
-	hints, ids := hc.MaybeGetStatementHints(ctx, fingerprint, fingerprintFlags)
+	hints, ids := hc.MaybeGetStatementHints(ctx, fingerprint, fingerprintFlags, "" /* currentDB */)
 	require.Len(t, hints, expectedCount)
 	require.Len(t, ids, expectedCount)
 	checkIDOrder(t, ids)
@@ -575,8 +580,8 @@ func insertStatementHint(t *testing.T, r *sqlutils.SQLRunner, fingerprint string
 	hint.SetValue(&hintpb.InjectHints{})
 	hintBytes, err := hintpb.ToBytes(hint)
 	require.NoError(t, err)
-	const insertStmt = `INSERT INTO system.statement_hints ("fingerprint", "hint") VALUES ($1, $2)`
-	r.Exec(t, insertStmt, fingerprint, hintBytes)
+	const insertStmt = `INSERT INTO system.statement_hints ("fingerprint", "hint", "hint_type") VALUES ($1, $2, $3)`
+	r.Exec(t, insertStmt, fingerprint, hintBytes, hint.HintType())
 }
 
 // deleteStatementHints deletes statement hints from the system.statement_hints

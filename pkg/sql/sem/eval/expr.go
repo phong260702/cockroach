@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // Expr evaluates a TypedExpr into a Datum.
@@ -176,8 +177,15 @@ func (e *evaluator) EvalCastExpr(ctx context.Context, expr *tree.CastExpr) (tree
 		return nil, err
 	}
 
-	// NULL cast to anything is NULL.
+	// NULL cast to anything is NULL, but domain NOT NULL constraints must
+	// still be checked. Use expr.Type to access the target type since
+	// ResolvedType() panics on un-type-checked expressions.
 	if d == tree.DNull {
+		if t, ok := expr.Type.(*types.T); ok && t.TypeMeta.DomainData != nil {
+			if err := ValidateDomainConstraints(ctx, e.ctx(), d, t); err != nil {
+				return nil, err
+			}
+		}
 		return d, nil
 	}
 	d = UnwrapDatum(ctx, e.ctx(), d)
@@ -374,6 +382,28 @@ func (e *evaluator) EvalIndirectionExpr(
 			}
 		}
 		return tree.NewDJSON(curr), nil
+	case types.StringFamily:
+		if d.ResolvedType().Oid() != oid.T_name {
+			return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+		}
+		for i, t := range expr.Indirection {
+			if t.Slice || i > 0 {
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
+			beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if beginDatum == tree.DNull {
+				return tree.DNull, nil
+			}
+			subscriptIdx = int(tree.MustBeDInt(beginDatum))
+		}
+		str := string(tree.MustBeDString(d))
+		if subscriptIdx < 0 || subscriptIdx >= len(str) {
+			return tree.DNull, nil
+		}
+		return tree.NewDString(string(str[subscriptIdx])), nil
 	}
 	return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
 }

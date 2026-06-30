@@ -1853,12 +1853,13 @@ message ExportRequest {
       (gogoproto.customname) = "ResumeKeyTS"
   ];
 
-  // MVCCFilter determines if request exports all data or latest data as of
-  // Timestamp specified in request header. If all data is requested StartTime
-  // is used as a lower bound and header Timestamp as higher bound or exported
-  // entries.
+  // MVCCFilter determines if the request exports all revisions of a key or
+  // only the latest value as of the Timestamp specified in request header.
   MVCCFilter mvcc_filter = 4 [(gogoproto.customname) = "MVCCFilter"];
-  // StartTime is only used when MVCCFilter is set to All.
+  // StartTime specifies the start of the time range (StartTime, Timestamp]
+  // from which keys are exported. NB: When non-empty with MVCCFilter_Latest,
+  // point key tombstones are included in the export so that deletions
+  // that occurred in the interval are preserved.
   util.hlc.Timestamp start_time = 3 [(gogoproto.nullable) = false];
 
   // Split large rows in the middle of key sequence. This option will allow
@@ -2193,7 +2194,7 @@ message LinkExternalSSTableRequest {
     RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 
   message  ExternalFile {
-    string locator = 1;
+    string locator = 1 [(gogoproto.nullable) = false, (gogoproto.customtype) = "github.com/cockroachdb/redact.RedactableString"];
     string path = 2;
     uint64 backing_file_size = 3;
     uint64 approximate_physical_size = 4;
@@ -3022,9 +3023,25 @@ message Header {
   // evaluated in descending range order.
   bool is_reverse = 38;
 
+  // workload_id identifies the workload that triggered this batch (statement
+  // fingerprint ID, job ID, etc.). Used for ASH sampling.
+  uint64 workload_id = 39 [(gogoproto.customname) = "WorkloadID"];
+
+  // app_name_id is the hash of the application name. Used for ASH sampling.
+  // Set when the workload is from SQL execution.
+  // Note(alyshan): This will eventually be replaced by a general
+  // enrichment_id field which will enable the ASH sampler to
+  // enrich samples with more workload context.
+  uint64 app_name_id = 40 [(gogoproto.customname) = "AppNameID"];
+
+  // workload_type distinguishes the kind of workload that workload_id
+  // represents (statement fingerprint, job ID, system task, etc.).
+  // Used by the ASH sampler to choose the right encoding.
+  uint32 workload_type = 41 [(gogoproto.customname) = "WorkloadType"];
+
   reserved 7, 10, 12, 14, 20, 24;
 
-  // Next ID: 39
+  // Next ID: 42
 }
 
 message WriteOptions {
@@ -3134,6 +3151,15 @@ message AdmissionHeader {
   // already been accounted for, and can start reserving more only when it
   // exceeds.
   bool no_memory_reserved_at_source = 5;
+
+  // ResourceGroupID identifies the resource group that the originating SQL
+  // session bound itself to via SET resource_group. It is resolved from the
+  // group name on the gateway and carried here so the server can route the
+  // request's admission work to that group. Zero means "no opinion": the
+  // server falls back to its existing routing (priority- or tenant-derived).
+  // Old servers ignore this field; new servers treat zero as unset, so the
+  // field is safe to set in a mixed-version cluster.
+  uint64 resource_group_id = 6 [(gogoproto.customname) = "ResourceGroupID"];
 }
 
 // A BatchRequest contains one or more requests to be executed in

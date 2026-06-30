@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgrepl/lsn"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -2466,6 +2467,7 @@ func NewTimestampExceedsBoundsError(t time.Time) error {
 }
 
 // DTimestamp is the timestamp Datum.
+// See docs/tech-notes/timestamp-types.md for details on timestamp types.
 type DTimestamp struct {
 	// DTimestamp represents a timezoneless date and time value. It is stored in
 	// the time.Time as if it had UTC location, regardless of what timezone it
@@ -2726,6 +2728,7 @@ func (d *DTimestamp) Size() uintptr {
 }
 
 // DTimestampTZ is the timestamp Datum that is rendered with session offset.
+// See docs/tech-notes/timestamp-types.md for details on timestamp types.
 type DTimestampTZ struct {
 	// Just like time.Time, DTimestampTZ represents an instant in global time that
 	// is stored internally in UTC and converted to local time when rendering.
@@ -4771,6 +4774,10 @@ type DArray struct {
 
 	// customOid, if non-0, is the oid of this array datum.
 	customOid oid.Oid
+
+	// zeroIndexed, if true, makes FirstIndex() return 0 instead of 1.
+	// This is used for TG_ARGV to match PostgreSQL's 0-indexed behavior.
+	zeroIndexed bool
 }
 
 // NewDArray returns a DArray containing elements of the specified type.
@@ -4883,11 +4890,20 @@ func (d *DArray) IsComposite() bool {
 // which are 1-indexed, and 0 for the special Postgers vector types which are
 // 0-indexed.
 func (d *DArray) FirstIndex() int {
+	if d.zeroIndexed {
+		return 0
+	}
 	switch d.customOid {
 	case oid.T_int2vector, oid.T_oidvector:
 		return 0
 	}
 	return 1
+}
+
+// SetZeroIndexed marks this array as 0-indexed. This is used for TG_ARGV
+// to match PostgreSQL's 0-indexed behavior.
+func (d *DArray) SetZeroIndexed() {
+	d.zeroIndexed = true
 }
 
 // Compare implements the Datum interface.
@@ -5571,6 +5587,11 @@ func (d *DOid) Format(ctx *FmtCtx) {
 		ctx.WriteByte(',')
 		lexbase.EncodeSQLStringWithFlags(&ctx.Buffer, d.name, lexbase.EncNoFlags)
 		ctx.WriteByte(')')
+	} else if ctx.HasFlags(FmtPgwireText) {
+		// Pgwire text output: emit the name verbatim, matching Postgres's
+		// reg*out behavior (the name is already in qualified-identifier form
+		// when produced by resolveOID / castStringToRegClassTableName).
+		ctx.WriteString(d.name)
 	} else {
 		// This is used to print the name of pseudo-procedures in e.g.
 		// pg_catalog.pg_type.typinput
@@ -5640,6 +5661,7 @@ func (d *DOid) Name() string {
 // Types that currently benefit from DOidWrapper are:
 // - DName => DOidWrapper(*DString, oid.T_name)
 // - DRefCursor => DOidWrapper(*DString, oid.T_refcursor)
+// - DACLItem => DOidWrapper(*DString, oid.T_aclitem)
 // - DCIText => DOidWrapper(*DCollatedString, oidext.T_citext)
 type DOidWrapper struct {
 	Wrapped Datum
@@ -5738,7 +5760,13 @@ func (d *DOidWrapper) AmbiguousFormat() bool {
 func (d *DOidWrapper) Format(ctx *FmtCtx) {
 	if d.Oid == oid.T_refcursor {
 		wrapped := MustBeDString(d.Wrapped)
+		if ctx.flags.HasFlags(FmtMarkRedactionNode) {
+			ctx.WriteString(string(redact.StartMarker()))
+		}
 		wrapped.Format(ctx)
+		if ctx.flags.HasFlags(FmtMarkRedactionNode) {
+			ctx.WriteString(string(redact.EndMarker()))
+		}
 		return
 	}
 	ctx.FormatNode(d.Wrapped)
@@ -5814,6 +5842,24 @@ func NewDNameFromDString(d *DString) Datum {
 // initialized from a string.
 func NewDName(d string) Datum {
 	return NewDNameFromDString(NewDString(d))
+}
+
+// NewDACLItemFromDString is a helper routine to create a *DOidWrapper with
+// aclitem OID, initialized from an existing *DString. It validates the format
+// and returns an error if the string is not a valid aclitem.
+func NewDACLItemFromDString(d *DString) (Datum, error) {
+	if _, err := privilege.ParseACLItem(string(*d)); err != nil {
+		return nil, err
+	}
+	return wrapWithOid(d, oid.T_aclitem), nil
+}
+
+// NewDACLItem creates a *DOidWrapper with aclitem OID from a structured
+// privilege.ACLItem. No validation is performed since the ACLItem is
+// already well-formed.
+func NewDACLItem(item privilege.ACLItem) Datum {
+	s := DString(item.String())
+	return wrapWithOid(&s, oid.T_aclitem)
 }
 
 // NewDCIText is a helper routine to create a *DCIText (implemented as a *DOidWrapper)

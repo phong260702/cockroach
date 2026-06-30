@@ -58,7 +58,6 @@ var (
 
 // maybeStartCompactionJob will initiate a compaction job off of a triggering
 // incremental job if the backup chain length exceeds the threshold.
-// backupStmt should be the original backup statement that triggered the job.
 // It is the responsibility of the caller to ensure that the backup details'
 // destination contains a resolved subdir.
 func maybeStartCompactionJob(
@@ -77,8 +76,6 @@ func maybeStartCompactionJob(
 		return 0, errors.New("only scheduled backups can be compacted")
 	case len(triggerJob.SpecificTenantIds) != 0 || triggerJob.IncludeAllSecondaryTenants:
 		return 0, errors.New("backups of tenants not supported for compaction")
-	case len(triggerJob.URIsByLocalityKV) != 0:
-		return 0, errors.New("locality aware backups not supported for compaction")
 	}
 
 	env := scheduledjobs.ProdJobSchedulerEnv
@@ -116,8 +113,13 @@ func maybeStartCompactionJob(
 	}
 
 	chain, _, _, _, err := getBackupChain(
-		ctx, execCfg, user, triggerJob.Destination, triggerJob.EncryptionOptions,
-		triggerJob.EndTime, &kmsEnv,
+		ctx,
+		execCfg,
+		user,
+		triggerJob.Destination,
+		triggerJob.EncryptionOptions,
+		hlc.Timestamp{}, // Use the whole chain when considering what to compact.
+		&kmsEnv,
 	)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to get backup chain")
@@ -205,6 +207,9 @@ func StartCompactionJob(
 
 	var executionLocality roachpb.Locality
 	if options.ExecutionLocality != nil {
+		if options.Strict {
+			return 0, errors.New("cannot set both EXECUTION LOCALITY and WITH STRICT STORAGE LOCALITY")
+		}
 		if strVal, ok := options.ExecutionLocality.(*tree.StrVal); ok {
 			s := strVal.RawString()
 			if s != "" {
@@ -245,9 +250,10 @@ func StartCompactionJob(
 			Subdir: fullBackupPath,
 			Exists: true,
 		},
-		EncryptionOptions: &encryption,
-		ExecutionLocality: executionLocality,
-		Compact:           true,
+		EncryptionOptions:       &encryption,
+		ExecutionLocality:       executionLocality,
+		StrictLocalityFiltering: options.Strict,
+		Compact:                 true,
 	}
 	jobID := planHook.ExecCfg().JobRegistry.MakeJobID()
 	description, err := compactionJobDescription(details)
@@ -349,7 +355,9 @@ func (b *backupResumer) ResumeCompaction(
 		// Update the job payload (non-volatile job definition) once, with the now
 		// resolved destination, updated description, etc. If we resume again we'll
 		// skip this whole block so this isn't an excessive update of payload.
-		if err := b.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		//
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		if err := b.job.DeprecatedNoTxn().Update(ctx, func(txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
 			if err := md.CheckRunningOrReverting(); err != nil {
 				return err
 			}
@@ -390,15 +398,6 @@ func (b *backupResumer) ResumeCompaction(
 		}
 	}
 
-	storageByLocalityKV := make(map[string]*cloudpb.ExternalStorage)
-	for kv, uri := range updatedDetails.URIsByLocalityKV {
-		conf, err := cloud.ExternalStorageConfFromURI(uri, execCtx.User())
-		if err != nil {
-			return err
-		}
-		storageByLocalityKV[kv] = &conf
-	}
-
 	mem := execCtx.ExecCfg().RootMemoryMonitor.MakeBoundAccount()
 	defer mem.Close(ctx)
 	var memSize int64
@@ -423,8 +422,8 @@ func (b *backupResumer) ResumeCompaction(
 		MaxRetries: 5,
 	}
 
-	if testingKnobs != nil && testingKnobs.BackupDistSQLRetryPolicy != nil {
-		retryOpts = *testingKnobs.BackupDistSQLRetryPolicy
+	if testingKnobs != nil && testingKnobs.BackupDistSQLInitialRetryPolicy != nil {
+		retryOpts = *testingKnobs.BackupDistSQLInitialRetryPolicy
 	}
 
 	// We want to retry a backup if there are transient failures (i.e. worker nodes
@@ -480,7 +479,7 @@ func (b *backupResumer) processCompactionCompletion(
 	if details.ScheduleID == 0 {
 		return nil
 	}
-	return execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+	if err := execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		scheduledJob := jobs.ScheduledJobTxn(txn)
 		backupSchedule, args, err := getScheduledBackupExecutionArgsFromSchedule(
 			ctx, env, scheduledJob, details.ScheduleID,
@@ -497,7 +496,31 @@ func (b *backupResumer) processCompactionCompletion(
 			backupSchedule.ExecutorType(), jobspb.ExecutionArguments{Args: any},
 		)
 		return scheduledJob.Update(ctx, backupSchedule)
-	})
+	}); err != nil {
+		return errors.Wrapf(err, "failed to clear compaction job ID from schedule %d", details.ScheduleID)
+	}
+
+	if err := b.maybeTriggerFollowupCompaction(ctx, execCtx, details); err != nil {
+		log.Dev.Warningf(ctx, "failed to trigger follow-up compaction job: %+v", err)
+	}
+	return nil
+}
+
+func (b *backupResumer) maybeTriggerFollowupCompaction(
+	ctx context.Context, execCtx sql.JobExecContext, details jobspb.BackupDetails,
+) error {
+	jobID, err := maybeStartCompactionJob(
+		ctx, execCtx.ExecCfg(), execCtx.User(), details,
+	)
+	if err != nil {
+		return err
+	}
+	if jobID != 0 {
+		log.Dev.Infof(
+			ctx, "compaction job %d completed, triggering follow-up compaction job %d", b.job.ID(), jobID,
+		)
+	}
+	return nil
 }
 
 type compactionChain struct {
@@ -677,6 +700,7 @@ func (c compactionChain) createCompactionManifest(
 	// manifest of the last incremental.
 	cManifest.DescriptorChanges = nil
 	cManifest.Files = nil
+	cManifest.PartitionDescriptorFilenames = nil
 	cManifest.EntryCounts = roachpb.RowCount{}
 
 	// The StatisticsFileNames is inherited from the stats of the latest
@@ -807,14 +831,15 @@ func getBackupChain(
 	return manifests, localityInfo, baseEncryptionInfo, allIters, nil
 }
 
-// processProgress processes progress updates from the bulk processor for a backup and updates
+// checkpointLoop processes progress updates from the bulk processor for a backup and updates
 // the associated manifest.
-func processProgress(
+func checkpointLoop(
 	ctx context.Context,
 	execCtx sql.JobExecContext,
 	details jobspb.BackupDetails,
 	manifest *backuppb.BackupManifest,
 	progCh <-chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
+	chunkFinishedCh chan<- struct{},
 	kmsEnv cloud.KMSEnv,
 ) error {
 	var lastCheckpointTime time.Time
@@ -829,6 +854,9 @@ func processProgress(
 		for _, file := range progDetails.Files {
 			manifest.Files = append(manifest.Files, file)
 			manifest.EntryCounts.Add(file.EntryCounts)
+		}
+		for range progDetails.CompletedSpans {
+			chunkFinishedCh <- struct{}{}
 		}
 
 		// TODO (kev-cao): Add per node progress updates.
@@ -881,24 +909,61 @@ func doCompaction(
 	defaultStore cloud.ExternalStorage,
 	kmsEnv cloud.KMSEnv,
 ) error {
+	compactionPlan, err := createCompactionPlan(
+		ctx, execCtx, jobID, details, compactChain, manifest, defaultStore, kmsEnv,
+	)
+	if err != nil {
+		return errors.Wrap(err, "creating compaction plan")
+	}
+
 	progCh := make(chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
 	runDistCompaction := func(ctx context.Context) error {
 		defer close(progCh)
 		return runCompactionPlan(
-			ctx, execCtx, jobID, details, compactChain, manifest, defaultStore, kmsEnv, progCh,
+			ctx, execCtx, jobID, compactionPlan, progCh,
 		)
 	}
-	checkpointLoop := func(ctx context.Context) error {
-		return processProgress(ctx, execCtx, details, manifest, progCh, kmsEnv)
+
+	var totalEntriesLeft int
+	for _, set := range compactionPlan.localitySets {
+		totalEntriesLeft += set.totalEntries
 	}
+	chunkFinishedCh := make(chan struct{}, totalEntriesLeft)
+	checkpointLoop := func(ctx context.Context) error {
+		defer close(chunkFinishedCh)
+		return checkpointLoop(
+			ctx, execCtx, details, manifest, progCh, chunkFinishedCh, kmsEnv,
+		)
+	}
+
+	var frac float64
+	if err := execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, t isql.Txn) error {
+		var err error
+		frac, _, _, err = jobs.ProgressStorage(jobID).Get(ctx, t)
+		return err
+	}); err != nil {
+		return err
+	}
+	if math.IsNaN(frac) {
+		frac = 0
+	}
+	logger := jobs.NewChunkProgressLoggerForJob(
+		jobID, execCtx.ExecCfg().InternalDB, totalEntriesLeft, frac, 1.0,
+	)
+	progressLoop := func(ctx context.Context) error {
+		return logger.Loop(ctx, chunkFinishedCh)
+	}
+
 	// TODO (kev-cao): Add trace aggregator loop.
 
 	if err := ctxgroup.GoAndWait(
-		ctx, runDistCompaction, checkpointLoop,
+		ctx, runDistCompaction, checkpointLoop, progressLoop,
 	); err != nil {
 		return err
 	}
-	statsTable := getTableStatsForBackup(ctx, execCtx.ExecCfg().InternalDB.Executor(), manifest.Descriptors)
+	statsTable := getTableStatsForBackup(
+		ctx, execCtx.ExecCfg().InternalDB.Executor(), execCtx.ExecCfg().Settings, manifest.Descriptors,
+	)
 	return backupinfo.WriteBackupMetadata(
 		ctx, execCtx, defaultStore, details, kmsEnv, manifest, statsTable,
 	)

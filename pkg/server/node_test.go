@@ -82,7 +82,7 @@ func TestBootstrapCluster(t *testing.T) {
 	}
 
 	// Scan the complete contents of the local database directly from the engine.
-	res, err := storage.MVCCScan(ctx, e.TODOEngine(), keys.LocalMax, roachpb.KeyMax, hlc.MaxTimestamp, storage.MVCCScanOptions{})
+	res, err := storage.MVCCScan(ctx, e.StateEngine(), keys.LocalMax, roachpb.KeyMax, hlc.MaxTimestamp, storage.MVCCScanOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -900,83 +900,14 @@ func TestNodeCrossLocalityMetrics(t *testing.T) {
 	}
 }
 
-func TestGetTenantWeights(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-
-	specs := []base.StoreSpec{
-		{InMemory: true},
-		{InMemory: true},
-	}
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{
-		StoreSpecs: specs,
-	})
-	defer s.Stopper().Stop(ctx)
-	// Wait until both stores are started properly.
-	testutils.SucceedsSoon(t, func() error {
-		var n int
-		err := s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-			if !s.IsStarted() {
-				return fmt.Errorf("not started: %s", s)
-			}
-			n++
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		if exp := len(specs); exp != n {
-			return fmt.Errorf("found only %d of %d stores", n, exp)
-		}
-		return nil
-	})
-	// At this point, all ranges have the SystemTenantID. Create a split using
-	// another tenant, which will cause that tenant to have a weight of 1 in the
-	// relevant store(s).
-	const otherTenantID = 5
-	prefix := keys.MakeTenantPrefix(roachpb.MustMakeTenantID(otherTenantID))
-	require.NoError(t, s.DB().AdminSplit(
-		ctx,
-		prefix,           /* splitKey */
-		hlc.MaxTimestamp, /* expirationTime */
-	))
-	// The range can have replicas on multiple stores, so wait for the split to
-	// be applied everywhere.
-	stores := s.GetStores().(*kvserver.Stores)
-	testutils.SucceedsSoon(t, func() error {
-		return stores.VisitStores(func(s *kvserver.Store) error {
-			r := s.LookupReplica(roachpb.RKey(prefix))
-			if r != nil && !r.Desc().StartKey.Equal(prefix) {
-				return errors.Errorf("waiting for split")
-			}
-			return nil
-		})
-	})
-	// Unfortunately, the non-determinism of replica distribution can make this
-	// test more complicated than the code it is trying to test, if we were to
-	// validate exact counts. So we do some simple validation instead.
-	weights := s.Node().(*Node).GetTenantWeights()
-	// Both tenants have overall non-zero counts.
-	require.Less(t, uint32(0), weights.Node[roachpb.SystemTenantID.ToUint64()])
-	require.Less(t, uint32(0), weights.Node[otherTenantID])
-	// There are two stores.
-	require.Equal(t, 2, len(weights.Stores))
-	// The sum of the values in the stores is equal to the node-level value.
-	checkSum := func(tenantID uint64) {
-		require.Equal(t, weights.Node[tenantID], weights.Stores[0].Weights[tenantID]+
-			weights.Stores[1].Weights[tenantID])
-	}
-	checkSum(roachpb.SystemTenantID.ToUint64())
-	checkSum(otherTenantID)
-}
-
 type testMonitorManager struct {
-	monitors map[string]*testDiskStatsMonitor
+	monitors  map[string]*testDiskStatsMonitor
+	idCounter uint32
 }
 
 func (t *testMonitorManager) Monitor(path string) (kvserver.DiskStatsMonitor, error) {
-	monitor := &testDiskStatsMonitor{}
+	t.idCounter++
+	monitor := &testDiskStatsMonitor{deviceID: disk.DeviceID{Major: t.idCounter}}
 	t.monitors[path] = monitor
 	return monitor, nil
 }
@@ -990,8 +921,25 @@ func (t *testMonitorManager) injectStats(diskStats map[string]disk.Stats) {
 	}
 }
 
+func (t *testMonitorManager) CollectInstantaneous(
+	statsBuf []disk.Stats, byteBuf []byte,
+) ([]disk.Stats, []byte, error) {
+	statsBuf = statsBuf[:0]
+	for _, monitor := range t.monitors {
+		s := monitor.stats
+		s.DeviceID = monitor.deviceID
+		statsBuf = append(statsBuf, s)
+	}
+	return statsBuf, byteBuf, nil
+}
+
 type testDiskStatsMonitor struct {
-	stats disk.Stats
+	deviceID disk.DeviceID
+	stats    disk.Stats
+}
+
+func (t *testDiskStatsMonitor) DeviceID() disk.DeviceID {
+	return t.deviceID
 }
 
 func (t *testDiskStatsMonitor) CumulativeStats() (disk.Stats, error) {
@@ -1066,31 +1014,51 @@ func TestDiskStatsMap(t *testing.T) {
 			WritesSectors: 5,
 		},
 	})
+	// checkStats verifies that the given per-store stats match expectations.
+	checkStats := func(
+		byStore map[roachpb.StoreID]admission.DiskStats,
+		fooReadSectors, fooWriteSectors, barReadSectors, barWriteSectors uint64,
+	) {
+		require.Equal(t, admission.DiskStats{
+			BytesRead:            fooReadSectors * disk.SectorSizeBytes,
+			BytesWritten:         fooWriteSectors * disk.SectorSizeBytes,
+			ProvisionedBandwidth: clusterProvisionedBW,
+		}, byStore[10]) // "foo"
+		require.Equal(t, admission.DiskStats{
+			BytesRead:            barReadSectors * disk.SectorSizeBytes,
+			BytesWritten:         barWriteSectors * disk.SectorSizeBytes,
+			ProvisionedBandwidth: 200,
+		}, byStore[5]) // "bar"
+	}
+
 	stats, err = dsm.tryPopulateAdmissionDiskStats(clusterProvisionedBW)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(stats))
-	for _, id := range engineIDs {
-		ds, ok := stats[id]
-		require.True(t, ok)
-		var expectedDS admission.DiskStats
-		switch id {
-		// "foo"
-		case 10:
-			expectedDS = admission.DiskStats{
-				BytesRead:            disk.SectorSizeBytes,
-				BytesWritten:         2 * disk.SectorSizeBytes,
-				ProvisionedBandwidth: clusterProvisionedBW,
-			}
-		// "bar"
-		case 5:
-			expectedDS = admission.DiskStats{
-				BytesRead:            4 * disk.SectorSizeBytes,
-				BytesWritten:         5 * disk.SectorSizeBytes,
-				ProvisionedBandwidth: 200,
-			}
-		}
-		require.Equal(t, expectedDS, ds)
+	checkStats(stats, 1, 2, 4, 5)
+
+	// Verify collectInstantaneous returns the same results using the same
+	// injected stats.
+	var buf admission.DiskMetricsBuf
+	require.NoError(t, dsm.collectInstantaneous(&buf, clusterProvisionedBW))
+	require.Equal(t, 2, len(buf.Stats))
+	byStore := make(map[roachpb.StoreID]admission.DiskStats)
+	for _, s := range buf.Stats {
+		byStore[s.StoreID] = s.Stats
 	}
+	checkStats(byStore, 1, 2, 4, 5)
+
+	// Inject updated stats and collect again.
+	diskManager.injectStats(map[string]disk.Stats{
+		"foo": {ReadsSectors: 10, WritesSectors: 20},
+		"bar": {ReadsSectors: 40, WritesSectors: 50},
+	})
+	require.NoError(t, dsm.collectInstantaneous(&buf, clusterProvisionedBW))
+	require.Equal(t, 2, len(buf.Stats))
+	byStore = make(map[roachpb.StoreID]admission.DiskStats)
+	for _, s := range buf.Stats {
+		byStore[s.StoreID] = s.Stats
+	}
+	checkStats(byStore, 10, 20, 40, 50)
 }
 
 // TestRevertToEpochIfTooManyRanges verifies that leases switch from expiration

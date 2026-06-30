@@ -13,8 +13,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
@@ -137,7 +140,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					EvalCtx: &evalCtx,
 					Mon:     evalCtx.TestingMon,
 					Cfg: &execinfra.ServerConfig{
-						Settings: st,
+						Settings:   st,
+						RPCContext: &rpc.Context{ContextOptions: rpc.ContextOptions{}},
 					},
 				}
 				rng, _ := randutil.NewTestRand()
@@ -199,7 +203,8 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					&execinfra.FlowCtx{
 						Gateway: false,
 						Cfg: &execinfra.ServerConfig{
-							Settings: st,
+							Settings:   st,
+							RPCContext: &rpc.Context{ContextOptions: rpc.ContextOptions{}},
 						},
 					},
 					0, /* processorID */
@@ -244,11 +249,15 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					id int,
 					outboxMetadataSources []colexecop.MetadataSource,
 				) {
+					var nodeid base.NodeIDContainer
+					nodeid.Set(context.Background(), roachpb.NodeID(7))
 					outbox, err := colrpc.NewOutbox(
 						&execinfra.FlowCtx{
+							NodeID:  base.NewSQLIDContainerForNode(&nodeid),
 							Gateway: false,
 							Cfg: &execinfra.ServerConfig{
-								Settings: st,
+								Settings:   st,
+								RPCContext: &rpc.Context{ContextOptions: rpc.ContextOptions{}},
 							},
 						},
 						0, /* processorID */
@@ -283,7 +292,7 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 					doneFn := func() { close(serverStreamNotification.Donec) }
 					wg.Add(1)
 					go func(id int, stream execinfrapb.DistSQL_FlowStreamServer, doneFn func()) {
-						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream)
+						handleStreamErrCh[id] <- inbox.RunWithStream(stream.Context(), stream, nil /* header */)
 						doneFn()
 						wg.Done()
 					}(id, serverStream, doneFn)
@@ -399,6 +408,11 @@ func TestVectorizedFlowShutdown(t *testing.T) {
 				checkMetadata := func(receivedMeta []execinfrapb.ProducerMetadata) {
 					receivedMetaFromID := make([]bool, streamID)
 					for _, meta := range receivedMeta {
+						// Each outbox also emits an always-on Metrics record
+						// carrying RawSQLCPUTime; skip those.
+						if meta.Metrics != nil {
+							continue
+						}
 						require.NotNil(t, meta.Err)
 						id, err := strconv.Atoi(meta.Err.Error())
 						require.NoError(t, err)

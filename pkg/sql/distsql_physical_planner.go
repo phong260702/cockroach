@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -48,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -142,11 +144,6 @@ type DistSQLPlanner struct {
 
 const NoStrictLocalityFiltering = false
 
-// ReplicaOraclePolicy controls which policy the physical planner uses to choose
-// a replica for a given range. It is exported so that it may be overwritten
-// during initialization by CCL code to enable follower reads.
-var ReplicaOraclePolicy = replicaoracle.BinPackingChoice
-
 // NewDistSQLPlanner initializes a DistSQLPlanner.
 //
 // sqlInstanceID is the ID of the node on which this planner runs. It is used to
@@ -240,11 +237,30 @@ func (dsp *DistSQLPlanner) GetAllInstancesByLocality(
 	return all[:pos], nil
 }
 
-// GetSQLInstanceInfo gets a node descriptor by node ID.
+// GetSQLInstanceInfo gets SQL instance info by instance ID. This properly handles
+// SQL instances in multi-tenant environments where instances may not map to KV nodes.
+// The previous behavior is available by turning off the instance resolver
+// via cluster settings.
 func (dsp *DistSQLPlanner) GetSQLInstanceInfo(
-	sqlInstanceID base.SQLInstanceID,
-) (*roachpb.NodeDescriptor, error) {
-	return dsp.nodeDescs.GetNodeDescriptor(roachpb.NodeID(sqlInstanceID))
+	ctx context.Context, sqlInstanceID base.SQLInstanceID,
+) (sqlinstance.InstanceInfo, error) {
+	if sqlclustersettings.UseInstanceInfoForSQLInstances.Get(&dsp.st.SV) {
+		return dsp.sqlAddressResolver.GetInstance(ctx, sqlInstanceID)
+	}
+
+	// This only works when SQL instances map 1:1 to KV nodes, i.e. not in
+	// serverless tenants.
+	nodeDesc, err := dsp.nodeDescs.GetNodeDescriptor(roachpb.NodeID(sqlInstanceID))
+	if err != nil {
+		return sqlinstance.InstanceInfo{}, err
+	}
+	return sqlinstance.InstanceInfo{
+		InstanceID:      base.SQLInstanceID(nodeDesc.NodeID),
+		InstanceSQLAddr: nodeDesc.SQLAddress.String(),
+		InstanceRPCAddr: nodeDesc.Address.String(),
+		Locality:        nodeDesc.Locality,
+		BinaryVersion:   nodeDesc.ServerVersion,
+	}, nil
 }
 
 // ReplicaOracleConfig returns the DSP's replicaoracle.Config.
@@ -270,7 +286,7 @@ func (dsp *DistSQLPlanner) ConstructAndSetSpanResolver(
 		log.Dev.Fatal(ctx, "trying to construct and set span resolver when one already exists")
 	}
 	sr := physicalplan.NewSpanResolver(dsp.st, dsp.distSender, dsp.nodeDescs, nodeID, locality,
-		dsp.clock, dsp.rpcCtx, ReplicaOraclePolicy)
+		dsp.clock, dsp.rpcCtx, followerreads.FollowerReadOraclePolicy)
 	dsp.SetSpanResolver(sr)
 }
 
@@ -485,9 +501,9 @@ type PlanningCtx struct {
 	// path it will get called.
 	onFlowCleanup []func()
 
-	// OverridePlannerMon, if set, will be used instead of the Planner.Mon() as
-	// the parent monitor for the DistSQL flow.
-	OverridePlannerMon *mon.BytesMonitor
+	// OverridePlannerExecMon, if set, will be used instead of the
+	// Planner.ExecMon() as the parent monitor for the DistSQL flow.
+	OverridePlannerExecMon *mon.BytesMonitor
 }
 
 var _ physicalplan.ExprContext = &PlanningCtx{}
@@ -884,7 +900,7 @@ func (h *distSQLNodeHealth) checkSystem(
 	}
 
 	// Check that the node is not draining.
-	g, ok := h.gossip.Optional(distsql.MultiTenancyIssueNo)
+	g, ok := h.gossip.Optional()
 	if !ok {
 		return errors.AssertionFailedf("gossip is expected to be available for the system tenant")
 	}
@@ -3575,6 +3591,14 @@ func (dsp *DistSQLPlanner) planJoiners(
 	return p
 }
 
+type noopMetadataForwarder struct{}
+
+var _ metadataForwarder = &noopMetadataForwarder{}
+
+func (n noopMetadataForwarder) forwardMetadata(*execinfrapb.ProducerMetadata) {}
+
+var singletonNoopMetadataForwarder = &noopMetadataForwarder{}
+
 // createPhysPlan creates a PhysicalPlan as well as returns a non-nil cleanup
 // function that must be called after the flow has been cleaned up.
 func (dsp *DistSQLPlanner) createPhysPlan(
@@ -3584,6 +3608,22 @@ func (dsp *DistSQLPlanner) createPhysPlan(
 		// Note that planCtx.getCleanupFunc() is already set in
 		// plan.physPlan.onClose, so here we return a noop cleanup function.
 		return plan.physPlan.PhysicalPlan, func() {}, nil
+	}
+	// If we happen to evaluate an expression with a routine during the physical
+	// planning, we haven't yet set the metadata forwarder (we do that later,
+	// during the flow setup). So to prevent expected nil pointer internal
+	// errors we set a noop forwarder and then unset it once the physical
+	// planning is done.
+	//
+	// The only exception is if we're running parallel CHECKs, we'll avoid
+	// mutating the planner (since it's shared between goroutines) - similar to
+	// what we do in DistSQLPlanner.Run. (We can't have routines in post-query
+	// CHECKs since only FK and UNIQUE checks are run in parallel.)
+	if planCtx.flowConcurrency&distsql.ConcurrencyParallelChecks == 0 {
+		planCtx.planner.routineMetadataForwarder = singletonNoopMetadataForwarder
+		defer func() {
+			planCtx.planner.routineMetadataForwarder = nil
+		}()
 	}
 	physPlan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, plan.planNode)
 	return physPlan, planCtx.getCleanupFunc(), err
@@ -4964,6 +5004,14 @@ func checkScanParallelizationIfLocal(
 // knows plans will only be run on one node. On SQL tenants, the plan is only
 // distributed if tenantDistributionEnabled is true. planner argument can be
 // left nil.
+//
+// If a non-nil planner is provided and its session data has a non-empty
+// distsql_plan_locality_filter, that filter (and the distsql_plan_locality_filter_strict
+// flag) is propagated to the PlanningCtx so that physical planning will
+// restrict instance selection to matching SQL instances. The session var
+// setter validates the filter string when it is set, so an unparseable value
+// at this point is a bug; we log and proceed with no filter rather than
+// failing the query.
 func (dsp *DistSQLPlanner) NewPlanningCtx(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
@@ -4971,8 +5019,23 @@ func (dsp *DistSQLPlanner) NewPlanningCtx(
 	txn *kv.Txn,
 	distributionType DistributionType,
 ) *PlanningCtx {
+	var localityFilters []roachpb.Locality
+	strictFiltering := NoStrictLocalityFiltering
+	if planner != nil {
+		sd := planner.SessionData()
+		if sd != nil && sd.DistSQLPlanLocalityFilter != "" {
+			var loc roachpb.Locality
+			if err := loc.Set(sd.DistSQLPlanLocalityFilter); err != nil {
+				log.Dev.Warningf(ctx, "ignoring invalid distsql_plan_locality_filter %q: %v",
+					sd.DistSQLPlanLocalityFilter, err)
+			} else {
+				localityFilters = SingleLocalityFilter(loc)
+				strictFiltering = sd.DistSQLPlanLocalityFilterStrict
+			}
+		}
+	}
 	return dsp.NewPlanningCtxWithOracle(
-		ctx, evalCtx, planner, txn, distributionType, physicalplan.DefaultReplicaChooser, []roachpb.Locality{}, NoStrictLocalityFiltering,
+		ctx, evalCtx, planner, txn, distributionType, physicalplan.DefaultReplicaChooser, localityFilters, strictFiltering,
 	)
 }
 

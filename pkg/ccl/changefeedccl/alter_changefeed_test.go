@@ -23,11 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobfrontier"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -38,14 +36,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -94,9 +93,6 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 	)
 
 	rootDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
-	enableEnterprise := utilccl.TestingDisableEnterprise()
-	enableEnterprise()
-
 	withUser := func(t *testing.T, user string, fn func(*sqlutils.SQLRunner)) {
 		password := `password`
 		rootDB.Exec(t, fmt.Sprintf(`ALTER USER %s WITH PASSWORD '%s'`, user, password))
@@ -152,18 +148,20 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 			)
 		})
 
-		// With require_external_connection_sink enabled, the user requires USAGE on the external connection.
+		// With require_external_connection_sink enabled, the user requires
+		// USAGE on the external connection. Drop and re-add tables since
+		// they were already added above.
 		rootDB.Exec(t, "SET CLUSTER SETTING changefeed.permissions.require_external_connection_sink.enabled = true")
 		withUser(t, "user1", func(userDB *sqlutils.SQLRunner) {
 			userDB.ExpectErr(t,
 				"user user1 does not have USAGE privilege on external_connection second",
-				fmt.Sprintf("ALTER CHANGEFEED %d ADD table_b, table_c set sink='external://second'", jobID),
+				fmt.Sprintf("ALTER CHANGEFEED %d DROP table_b, table_c ADD table_b, table_c set sink='external://second'", jobID),
 			)
 		})
 		rootDB.Exec(t, `GRANT USAGE ON EXTERNAL CONNECTION second TO user1`)
 		withUser(t, "user1", func(userDB *sqlutils.SQLRunner) {
 			userDB.Exec(t,
-				fmt.Sprintf("ALTER CHANGEFEED %d ADD table_b, table_c set sink='external://second'", jobID),
+				fmt.Sprintf("ALTER CHANGEFEED %d DROP table_b, table_c ADD table_b, table_c set sink='external://second'", jobID),
 			)
 		})
 		rootDB.Exec(t, "SET CLUSTER SETTING changefeed.permissions.require_external_connection_sink.enabled = false")
@@ -301,7 +299,18 @@ func TestAlterChangefeedAddTargetAfterInitialScan(t *testing.T) {
 			sqlDB.Exec(t, `PAUSE JOB $1`, feed.JobID())
 			waitForJobState(sqlDB, t, feed.JobID(), `paused`)
 
-			sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan = '%s'`, feed.JobID(), initialScan))
+			switch initialScan {
+			case "only":
+				// initial_scan = 'only' is not supported when adding targets
+				// to a non-scan-only changefeed.
+				sqlDB.ExpectErr(t,
+					`cannot use initial_scan = 'only' when adding targets to a non-scan-only changefeed`,
+					fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan = 'only'`, feed.JobID()),
+				)
+				return
+			default:
+				sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan = '%s'`, feed.JobID(), initialScan))
+			}
 
 			sqlDB.Exec(t, `RESUME JOB $1`, feed.JobID())
 			waitForJobState(sqlDB, t, feed.JobID(), `running`)
@@ -315,9 +324,6 @@ func TestAlterChangefeedAddTargetAfterInitialScan(t *testing.T) {
 					// because it was inserted before the highwater.
 					`bar: [2]->{"after": {"a": 2, "b": 9}}`,
 				})
-			case "only":
-				// Strangely, when initial_scan = 'only', we don't do an initial
-				// scan unless the original changefeed was initial_scan = 'only'.
 			case "no":
 			default:
 				t.Fatalf("unknown initial scan type %q", initialScan)
@@ -402,57 +408,63 @@ func TestAlterChangefeedSwitchFamily(t *testing.T) {
 
 	testutils.SetVModule(t, "helpers_test=1")
 
-	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, FAMILY onlya (a), FAMILY onlyb (b))`)
+	testutils.RunTrueAndFalse(t, "drop first", func(t *testing.T, dropFirst bool) {
+		testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+			sqlDB := sqlutils.MakeSQLRunner(s.DB)
+			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, FAMILY onlya (a), FAMILY onlyb (b))`)
 
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo FAMILY onlya`)
-		defer closeFeed(t, testFeed)
+			testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo FAMILY onlya`)
+			defer closeFeed(t, testFeed)
 
-		tsr := sqlDB.QueryRow(t, `INSERT INTO foo VALUES(1, 'hello') RETURNING cluster_logical_timestamp()`)
-		var insertTsDecStr string
-		tsr.Scan(&insertTsDecStr)
-		insertTs := parseTimeToHLC(t, insertTsDecStr)
+			tsr := sqlDB.QueryRow(t, `INSERT INTO foo VALUES(1, 'hello') RETURNING cluster_logical_timestamp()`)
+			var insertTsDecStr string
+			tsr.Scan(&insertTsDecStr)
+			insertTs := parseTimeToHLC(t, insertTsDecStr)
 
-		assertPayloads(t, testFeed, []string{
-			`foo.onlya: [1]->{"after": {"a": 1}}`,
-		})
+			assertPayloads(t, testFeed, []string{
+				`foo.onlya: [1]->{"after": {"a": 1}}`,
+			})
 
-		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
-		require.True(t, ok)
+			feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+			require.True(t, ok)
 
-		// Wait for the high water mark (aka resolved ts) to advance past the row we inserted's
-		// mvcc ts. Otherwise, we'd see [1] again due to a catch up scan, and it
-		// would muddy the waters.
-		testutils.SucceedsSoon(t, func() error {
-			registry := s.Server.JobRegistry().(*jobs.Registry)
-			job, err := registry.LoadJob(context.Background(), feed.JobID())
-			require.NoError(t, err)
-			prog := job.Progress()
-			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() && insertTs.Less(*p) {
-				return nil
+			// Wait for the high water mark (aka resolved ts) to advance past the row we inserted's
+			// mvcc ts. Otherwise, we'd see [1] again due to a catch up scan, and it
+			// would muddy the waters.
+			testutils.SucceedsSoon(t, func() error {
+				registry := s.Server.JobRegistry().(*jobs.Registry)
+				job, err := registry.LoadJob(context.Background(), feed.JobID())
+				require.NoError(t, err)
+				prog := job.Progress()
+				if p := prog.GetHighWater(); p != nil && !p.IsEmpty() && insertTs.Less(*p) {
+					return nil
+				}
+				return errors.New("waiting for highwater")
+			})
+
+			sqlDB.Exec(t, `PAUSE JOB $1`, feed.JobID())
+			waitForJobState(sqlDB, t, feed.JobID(), `paused`)
+
+			alterCmd := `ADD foo FAMILY onlyb DROP foo FAMILY onlya`
+			if dropFirst {
+				alterCmd = `DROP foo FAMILY onlya ADD foo FAMILY onlyb`
 			}
-			return errors.New("waiting for highwater")
-		})
+			sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d %s`, feed.JobID(), alterCmd))
 
-		sqlDB.Exec(t, `PAUSE JOB $1`, feed.JobID())
-		waitForJobState(sqlDB, t, feed.JobID(), `paused`)
+			sqlDB.Exec(t, fmt.Sprintf(`RESUME JOB %d`, feed.JobID()))
+			waitForJobState(sqlDB, t, feed.JobID(), `running`)
 
-		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD foo FAMILY onlyb DROP foo FAMILY onlya`, feed.JobID()))
+			sqlDB.Exec(t, `INSERT INTO foo VALUES(2, 'goodbye')`)
+			assertPayloads(t, testFeed, []string{
+				// Note that we don't see foo.onlyb.[1] here, because we're not
+				// doing a catchup scan and we've already processed that tuple.
+				`foo.onlyb: [2]->{"after": {"b": "goodbye"}}`,
+			})
+		}
 
-		sqlDB.Exec(t, fmt.Sprintf(`RESUME JOB %d`, feed.JobID()))
-		waitForJobState(sqlDB, t, feed.JobID(), `running`)
-
-		sqlDB.Exec(t, `INSERT INTO foo VALUES(2, 'goodbye')`)
-		assertPayloads(t, testFeed, []string{
-			// Note that we don't see foo.onlyb.[1] here, because we're not
-			// doing a catchup scan and we've already processed that tuple.
-			`foo.onlyb: [2]->{"after": {"b": "goodbye"}}`,
-		})
-	}
-
-	// TODO: Figure out why this freezes on other sinks (ex: cloudstorage)
-	cdcTest(t, testFn, feedTestForceSink("kafka"), feedTestNoExternalConnection)
+		// TODO: Figure out why this freezes on other sinks (ex: cloudstorage)
+		cdcTest(t, testFn, feedTestForceSink("kafka"), feedTestNoExternalConnection)
+	})
 }
 
 func TestAlterChangefeedDropTarget(t *testing.T) {
@@ -1041,7 +1053,9 @@ func TestAlterChangefeedAddTargetErrors(t *testing.T) {
 		sqlDB.Exec(t, `CREATE TABLE bar (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `INSERT INTO bar VALUES (1), (2), (3)`)
 		sqlDB.ExpectErr(t,
-			`pq: target "bar" cannot be resolved as of the creation time of the changefeed. Please wait until the high water mark progresses past the creation time of this target in order to add it to the changefeed.`,
+			`pq: target "bar" cannot be resolved as of the resume time .+\. `+
+				`Please wait until the high water mark progresses past the creation `+
+				`time of this target in order to add it to the changefeed.`,
 			fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar`, feed.JobID()),
 		)
 
@@ -1071,7 +1085,9 @@ func TestAlterChangefeedAddTargetErrors(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO baz VALUES (1), (2), (3)`)
 
 		sqlDB.ExpectErr(t,
-			`pq: target "baz" cannot be resolved as of the high water mark. Please wait until the high water mark progresses past the creation time of this target in order to add it to the changefeed.`,
+			`pq: target "baz" cannot be resolved as of the resume time .+\. `+
+				`Please wait until the high water mark progresses past the creation `+
+				`time of this target in order to add it to the changefeed.`,
 			fmt.Sprintf(`ALTER CHANGEFEED %d ADD baz`, feed.JobID()),
 		)
 	}
@@ -1180,6 +1196,7 @@ func TestAlterChangefeedDatabaseScope(t *testing.T) {
 func TestAlterChangefeedDatabaseLevelChangefeedFilters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	// The cases in this test will either a) create a changefeed with no filter,
 	// and then remove the filter with an ALTER CHANGEFEED, or b) create a
@@ -1272,6 +1289,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedFilters(t *testing.T) {
 func TestAlterChangefeedDatabaseLevelChangefeedDoesntRemoveFilter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1313,6 +1331,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedDoesntRemoveFilter(t *testing.T) 
 func TestAlterChangefeedDatabaseLevelChangefeedRemainsDatabaseLevel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1356,6 +1375,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedRemainsDatabaseLevel(t *testing.T
 func TestAlterChangefeedDatabaseLevelChangefeedDiff(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1394,6 +1414,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedDiff(t *testing.T) {
 func TestAlterChangefeedDatabaseLevelChangefeedFailsOnTargetAlter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	for _, op := range []string{"ADD", "DROP"} {
 		testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
@@ -1426,6 +1447,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedFailsOnTargetAlter(t *testing.T) 
 func TestAlterChangefeedDatabaseLevelChangefeedMultipleSetClauses(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1466,6 +1488,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedMultipleSetClauses(t *testing.T) 
 func TestAlterChangefeedDatabaseLevelChangefeedFilterSemantics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	type alterSpec struct {
 		stmt string
@@ -1683,6 +1706,7 @@ func TestAlterChangefeedDatabaseLevelChangefeedFilterSemantics(t *testing.T) {
 func TestAlterChangefeedFilterChangesDontEmitPreAlterEvents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1740,6 +1764,7 @@ func TestAlterChangefeedFilterChangesDontEmitPreAlterEvents(t *testing.T) {
 func TestAlterChangefeedFilterChangesWriteProgressForTablesThatWillBeAdded(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1798,6 +1823,7 @@ func TestAlterChangefeedFilterChangesWriteProgressForTablesThatWillBeAdded(t *te
 func TestAlterChangefeedFilterChangesDontWriteProgressForTablesThatWillBeDropped(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1848,6 +1874,7 @@ func TestAlterChangefeedFilterChangesDontWriteProgressForTablesThatWillBeDropped
 func TestAlterChangefeedFilterChangesDontOverwriteProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1933,6 +1960,7 @@ func TestAlterChangefeedFilterChangesDontOverwriteProgress(t *testing.T) {
 func TestAlterChangefeedDatabaseLevelChangefeedWithInitialScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 154053, "unreleased feature")
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2143,7 +2171,7 @@ func TestAlterChangefeedAlterTableName(t *testing.T) {
 	cdcTest(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection, feedTestUseRootUserConnection)
 }
 
-func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
+func TestAlterChangefeedAddTargetsDuringSchemaChangeBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -2155,14 +2183,9 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		usingLegacySchemaChanger := maybeDisableDeclarativeSchemaChangesForTest(t, sqlDB)
-		// NB: For the `ALTER TABLE foo ADD COLUMN ... DEFAULT` schema change,
-		// the expected boundary is different depending on if we are using the
-		// legacy schema changer or not.
-		expectedBoundaryType := jobspb.ResolvedSpan_RESTART
-		if usingLegacySchemaChanger {
-			expectedBoundaryType = jobspb.ResolvedSpan_BACKFILL
-		}
+		// Metemorphically disable declarative schema changer to ensure we cover
+		// BACKFILL and RESTART boundary events.
+		_ = maybeDisableDeclarativeSchemaChangesForTest(t, sqlDB)
 
 		knobs := s.TestingKnobs.
 			DistSQL.(*execinfra.TestingKnobs).
@@ -2190,12 +2213,23 @@ WITH resolved = '1s', no_initial_scan, min_checkpoint_frequency='1ns'`,
 		jobRegistry := s.Server.JobRegistry().(*jobs.Registry)
 
 		// Kafka feeds are not buffered, so we have to consume messages.
+		// Track which bar keys we see to verify the initial scan.
+		var seenBarKeys struct {
+			syncutil.Mutex
+			keys map[string]struct{}
+		}
+		seenBarKeys.keys = make(map[string]struct{})
 		g := ctxgroup.WithContext(context.Background())
 		g.Go(func() error {
 			for {
-				_, err := testFeed.Next()
+				msg, err := testFeed.Next()
 				if err != nil {
 					return err
+				}
+				if msg != nil && msg.Topic == `bar` && len(msg.Key) > 0 {
+					seenBarKeys.Lock()
+					seenBarKeys.keys[string(msg.Key)] = struct{}{}
+					seenBarKeys.Unlock()
 				}
 			}
 		})
@@ -2218,91 +2252,101 @@ WITH resolved = '1s', no_initial_scan, min_checkpoint_frequency='1ns'`,
 			context.Background(), &s.Server.ClusterSettings().SV, 1*time.Nanosecond)
 		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
+		changefeedbase.FrontierPersistenceInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 100*time.Millisecond)
 
-		// Note the tableSpan to avoid resolved events that leave no gaps
-		fooDesc := desctestutils.TestingGetPublicTableDescriptor(
-			s.SystemServer.DB(), s.Codec, "d", "foo")
-		tableSpan := fooDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
-
-		// FilterSpanWithMutation should ensure that once the backfill begins, the following resolved events
-		// that are for that backfill (are of the timestamp right after the backfill timestamp) resolve some
-		// but not all of the time, which results in a checkpoint eventually being created
-		haveGaps := false
+		// backfillTimestamp is used to track the timestamp of the backfill scan.
+		// We only emit checkpoints that are part of the boundary event or part of
+		// the backfill scan. This way we ensure we construct a partial checkpoint
+		// for the backfill scan.
 		var backfillTimestamp hlc.Timestamp
-		var initialCheckpoint roachpb.SpanGroup
-		var foundCheckpoint int32
-		progressBackoff := jobRecordPollFrequency
-		var nextProgressCheck time.Time
+
+		// We track skipped spans to ensure we never emit a checkpoint that
+		// overlaps with a span we already skipped.
+		skippedSpans := interval.NewRangeTree()
+
 		knobs.FilterSpanWithMutation = func(r *jobspb.ResolvedSpan) (bool, error) {
-			// Stop resolving anything after checkpoint set to avoid eventually resolving the full span
-			if initialCheckpoint.Len() > 0 {
-				return true, nil
-			}
 			t.Logf("span %s %s %s", r.Span.String(), r.BoundaryType.String(), r.Timestamp.String())
 
-			// A backfill begins when the associated resolved event arrives, which has a
-			// timestamp such that all backfill spans have a timestamp of timestamp.Next().
-			if r.BoundaryType == expectedBoundaryType {
-				t.Logf("setting boundary timestamp %s", r.Timestamp.String())
-				backfillTimestamp = r.Timestamp
+			if r.BoundaryType != jobspb.ResolvedSpan_NONE {
+				t.Logf("found the boundary event")
+				backfillTimestamp = r.Timestamp.Next()
 				return false, nil
 			}
-
-			// Avoid reading for the job progress too frequently. Attempting
-			// to read the job record continuously in a loop may continuously
-			// abort the transaction which is trying to write the job record.
-			if nextProgressCheck.IsZero() || nextProgressCheck.Before(timeutil.Now()) {
-				// Check if we've set a checkpoint yet
-				progress := loadProgress(t, jobFeed, jobRegistry)
-				if checkpoint := loadCheckpoint(t, progress); checkpoint != nil {
-					initialCheckpoint = makeSpanGroupFromCheckpoint(t, checkpoint)
-					atomic.StoreInt32(&foundCheckpoint, 1)
-				}
-				nextProgressCheck = timeutil.Now().Add(progressBackoff)
+			if backfillTimestamp.IsEmpty() {
+				t.Logf("dropping span %s because we haven't found the boundary event yet", r.Span.String())
+				return true, nil
 			}
 
-			// Filter non-backfill-related spans
-			if !r.Timestamp.Equal(backfillTimestamp.Next()) {
-				skip := !(backfillTimestamp.IsEmpty() || r.Timestamp.LessEq(backfillTimestamp.Next()))
-				t.Logf("handling span %s: %t", r.Span.String(), skip)
-				// Only allow spans prior to a valid backfillTimestamp to avoid moving past the backfill
-				return skip, nil
+			spanInterval := interval.Range{
+				Start: interval.Comparable(r.Span.Key),
+				End:   interval.Comparable(r.Span.EndKey),
 			}
-
-			// Only allow resolving if we definitely won't have a completely resolved table
-			if !r.Span.Equal(tableSpan) && haveGaps {
-				skip := rnd.Intn(10) > 7
-				t.Logf("handling span %s: %t", r.Span.String(), skip)
-				return skip, nil
+			switch {
+			case !r.Timestamp.Equal(backfillTimestamp):
+				t.Logf("dropping span %s because it is not at the boundary timestamp", r.Span.String())
+				return true, nil
+			case skippedSpans.Overlaps(spanInterval):
+				t.Logf("skipping span %s because it overlaps with an already skipped span", r.Span.String())
+				return true, nil
+			case rnd.Intn(2) != 1:
+				t.Logf("randomly skipping span %s to create gaps in the frontier", r.Span.String())
+				skippedSpans.Add(spanInterval)
+				return true, nil
+			default:
+				t.Logf("passing span %s through", r.Span.String())
+				return false, nil
 			}
-			t.Logf("skipping span %s", r.Span.String())
-			haveGaps = true
-			return true, nil
 		}
 
 		require.NoError(t, jobFeed.Resume())
 		sqlDB.Exec(t, `ALTER TABLE foo ADD COLUMN b STRING DEFAULT 'd'`)
 
-		// Wait for a checkpoint to have been set
+		// Wait for a checkpoint, indicating partial backfill progress,
+		// before altering the changefeed to add a new target.
+		idb := s.Server.InternalDB().(isql.DB)
 		testutils.SucceedsSoon(t, func() error {
-			if atomic.LoadInt32(&foundCheckpoint) != 0 {
-				return nil
+			checkpointSpans := loadCheckpointSpans(t, jobFeed.JobID(), idb)
+			if len(checkpointSpans) == 0 {
+				return errors.Newf("waiting for checkpoint")
 			}
-			if err := jobFeed.FetchTerminalJobErr(); err != nil {
-				return err
-			}
-			return errors.Newf("waiting for checkpoint")
+			require.NoError(t, jobFeed.FetchTerminalJobErr())
+			return nil
 		})
 
 		require.NoError(t, jobFeed.Pause())
 		waitForJobState(sqlDB, t, jobFeed.JobID(), `paused`)
 
-		errMsg := fmt.Sprintf(
-			`pq: cannot perform initial scan on newly added targets while the checkpoint is non-empty, please unpause the changefeed and wait until the high watermark progresses past the current value %s to add these targets.`,
-			backfillTimestamp.AsOfSystemTime(),
-		)
+		// Adding a target with initial_scan during a schema change backfill
+		// is supported — the new table's spans are merged into the existing
+		// checkpoint.
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan`, jobFeed.JobID()))
 
-		sqlDB.ExpectErr(t, errMsg, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan`, jobFeed.JobID()))
+		// Verify the highwater was reset so the initial scan triggers.
+		progress := loadProgress(t, jobFeed, jobRegistry)
+		h := progress.GetHighWater()
+		require.True(t, h == nil || h.IsEmpty())
+
+		// Stop filtering spans so the changefeed can make progress.
+		knobs.FilterSpanWithMutation = func(r *jobspb.ResolvedSpan) (bool, error) {
+			return false, nil
+		}
+
+		require.NoError(t, jobFeed.Resume())
+
+		// Wait for highwater to advance, proving the schema change backfill
+		// completed and bar's initial scan succeeded.
+		waitForHighwater(t, jobFeed, jobRegistry)
+
+		// Verify we received bar's initial scan for all 1000 rows.
+		testutils.SucceedsSoon(t, func() error {
+			seenBarKeys.Lock()
+			defer seenBarKeys.Unlock()
+			if len(seenBarKeys.keys) < 1000 {
+				return errors.Newf("waiting for bar keys: %d/1000", len(seenBarKeys.keys))
+			}
+			return nil
+		})
 	}
 
 	cdcTestWithSystem(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection)
@@ -2383,6 +2427,8 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 			context.Background(), &s.Server.ClusterSettings().SV, 1)
 		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
+		changefeedbase.FrontierPersistenceInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 100*time.Millisecond)
 
 		registry := s.Server.JobRegistry().(*jobs.Registry)
 		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo
@@ -2408,9 +2454,10 @@ WITH resolved = '100ms', min_checkpoint_frequency='1ns'`, optOutOfMetamorphicDBL
 		}()
 
 		jobFeed := testFeed.(cdctest.EnterpriseTestFeed)
+		idb := s.Server.InternalDB().(isql.DB)
 
 		// Wait for non-nil checkpoint.
-		waitForCheckpoint(t, jobFeed, registry)
+		waitForCheckpoint(t, jobFeed, idb)
 
 		// Pause the job and read and verify the latest checkpoint information.
 		require.NoError(t, jobFeed.Pause())
@@ -2420,7 +2467,8 @@ WITH resolved = '100ms', min_checkpoint_frequency='1ns'`, optOutOfMetamorphicDBL
 		noHighWater := h == nil || h.IsEmpty()
 		require.True(t, noHighWater)
 
-		checkpoint := makeSpanGroupFromCheckpoint(t, loadCheckpoint(t, progress))
+		checkpointSpans := loadCheckpointSpans(t, jobFeed.JobID(), idb)
+		checkpoint := makeSpanGroupFromFrontierSpans(t, checkpointSpans)
 		require.Greater(t, checkpoint.Len(), 0)
 
 		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan`, jobFeed.JobID()))
@@ -2441,10 +2489,6 @@ WITH resolved = '100ms', min_checkpoint_frequency='1ns'`, optOutOfMetamorphicDBL
 
 		// Wait for highwater to be set, which signifies that the initial scan is complete.
 		waitForHighwater(t, jobFeed, registry)
-
-		// At this point, highwater mark should be set, and previous checkpoint should be gone.
-		progress = loadProgress(t, jobFeed, registry)
-		require.Nil(t, loadCheckpoint(t, progress))
 
 		require.NoError(t, jobFeed.Pause())
 
@@ -2620,7 +2664,6 @@ func TestAlterChangefeedInitialScan(t *testing.T) {
 	for _, initialScanOpt := range []string{
 		"initial_scan = 'yes'",
 		"initial_scan = 'no'",
-		"initial_scan = 'only'",
 		"initial_scan",
 		"no_initial_scan",
 	} {
@@ -2816,8 +2859,7 @@ func TestAlterChangefeedAddDropSameTarget(t *testing.T) {
 		require.NoError(t, feed.Resume())
 		sqlDB.Exec(t, `INSERT INTO bar VALUES(2)`)
 		assertPayloads(t, testFeed, []string{
-			// TODO(#144032): This row should be produced.
-			// `bar: [1]->{"after": {"a": 1}}`,
+			`bar: [1]->{"after": {"a": 1}}`,
 			`bar: [2]->{"after": {"a": 2}}`,
 		})
 	}
@@ -2950,17 +2992,13 @@ func TestAlterChangefeedRandomizedTargetChanges(t *testing.T) {
 
 					write(` ADD %s`, addTarget)
 
-					switch rnd.Intn(4) {
+					switch rnd.Intn(3) {
 					case 0:
 						write(` WITH initial_scan='yes'`)
 						expectedRows = append(expectedRows, makeInitialScanRows([]string{addTarget}, hw)...)
 					case 1:
-						write(` WITH initial_scan='only'`)
-						// We don't do an initial scan because the original
-						// changefeed did not have initial_scan='only'.
-					case 2:
 						write(` WITH initial_scan='no'`)
-					case 3:
+					case 2:
 						// The default option is initial_scan='no'.
 					}
 					expectedRows = append(expectedRows,

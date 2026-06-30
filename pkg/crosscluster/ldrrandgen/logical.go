@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -20,6 +21,14 @@ func isSupportedType(t *types.T) bool {
 	case types.RefCursorFamily:
 		// We don't support RefCursor columns in LDR tables because they do not
 		// support equality.
+		return false
+	case types.TSVectorFamily,
+		types.TSQueryFamily,
+		types.JsonpathFamily,
+		types.PGVectorFamily:
+		// These type families do not support keyside encoding, which means they
+		// cannot be used with crdb_internal.datums_to_bytes. This prevents
+		// fingerprinting and diff hashing from working.
 		return false
 	case types.ArrayFamily:
 		// We don't allow Arrays of bits because rand.LoadTable doesn't correctly identify their bit width.
@@ -40,7 +49,10 @@ func isSupportedType(t *types.T) bool {
 }
 
 func GenerateLDRTable(
-	ctx context.Context, rng *rand.Rand, tableName string, supportKVWriter bool,
+	ctx context.Context,
+	rng *rand.Rand,
+	tableName string,
+	writerType sqlclustersettings.LDRWriterType,
 ) *tree.CreateTable {
 	columnByName := func(name tree.Name, columnDefs []*tree.ColumnTableDef) *tree.ColumnTableDef {
 		for _, col := range columnDefs {
@@ -59,6 +71,9 @@ func GenerateLDRTable(
 		}),
 		randgen.WithPrimaryIndexFilter(func(indexDef *tree.IndexTableDef, columnDefs []*tree.ColumnTableDef) bool {
 			for _, col := range indexDef.Columns {
+				if col.Expr != nil {
+					continue
+				}
 				columnDef := columnByName(col.Column, columnDefs)
 				// TODO(127315): types with composite encoding are not supported in the
 				// primary key by LDR.
@@ -72,7 +87,7 @@ func GenerateLDRTable(
 					return false
 				}
 			}
-			if supportKVWriter && indexDef.Sharded != nil {
+			if writerType == sqlclustersettings.LDRWriterTypeLegacyKV && indexDef.Sharded != nil {
 				// The KV writer does not support hash sharded indexes.
 				return false
 			}
@@ -89,21 +104,25 @@ func GenerateLDRTable(
 				return false
 			case *tree.IndexTableDef:
 				for _, col := range indexDef.Columns {
-					if supportKVWriter && col.Expr != nil {
-						// Do not allow expression indexes. These cause SQL to generate a hidden computed column, which is not
-						// supported by the kv writer.
-						if col.Expr != nil {
+					if col.Expr != nil {
+						if writerType == sqlclustersettings.LDRWriterTypeLegacyKV {
+							// Expression indexes generate hidden computed
+							// columns not supported by the KV writer.
 							return false
 						}
+						// Expression columns don't map to a column def;
+						// skip column-level checks.
+						continue
 					}
 					columnDef := columnByName(col.Column, columnDefs)
-					if columnDef.IsVirtual() {
-						// Virtual computed columns are not supported in indexes by the classic sql writer or the kv writer.
-						// TODO(jeffswenson): remove this restriction once the crud writer is the only writer.
+					if columnDef != nil && columnDef.IsVirtual() &&
+						writerType == sqlclustersettings.LDRWriterTypeLegacyKV {
+						// Virtual computed columns in indexes are not supported by the
+						// legacy KV writer, which cannot evaluate expressions.
 						return false
 					}
 				}
-				if supportKVWriter && indexDef.Sharded != nil {
+				if writerType == sqlclustersettings.LDRWriterTypeLegacyKV && indexDef.Sharded != nil {
 					// The KV writer does not support hash sharded indexes.
 					return false
 				}

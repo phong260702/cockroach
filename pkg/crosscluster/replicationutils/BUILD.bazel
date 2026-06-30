@@ -10,6 +10,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/crosscluster/replicationutils",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/clusterversion",
         "//pkg/crosscluster/streamclient",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
@@ -36,6 +37,7 @@ go_library(
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/log",
+        "//pkg/util/rangescanstats/rangescanstatspb",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
@@ -53,7 +55,6 @@ go_test(
     deps = [
         "//pkg/clusterversion",
         "//pkg/kv/kvpb",
-        "//pkg/repstream/streampb",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/storage",
@@ -61,6 +62,7 @@ go_test(
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
+        "//pkg/util/rangescanstats/rangescanstatspb",
         "//pkg/util/timeutil",
         "@com_github_stretchr_testify//require",
     ],

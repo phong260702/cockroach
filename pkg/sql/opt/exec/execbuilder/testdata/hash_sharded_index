@@ -1141,7 +1141,7 @@ vectorized: true
         │
         └── • lookup join (anti)
             │ columns: (crdb_internal_b_shard_8_eq, column1, column2, crdb_internal_b_shard_8_comp)
-            │ estimated row count: 0 (missing stats)
+            │ estimated row count: 1 (missing stats)
             │ table: t_hash_indexed@idx_t_hash_indexed
             │ equality: (crdb_internal_b_shard_8_eq, column2) = (crdb_internal_b_shard_8, b)
             │ equality cols are key
@@ -1200,7 +1200,7 @@ vectorized: true
         │
         └── • lookup join (anti)
             │ columns: (crdb_internal_b_shard_8_eq, column1, column2, crdb_internal_b_shard_8_comp)
-            │ estimated row count: 0 (missing stats)
+            │ estimated row count: 1 (missing stats)
             │ table: t_hash_indexed@idx_t_hash_indexed
             │ equality: (crdb_internal_b_shard_8_eq, column2) = (crdb_internal_b_shard_8, b)
             │ equality cols are key
@@ -1215,7 +1215,7 @@ vectorized: true
                 │
                 └── • lookup join (anti)
                     │ columns: (crdb_internal_b_shard_8_comp, column1, column2)
-                    │ estimated row count: 0 (missing stats)
+                    │ estimated row count: 1 (missing stats)
                     │ table: t_hash_indexed@t_hash_indexed_pkey
                     │ equality: (column1) = (a)
                     │ equality cols are key
@@ -1300,7 +1300,7 @@ vectorized: true
         │
         └── • lookup join (anti)
             │ columns: (crdb_internal_b_shard_8_eq, crdb_internal_b_shard_8_comp, column1, column2)
-            │ estimated row count: 0 (missing stats)
+            │ estimated row count: 1 (missing stats)
             │ table: t_hash_indexed@idx_t_hash_indexed
             │ equality: (crdb_internal_b_shard_8_eq, column2) = (crdb_internal_b_shard_8, b)
             │ equality cols are key
@@ -1369,7 +1369,7 @@ vectorized: true
             │
             └── • lookup join (anti)
                 │ columns: (crdb_internal_id_shard_16_eq, pid)
-                │ estimated row count: 0 (missing stats)
+                │ estimated row count: 1 (missing stats)
                 │ table: t_parent_pk@t_parent_pk_pkey
                 │ equality: (crdb_internal_id_shard_16_eq, pid) = (crdb_internal_id_shard_16, id)
                 │ equality cols are key
@@ -1439,7 +1439,7 @@ vectorized: true
             │
             └── • lookup join (anti)
                 │ columns: (crdb_internal_real_id_shard_16_eq, pid)
-                │ estimated row count: 0 (missing stats)
+                │ estimated row count: 1 (missing stats)
                 │ table: t_parent_sec@idx_t_parent_sec_real_id
                 │ equality: (crdb_internal_real_id_shard_16_eq, pid) = (crdb_internal_real_id_shard_16, real_id)
                 │ equality cols are key
@@ -1574,5 +1574,105 @@ vectorized: true
           table: t130334@t130334_pkey
           spans: FULL SCAN
           locking strength: for update
+
+subtest end
+
+subtest non_covering_hash_sharded_secondary
+
+statement ok
+CREATE TABLE sharded_secondary_wide (a INT8, b INT8, INDEX (a) USING HASH WITH (bucket_count=4))
+
+statement ok
+ALTER TABLE sharded_secondary_wide INJECT STATISTICS '[
+  {
+    "columns": ["rowid"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 1000000
+  },
+  {
+    "columns": ["a"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 100
+  },
+  {
+    "columns": ["b"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 100
+  },
+  {
+    "columns": ["crdb_internal_a_shard_4"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 1000000,
+    "distinct_count": 4
+  }
+]'
+
+query T
+EXPLAIN (VERBOSE) SELECT * FROM sharded_secondary_wide ORDER BY a LIMIT 10
+----
+distribution: local
+vectorized: true
+·
+• index join
+│ columns: (a, b)
+│ ordering: +a
+│ estimated row count: 10
+│ table: sharded_secondary_wide@sharded_secondary_wide_pkey
+│ key columns: rowid
+│ parallel
+│
+└── • limit
+    │ columns: (a, rowid)
+    │ count: 10
+    │
+    └── • union all
+        │ columns: (a, rowid)
+        │ ordering: +a
+        │ estimated row count: 40
+        │
+        ├── • union all
+        │   │ columns: (a, rowid)
+        │   │ ordering: +a
+        │   │ estimated row count: 20
+        │   │
+        │   ├── • scan
+        │   │     columns: (a, rowid)
+        │   │     ordering: +a
+        │   │     estimated row count: 10 (<0.01% of the table; stats collected <hidden> ago)
+        │   │     table: sharded_secondary_wide@sharded_secondary_wide_a_idx
+        │   │     spans: /0-/1
+        │   │     limit: 10
+        │   │
+        │   └── • scan
+        │         columns: (a, rowid)
+        │         ordering: +a
+        │         estimated row count: 10 (<0.01% of the table; stats collected <hidden> ago)
+        │         table: sharded_secondary_wide@sharded_secondary_wide_a_idx
+        │         spans: /1-/2
+        │         limit: 10
+        │
+        └── • union all
+            │ columns: (a, rowid)
+            │ ordering: +a
+            │ estimated row count: 20
+            │
+            ├── • scan
+            │     columns: (a, rowid)
+            │     ordering: +a
+            │     estimated row count: 10 (<0.01% of the table; stats collected <hidden> ago)
+            │     table: sharded_secondary_wide@sharded_secondary_wide_a_idx
+            │     spans: /2-/3
+            │     limit: 10
+            │
+            └── • scan
+                  columns: (a, rowid)
+                  ordering: +a
+                  estimated row count: 10 (<0.01% of the table; stats collected <hidden> ago)
+                  table: sharded_secondary_wide@sharded_secondary_wide_a_idx
+                  spans: /3-/4
+                  limit: 10
 
 subtest end

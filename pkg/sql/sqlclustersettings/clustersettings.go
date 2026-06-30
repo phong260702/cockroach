@@ -6,6 +6,9 @@
 package sqlclustersettings
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -99,6 +102,22 @@ var ApproxMaxSchemaObjectCount = settings.RegisterIntSetting(
 	settings.WithPublic,
 )
 
+// SchemaLockedAutoUnlockEnabled controls whether DDL operations will
+// attempt to automatically unlock and re-lock schema_locked tables.
+// When false, DDL on schema-locked tables is blocked unless the user
+// manually unlocks the table first.
+var SchemaLockedAutoUnlockEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.schema.auto_unlock.enabled",
+	"controls whether DDL operations will attempt to automatically unlock "+
+		"and re-lock schema_locked tables. When this setting is false, DDL on "+
+		"schema_locked tables is blocked unless the user manually unlocks the "+
+		"table first. The schema_locked storage parameter improves changefeed "+
+		"performance by locking the table's schema from the perspective of the "+
+		"changefeed.",
+	true,
+	settings.WithPublic)
+
 // RequireSystemTenantOrClusterSetting returns a setting disabled error if
 // executed from inside a secondary tenant that does not have the specified
 // cluster setting.
@@ -113,6 +132,18 @@ func RequireSystemTenantOrClusterSetting(
 		"Feature was disabled by the system operator."),
 		"Feature flag: %s", setting.Name())
 }
+
+// InferRegionUsingConstraintEnabled is used to enable and disable setting a
+// foreign key constraint for looking up the region column in a REGIONAL BY ROW
+// table.
+var InferRegionUsingConstraintEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"feature.infer_rbr_region_col_using_constraint.enabled",
+	"set to true to enable looking up the region column via a foreign key constraint in a "+
+		"REGIONAL BY ROW table, false to disable; default is false",
+	false,
+	settings.WithPublic,
+)
 
 // CachedSequencesCacheSizeSetting is the default cache size used when
 // SessionNormalizationMode is SerialUsesCachedSQLSequences or
@@ -138,17 +169,98 @@ const (
 	// writerTypeCRUD is the shiny new sql writer that uses explicit reads,
 	// inserts, updates, and deletes instead of upserts.
 	LDRWriterTypeCRUD LDRWriterType = "crud"
+	// LDRWriterTypeTxn uses the transaction writer which applies rows using the
+	// SQL layer with explicit CRUD operations and savepoint-based conflict
+	// handling.
+	LDRWriterTypeTxn LDRWriterType = "txn"
 )
 
 var LDRImmediateModeWriter = settings.RegisterStringSetting(
 	settings.ApplicationLevel,
 	"logical_replication.consumer.immediate_mode_writer",
 	"the writer to use when in immediate mode",
-	metamorphic.ConstantWithTestChoice("logical_replication.consumer.immediate_mode_writer", string(LDRWriterTypeCRUD), string(LDRWriterTypeLegacyKV), string(LDRWriterTypeSQL)),
+	metamorphic.ConstantWithTestChoice("logical_replication.consumer.immediate_mode_writer", string(LDRWriterTypeCRUD), string(LDRWriterTypeLegacyKV), string(LDRWriterTypeSQL), string(LDRWriterTypeTxn)),
 	settings.WithValidateString(func(sv *settings.Values, val string) error {
-		if val != string(LDRWriterTypeSQL) && val != string(LDRWriterTypeLegacyKV) && val != string(LDRWriterTypeCRUD) {
-			return errors.Newf("immediate mode writer must be either 'sql', 'legacy-kv', or 'crud', got '%s'", val)
+		switch LDRWriterType(val) {
+		case LDRWriterTypeSQL, LDRWriterTypeLegacyKV, LDRWriterTypeCRUD, LDRWriterTypeTxn:
+			return nil
+		default:
+			return errors.Newf("immediate mode writer must be 'sql', 'legacy-kv', 'crud', or 'txn', got '%s'", val)
 		}
-		return nil
 	}),
 )
+
+// UseInstanceInfoForSQLInstances controls whether to use sqlinstance.InstanceInfo
+// instead of roachpb.NodeDescriptor when retrieving SQL instance information.
+// This is necessary for proper handling of SQL instances in multi-tenant
+// environments where SQL instances may not have corresponding KV nodes.
+var UseInstanceInfoForSQLInstances = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.instance_info.use_instance_resolver.enabled",
+	"use sqlinstance.InstanceInfo instead of NodeDescriptor for SQL instance lookups; "+
+		"enables proper handling of SQL instances in serverless environments",
+	metamorphic.ConstantWithTestBool("sql.instance_info.use_instance_resolver.enabled", true))
+
+var PLpgSQLProcedureLateBinding = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.procedures.plpgsql.late_binding.enabled",
+	"when true, PL/pgSQL procedure bodies are not resolved at creation time; "+
+		"references are resolved at CALL time instead, matching PostgreSQL "+
+		"PL/pgSQL semantics. Does not affect LANGUAGE SQL procedures or "+
+		"functions",
+	false,
+	settings.WithPublic,
+)
+
+// PLpgSQLProcedureLateBindingEnabled returns true when both the V26_3 version
+// gate and the cluster setting permit PL/pgSQL procedure late binding. All
+// late-binding call sites must use this helper.
+func PLpgSQLProcedureLateBindingEnabled(ctx context.Context, st *cluster.Settings) bool {
+	return st.Version.IsActive(ctx, clusterversion.V26_3) &&
+		PLpgSQLProcedureLateBinding.Get(&st.SV)
+}
+
+// SkipUnderlyingViewPrivilegeChecks controls whether privilege checks on underlying
+// tables are skipped when selecting from a view. By default (false), the view
+// owner's privileges are checked on the underlying tables, and the owner's
+// row-level security (RLS) policies are enforced. When enabled, all privilege
+// checks on the underlying tables are skipped and the invoker RLS is enforced.
+// This means that any user with SELECT privileges on the view can query it
+// regardless of the underlying table privileges. This restores the pre-v26.2 behavior.
+var SkipUnderlyingViewPrivilegeChecks = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.auth.skip_underlying_view_privilege_checks.enabled",
+	"determines whether to skip privilege checks on tables underlying views. "+
+		"When enabled, users with SELECT privileges on a view can query it regardless of "+
+		"their privileges on the underlying tables, and row-level security "+
+		"policies are evaluated as the invoking user rather than the view owner. "+
+		"This restores pre-v26.2 behavior.",
+	false,
+	settings.WithPublic)
+
+// AllowSubsetUniqueFKs gates creation of subset-unique foreign keys: a
+// CockroachDB extension that lets an FK be backed by a unique constraint
+// covering only some of the FK's referenced columns (e.g. a parent with
+// UNIQUE(a) can back an FK that references (a, b)). When this setting is
+// false, only exact matches between the FK's referenced columns and a
+// parent unique constraint are accepted at creation time.
+//
+// Mixed-version safety is enforced separately by clusterversion.V26_3.
+// This setting is what operators can flip once V26_3 has been finalized,
+// either as a kill switch if a regression appears or to enforce
+// SQL standard/PostgreSQL-compatible strict matching cluster-wide.
+//
+// The setting governs creation only. Once a subset-unique FK exists in the
+// catalog, lookups that resolve it for validation or back-reference
+// handling continue to honor subset matching regardless of the setting
+// so that flipping the setting off cannot break any existing FKs.
+var AllowSubsetUniqueFKs = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.subset_unique_fks.enabled",
+	"if true, foreign keys may be backed by a unique constraint that covers "+
+		"only a strict subset of the foreign key's referenced columns (e.g. a "+
+		"parent with UNIQUE(a) can back an FK that references (a, b)); set to "+
+		"false to require strict matching, as required by the SQL standard "+
+		"and PostgreSQL",
+	true,
+	settings.WithPublic)

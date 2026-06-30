@@ -97,6 +97,23 @@ func PerformAssignmentCast(
 func performCast(
 	ctx context.Context, evalCtx *Context, d tree.Datum, t *types.T, truncateWidth bool,
 ) (tree.Datum, error) {
+	// For domain types, perform the cast (using the domain type's inherited base
+	// type properties), adjust the value, then validate domain constraints.
+	// AdjustValueToType uses the base type because it has OID-specific branches
+	// (e.g., T_bpchar whitespace trimming, T_varchar truncation) that would not
+	// match the domain's user-defined OID.
+	if t.TypeMeta.DomainData != nil {
+		var err error
+		d, err = performCastWithoutPrecisionTruncation(ctx, evalCtx, d, t, truncateWidth)
+		if err != nil {
+			return nil, err
+		}
+		d, err = tree.AdjustValueToType(t.TypeMeta.DomainData.BaseType, d)
+		if err != nil {
+			return nil, err
+		}
+		return d, ValidateDomainConstraints(ctx, evalCtx, d, t)
+	}
 	d, err := performCastWithoutPrecisionTruncation(ctx, evalCtx, d, t, truncateWidth)
 	if err != nil {
 		return nil, err
@@ -515,6 +532,10 @@ func performCastWithoutPrecisionTruncation(
 			if t.Oid() == oid.T_name {
 				return tree.NewDName(s), nil
 			}
+			if t.Oid() == oid.T_aclitem {
+				ds := tree.DString(s)
+				return tree.NewDACLItemFromDString(&ds)
+			}
 
 			// bpchar types truncate trailing whitespace.
 			if t.Oid() == oid.T_bpchar {
@@ -617,6 +638,11 @@ func performCastWithoutPrecisionTruncation(
 		case *tree.DArray:
 			switch d.ParamTyp.Family() {
 			case types.FloatFamily, types.IntFamily, types.DecimalFamily:
+				if len(d.Array) == 0 {
+					return nil, pgerror.Newf(pgcode.DataException,
+						"vector must have at least 1 dimension")
+				}
+
 				if d.HasNulls() {
 					return nil, pgerror.Newf(pgcode.NullValueNotAllowed,
 						"array must not contain nulls")
@@ -627,7 +653,19 @@ func performCastWithoutPrecisionTruncation(
 					if err != nil {
 						return nil, err
 					}
-					v[i] = float32(*datum.(*tree.DFloat))
+
+					val := float32(*datum.(*tree.DFloat))
+					if math.IsInf(float64(val), 0) {
+						return nil, pgerror.Newf(pgcode.DataException,
+							"infinite value not allowed in vector")
+					}
+
+					if math.IsNaN(float64(val)) {
+						return nil, pgerror.Newf(pgcode.DataException,
+							"NaN not allowed in vector")
+					}
+
+					v[i] = val
 				}
 				return tree.NewDPGVector(v), nil
 			}
@@ -1082,39 +1120,24 @@ func performIntToOidCast(
 	case oid.T_oid:
 		return tree.NewDOidWithType(o, t), nil
 	case oid.T_regtype:
-		// Mapping an dOid to a regtype is easy: we have a hardcoded map.
-		var name string
+		// Builtin types have hardcoded SQL-standard names (e.g. "integer"
+		// for int4) that match Postgres's format_type output and are
+		// independent of search_path. UDTs fall through to resolveOID for
+		// search-path-aware schema qualification.
 		if typ, ok := types.OidToType[o]; ok {
-			name = typ.PGName()
-		} else if types.IsOIDUserDefinedType(o) {
-			typ, err := res.ResolveTypeByOID(ctx, o)
-			if err != nil {
-				return nil, err
-			}
-			name = typ.PGName()
+			return tree.NewDOidWithTypeAndName(o, t, typ.PGName()), nil
 		}
-		return tree.NewDOidWithTypeAndName(o, t, name), nil
-
-	case oid.T_regproc, oid.T_regprocedure:
-		name, _, err := res.ResolveFunctionByOID(ctx, oid.Oid(v))
-		if err != nil {
-			if errors.Is(err, tree.ErrRoutineUndefined) {
-				return tree.NewDOidWithType(o, t), nil //nolint:returnerrcheck
-			}
+	}
+	// resolveOID applies Postgres's search-path-aware schema qualification
+	// (regclassout / regprocout / regtypeout style output).
+	dOid, errSafeToIgnore, err := res.ResolveOIDFromOID(ctx, t, tree.NewDOid(o))
+	if err != nil {
+		if !errSafeToIgnore {
 			return nil, err
 		}
-		return tree.NewDOidWithTypeAndName(o, t, name.Object()), nil
-
-	default:
-		dOid, errSafeToIgnore, err := res.ResolveOIDFromOID(ctx, t, tree.NewDOid(o))
-		if err != nil {
-			if !errSafeToIgnore {
-				return nil, err
-			}
-			dOid = tree.NewDOidWithType(o, t)
-		}
-		return dOid, nil
+		dOid = tree.NewDOidWithType(o, t)
 	}
+	return dOid, nil
 }
 
 func roundDecimalToInt(d *apd.Decimal) (int64, error) {

@@ -178,6 +178,7 @@ func TestDistSQLRunningInAbortedTxn(t *testing.T) {
 			ctx, stmt, clusterunique.ID{},
 			tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(&execCfg.Settings.SV)),
 			nil, /* statementHintsCache */
+			"",  /* currentDB */
 		)
 		if err := p.makeOptimizerPlan(ctx); err != nil {
 			t.Fatal(err)
@@ -300,6 +301,7 @@ func TestDistSQLRunningParallelFKChecksAfterAbort(t *testing.T) {
 			ctx, stmt, clusterunique.ID{},
 			tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(&s.ClusterSettings().SV)),
 			nil, /* statementHintsCache */
+			"",  /* currentDB */
 		)
 		if err := p.makeOptimizerPlan(ctx); err != nil {
 			t.Fatal(err)
@@ -999,14 +1001,17 @@ func TestDistributedQueryErrorIsRetriedLocally(t *testing.T) {
 
 	// We use different queries to simplify handling the node ID on which the
 	// error should be injected (i.e. we avoid the need for synchronization in
-	// the test). In particular, the difficulty comes from the fact that some of
-	// the SetupFlow RPCs might not be issued at all while others are served
-	// after the corresponding flow on the gateway has exited.
+	// the test).
+	//
+	// We'll inject errors for the first two queries, and they must have such
+	// plans that no query result row can be produced by any flow independently
+	// (i.e. we must have a "final" processor on the gateway that waits for
+	// remote flows' data).
 	queries := []string{
-		"SELECT k FROM test.foo",
+		"SELECT count(v) FROM test.foo",
 		// Run one of the queries via EXPLAIN ANALYZE (DEBUG) so that we can
 		// check the contents of the bundle later.
-		"EXPLAIN ANALYZE (DEBUG) SELECT v FROM test.foo",
+		"EXPLAIN ANALYZE (DEBUG) SELECT max(v) FROM test.foo",
 		"SELECT * FROM test.foo",
 	}
 	stmtToNodeIDForError := map[string]base.SQLInstanceID{
@@ -1109,7 +1114,7 @@ func TestDistributedQueryErrorIsRetriedLocally(t *testing.T) {
 
 	// Now sanity check the contents of the stmt bundle that was collected when
 	// retry-as-local mechanism kicked in.
-	baseFiles := `env.sql opt-v.txt opt-vv.txt opt.txt plan.txt schema.sql statement.sql stats-test.public.foo.sql trace-jaeger.json trace.json trace.txt`
+	baseFiles := `descriptors.json env.sql opt-v.txt opt-vv.txt opt.txt plan.txt schema.sql schema_changes.txt statement.sql stats-test.public.foo.sql trace-jaeger.json trace.json trace.txt`
 	distributedRunFiles := `distsql-1-main-query.html vec-1-main-query-v.txt vec-1-main-query.txt`
 	localRunFiles := `distsql-2-main-query.html vec-2-main-query-v.txt vec-2-main-query.txt`
 	checkBundle(

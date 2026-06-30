@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/replica_rac2"
@@ -56,6 +55,18 @@ import (
 var raftDisableLeaderFollowsLeaseholder = envutil.EnvOrDefaultBool(
 	"COCKROACH_DISABLE_LEADER_FOLLOWS_LEASEHOLDER", false)
 
+// leaderTransferStuckThreshold is the minimum duration a leadership transfer
+// must be blocked before diagnostic logging is emitted.
+const leaderTransferStuckThreshold = time.Minute
+
+// Rate limiters for leadership transfer diagnostic logging, shared across all
+// ranges on the process. These limit log volume when many ranges simultaneously
+// experience a leader/leaseholder split.
+var (
+	logLeaderTransferStuck    = log.Every(200 * time.Millisecond) // 5/s
+	logLeaderTransferResolved = log.Every(200 * time.Millisecond) // 5/s
+)
+
 // ReplicaLeaderlessUnavailableThreshold is the duration after which leaderless
 // replicas are considered unavailable. Set to 0 to disable.
 var ReplicaLeaderlessUnavailableThreshold = settings.RegisterDurationSettingWithExplicitUnit(
@@ -81,6 +92,10 @@ var ReplicaLeaderlessUnavailableThreshold = settings.RegisterDurationSettingWith
 // caller should relinquish all ownership of it. If it does return an error, the
 // caller retains full ownership over the guard.
 //
+// Any bytes that will be scanned or written by the replica during the
+// application of the Raft command will be accumulated into the *StoreWorkStats
+// parameter.
+//
 // evalAndPropose takes ownership of the supplied token; the caller should
 // tok.Move() it into this method. It will be used to untrack the request once
 // it comes out of the proposal buffer.
@@ -96,27 +111,22 @@ var ReplicaLeaderlessUnavailableThreshold = settings.RegisterDurationSettingWith
 //     terminate execution, although it is given no guarantee that the proposal
 //     won't still go on to commit and apply at some later time.
 //   - the proposal's ID.
-//   - the bytes that will be written by the replica during the application of
-//     the Raft command.
 //   - any error obtained during the creation or proposal of the command, in
 //     which case the other returned values are zero.
 func (r *Replica) evalAndPropose(
 	ctx context.Context,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	tok TrackedRequestToken,
-) (
-	chan proposalResult,
-	abandonToken,
-	kvserverbase.CmdIDKey,
-	*kvadmission.StoreWriteBytes,
-	*kvpb.Error,
-) {
+	stats *StoreWorkStats,
+	admissionInfo kvadmission.AdmissionInfo,
+) (chan proposalResult, abandonToken, kvserverbase.CmdIDKey, *kvpb.Error) {
 	defer tok.DoneIfNotMoved(ctx)
 	idKey := raftlog.MakeCmdIDKey()
-	proposal, pErr := r.requestToProposal(ctx, idKey, ba, g, st, ui)
+	ss := stats.ScanStats()
+	proposal, pErr := r.requestToProposal(ctx, idKey, ss, ba, g, st, ui)
 	ba = proposal.Request // may have been updated
 	log.Event(proposal.Context(), "evaluated request")
 
@@ -124,9 +134,7 @@ func (r *Replica) evalAndPropose(
 	// propagate the error. Don't assume ownership of the concurrency guard.
 	if isConcurrencyRetryError(pErr) {
 		pErr = maybeAttachLease(pErr, &st.Lease)
-		return nil, nil, "", nil, pErr
-	} else if _, ok := pErr.GetDetail().(*kvpb.ReplicaCorruptionError); ok {
-		return nil, nil, "", nil, pErr
+		return nil, nil, "", pErr
 	}
 
 	// Pull out proposal channel to return. proposal.doneCh may be set to
@@ -141,7 +149,7 @@ func (r *Replica) evalAndPropose(
 	//    in an error.
 	if proposal.command == nil {
 		if proposal.Local.RequiresRaft() {
-			return nil, nil, "", nil, kvpb.NewError(errors.AssertionFailedf(
+			return nil, nil, "", kvpb.NewError(errors.AssertionFailedf(
 				"proposal resulting from batch %s erroneously bypassed Raft", ba))
 		}
 		intents := proposal.Local.DetachEncounteredIntents()
@@ -160,7 +168,7 @@ func (r *Replica) evalAndPropose(
 		proposal.ec = makeUnreplicatedEndCmds(r, g, *st)
 		pr := makeProposalResult(proposal.Local.Reply, pErr, intents, endTxns)
 		proposal.finishApplication(ctx, pr)
-		return proposalCh, nil, "", nil, nil
+		return proposalCh, nil, "", nil
 	}
 
 	// Make it a truly replicated proposal. We measure the replication latency
@@ -183,12 +191,13 @@ func (r *Replica) evalAndPropose(
 	// typical lag in consensus is expected to be small compared to the time
 	// granularity of admission control doing token and size estimation (which
 	// is 15s). Also, admission control corrects for gaps in reporting.
-	writeBytes := kvadmission.NewStoreWriteBytes()
-	if proposal.command.WriteBatch != nil {
-		writeBytes.WriteBytes = int64(len(proposal.command.WriteBatch.Data))
-	}
-	if proposal.command.ReplicatedEvalResult.AddSSTable != nil {
-		writeBytes.IngestedBytes = int64(len(proposal.command.ReplicatedEvalResult.AddSSTable.Data))
+	if stats != nil {
+		if proposal.command.WriteBatch != nil {
+			stats.WriteBytes += int64(len(proposal.command.WriteBatch.Data))
+		}
+		if proposal.command.ReplicatedEvalResult.AddSSTable != nil {
+			stats.IngestedBytes += int64(len(proposal.command.ReplicatedEvalResult.AddSSTable.Data))
+		}
 	}
 	// If the request requested that Raft consensus be performed asynchronously,
 	// return a proposal result immediately on the proposal's done channel.
@@ -200,7 +209,7 @@ func (r *Replica) evalAndPropose(
 			// Disallow async consensus for commands with EndTxnIntents because
 			// any !Always EndTxnIntent can't be cleaned up until after the
 			// command succeeds.
-			return nil, nil, "", writeBytes, kvpb.NewErrorf("cannot perform consensus asynchronously for "+
+			return nil, nil, "", kvpb.NewErrorf("cannot perform consensus asynchronously for "+
 				"proposal with EndTxnIntents=%v; %v", ets, ba)
 		}
 
@@ -233,9 +242,7 @@ func (r *Replica) evalAndPropose(
 		// Continue with proposal...
 	}
 
-	if meta := kvflowcontrol.MetaFromContext(ctx); meta != nil {
-		proposal.raftAdmissionMeta = meta
-	}
+	proposal.raftAdmissionMeta = admissionInfo.RaftAdmissionMeta
 
 	// Attach information about the proposer's lease to the command, for
 	// verification below raft. Lease requests are special since they are not
@@ -281,7 +288,7 @@ func (r *Replica) evalAndPropose(
 	// behavior.
 	quotaSize := uint64(proposal.command.Size())
 	if maxSize := uint64(kvserverbase.MaxCommandSize.Get(&r.store.cfg.Settings.SV)); quotaSize > maxSize {
-		return nil, nil, "", nil, kvpb.NewError(errors.Errorf(
+		return nil, nil, "", kvpb.NewError(errors.Errorf(
 			"command is too large: %d bytes (max: %d)", quotaSize, maxSize,
 		))
 	}
@@ -292,7 +299,7 @@ func (r *Replica) evalAndPropose(
 	var err error
 	proposal.quotaAlloc, err = r.maybeAcquireProposalQuota(ctx, ba, quotaSize)
 	if err != nil {
-		return nil, nil, "", nil, kvpb.NewError(err)
+		return nil, nil, "", kvpb.NewError(err)
 	}
 	// Make sure we clean up the proposal if we fail to insert it into the
 	// proposal buffer successfully. This ensures that we always release any
@@ -316,13 +323,13 @@ func (r *Replica) evalAndPropose(
 			// SeedID not set, since this is not a reproposal.
 		}
 		if pErr = filter(filterArgs); pErr != nil {
-			return nil, nil, "", nil, pErr
+			return nil, nil, "", pErr
 		}
 	}
 
 	pErr = r.propose(ctx, proposal, tok.Move(ctx))
 	if pErr != nil {
-		return nil, nil, "", nil, pErr
+		return nil, nil, "", pErr
 	}
 	// We've successfully handed the proposal to the replication layer, so this
 	// method should not finish the trace span if we forked one off above.
@@ -334,7 +341,7 @@ func (r *Replica) evalAndPropose(
 	// the command may not be applied (or even processed): the process crashes
 	// or the local replica is removed from the range.
 
-	return proposalCh, abandonToken(proposal), idKey, writeBytes, nil
+	return proposalCh, abandonToken(proposal), idKey, nil
 }
 
 // abandonToken is an interface used for allowing callers to "abandon" an
@@ -1432,7 +1439,30 @@ func (r *Replica) tick(
 		return false, nil
 	}
 
-	r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx, leaseStatus)
+	{
+		outcome, lhRepID := r.maybeTransferRaftLeadershipToLeaseholderLocked(ctx, leaseStatus)
+		if outcome == raftLeaderTransferOK {
+			log.VEventf(ctx, 1, "transferring raft leadership to replica ID %v", lhRepID)
+		}
+		cumTickDur := time.Duration(r.mu.ticks) * r.store.cfg.RaftTickInterval
+		if logStuck, logResolved, elapsed, prev := r.mu.leaderTransferDiag.update(
+			outcome, cumTickDur,
+		); logStuck {
+			if logLeaderTransferStuck.ShouldLog() {
+				lhProg := r.mu.internalRaftGroup.ReplicaProgress(lhRepID)
+				log.KvExec.Infof(ctx,
+					"have been waiting %s to transfer raft leadership to replica ID %d; blocked: %s; "+
+						"leaseholder progress: %v",
+					elapsed, lhRepID, outcome, lhProg)
+			}
+		} else if logResolved {
+			if logLeaderTransferResolved.ShouldLog() {
+				log.KvExec.Infof(ctx,
+					"raft leadership transfer to replica ID %d unblocked after %s (%s)",
+					lhRepID, elapsed, prev)
+			}
+		}
+	}
 
 	// Eagerly acquire or extend leases. This only works for unquiesced ranges. We
 	// never quiesce expiration leases, but for epoch leases we fall back to the
@@ -1715,7 +1745,7 @@ func (r *Replica) poisonInflightLatches(err error) {
 		p.ec.poison()
 		// TODO(tbg): find out how `p.ec.done()` can have been called at this point,
 		// See: https://github.com/cockroachdb/cockroach/issues/86547
-		if p.ec.g != nil && p.ec.g.Req.PoisonPolicy == poison.Policy_Error {
+		if p.ec.g != nil && p.ec.g.Req().PoisonPolicy == poison.Policy_Error {
 			aErr := kvpb.NewAmbiguousResultError(err)
 			// NB: this does not release the request's latches. It's important that
 			// the latches stay in place, since the command could still apply.
@@ -2610,6 +2640,88 @@ func (r *Replica) forgetLeaderLocked(ctx context.Context) {
 	}
 }
 
+// raftLeaderTransferOutcome describes the result of evaluating whether this
+// replica (as Raft leader) should transfer leadership to the leaseholder.
+//
+//go:generate stringer -type raftLeaderTransferOutcome
+type raftLeaderTransferOutcome int
+
+const (
+	// raftLeaderTransferNotNeeded indicates that no leadership transfer is needed,
+	// either because this replica is not the Raft leader, the lease is locally
+	// owned, or the lease is invalid.
+	raftLeaderTransferNotNeeded raftLeaderTransferOutcome = iota
+	// raftLeaderTransferOK indicates that a leadership transfer to the
+	// leaseholder should proceed (or just did).
+	raftLeaderTransferOK
+	// raftLeaderTransferBlockedByPendingAcquisition indicates that a
+	// leader/leaseholder split exists but we can't transfer leadership because
+	// there is a lease acquisition in progress on this replica.
+	raftLeaderTransferBlockedByPendingAcquisition
+	// raftLeaderTransferBlockedByLeaseholderBehind indicates that a
+	// leader/leaseholder split exists but we can't transfer leadership because
+	// the leaseholder is not caught up on the Raft log (or its progress is
+	// unknown).
+	raftLeaderTransferBlockedByLeaseholderBehind
+)
+
+func (o raftLeaderTransferOutcome) isBlocked() bool {
+	return o == raftLeaderTransferBlockedByPendingAcquisition ||
+		o == raftLeaderTransferBlockedByLeaseholderBehind
+}
+
+// leaderTransferDiagState tracks the state machine for Raft leadership transfer
+// diagnostics. It is updated on the tick path (by the caller of
+// maybeTransferRaftLeadershipToLeaseholderLocked) and used to determine when
+// rate-limited log messages about a stuck leadership/leaseholder split should
+// be emitted.
+type leaderTransferDiagState struct {
+	// outcome is the last observed raftLeaderTransferOutcome.
+	outcome raftLeaderTransferOutcome
+	// since is the cumulative tick duration at which outcome last changed. This
+	// is a monotonic value derived from ticks * RaftTickInterval.
+	since time.Duration
+	// loggedOnce is set after a "stuck" log message has been emitted for the
+	// current blocked state, preventing repeat logs for the same episode.
+	loggedOnce bool
+}
+
+// update advances the state machine given a new outcome and the current
+// cumulative tick duration. It returns whether the caller should log a "stuck"
+// or "resolved" message, the elapsed duration in the blocked state, and the
+// previous outcome (useful for "resolved" log messages).
+func (s *leaderTransferDiagState) update(
+	outcome raftLeaderTransferOutcome, cumTickDur time.Duration,
+) (logStuck, logResolved bool, elapsed time.Duration, prevOutcome raftLeaderTransferOutcome) {
+	prevOutcome = s.outcome
+	if outcome != s.outcome {
+		// State changed. Only reset the timer when transitioning into a blocked
+		// state from a non-blocked one. Transitions between different blocked
+		// reasons (e.g. leaseholder-behind -> pending-acquisition) update the
+		// tracked reason but keep the original timer, so that a flip-flopping
+		// reason doesn't prevent the "stuck" log from ever firing.
+		if s.outcome.isBlocked() && outcome == raftLeaderTransferOK {
+			elapsed = cumTickDur - s.since
+			logResolved = elapsed >= leaderTransferStuckThreshold
+		}
+		s.outcome = outcome
+		if !prevOutcome.isBlocked() {
+			s.since = cumTickDur
+			s.loggedOnce = false
+		}
+		return logStuck, logResolved, elapsed, prevOutcome
+	}
+	// State unchanged.
+	if outcome.isBlocked() && !s.loggedOnce {
+		elapsed = cumTickDur - s.since
+		if elapsed >= leaderTransferStuckThreshold {
+			logStuck = true
+			s.loggedOnce = true
+		}
+	}
+	return logStuck, logResolved, elapsed, prevOutcome
+}
+
 // maybeTransferRaftLeadershipToLeaseholderLocked attempts to transfer the
 // leadership away from this node to the leaseholder, if this node is the
 // current raft leader but not the leaseholder. We don't attempt to transfer
@@ -2620,11 +2732,15 @@ func (r *Replica) forgetLeaderLocked(ctx context.Context) {
 // both the lease holder and the raft leader before being applied by other
 // replicas). Collocation also permits the use of Leader leases, which are more
 // efficient than expiration-based leases.
+//
+// The returned values are intended for diagnostic logging by the caller (the
+// tick path). The raftpb.PeerID identifies the leaseholder / leadership
+// transfer target.
 func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
 	ctx context.Context, leaseStatus kvserverpb.LeaseStatus,
-) {
+) (raftLeaderTransferOutcome, raftpb.PeerID) {
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
-		return
+		return raftLeaderTransferNotNeeded, 0
 	}
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
 
@@ -2634,19 +2750,19 @@ func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
 	// also handled there.
 	if raftStatus.RaftState != raftpb.StateLeader ||
 		leaseStatus.OwnedBy(r.store.StoreID()) {
-		return
+		return raftLeaderTransferNotNeeded, 0
 	}
 
 	lhReplicaID := raftpb.PeerID(leaseStatus.Lease.Replica.ReplicaID)
 	leaseAcquisitionPending := r.mu.pendingLeaseRequest.AcquisitionInProgress()
-	ok := shouldTransferRaftLeadershipToLeaseholderLocked(
+	outcome := shouldTransferRaftLeadershipToLeaseholderLocked(
 		raftStatus, r.mu.internalRaftGroup.ReplicaProgress(lhReplicaID), leaseStatus,
 		leaseAcquisitionPending, r.StoreID(), r.store.IsDraining())
-	if ok {
-		log.VEventf(ctx, 1, "transferring raft leadership to replica ID %v", lhReplicaID)
+	if outcome == raftLeaderTransferOK {
 		r.store.metrics.RangeRaftLeaderTransfers.Inc(1)
 		r.mu.internalRaftGroup.TransferLeader(lhReplicaID)
 	}
+	return outcome, lhReplicaID
 }
 
 func shouldTransferRaftLeadershipToLeaseholderLocked(
@@ -2656,16 +2772,16 @@ func shouldTransferRaftLeadershipToLeaseholderLocked(
 	leaseAcquisitionPending bool,
 	storeID roachpb.StoreID,
 	draining bool,
-) bool {
+) raftLeaderTransferOutcome {
 	// If we're not the leader, there's nothing to do.
 	if raftStatus.RaftState != raftpb.StateLeader {
-		return false
+		return raftLeaderTransferNotNeeded
 	}
 
 	// The status is invalid or its owned locally, there's nothing to do.
 	// Otherwise, the lease is valid and owned by another store.
 	if !leaseStatus.IsValid() || leaseStatus.OwnedBy(storeID) {
-		return false
+		return raftLeaderTransferNotNeeded
 	}
 
 	// If there is an attempt to acquire the lease in progress, we don't want to
@@ -2689,7 +2805,7 @@ func shouldTransferRaftLeadershipToLeaseholderLocked(
 	// a leader lease must never transfer leadership away before transferring the
 	// lease away first.
 	if leaseAcquisitionPending {
-		return false
+		return raftLeaderTransferBlockedByPendingAcquisition
 	}
 
 	// If we're draining, begin the transfer regardless of the leaseholder's raft
@@ -2699,12 +2815,14 @@ func shouldTransferRaftLeadershipToLeaseholderLocked(
 	// maybeTransferRaftLeadershipToLeaseholderLocked after the target is caught
 	// up before starting the process. See 68577d74.
 	if draining {
-		return true
+		return raftLeaderTransferOK
 	}
 
 	// Otherwise, only transfer if the leaseholder is caught up on the raft log.
-	lhCaughtUp := lhProgress != nil && lhProgress.Match >= raftStatus.Commit
-	return lhCaughtUp
+	if lhProgress != nil && lhProgress.Match >= raftStatus.Commit {
+		return raftLeaderTransferOK
+	}
+	return raftLeaderTransferBlockedByLeaseholderBehind
 }
 
 // a lastUpdateTimesMap is maintained on the Raft leader to keep track of the
@@ -2912,8 +3030,9 @@ func handleTruncatedStateBelowRaftPreApply(
 	next kvserverpb.RaftTruncatedState,
 	loader logstore.StateLoader,
 	writer storage.Writer,
+	enginesSeparated bool,
 ) error {
-	return logstore.Compact(ctx, prev, next, loader, writer)
+	return logstore.Compact(ctx, prev, next, loader, writer, enginesSeparated)
 }
 
 // shouldCampaignAfterConfChange returns true if the current replica should
@@ -2979,7 +3098,7 @@ func (r *Replica) printRaftTail(
 	end := keys.RaftLogPrefix(r.RangeID).PrefixEnd()
 
 	// NB: raft log does not have intents.
-	it, err := r.store.TODOEngine().NewEngineIterator(
+	it, err := r.store.LogEngine().NewEngineIterator(
 		ctx, storage.IterOptions{LowerBound: start, UpperBound: end})
 	if err != nil {
 		return "", err

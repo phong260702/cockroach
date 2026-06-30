@@ -573,7 +573,9 @@ type SetTriggerName struct {
 // whether it will be executed in response to a triggering event.
 type SetTriggerEnabled struct {
 	immediateMutationOp
-	Enabled scpb.TriggerEnabled
+	TableID   catid.DescID
+	TriggerID catid.TriggerID
+	Enabled   bool
 }
 
 // SetTriggerTiming sets the timing of a trigger, which indicates when it
@@ -902,6 +904,22 @@ type RemoveTypeComment struct {
 	TypeID descpb.ID
 }
 
+// UpsertFunctionComment is used to add a comment to a function (or
+// procedure). Functions and procedures share descriptor space, so a single
+// op covers both.
+type UpsertFunctionComment struct {
+	immediateMutationOp
+	FunctionID descpb.ID
+	Comment    string
+}
+
+// RemoveFunctionComment is used to delete a comment associated with a
+// function (or procedure).
+type RemoveFunctionComment struct {
+	immediateMutationOp
+	FunctionID descpb.ID
+}
+
 // UpsertDatabaseComment is used to add a comment to a database.
 type UpsertDatabaseComment struct {
 	immediateMutationOp
@@ -1042,6 +1060,11 @@ type SetFunctionBody struct {
 	Body scpb.FunctionBody
 }
 
+type SetFunctionParams struct {
+	immediateMutationOp
+	Params scpb.FunctionParams
+}
+
 type SetFunctionSecurity struct {
 	immediateMutationOp
 	FunctionID descpb.ID
@@ -1063,13 +1086,15 @@ type UpdateFunctionRelationReferences struct {
 	FunctionReferences []descpb.ID
 }
 
-// UpdateTableBackReferencesInRelations updates the DependedOnBy metadata in
-// relation descriptors (e.g., tableDesc) for triggers. It handles both adding
-// and removing dependencies. The function relies on forward references being
-// set beforehand to determine whether a back-reference should be added or removed.
-type UpdateTableBackReferencesInRelations struct {
+// UpdateTriggerBackReferencesInRelations updates the DependedOnBy metadata in
+// relation descriptors for triggers. It handles both adding and removing
+// trigger-specific dependencies. The function relies on forward references
+// being set beforehand to determine whether a back-reference should be added
+// or removed.
+type UpdateTriggerBackReferencesInRelations struct {
 	immediateMutationOp
 	TableID            descpb.ID
+	TriggerID          descpb.TriggerID
 	RelationReferences []scpb.TriggerDeps_RelationReference
 }
 
@@ -1086,6 +1111,13 @@ type UpdateUserPrivileges struct {
 type UpdateOwner struct {
 	immediateMutationOp
 	Owner scpb.Owner
+}
+
+// RemoveOwner is a noop. The descriptor drop or the UpdateOwner handles the
+// state change.
+type RemoveOwner struct {
+	immediateMutationOp
+	DescriptorID descpb.ID
 }
 
 type CreateSchemaDescriptor struct {
@@ -1223,6 +1255,39 @@ type ForcedRowLevelSecurityMode struct {
 	Forced  bool
 }
 
+// SetTableLocalityGlobal sets the table's locality to GLOBAL.
+type SetTableLocalityGlobal struct {
+	immediateMutationOp
+	TableID descpb.ID
+}
+
+// SetTableLocalityPrimaryRegion sets the table's locality to REGIONAL BY TABLE in the primary region.
+type SetTableLocalityPrimaryRegion struct {
+	immediateMutationOp
+	TableID descpb.ID
+}
+
+// SetTableLocalitySecondaryRegion sets the table's locality to REGIONAL BY TABLE in a specific region.
+type SetTableLocalitySecondaryRegion struct {
+	immediateMutationOp
+	TableID          descpb.ID
+	RegionEnumTypeID descpb.ID
+	RegionName       catpb.RegionName
+}
+
+// SetTableLocalityRegionalByRow sets the table's locality to REGIONAL BY ROW.
+type SetTableLocalityRegionalByRow struct {
+	immediateMutationOp
+	TableID descpb.ID
+	As      string
+}
+
+// UnsetTableLocality removes the table's locality configuration.
+type UnsetTableLocality struct {
+	immediateMutationOp
+	TableID descpb.ID
+}
+
 // MarkRecreatedIndexAsInvisible is used to mark secondary indexes recreated
 // after a primary key swap as invisible. This is to prevent their use before
 // primary key swap is complete.
@@ -1260,6 +1325,14 @@ type SetTableSchemaLocked struct {
 	Locked  bool
 }
 
+// SetTableRBRUsingConstraint sets or clears the RBRUsingConstraint field on the
+// table descriptor. A ConstraintID of 0 clears the field.
+type SetTableRBRUsingConstraint struct {
+	immediateMutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
 // SetTableStorageParam sets a storage parameter on a table.
 type SetTableStorageParam struct {
 	immediateMutationOp
@@ -1278,4 +1351,89 @@ type UpsertRowLevelTTL struct {
 	TableID     descpb.ID
 	RowLevelTTL catpb.RowLevelTTL
 	TTLExpr     *scpb.Expression
+}
+
+// AddEnumTypeValue adds an enum value to the type descriptor in the READ_ONLY
+// capability with ADD direction.
+type AddEnumTypeValue struct {
+	immediateMutationOp
+	TypeID                 descpb.ID
+	PhysicalRepresentation []byte
+	LogicalRepresentation  string
+}
+
+// PromoteEnumTypeValue promotes a READ_ONLY/ADD enum value to ALL/NONE, making
+// it fully writable.
+type PromoteEnumTypeValue struct {
+	immediateMutationOp
+	TypeID                 descpb.ID
+	PhysicalRepresentation []byte
+	LogicalRepresentation  string
+}
+
+// DemoteEnumTypeValue demotes a public enum value to READ_ONLY capability
+// with REMOVE direction.
+type DemoteEnumTypeValue struct {
+	immediateMutationOp
+	TypeID                 descpb.ID
+	PhysicalRepresentation []byte
+	LogicalRepresentation  string
+}
+
+// RemoveEnumTypeValue removes an READ_ONLY/REMOVE enum value from the type
+// descriptor.
+type RemoveEnumTypeValue struct {
+	immediateMutationOp
+	TypeID                 descpb.ID
+	PhysicalRepresentation []byte
+	LogicalRepresentation  string
+}
+
+// AddDomainNotNull installs a NOT NULL constraint on a domain type descriptor
+// in the VALIDATING state.
+type AddDomainNotNull struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// MakeValidatedDomainNotNullPublic transitions a domain's NOT NULL constraint
+// from VALIDATING to ENFORCING.
+type MakeValidatedDomainNotNullPublic struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// MakePublicDomainNotNullValidated transitions a domain's NOT NULL constraint
+// from ENFORCING to DROPPING.
+type MakePublicDomainNotNullValidated struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// RemoveDomainNotNull removes the NOT NULL constraint from a domain type
+// descriptor.
+type RemoveDomainNotNull struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// SetDomainConstraintName sets the name of a constraint on a domain type
+// descriptor.
+type SetDomainConstraintName struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
+	Name         string
+}
+
+// RemoveDomainConstraintName replaces a constraint's name on a domain type
+// descriptor with a placeholder.
+type RemoveDomainConstraintName struct {
+	immediateMutationOp
+	TypeID       descpb.ID
+	ConstraintID descpb.ConstraintID
 }

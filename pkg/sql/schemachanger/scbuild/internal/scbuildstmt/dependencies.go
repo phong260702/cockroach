@@ -64,6 +64,14 @@ type BuildCtx interface {
 	// Drop sets the ABSENT target on an existing element in the BuilderState.
 	Drop(element scpb.Element)
 
+	// Replace replaces an existing PUBLIC element's content while preserving
+	// its key. It sets initial=ABSENT, current=ABSENT, target=ToPublic so
+	// the planner emits "add" operations that update the already-existing
+	// descriptor.
+	// Note: When the element keys match, Drop/Add is preferred over Replace since
+	// it is idempotent.
+	Replace(element scpb.Element)
+
 	// WithNewSourceElementID wraps BuilderStateWithNewSourceElementID in a
 	// BuildCtx return type.
 	WithNewSourceElementID() BuildCtx
@@ -90,6 +98,7 @@ type BuilderState interface {
 	NameResolver
 	PrivilegeChecker
 	TableHelpers
+	TypeHelpers
 	FunctionHelpers
 	SchemaHelpers
 
@@ -201,6 +210,10 @@ type Telemetry interface {
 	// IncrementSchemaChangeIndexCounter schema change counters related to index
 	// features during creation.
 	IncrementSchemaChangeIndexCounter(counterType string)
+
+	// IncrementAlterTableLocalityCounter increments the selected ALTER TABLE LOCALITY
+	// counter
+	IncrementAlterTableLocalityCounter(counterTypeFrom, counterTypeTo string)
 }
 
 // SchemaFeatureChecker checks if a schema change feature is allowed by the
@@ -238,7 +251,7 @@ type PrivilegeChecker interface {
 	// to descriptors. However, privileges can also live in the
 	// `system.privileges` table (i.e. system-level privileges) and checking those
 	// global privileges are done by the CheckGlobalPrivilege method below.
-	CheckPrivilege(e scpb.Element, privilege privilege.Kind) error
+	CheckPrivilege(e scpb.Element, privileges ...privilege.Kind) error
 
 	// CheckGlobalPrivilege panics if the current user does not have the specified
 	// global privilege.
@@ -254,6 +267,12 @@ type PrivilegeChecker interface {
 
 	// CurrentUser returns the user of current session.
 	CurrentUser() username.SQLUsername
+
+	// CheckPrivilegeForUser checks that the specified user has the given
+	// privilege on the element's descriptor.
+	CheckPrivilegeForUser(
+		e scpb.Element, priv privilege.Kind, user username.SQLUsername,
+	) error
 
 	// CheckRoleExists returns nil if `role` exists.
 	CheckRoleExists(ctx context.Context, role username.SQLUsername) error
@@ -346,12 +365,26 @@ type TableHelpers interface {
 type FunctionHelpers interface {
 	BuildReferenceProvider(stmt tree.Statement) ReferenceProvider
 	WrapFunctionBody(fnID descpb.ID, bodyStr string, lang catpb.Function_Language,
-		returnType tree.ResolvableTypeReference, provider ReferenceProvider) *scpb.FunctionBody
+		lazilyEvalSQL bool, provider ReferenceProvider) *scpb.FunctionBody
 	ReplaceSeqTypeNamesInStatements(queryStr string, lang catpb.Function_Language) string
 }
 
 type SchemaHelpers interface {
 	ResolveDatabasePrefix(schemaPrefix *tree.ObjectNamePrefix)
+}
+
+// TypeHelpers exposes builder operations that are specific to user-defined
+// type descriptors (enums, composites, domains).
+type TypeHelpers interface {
+
+	// NextDomainConstraintID returns the ID that should be used for any new
+	// constraint (NOT NULL or CHECK) added to this domain type. The returned ID
+	// is monotonically increasing across the lifetime of the descriptor.
+	NextDomainConstraintID(typeID catid.DescID) catid.ConstraintID
+
+	// DomainConstraintNames returns the set of constraint names currently in
+	// use on the given domain, as recorded in the persisted descriptor.
+	DomainConstraintNames(typeID catid.DescID) []string
 }
 
 type ElementResultSet = *scpb.ElementCollection[scpb.Element]

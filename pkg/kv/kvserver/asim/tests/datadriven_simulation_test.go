@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/assertion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/event"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/logtags"
+	"github.com/gogo/protobuf/jsonpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,10 +64,15 @@ var runAsimTests = envutil.EnvOrDefaultBool("COCKROACH_RUN_ASIM_TESTS", false)
 //
 //   - "gen_cluster" [nodes=<int>] [stores_per_node=<int>]
 //     [store_byte_capacity_gib=<int>] [node_cpu_cores=<float>]
+//     [cpu_overhead_multiplier=<float>] [space_amplification=<float>]
+//     [reserved_disk_gib=<int>]
 //     Initialize the cluster generator parameters. On the next call to eval,
 //     the cluster generator is called to create the initial state used in the
 //     simulation. The default values are: nodes=3 stores_per_node=1
-//     store_byte_capacity_gib=256, node_cpu_cores=8.0.
+//     store_byte_capacity_gib=256, node_cpu_cores=8.0,
+//     cpu_overhead_multiplier=1.0 (ratio of OS CPU to tracked CPU),
+//     space_amplification=1.25 (Used/LogicalBytes ratio),
+//     reserved_disk_gib=0 (filesystem reserved blocks).
 //
 //   - "load_cluster": config=<name>
 //     Load a defined cluster configuration to be the generated cluster in the
@@ -91,7 +98,7 @@ var runAsimTests = envutil.EnvOrDefaultBool("COCKROACH_RUN_ASIM_TESTS", false)
 //
 //   - set_status store=<int> [delay=<duration>] liveness=(live|unavailable|dead)
 //   - set_status node=<int> [delay=<duration>] [liveness=(live|unavailable|dead)]
-//       [membership=(active|decommissioning|decommissioned)] [draining=<bool>]
+//     [membership=(active|decommissioning|decommissioned)] [draining=<bool>]
 //     Set status signals for stores or nodes. The store= form sets liveness for
 //     a single store. The node= form can set liveness for all stores on a node
 //     and/or set membership/draining (which are per-node). Defaults for node=:
@@ -101,6 +108,13 @@ var runAsimTests = envutil.EnvOrDefaultBool("COCKROACH_RUN_ASIM_TESTS", false)
 //     Sets the locality of the node with ID NodeID. This applies at the start
 //     of the simulation or with some delay after the simulation stats, if
 //     specified.
+//
+//   - set_store_attrs store=<int> attrs=(a,b,...) [delay=<duration>]
+//     Overwrites the store-level attributes of the store with the given
+//     StoreID. The constraint matcher in span configs sees these as "+attr"
+//     tokens (e.g. voter_constraints={"+ssd":1}). Stores have empty Attrs by
+//     default, so this is the only way to make constraints discriminate
+//     between sibling stores on the same node (since locality is per-node).
 //
 //   - add_node: [stores=<int>] [locality=<string>] [delay=<duration>]
 //     Add a node to the cluster after initial generation with some delay,
@@ -119,13 +133,18 @@ var runAsimTests = envutil.EnvOrDefaultBool("COCKROACH_RUN_ASIM_TESTS", false)
 //
 //   - "assertion" type=<string> [stat=<string>] [ticks=<int>]
 //     [(exact_bound|upper_bound|lower_bound)=<float>] [store=<int>]
-//     [(under|over|unavailable|violating)=<int>]
+//     [(under|over|unavailable|violating)=<int>] [issue=<url>]
 //     Add an assertion to the list of assertions that run against each sample
 //     on subsequent calls to eval. When every assertion holds during eval, OK
 //     is printed, otherwise the reason the assertion(s) failed is printed.
 //     type=balance,steady,stat assertions look at the last 'ticks' duration of
 //     the simulation run. type=conformance assertions look at the end of the
 //     evaluation.
+//
+//     When issue=<url> is provided, the assertion is expected to fail (tracked
+//     by the referenced issue). If the assertion stops failing, the test errors
+//     out so the annotation can be cleaned up. Conversely, a failing assertion
+//     without an issue= annotation causes a test error.
 //
 //     For type=balance assertions, the max stat (e.g. stat=qps) value of each
 //     store is taken and divided by the mean store stat value. If the max/mean
@@ -203,7 +222,17 @@ func TestDataDriven(t *testing.T) {
 			var rangeGen gen.MultiRanges
 			settingsGen := gen.StaticSettings{Settings: config.DefaultSimulationSettings()}
 			var events []scheduled.ScheduledEvent
-			assertions := []assertion.SimulationAssertion{}
+			type trackedAssertion struct {
+				assertion.SimulationAssertion
+				// When non-empty, the assertion is expected to fail and the URL
+				// points at a tracking issue (GitHub, Jira, etc). If the assertion
+				// stops failing, the test errors out so the annotation can be
+				// cleaned up. If it is empty and the assertion fails, the test
+				// also errors out, prompting the author to either fix the problem
+				// or add a tracking issue.
+				issue string
+			}
+			assertions := []trackedAssertion{}
 			// TODO(tbg): make it unnecessary to hold on to a per-file
 			// history of runs by removing commands that reference a specific
 			// runs. Instead, all run-specific data should become a generated
@@ -348,12 +377,18 @@ func TestDataDriven(t *testing.T) {
 					var region []string
 					var nodesPerRegion []int
 					var storeByteCapacityGiB int64 = 256
+					var cpuOverheadMultiplier float64
+					var spaceAmplification float64
+					var reservedDiskGiB int64
 					scanIfExists(t, d, "nodes", &nodes)
 					scanIfExists(t, d, "stores_per_node", &storesPerNode)
 					scanIfExists(t, d, "store_byte_capacity_gib", &storeByteCapacityGiB)
 					scanIfExists(t, d, "region", &region)
 					scanIfExists(t, d, "nodes_per_region", &nodesPerRegion)
 					scanIfExists(t, d, "node_cpu_cores", &nodeCPUCores)
+					scanIfExists(t, d, "cpu_overhead_multiplier", &cpuOverheadMultiplier)
+					scanIfExists(t, d, "space_amplification", &spaceAmplification)
+					scanIfExists(t, d, "reserved_disk_gib", &reservedDiskGiB)
 
 					var buf strings.Builder
 					require.NotEmpty(t, nodeCPUCores)
@@ -380,6 +415,11 @@ func TestDataDriven(t *testing.T) {
 						Region:              region,
 						NodesPerRegion:      nodesPerRegion,
 						NodeCPURateCapacity: state.NodeCPUCores(nodeCPUCores).ToRateCapacityNanos(),
+						NodePhysical: state.NodePhysicalCharacteristics{
+							CPUOverheadMultiplier: cpuOverheadMultiplier,
+							SpaceAmplification:    spaceAmplification,
+							ReservedDiskBytes:     reservedDiskGiB << 30,
+						},
 					}
 					return buf.String()
 				case "load_cluster":
@@ -536,6 +576,21 @@ func TestDataDriven(t *testing.T) {
 						},
 					})
 					return ""
+				case "set_store_attrs":
+					var store int
+					var attrs []string
+					var delay time.Duration
+					scanMustExist(t, d, "store", &store)
+					scanMustExist(t, d, "attrs", &attrs)
+					scanIfExists(t, d, "delay", &delay)
+					events = append(events, scheduled.ScheduledEvent{
+						At: settingsGen.Settings.StartTime.Add(delay),
+						TargetEvent: event.SetStoreAttrsEvent{
+							StoreID: state.StoreID(store),
+							Attrs:   attrs,
+						},
+					})
+					return ""
 				case "set_capacity":
 					var store int
 					var ioThreshold float64 = -1
@@ -634,6 +689,16 @@ func TestDataDriven(t *testing.T) {
 					// the first LBRebalancingMode configuration since this string is only
 					// generated for once at the start.
 					var stateStrForOnce string
+					// TODO(tbg): there's tension between having subtests per
+					// config (for filtering and individual failure reporting),
+					// running them concurrently (for speed), and combining
+					// their output into a single testdata file.  Parallel
+					// subtests don't start until the parent yields, which
+					// deadlocks if we block waiting for results to combine. A
+					// clean-ish fix is to split each config into its own
+					// testdata file, sharing common setup via an `include`
+					// directive (see TestClusterState for an example).
+					assertionEverFailed := make([]bool, len(assertions))
 					for _, mv := range cfgs {
 						t.Run(mv, func(t *testing.T) {
 							ctx := logtags.AddTag(context.Background(), "name", name+"/"+mv)
@@ -684,8 +749,13 @@ func TestDataDriven(t *testing.T) {
 								h := simulator.History()
 								run.hs = append(run.hs, h)
 
-								for _, stmt := range assertions {
+								if rewrite {
+									writeMMASnapshots(t, simulator, plotDir, testName, sample+1)
+								}
+
+								for i, stmt := range assertions {
 									if holds, reason := stmt.Assert(ctx, h); !holds {
+										assertionEverFailed[i] = true
 										assertionFailures = append(assertionFailures, reason)
 									}
 								}
@@ -694,6 +764,7 @@ func TestDataDriven(t *testing.T) {
 
 							runs = append(runs, run)
 
+							_, _ = fmt.Fprintf(&buf, "%s:\n", mv)
 							// Generate artifacts. Hash artifact input data to ensure they are
 							// up to date.
 							hasher := fnv.New64a()
@@ -706,7 +777,7 @@ func TestDataDriven(t *testing.T) {
 
 							// For each sample that had at least one failing assertion,
 							// report the sample and every failing assertion.
-							_, _ = fmt.Fprintf(&buf, "artifacts[%s]: %x\n", mv, artifactsHash)
+							_, _ = fmt.Fprintf(&buf, "hash: %x\n", artifactsHash)
 							for sample, failString := range sampleAssertFailures {
 								if failString != "" {
 									_, _ = fmt.Fprintf(&buf, "failed assertion sample %d\n%s\n",
@@ -715,6 +786,18 @@ func TestDataDriven(t *testing.T) {
 							}
 							_, _ = fmt.Fprint(&buf, "==========================\n")
 						})
+					}
+					for i, a := range assertions {
+						if a.issue != "" && !assertionEverFailed[i] {
+							t.Errorf("assertion %q has issue=%s but did not fail in any "+
+								"config; the issue may be resolved, consider removing "+
+								"the annotation", a.SimulationAssertion, a.issue)
+						}
+						if a.issue == "" && assertionEverFailed[i] {
+							t.Errorf("assertion %q failed without a tracking issue; "+
+								"add issue=<url> or fix the underlying problem",
+								a.SimulationAssertion)
+						}
 					}
 					writeStateStrToFile(t, filepath.Join(plotDir, fmt.Sprintf("%s_setup.txt", name)), stateStrForOnce, rewrite)
 					if full {
@@ -726,19 +809,22 @@ func TestDataDriven(t *testing.T) {
 					var stat string
 					var typ string
 					var ticks int
+					var issue string
 					scanMustExist(t, d, "type", &typ)
+					scanIfExists(t, d, "issue", &issue)
 
 					var buf strings.Builder
+					var a assertion.SimulationAssertion
 					switch typ {
 					case "balance":
 						scanMustExist(t, d, "stat", &stat)
 						scanMustExist(t, d, "ticks", &ticks)
 						threshold := scanThreshold(t, d)
-						assertions = append(assertions, assertion.BalanceAssertion{
+						a = assertion.BalanceAssertion{
 							Ticks:     ticks,
 							Stat:      stat,
 							Threshold: threshold,
-						})
+						}
 						_, _ = fmt.Fprintf(&buf, "asserting: max_{stores}(%s)/mean_{stores}(%s) %s %.2f at each of last %d ticks",
 							stat, stat, threshold.ThresholdType, threshold.Value, ticks)
 						// ^-- the max and mean are taken over the stores (with the tick fixed).
@@ -746,11 +832,11 @@ func TestDataDriven(t *testing.T) {
 						scanMustExist(t, d, "stat", &stat)
 						scanMustExist(t, d, "ticks", &ticks)
 						threshold := scanThreshold(t, d)
-						assertions = append(assertions, assertion.SteadyStateAssertion{
+						a = assertion.SteadyStateAssertion{
 							Ticks:     ticks,
 							Stat:      stat,
 							Threshold: threshold,
-						})
+						}
 						_, _ = fmt.Fprintf(&buf, "asserting: |%s(t)/mean_{T}(%s) - 1| %s %.2f ∀ t∈T and each store ("+
 							"T=last %d ticks)",
 							stat, stat, threshold.ThresholdType, threshold.Value, ticks)
@@ -762,12 +848,12 @@ func TestDataDriven(t *testing.T) {
 						scanMustExist(t, d, "stat", &stat)
 						scanMustExist(t, d, "ticks", &ticks)
 						scanMustExist(t, d, "stores", &stores)
-						assertions = append(assertions, assertion.StoreStatAssertion{
+						a = assertion.StoreStatAssertion{
 							Ticks:     ticks,
 							Stat:      stat,
 							Threshold: scanThreshold(t, d),
 							Stores:    stores,
-						})
+						}
 					case "conformance":
 						var under, over, unavailable, violating, leaseViolating, leaseLessPref int
 						under = assertion.ConformanceAssertionSentinel
@@ -782,17 +868,21 @@ func TestDataDriven(t *testing.T) {
 						scanIfExists(t, d, "violating", &violating)
 						scanIfExists(t, d, "lease-violating", &leaseViolating)
 						scanIfExists(t, d, "lease-less-preferred", &leaseLessPref)
-						assertions = append(assertions, assertion.ConformanceAssertion{
+						a = assertion.ConformanceAssertion{
 							Underreplicated:           under,
 							Overreplicated:            over,
 							ViolatingConstraints:      violating,
 							Unavailable:               unavailable,
 							ViolatingLeasePreferences: leaseViolating,
 							LessPreferredLeases:       leaseLessPref,
-						})
+						}
 					default:
 						panic("unknown assertion: " + typ)
 					}
+					assertions = append(assertions, trackedAssertion{
+						SimulationAssertion: a,
+						issue:               issue,
+					})
 					return buf.String()
 				case "setting":
 					// NB: delay could be supported for the below settings,
@@ -856,5 +946,26 @@ type modeHistory struct {
 func writeStateStrToFile(t *testing.T, topFile string, stateStr string, rewrite bool) {
 	if rewrite {
 		require.NoError(t, os.WriteFile(topFile, []byte(stateStr), 0644))
+	}
+}
+
+// writeMMASnapshots writes one JSON file per node containing the MMA
+// allocator's view of the cluster at the moment the simulation ended. The
+// snapshot is intended as a representative artifact for tooling that
+// consumes mmaprototype.Allocator.ClusterStateSnapshot in production
+// (debug-zip, status RPC, mma-investigator).
+func writeMMASnapshots(
+	t *testing.T, simulator *asim.Simulator, plotDir, testName string, sample int,
+) {
+	require.NoError(t, os.MkdirAll(plotDir, 0755))
+	m := &jsonpb.Marshaler{Indent: "  "}
+	for _, node := range simulator.State().Nodes() {
+		snap, err := node.MMAllocator().ClusterStateSnapshot()
+		require.NoError(t, err)
+		s, err := m.MarshalToString(snap)
+		require.NoError(t, err)
+		path := filepath.Join(plotDir,
+			fmt.Sprintf("%s_%d_n%d_mma_snapshot.json", testName, sample, node.NodeID()))
+		require.NoError(t, os.WriteFile(path, []byte(s), 0644))
 	}
 }

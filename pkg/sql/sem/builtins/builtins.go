@@ -8,6 +8,7 @@ package builtins
 import (
 	"bytes"
 	"context"
+	"crypto/fips140"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -27,11 +28,13 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,7 +42,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -88,7 +90,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ltree"
-	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
@@ -1395,11 +1396,13 @@ var regularBuiltins = map[string]builtinDefinition{
 	"fnv64": hash64Builtin(
 		func() hash.Hash64 { return fnv.New64() },
 		"Calculates the 64-bit FNV-1 hash value of a set of values.",
+		tree.FNV64,
 	),
 
 	"fnv64a": hash64Builtin(
 		func() hash.Hash64 { return fnv.New64a() },
 		"Calculates the 64-bit FNV-1a hash value of a set of values.",
+		tree.FNV64a,
 	),
 
 	"crc32ieee": hash32Builtin(
@@ -2172,6 +2175,36 @@ var regularBuiltins = map[string]builtinDefinition{
 		},
 	),
 
+	"random_normal": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types:      tree.ParamTypes{},
+			ReturnType: tree.FixedReturnType(types.Float),
+			Fn: func(_ context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				return tree.NewDFloat(tree.DFloat(evalCtx.GetRNG().NormFloat64())), nil
+			},
+			Info:       "Returns a random floating-point value drawn from the standard normal distribution (mean 0, standard deviation 1).",
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "mean", Typ: types.Float},
+				{Name: "stddev", Typ: types.Float},
+			},
+			ReturnType: tree.FixedReturnType(types.Float),
+			Fn: func(_ context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				mean := float64(tree.MustBeDFloat(args[0]))
+				stddev := float64(tree.MustBeDFloat(args[1]))
+				if stddev < 0 {
+					return nil, pgerror.New(pgcode.InvalidParameterValue, "stddev cannot be negative")
+				}
+				return tree.NewDFloat(tree.DFloat(stddev*evalCtx.GetRNG().NormFloat64() + mean)), nil
+			},
+			Info:       "Returns a random floating-point value drawn from a normal distribution with the given `mean` and `stddev`.",
+			Volatility: volatility.Volatile,
+		},
+	),
+
 	"setseed": makeBuiltin(
 		defProps(),
 		tree.Overload{
@@ -2553,6 +2586,72 @@ var regularBuiltins = map[string]builtinDefinition{
 			Info:       "Convert a timestamp with time zone to a string using the given format.",
 			Volatility: volatility.Stable,
 		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "number", Typ: types.Int}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				val := int64(tree.MustBeDInt(args[0]))
+				f := string(tree.MustBeDString(args[1]))
+				d := new(apd.Decimal)
+				d.SetInt64(val)
+				s, err := tochar.DecimalToChar(d, ctx.ToCharFormatCache, f)
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert an integer to a string using the given format.",
+			Volatility: volatility.Stable,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "number", Typ: types.Float}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				val := float64(tree.MustBeDFloat(args[0]))
+				f := string(tree.MustBeDString(args[1]))
+				d := new(apd.Decimal)
+				if _, err := d.SetFloat64(val); err != nil {
+					return nil, err
+				}
+				s, err := tochar.Float8DecimalToChar(d, ctx.ToCharFormatCache, f)
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert a float to a string using the given format.",
+			Volatility: volatility.Stable,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "number", Typ: types.Decimal}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				dd := tree.MustBeDDecimal(args[0])
+				f := string(tree.MustBeDString(args[1]))
+				s, err := tochar.DecimalToChar(&dd.Decimal, ctx.ToCharFormatCache, f)
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert a decimal to a string using the given format.",
+			Volatility: volatility.Stable,
+		},
+	),
+
+	"to_number": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "value", Typ: types.String}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.Decimal),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				val := string(tree.MustBeDString(args[0]))
+				f := string(tree.MustBeDString(args[1]))
+				d, err := tochar.CharToDecimal(val, ctx.ToCharFormatCache, f)
+				if err != nil {
+					return nil, err
+				}
+				if d == nil {
+					return tree.DNull, nil
+				}
+				dd := &tree.DDecimal{}
+				dd.Set(d)
+				return dd, nil
+			},
+			Info:       "Convert a string to a numeric using the given format.",
+			Volatility: volatility.Stable,
+		},
 	),
 
 	"to_char_with_style": makeBuiltin(
@@ -2628,12 +2727,18 @@ var regularBuiltins = map[string]builtinDefinition{
 				if year == 0 {
 					return nil, pgerror.New(pgcode.DatetimeFieldOverflow, "year value of 0 is not valid")
 				}
+				// PostgreSQL's make_date treats a negative year argument as
+				// "N BC" (no year zero in SQL semantics), but Go's time.Date
+				// uses astronomical numbering (year 0 = 1 BC). Shift negative
+				// inputs by one so e.g. -2013 maps to astronomical year -2012,
+				// matching PostgreSQL output. See #149950.
+				if year < 0 {
+					year++
+				}
 				location := evalCtx.GetLocation()
 				return tree.NewDDateFromTime(time.Date(year, month, day, 0, 0, 0, 0, location))
 			},
-			// For the ISO 8601 standard, the conversion from a negative year to BC changes the year value (ex. -2013 == 2014 BC).
-			// https://en.wikipedia.org/wiki/ISO_8601#Years
-			Info:       "Create date (formatted according to ISO 8601) from year, month, and day fields (negative years signify BC).",
+			Info:       "Create date from year, month, and day fields (negative years signify BC).",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -2729,6 +2834,40 @@ var regularBuiltins = map[string]builtinDefinition{
 			},
 			Info:       "Convert Unix epoch (seconds since 1970-01-01 00:00:00+00) to timestamp with time zone.",
 			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "date_string", Typ: types.String}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.TimestampTZ),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				dateStr := string(tree.MustBeDString(args[0]))
+				fmtStr := string(tree.MustBeDString(args[1]))
+				t, err := tochar.CharToTimestamp(dateStr, ctx.ToCharFormatCache, fmtStr, ctx.GetLocation())
+				if err != nil {
+					return nil, err
+				}
+				return tree.MakeDTimestampTZ(t, time.Microsecond)
+			},
+			Info:       "Convert a string to a timestamp with time zone using the given format.",
+			Volatility: volatility.Stable,
+		},
+	),
+
+	"to_date": makeBuiltin(
+		defProps(),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "date_string", Typ: types.String}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.Date),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				dateStr := string(tree.MustBeDString(args[0]))
+				fmtStr := string(tree.MustBeDString(args[1]))
+				year, month, day, err := tochar.CharToDate(dateStr, ctx.ToCharFormatCache, fmtStr)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDDateFromTime(time.Date(year, month, day, 0, 0, 0, 0, time.UTC))
+			},
+			Info:       "Convert a string to a date using the given format.",
+			Volatility: volatility.Stable,
 		},
 	),
 
@@ -3711,7 +3850,10 @@ value if you rely on the HLC for accuracy.`,
 				if args[0] == tree.DNull || args[1] == tree.DNull {
 					return tree.DNull, nil
 				}
-				arr := tree.MustBeDArray(args[0])
+				arr, err := checkIfDArrayErrOnDString(args[0])
+				if err != nil {
+					return nil, err
+				}
 				delim := string(tree.MustBeDString(args[1]))
 				return arrayToString(evalCtx, arr, delim, nil)
 			},
@@ -3726,7 +3868,10 @@ value if you rely on the HLC for accuracy.`,
 				if args[0] == tree.DNull || args[1] == tree.DNull {
 					return tree.DNull, nil
 				}
-				arr := tree.MustBeDArray(args[0])
+				arr, err := checkIfDArrayErrOnDString(args[0])
+				if err != nil {
+					return nil, err
+				}
 				delim := string(tree.MustBeDString(args[1]))
 				nullStr := stringOrNil(args[2])
 				return arrayToString(evalCtx, arr, delim, nullStr)
@@ -3742,7 +3887,10 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "array_dimension", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				arr := tree.MustBeDArray(args[0])
+				arr, err := checkIfDArrayErrOnDString(args[0])
+				if err != nil {
+					return nil, err
+				}
 				dimen := int64(tree.MustBeDInt(args[1]))
 				return arrayLength(arr, dimen), nil
 			},
@@ -3758,7 +3906,10 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				arr := tree.MustBeDArray(args[0])
+				arr, err := checkIfDArrayErrOnDString(args[0])
+				if err != nil {
+					return nil, err
+				}
 				return cardinality(arr), nil
 			},
 			Info:       "Calculates the number of elements contained in `input`",
@@ -3771,7 +3922,10 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "array_dimension", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				arr := tree.MustBeDArray(args[0])
+				arr, err := checkIfDArrayErrOnDString(args[0])
+				if err != nil {
+					return nil, err
+				}
 				dimen := int64(tree.MustBeDInt(args[1]))
 				return arrayLower(arr, dimen), nil
 			},
@@ -3787,7 +3941,10 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ParamTypes{{Name: "input", Typ: types.AnyArray}, {Name: "array_dimension", Typ: types.Int}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				arr := tree.MustBeDArray(args[0])
+				arr, err := checkIfDArrayErrOnDString(args[0])
+				if err != nil {
+					return nil, err
+				}
 				dimen := int64(tree.MustBeDInt(args[1]))
 				return arrayLength(arr, dimen), nil
 			},
@@ -4134,8 +4291,55 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Immutable,
 		},
 	),
-	"dmetaphone":     makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 56820, Category: builtinconstants.CategoryFuzzyStringMatching}),
-	"dmetaphone_alt": makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 56820, Category: builtinconstants.CategoryFuzzyStringMatching}),
+	"dmetaphone": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategoryFuzzyStringMatching},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "source", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				return tree.NewDString(fuzzystrmatch.DMetaphone(s)), nil
+			},
+			Info:       "Returns the primary Double Metaphone code for the input string.",
+			Volatility: volatility.Immutable,
+		},
+	),
+	"dmetaphone_alt": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategoryFuzzyStringMatching},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "source", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				return tree.NewDString(fuzzystrmatch.DMetaphoneAlt(s)), nil
+			},
+			Info:       "Returns the alternate Double Metaphone code for the input string.",
+			Volatility: volatility.Immutable,
+		},
+	),
+	"daitch_mokotoff": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategoryFuzzyStringMatching},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "source", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.MakeArray(types.String)),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				s := string(tree.MustBeDString(args[0]))
+				codes := fuzzystrmatch.DaitchMokotoff(s)
+				if codes == nil {
+					return tree.DNull, nil
+				}
+				arr := tree.NewDArray(types.String)
+				for _, code := range codes {
+					if err := arr.Append(tree.NewDString(code)); err != nil {
+						return nil, err
+					}
+				}
+				return arr, nil
+			},
+			Info:       "Returns an array of Daitch-Mokotoff soundex codes for the input string.",
+			Volatility: volatility.Immutable,
+		},
+	),
 	"levenshtein_less_equal": makeBuiltin(
 		tree.FunctionProperties{Category: builtinconstants.CategoryFuzzyStringMatching},
 		tree.Overload{
@@ -5126,10 +5330,11 @@ value if you rely on the HLC for accuracy.`,
 			Types:      tree.ParamTypes{},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				if evalCtx.SessionData().User().Undefined() {
+				u := evalCtx.EffectiveUser()
+				if u.Undefined() {
 					return tree.DNull, nil
 				}
-				return tree.NewDString(evalCtx.SessionData().User().Normalized()), nil
+				return tree.NewDString(u.Normalized()), nil
 			},
 			Info: "Returns the current user. This function is provided for " +
 				"compatibility with PostgreSQL.",
@@ -5599,7 +5804,10 @@ DO NOT USE -- USE 'CREATE VIRTUAL CLUSTER' INSTEAD`,
 	),
 
 	"crdb_internal.encode_key": makeBuiltin(
-		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
+		},
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "table_id", Typ: types.Int},
@@ -5632,6 +5840,30 @@ DO NOT USE -- USE 'CREATE VIRTUAL CLUSTER' INSTEAD`,
 				return tree.NewDBytes(tree.DBytes(res)), nil
 			},
 			Info:       "Generate the key for a row on a particular table and index.",
+			Volatility: volatility.Stable,
+		},
+	),
+
+	"crdb_internal.decode_key": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "key", Typ: types.Bytes}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				keyBytes := []byte(tree.MustBeDBytes(args[0]))
+				res, err := evalCtx.CatalogBuiltins.DecodeTableIndexKey(ctx, keyBytes)
+				if err != nil {
+					return nil, err
+				}
+				if res == nil || res == json.NullJSONValue {
+					return tree.DNull, nil
+				}
+				return tree.NewDJSON(res), nil
+			},
+			Info:       "Decodes an encoded key and returns JSON with table, index, and column information.",
 			Volatility: volatility.Stable,
 		},
 	),
@@ -6180,6 +6412,39 @@ SELECT
 		},
 	),
 
+	"crdb_internal.fips_ready": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// It's debatable whether we need a permission check here at all.
+				// It's not very sensitive and is (currently) a very cheap function
+				// call. However, it's something that regular users should have no
+				// reason to look at so in the interest of least privilege we put it
+				// behind the VIEWCLUSTERSETTING privilege.
+				session := evalCtx.SessionAccessor
+				hasView, err := session.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWCLUSTERSETTING)
+				if err != nil {
+					return nil, err
+				} else if !hasView {
+					return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
+						"user %s does not have %s system privilege",
+						evalCtx.SessionData().User(),
+						privilege.VIEWCLUSTERSETTING,
+					)
+				}
+
+				return tree.MakeDBool(tree.DBool(fips140.Enabled())), nil
+			},
+			Info:       "Returns true if all FIPS readiness checks pass.",
+			Class:      tree.NormalClass,
+			Volatility: volatility.Stable,
+		},
+	),
+
 	// Fetches the corresponding lease_holder for the request key.
 	"crdb_internal.lease_holder": makeBuiltin(
 		tree.FunctionProperties{
@@ -6711,6 +6976,40 @@ SELECT
 				}
 				return tree.NewDBytes(bytes), nil
 			},
+			Volatility: volatility.Stable,
+		},
+	),
+
+	// Returns the fully resolved (inheritance-applied) zone configuration for
+	// the range that contains the given key, as JSONB. This is used by
+	// SHOW RANGES WITH ZONE to expose the desired zone config per range.
+	"crdb_internal.zone_config_for_key": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "key", Typ: types.Bytes}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				key := roachpb.Key(tree.MustBeDBytes(args[0]))
+				return evalCtx.PrivilegedAccessor.ResolvedZoneConfigForKey(ctx, key)
+			},
+			Volatility: volatility.Stable,
+		},
+	),
+
+	"crdb_internal.zone_config_span_end": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "key", Typ: types.Bytes}},
+			ReturnType: tree.FixedReturnType(types.Bytes),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				key := roachpb.Key(tree.MustBeDBytes(args[0]))
+				endKey, err := evalCtx.PrivilegedAccessor.ZoneConfigSpanEnd(ctx, key)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDBytes(tree.DBytes(endKey)), nil
+			},
+			Info:       "Returns the end key of the zone config span that the given key belongs to.",
 			Volatility: volatility.Stable,
 		},
 	),
@@ -9675,13 +9974,13 @@ WHERE object_id = table_descriptor_id
 			},
 		},
 	),
-
 	"crdb_internal.inject_hint": makeBuiltin(
 		tree.FunctionProperties{
 			Category:         builtinconstants.CategorySystemRepair,
 			DistsqlBlocklist: true,
 		},
 		rewriteInlineHintsOverload,
+		rewriteInlineHintsWithDatabaseOverload,
 	),
 	"information_schema.crdb_rewrite_inline_hints": makeBuiltin(
 		tree.FunctionProperties{
@@ -9689,6 +9988,158 @@ WHERE object_id = table_descriptor_id
 			DistsqlBlocklist: true,
 		},
 		rewriteInlineHintsOverload,
+		rewriteInlineHintsWithDatabaseOverload,
+	),
+	"information_schema.crdb_delete_statement_hints": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemRepair,
+			DistsqlBlocklist: true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "rowid", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// The user must have REPAIRCLUSTER to use this builtin.
+				if err := evalCtx.SessionAccessor.CheckPrivilege(
+					ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+				); err != nil {
+					return nil, err
+				}
+				rowIDArg := int64(tree.MustBeDInt(args[0]))
+				rowIDs, fingerprints, rawHintBytes, err := evalCtx.Planner.DeleteStatementHint(ctx, rowIDArg, "" /* statementFingerprint */, "" /* optDatabase */)
+				if err != nil {
+					return nil, err
+				}
+				for i := range rowIDs {
+					hint, err := hintpb.ParseHintProto(rawHintBytes[i])
+					if err != nil {
+						log.Dev.Warningf(ctx, "could not unmarshal hint for row %d: %v", rowIDs[i], err)
+						continue
+					}
+					if err := logDeleteHintEvent(ctx, evalCtx, hint, rowIDs[i], fingerprints[i]); err != nil {
+						return nil, err
+					}
+				}
+				return tree.NewDInt(tree.DInt(len(rowIDs))), nil
+			},
+			Info: `This function deletes a statement hint by its row ID. ` +
+				`It returns the number of deleted rows.`,
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "statement_fingerprint", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// The user must have REPAIRCLUSTER to use this builtin.
+				if err := evalCtx.SessionAccessor.CheckPrivilege(
+					ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+				); err != nil {
+					return nil, err
+				}
+				arg := string(tree.MustBeDString(args[0]))
+				fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+					&evalCtx.Settings.SV,
+				))
+				fingerprintArg, err := parserutils.FingerprintStatement(parserutils.FingerprintTagStatementFingerprint, arg, fingerprintFlags)
+				if err != nil {
+					return nil, err
+				}
+				if fingerprintArg != arg {
+					evalCtx.ClientNoticeSender.BufferClientNotice(
+						ctx, pgnotice.Newf("statement fingerprint changed to: %s", fingerprintArg),
+					)
+				}
+				rowIDs, fingerprints, rawHintBytes, err := evalCtx.Planner.DeleteStatementHint(ctx, 0 /* rowID */, fingerprintArg, "" /* optDatabase */)
+				if err != nil {
+					return nil, err
+				}
+				for i := range rowIDs {
+					hint, err := hintpb.ParseHintProto(rawHintBytes[i])
+					if err != nil {
+						log.Dev.Warningf(ctx, "could not unmarshal hint for row %d: %v", rowIDs[i], err)
+						continue
+					}
+					if err := logDeleteHintEvent(ctx, evalCtx, hint, rowIDs[i], fingerprints[i]); err != nil {
+						return nil, err
+					}
+				}
+				return tree.NewDInt(tree.DInt(len(rowIDs))), nil
+			},
+			Info: `This function deletes all statement hints matching the ` +
+				`given statement fingerprint. The statement fingerprint argument is ` +
+				`normalized before matching. It returns the number of deleted rows.`,
+			Volatility: volatility.Volatile,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "statement_fingerprint", Typ: types.String},
+				{Name: "database", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// The user must have REPAIRCLUSTER to use this builtin.
+				if err := evalCtx.SessionAccessor.CheckPrivilege(
+					ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+				); err != nil {
+					return nil, err
+				}
+				arg := string(tree.MustBeDString(args[0]))
+				fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+					&evalCtx.Settings.SV,
+				))
+				fingerprintArg, err := parserutils.FingerprintStatement(parserutils.FingerprintTagStatementFingerprint, arg, fingerprintFlags)
+				if err != nil {
+					return nil, err
+				}
+				if fingerprintArg != arg {
+					evalCtx.ClientNoticeSender.BufferClientNotice(
+						ctx, pgnotice.Newf("statement fingerprint changed to: %s", fingerprintArg),
+					)
+				}
+				database := string(tree.MustBeDString(args[1]))
+				rowIDs, fingerprints, rawHintBytes, err := evalCtx.Planner.DeleteStatementHint(ctx, 0 /* rowID */, fingerprintArg, database)
+				if err != nil {
+					return nil, err
+				}
+				for i := range rowIDs {
+					hint, err := hintpb.ParseHintProto(rawHintBytes[i])
+					if err != nil {
+						log.Dev.Warningf(ctx, "could not unmarshal hint for row %d: %v", rowIDs[i], err)
+						continue
+					}
+					if err := logDeleteHintEvent(ctx, evalCtx, hint, rowIDs[i], fingerprints[i]); err != nil {
+						return nil, err
+					}
+				}
+				return tree.NewDInt(tree.DInt(len(rowIDs))), nil
+			},
+			Info: `This function deletes all statement hints matching the ` +
+				`given statement fingerprint and database. The statement fingerprint ` +
+				`argument is normalized before matching. It returns the number of ` +
+				`deleted rows.`,
+			Volatility: volatility.Volatile,
+		},
+	),
+	"information_schema.crdb_enable_statement_hints": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemRepair,
+			DistsqlBlocklist: true,
+		},
+		setStatementHintEnabledByRowIDOverload,
+		setStatementHintEnabledByFingerprintOverload,
+		setStatementHintEnabledByFingerprintAndDatabaseOverload,
+	),
+	"information_schema.crdb_set_session_variable_hint": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemRepair,
+			DistsqlBlocklist: true,
+		},
+		sessionVariableHintOverload,
+		sessionVariableHintWithDatabaseOverload,
 	),
 	"crdb_internal.clear_statement_hints_cache": makeBuiltin(
 		tree.FunctionProperties{
@@ -11157,11 +11608,14 @@ func hash32Builtin(newHash func() hash.Hash32, info string) builtinDefinition {
 	)
 }
 
-func hash64Builtin(newHash func() hash.Hash64, info string) builtinDefinition {
+func hash64Builtin(
+	newHash func() hash.Hash64, info string, vecBuiltin tree.SpecializedVectorizedBuiltin,
+) builtinDefinition {
 	return makeBuiltin(defProps(),
 		tree.Overload{
-			Types:      tree.VariadicType{VarType: types.String},
-			ReturnType: tree.FixedReturnType(types.Int),
+			Types:                 tree.VariadicType{VarType: types.String},
+			SpecializedVecBuiltin: vecBuiltin,
+			ReturnType:            tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				h := newHash()
 				if ok, err := feedHash(h, args); !ok || err != nil {
@@ -11174,8 +11628,9 @@ func hash64Builtin(newHash func() hash.Hash64, info string) builtinDefinition {
 			CalledOnNullInput: true,
 		},
 		tree.Overload{
-			Types:      tree.VariadicType{VarType: types.Bytes},
-			ReturnType: tree.FixedReturnType(types.Int),
+			Types:                 tree.VariadicType{VarType: types.Bytes},
+			SpecializedVecBuiltin: vecBuiltin,
+			ReturnType:            tree.FixedReturnType(types.Int),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 				h := newHash()
 				if ok, err := feedHash(h, args); !ok || err != nil {
@@ -11838,6 +12293,29 @@ func stringOrNil(d tree.Datum) *string {
 	return &s
 }
 
+var anyArrayEmptyStringErr = pgerror.Newf(
+	pgcode.DatatypeMismatch,
+	"could not determine polymorphic type because input has type unknown",
+)
+
+// checkIfDArrayErrOnDString checks whether d corresponds to an empty array
+// stored as DString and returns an error if so, otherwise it checks whether d
+// is a DArray and returns an assertion failure if not.
+//
+// It should only be called when d corresponds to an argument of AnyArray type.
+func checkIfDArrayErrOnDString(d tree.Datum) (*tree.DArray, error) {
+	if s, ok := d.(*tree.DString); ok {
+		if *s == "{}" {
+			return nil, anyArrayEmptyStringErr
+		}
+	}
+	a, ok := d.(*tree.DArray)
+	if !ok {
+		return nil, errors.AssertionFailedf("expected *DArray, found %T", d)
+	}
+	return a, nil
+}
+
 // stringToArray implements the string_to_array builtin - str is split on delim to form an array of strings.
 // If nullStr is set, any elements equal to it will be NULL.
 func stringToArray(str string, delimPtr *string, nullStr *string) (tree.Datum, error) {
@@ -12279,30 +12757,9 @@ func CleanEncodingName(s string) string {
 	return string(b)
 }
 
-// EvalFollowerReadOffset is a function used often with AS OF SYSTEM TIME queries
-// to determine the appropriate offset from now which is likely to be safe for
-// follower reads. It is injected by followerreadsccl. An error may be returned
-// if an enterprise license is not installed.
-var EvalFollowerReadOffset func(_ *cluster.Settings) (time.Duration, error)
-
-func recentTimestamp(ctx context.Context, evalCtx *eval.Context) (time.Time, error) {
-	if EvalFollowerReadOffset == nil {
-		telemetry.Inc(sqltelemetry.FollowerReadDisabledCCLCounter)
-		evalCtx.ClientNoticeSender.BufferClientNotice(
-			ctx,
-			pgnotice.Newf("follower reads disabled because you are running a non-CCL distribution"),
-		)
-		return evalCtx.StmtTimestamp.Add(builtinconstants.DefaultFollowerReadDuration), nil
-	}
-	offset, err := EvalFollowerReadOffset(evalCtx.Settings)
+func recentTimestamp(_ context.Context, evalCtx *eval.Context) (time.Time, error) {
+	offset, err := followerreads.EvalFollowerReadOffset(evalCtx.Settings)
 	if err != nil {
-		if code := pgerror.GetPGCode(err); code == pgcode.CCLValidLicenseRequired {
-			telemetry.Inc(sqltelemetry.FollowerReadDisabledNoEnterpriseLicense)
-			evalCtx.ClientNoticeSender.BufferClientNotice(
-				ctx, pgnotice.Newf("follower reads disabled: %s", err.Error()),
-			)
-			return evalCtx.StmtTimestamp.Add(builtinconstants.DefaultFollowerReadDuration), nil
-		}
 		return time.Time{}, err
 	}
 	return evalCtx.StmtTimestamp.Add(offset), nil
@@ -12317,27 +12774,6 @@ func followerReadTimestamp(
 	}
 	return tree.MakeDTimestampTZ(ts, time.Microsecond)
 }
-
-var (
-	// WithMinTimestamp is an injectable function containing the implementation of the
-	// with_min_timestamp builtin.
-	WithMinTimestamp = func(_ context.Context, _ *eval.Context, t time.Time) (time.Time, error) {
-		return time.Time{}, pgerror.Newf(
-			pgcode.CCLRequired,
-			"%s can only be used with a CCL distribution",
-			asof.WithMinTimestampFunctionName,
-		)
-	}
-	// WithMaxStaleness is an injectable function containing the implementation of the
-	// with_max_staleness builtin.
-	WithMaxStaleness = func(_ context.Context, _ *eval.Context, d duration.Duration) (time.Time, error) {
-		return time.Time{}, pgerror.Newf(
-			pgcode.CCLRequired,
-			"%s can only be used with a CCL distribution",
-			asof.WithMaxStalenessFunctionName,
-		)
-	}
-)
 
 const nearestOnlyInfo = `
 
@@ -12376,7 +12812,7 @@ Note this function requires an enterprise license on a CCL distribution.`,
 }
 
 func withMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (tree.Datum, error) {
-	t, err := WithMinTimestamp(ctx, evalCtx, t)
+	t, err := followerreads.EvalMinTimestamp(ctx, evalCtx, t)
 	if err != nil {
 		return nil, err
 	}
@@ -12386,7 +12822,7 @@ func withMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (
 func withMaxStaleness(
 	ctx context.Context, evalCtx *eval.Context, d duration.Duration,
 ) (tree.Datum, error) {
-	t, err := WithMaxStaleness(ctx, evalCtx, d)
+	t, err := followerreads.EvalMaxStaleness(ctx, evalCtx, d)
 	if err != nil {
 		return nil, err
 	}
@@ -12410,7 +12846,10 @@ func arrayNumInvertedIndexEntries(
 	if val == tree.DNull {
 		return tree.DZero, nil
 	}
-	arr := tree.MustBeDArray(val)
+	arr, err := checkIfDArrayErrOnDString(val)
+	if err != nil {
+		return nil, err
+	}
 
 	v := descpb.EmptyArraysInInvertedIndexesVersion
 	if version != tree.DNull {
@@ -12463,11 +12902,7 @@ func prettyStatement(p tree.PrettyCfg, stmt string) (string, error) {
 	var formattedStmt strings.Builder
 	for idx := range stmts {
 		p, err := p.Pretty(stmts[idx].AST)
-		if errors.Is(err, pretty.ErrPrettyMaxRecursionDepthExceeded) {
-			// If pretty-printing the statement fails, use the original
-			// statement.
-			p = stmt
-		} else if err != nil {
+		if err != nil {
 			return "", err
 		}
 		formattedStmt.WriteString(p)
@@ -12609,6 +13044,7 @@ argument is true, then the bundle will be redacted`
 				antiPlanGist,
 				samplingProbability,
 				minExecutionLatency,
+				0, // TODO(#161004): expose maxExecutionLatency in builtin API.
 				expiresAfter,
 				redacted,
 				username,
@@ -12668,9 +13104,7 @@ func makeTimestampStatementBuiltinOverload(withOutputTZ bool, withInputTZ bool) 
 	if !withOutputTZ && withInputTZ {
 		panic("Creating a timestamp without a timezone should not have an input timestamp attached to it.")
 	}
-	// For the ISO 8601 standard, the conversion from a negative year to BC changes the year value (ex. -2013 == 2014 BC).
-	// https://en.wikipedia.org/wiki/ISO_8601#Years
-	info := "Create timestamp (formatted according to ISO 8601) "
+	info := "Create timestamp "
 	vol := volatility.Immutable
 	typs := tree.ParamTypes{{Name: "year", Typ: types.Int}, {Name: "month", Typ: types.Int}, {Name: "day", Typ: types.Int},
 		{Name: "hour", Typ: types.Int}, {Name: "min", Typ: types.Int}, {Name: "sec", Typ: types.Float}}
@@ -12703,6 +13137,14 @@ func makeTimestampStatementBuiltinOverload(withOutputTZ bool, withInputTZ bool) 
 			}
 			if year == 0 {
 				return nil, pgerror.New(pgcode.DatetimeFieldOverflow, "year value of 0 is not valid")
+			}
+			// PostgreSQL's make_timestamp(tz) treats a negative year argument
+			// as "N BC" (no year zero in SQL semantics), but Go's time.Date
+			// uses astronomical numbering (year 0 = 1 BC). Shift negative
+			// inputs by one so e.g. -2013 maps to astronomical year -2012,
+			// matching PostgreSQL output. See #149950.
+			if year < 0 {
+				year++
 			}
 			hour := int(tree.MustBeDInt(args[3]))
 			min := int(tree.MustBeDInt(args[4]))
@@ -12808,8 +13250,9 @@ var datumsToBytesOverload = tree.Overload{
 	// Note that datums_to_bytes(a) == datums_to_bytes(b) iff (a IS NOT DISTINCT FROM b)
 	Info: "Converts datums into key-encoded bytes. " +
 		"Supports NULLs and all data types which may be used in index keys",
-	Types:      tree.VariadicType{VarType: types.Any},
-	ReturnType: tree.FixedReturnType(types.Bytes),
+	Types:                 tree.VariadicType{VarType: types.Any},
+	ReturnType:            tree.FixedReturnType(types.Bytes),
+	SpecializedVecBuiltin: tree.DatumsToBytes,
 	Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
 		var out []byte
 		for i, arg := range args {
@@ -12831,6 +13274,163 @@ var datumsToBytesOverload = tree.Overload{
 
 var nilRegionsError = errors.AssertionFailedf("evalCtx.Regions is nil")
 
+// rewriteInlineHintsImpl is the shared implementation for the 2-arg and 3-arg
+// overloads of crdb_internal.inject_hint and
+// information_schema.crdb_rewrite_inline_hints.
+func rewriteInlineHintsImpl(
+	ctx context.Context, evalCtx *eval.Context, targetArg, donorArg, optDatabase string,
+) (tree.Datum, error) {
+	// The user must have REPAIRCLUSTER to use this builtin.
+	if err := evalCtx.SessionAccessor.CheckPrivilege(
+		ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+	); err != nil {
+		return nil, err
+	}
+
+	// First, parse both arguments and convert both to statement fingerprints if
+	// they are not already.
+	fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+		&evalCtx.Settings.SV,
+	))
+	parse := func(arg string, tag parserutils.FingerprintTag, evalCtx *eval.Context) (stmt statements.Statement[tree.Statement], fingerprint string, err error) {
+		fingerprint, err = parserutils.FingerprintStatement(tag, arg, fingerprintFlags)
+		if err != nil {
+			return stmt, fingerprint, err
+		}
+		if fingerprint != arg {
+			evalCtx.ClientNoticeSender.BufferClientNotice(
+				ctx, pgnotice.Newf("%s changed to: %s", tag, fingerprint),
+			)
+		}
+		stmt, err = parserutils.ParseOne(fingerprint)
+		if err != nil {
+			// Assertion failure is appropriate here, so no error wrapping.
+			return stmt, fingerprint, err
+		}
+		return stmt, fingerprint, nil
+	}
+
+	targetStmt, targetSQL, err := parse(targetArg, parserutils.FingerprintTagStatementFingerprint, evalCtx)
+	if err != nil {
+		return nil, err
+	}
+	if isTransactionControlStatement(targetStmt.AST) {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+			"transaction control statements cannot be used as hint targets")
+	}
+
+	donorStmt, donorSQL, err := parse(donorArg, parserutils.FingerprintTagHintDonor, evalCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate that the donor statement matches the target statement
+	// without hints.
+	donor, err := tree.NewHintInjectionDonor(donorStmt.AST, fingerprintFlags)
+	if err != nil {
+		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error while creating donor")
+	}
+	if err := donor.Validate(targetStmt.AST, fingerprintFlags); err != nil {
+		return nil, pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
+	}
+
+	// Do a trial hint injection to validate that the target statement gets
+	// rewritten into the donor statement.
+	result, _, err := donor.InjectHints(targetStmt.AST)
+	if err != nil {
+		return nil, pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
+	}
+	// The donor statement could be non-fingerprint or fingerprint, so for an
+	// apples-to-apples comparison we convert both to fingerprints.
+	resultFingerprint := tree.FormatStatementHideConstants(result, fingerprintFlags)
+	donorFingerprint := tree.FormatStatementHideConstants(donorStmt.AST, fingerprintFlags)
+	if resultFingerprint != donorFingerprint {
+		return nil, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"could not validate that target statement is rewritten as donor statement (%s): %s",
+			donorFingerprint, resultFingerprint,
+		)
+	}
+
+	// Now that we've passed some basic validation, insert into statement_hints.
+	var hint hintpb.StatementHintUnion
+	hint.SetValue(&hintpb.InjectHints{DonorSQL: donorSQL})
+	hintID, numOverridden, err := evalCtx.Planner.InsertStatementHint(ctx, targetSQL, hint, optDatabase)
+	if err != nil {
+		return nil, err
+	}
+	if numOverridden > 0 {
+		evalCtx.ClientNoticeSender.BufferClientNotice(ctx, pgnotice.Newf(
+			"this hint overrides %d existing inline hint(s) for the same statement fingerprint; "+
+				"the older hint(s) will be skipped. Use SHOW STATEMENT HINTS to identify stale hints.",
+			numOverridden,
+		))
+	}
+
+	// Log the statement hint injection event.
+	if err := evalCtx.Planner.LogEvent(ctx, &eventpb.RewriteInlineHints{
+		StatementFingerprint: targetSQL,
+		DonorSQL:             donorSQL,
+		HintID:               hintID,
+		Database:             optDatabase,
+	}); err != nil {
+		return nil, err
+	}
+
+	return tree.NewDInt(tree.DInt(hintID)), nil
+}
+
+// isTransactionControlStatement returns true if the given AST node is a
+// transaction control statement (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, etc.).
+// These statements are dispatched before statement hints are applied and
+// cannot be meaningfully hinted.
+//
+// NB: We don't use ast.StatementType() == TypeTCL here because TypeTCL
+// includes many non-transaction-control statements (Call, Execute, Prepare,
+// Deallocate, ControlJobs, etc.) that are valid hint targets.
+func isTransactionControlStatement(ast tree.Statement) bool {
+	switch ast.(type) {
+	case *tree.BeginTransaction,
+		*tree.CommitTransaction,
+		*tree.RollbackTransaction,
+		*tree.Savepoint,
+		*tree.ReleaseSavepoint,
+		*tree.RollbackToSavepoint,
+		*tree.PrepareTransaction,
+		*tree.ShowCommitTimestamp:
+		return true
+	}
+	return false
+}
+
+// logDeleteHintEvent logs a telemetry event for the deletion of a statement
+// hint, dispatching to the appropriate event type based on the hint kind.
+func logDeleteHintEvent(
+	ctx context.Context,
+	evalCtx *eval.Context,
+	hint hintpb.StatementHintUnion,
+	hintID int64,
+	fingerprint string,
+) error {
+	switch t := hint.GetValue().(type) {
+	case *hintpb.InjectHints:
+		return evalCtx.Planner.LogEvent(ctx, &eventpb.DeleteRewriteInlineHints{
+			HintID:               hintID,
+			StatementFingerprint: fingerprint,
+			DonorSql:             t.DonorSQL,
+		})
+	case *hintpb.SessionVariableHint:
+		return evalCtx.Planner.LogEvent(ctx, &eventpb.DeleteSessionVariableHint{
+			HintID:               hintID,
+			StatementFingerprint: fingerprint,
+			VariableName:         t.VariableName,
+			VariableValue:        t.VariableValue,
+		})
+	default:
+		return nil
+	}
+}
+
 var rewriteInlineHintsOverload = tree.Overload{
 	Types: tree.ParamTypes{
 		{Name: "statement_fingerprint", Typ: types.String},
@@ -12838,109 +13438,279 @@ var rewriteInlineHintsOverload = tree.Overload{
 	},
 	ReturnType: tree.FixedReturnType(types.Int),
 	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-		// The user must have REPAIRCLUSTER to use this builtin.
-		if err := evalCtx.SessionAccessor.CheckPrivilege(
-			ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
-		); err != nil {
-			return nil, err
-		}
-
 		targetArg := string(tree.MustBeDString(args[0]))
 		donorArg := string(tree.MustBeDString(args[1]))
-
-		// First, parse both arguments and convert both to statement fingerprints if
-		// they are not already.
-		fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
-			&evalCtx.Settings.SV,
-		))
-		parse := func(arg, which string) (stmt statements.Statement[tree.Statement], fingerprint string, err error) {
-			stmts, err := parserutils.Parse(arg)
-			if err != nil {
-				return stmt, fingerprint, pgerror.Wrapf(
-					err, pgcode.InvalidParameterValue, "could not parse %s", which,
-				)
-			}
-			if len(stmts) != 1 {
-				return stmt, fingerprint, pgerror.Newf(
-					pgcode.InvalidParameterValue, "could not parse %s as a single SQL statement", which,
-				)
-			}
-			stmt = stmts[0]
-			fingerprint = tree.FormatStatementHideConstants(stmt.AST, fingerprintFlags)
-			if fingerprint != arg {
-				evalCtx.ClientNoticeSender.BufferClientNotice(
-					ctx, pgnotice.Newf("%s changed to: %s", which, fingerprint),
-				)
-				// Re-parse the statement fingerprint to get an updated AST.
-				stmt, err = parserutils.ParseOne(fingerprint)
-				if err != nil {
-					// Assertion failure is appropriate here, so no error wrapping.
-					return stmt, fingerprint, err
-				}
-			}
-			return stmt, fingerprint, nil
-		}
-
-		targetStmt, targetSQL, err := parse(targetArg, "statement fingerprint")
-		if err != nil {
-			return nil, err
-		}
-
-		donorStmt, donorSQL, err := parse(donorArg, "hint donor statement")
-		if err != nil {
-			return nil, err
-		}
-
-		// Validate that the donor statement matches the target statement
-		// without hints.
-		donor, err := tree.NewHintInjectionDonor(donorStmt.AST, fingerprintFlags)
-		if err != nil {
-			return nil, errors.NewAssertionErrorWithWrappedErrf(err, "error while creating donor")
-		}
-		if err := donor.Validate(targetStmt.AST, fingerprintFlags); err != nil {
-			return nil, pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
-		}
-
-		// Do a trial hint injection to validate that the target statement gets
-		// rewritten into the donor statement.
-		result, _, err := donor.InjectHints(targetStmt.AST)
-		if err != nil {
-			return nil, pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
-		}
-		// The donor statement could be non-fingerprint or fingerprint, so for an
-		// apples-to-apples comparison we convert both to fingerprints.
-		resultFingerprint := tree.FormatStatementHideConstants(result, fingerprintFlags)
-		donorFingerprint := tree.FormatStatementHideConstants(donorStmt.AST, fingerprintFlags)
-		if resultFingerprint != donorFingerprint {
-			return nil, pgerror.Newf(
-				pgcode.InvalidParameterValue,
-				"could not validate that target statement is rewritten as donor statement (%s): %s",
-				donorFingerprint, resultFingerprint,
-			)
-		}
-
-		// Now that we've passed some basic validation, insert into statement_hints.
-		var hint hintpb.StatementHintUnion
-		hint.SetValue(&hintpb.InjectHints{DonorSQL: donorSQL})
-		hintID, err := evalCtx.Planner.InsertStatementHint(ctx, targetSQL, hint)
-		if err != nil {
-			return nil, err
-		}
-
-		// Log the statement hint injection event.
-		if err := evalCtx.Planner.LogEvent(ctx, &eventpb.RewriteInlineHints{
-			StatementFingerprint: targetSQL,
-			DonorSQL:             donorSQL,
-			HintID:               hintID,
-		}); err != nil {
-			return nil, err
-		}
-
-		return tree.NewDInt(tree.DInt(hintID)), nil
+		return rewriteInlineHintsImpl(ctx, evalCtx, targetArg, donorArg, "" /* optDatabase */)
 	},
 	Info: `This function adds an inline-hints rewrite rule for a statement fingerprint. It ` +
 		`returns the hint ID of the newly created rewrite rule. The rewrite rule only applies to ` +
 		`matching statement fingerprints. It first removes all inline hints from the target ` +
 		`statement, and then copies inline hints from the donor statement.`,
+	Volatility: volatility.Volatile,
+}
+
+var rewriteInlineHintsWithDatabaseOverload = tree.Overload{
+	Types: tree.ParamTypes{
+		{Name: "statement_fingerprint", Typ: types.String},
+		{Name: "donor_sql", Typ: types.String},
+		{Name: "database", Typ: types.String},
+	},
+	ReturnType: tree.FixedReturnType(types.Int),
+	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+		targetArg := string(tree.MustBeDString(args[0]))
+		donorArg := string(tree.MustBeDString(args[1]))
+		database := string(tree.MustBeDString(args[2]))
+		return rewriteInlineHintsImpl(ctx, evalCtx, targetArg, donorArg, database)
+	},
+	Info: `This function adds an inline-hints rewrite rule for a statement fingerprint, scoped ` +
+		`to the given database. It returns the hint ID of the newly created rewrite rule. The ` +
+		`rewrite rule only applies to matching statement fingerprints when the current database ` +
+		`matches the specified database. It first removes all inline hints from the target ` +
+		`statement, and then copies inline hints from the donor statement.`,
+	Volatility: volatility.Volatile,
+}
+
+var setStatementHintEnabledByRowIDOverload = tree.Overload{
+	Types: tree.ParamTypes{
+		{Name: "enabled", Typ: types.Bool},
+		{Name: "rowid", Typ: types.Int},
+	},
+	ReturnType: tree.FixedReturnType(types.Int),
+	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+		if err := evalCtx.SessionAccessor.CheckPrivilege(
+			ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+		); err != nil {
+			return nil, err
+		}
+		enabled := bool(tree.MustBeDBool(args[0]))
+		rowID := int64(tree.MustBeDInt(args[1]))
+		numAffected, err := evalCtx.Planner.SetStatementHintEnabled(
+			ctx, rowID, "" /* statementFingerprint */, enabled, "", /* optDatabase */
+		)
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewDInt(tree.DInt(numAffected)), nil
+	},
+	Info: `This function enables or disables the statement hint with the given row ID. ` +
+		`It returns the number of affected rows.`,
+	Volatility: volatility.Volatile,
+}
+
+var setStatementHintEnabledByFingerprintOverload = tree.Overload{
+	Types: tree.ParamTypes{
+		{Name: "enabled", Typ: types.Bool},
+		{Name: "statement_fingerprint", Typ: types.String},
+	},
+	ReturnType: tree.FixedReturnType(types.Int),
+	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+		if err := evalCtx.SessionAccessor.CheckPrivilege(
+			ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+		); err != nil {
+			return nil, err
+		}
+		enabled := bool(tree.MustBeDBool(args[0]))
+		arg := string(tree.MustBeDString(args[1]))
+		fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+			&evalCtx.Settings.SV,
+		))
+		fingerprintArg, err := parserutils.FingerprintStatement(
+			parserutils.FingerprintTagStatementFingerprint, arg, fingerprintFlags,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if fingerprintArg != arg {
+			evalCtx.ClientNoticeSender.BufferClientNotice(
+				ctx, pgnotice.Newf("statement fingerprint changed to: %s", fingerprintArg),
+			)
+		}
+		numAffected, err := evalCtx.Planner.SetStatementHintEnabled(
+			ctx, 0 /* rowID */, fingerprintArg, enabled, "", /* optDatabase */
+		)
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewDInt(tree.DInt(numAffected)), nil
+	},
+	Info: `This function enables or disables all statement hints matching the given ` +
+		`statement fingerprint. The statement fingerprint argument is normalized ` +
+		`before matching. It returns the number of affected rows.`,
+	Volatility: volatility.Volatile,
+}
+
+var setStatementHintEnabledByFingerprintAndDatabaseOverload = tree.Overload{
+	Types: tree.ParamTypes{
+		{Name: "enabled", Typ: types.Bool},
+		{Name: "statement_fingerprint", Typ: types.String},
+		{Name: "database", Typ: types.String},
+	},
+	ReturnType: tree.FixedReturnType(types.Int),
+	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+		if err := evalCtx.SessionAccessor.CheckPrivilege(
+			ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+		); err != nil {
+			return nil, err
+		}
+		enabled := bool(tree.MustBeDBool(args[0]))
+		arg := string(tree.MustBeDString(args[1]))
+		fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+			&evalCtx.Settings.SV,
+		))
+		fingerprintArg, err := parserutils.FingerprintStatement(
+			parserutils.FingerprintTagStatementFingerprint, arg, fingerprintFlags,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if fingerprintArg != arg {
+			evalCtx.ClientNoticeSender.BufferClientNotice(
+				ctx, pgnotice.Newf("statement fingerprint changed to: %s", fingerprintArg),
+			)
+		}
+		database := string(tree.MustBeDString(args[2]))
+		numAffected, err := evalCtx.Planner.SetStatementHintEnabled(
+			ctx, 0 /* rowID */, fingerprintArg, enabled, database,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return tree.NewDInt(tree.DInt(numAffected)), nil
+	},
+	Info: `This function enables or disables all statement hints matching the given ` +
+		`statement fingerprint and database. The statement fingerprint argument is ` +
+		`normalized before matching. It returns the number of affected rows.`,
+	Volatility: volatility.Volatile,
+}
+
+// sessionVariableHintImpl is the shared implementation for the 3-arg and 4-arg
+// overloads of information_schema.crdb_set_session_variable_hint.
+func sessionVariableHintImpl(
+	ctx context.Context,
+	evalCtx *eval.Context,
+	statementFingerprintArg, varName, varValue, optDatabase string,
+) (tree.Datum, error) {
+	// Session variable hints require the hint_type column to exist.
+	if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.V26_2_StatementHintsTypeColumnBackfilled) {
+		return nil, pgerror.Newf(pgcode.FeatureNotSupported,
+			"session variable hints cannot be used until the cluster version is upgraded to %s",
+			clusterversion.V26_2_StatementHintsTypeColumnBackfilled.Version(),
+		)
+	}
+
+	// The user must have REPAIRCLUSTER to use this builtin.
+	if err := evalCtx.SessionAccessor.CheckPrivilege(
+		ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+	); err != nil {
+		return nil, err
+	}
+
+	// Parse and normalize the statement fingerprint.
+	fingerprintFlags := tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(
+		&evalCtx.Settings.SV,
+	))
+	fingerprint, err := parserutils.FingerprintStatement(
+		parserutils.FingerprintTagStatementFingerprint, statementFingerprintArg, fingerprintFlags,
+	)
+	if err != nil {
+		return nil, err
+	}
+	stmt, err := parserutils.ParseOne(fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if isTransactionControlStatement(stmt.AST) {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+			"transaction control statements cannot be used as hint targets")
+	}
+	if fingerprint != statementFingerprintArg {
+		evalCtx.ClientNoticeSender.BufferClientNotice(
+			ctx, pgnotice.Newf("statement fingerprint changed to: %s", fingerprint),
+		)
+	}
+
+	// Validate that the variable exists, is writable, is safe to hint,
+	// and that the value is valid.
+	if err := evalCtx.Planner.ValidateSessionVariableHint(
+		ctx, varName, varValue, evalCtx.SessionData().SafeUpdates,
+	); err != nil {
+		return nil, err
+	}
+
+	// Create the session variable hint and insert into system.statement_hints.
+	var hint hintpb.StatementHintUnion
+	hint.SetValue(&hintpb.SessionVariableHint{
+		VariableName:  varName,
+		VariableValue: varValue,
+	})
+	hintID, numOverridden, err := evalCtx.Planner.InsertStatementHint(ctx, fingerprint, hint, optDatabase)
+	if err != nil {
+		return nil, err
+	}
+	if numOverridden > 0 {
+		evalCtx.ClientNoticeSender.BufferClientNotice(ctx, pgnotice.Newf(
+			"this hint overrides %d existing session variable hint(s) for %q "+
+				"on the same statement fingerprint; the older hint(s) will be skipped. "+
+				"Use SHOW STATEMENT HINTS to identify stale hints.",
+			numOverridden, varName,
+		))
+	}
+
+	// Log the session variable hint event.
+	if err := evalCtx.Planner.LogEvent(ctx, &eventpb.SetSessionVariableHint{
+		StatementFingerprint: fingerprint,
+		VariableName:         varName,
+		VariableValue:        varValue,
+		HintID:               hintID,
+		Database:             optDatabase,
+	}); err != nil {
+		return nil, err
+	}
+
+	return tree.NewDInt(tree.DInt(hintID)), nil
+}
+
+var sessionVariableHintOverload = tree.Overload{
+	Types: tree.ParamTypes{
+		{Name: "statement_fingerprint", Typ: types.String},
+		{Name: "variable_name", Typ: types.String},
+		{Name: "variable_value", Typ: types.String},
+	},
+	ReturnType: tree.FixedReturnType(types.Int),
+	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+		statementFingerprintArg := string(tree.MustBeDString(args[0]))
+		varName := string(tree.MustBeDString(args[1]))
+		varValue := string(tree.MustBeDString(args[2]))
+		return sessionVariableHintImpl(ctx, evalCtx, statementFingerprintArg, varName, varValue, "" /* optDatabase */)
+	},
+	Info: `This function adds a session variable override hint for a statement fingerprint. It ` +
+		`returns the hint ID of the newly created hint. The hint only applies to matching ` +
+		`statement fingerprints and temporarily overrides the specified session variable ` +
+		`for that statement only. Safe variables can be hinted without restrictions. ` +
+		`Unsafe variables cannot be hinted when sql_safe_updates is enabled.`,
+	Volatility: volatility.Volatile,
+}
+
+var sessionVariableHintWithDatabaseOverload = tree.Overload{
+	Types: tree.ParamTypes{
+		{Name: "statement_fingerprint", Typ: types.String},
+		{Name: "variable_name", Typ: types.String},
+		{Name: "variable_value", Typ: types.String},
+		{Name: "database", Typ: types.String},
+	},
+	ReturnType: tree.FixedReturnType(types.Int),
+	Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+		statementFingerprintArg := string(tree.MustBeDString(args[0]))
+		varName := string(tree.MustBeDString(args[1]))
+		varValue := string(tree.MustBeDString(args[2]))
+		database := string(tree.MustBeDString(args[3]))
+		return sessionVariableHintImpl(ctx, evalCtx, statementFingerprintArg, varName, varValue, database)
+	},
+	Info: `This function adds a session variable override hint for a statement fingerprint, scoped ` +
+		`to the given database. It returns the hint ID of the newly created hint. The hint only ` +
+		`applies to matching statement fingerprints when the current database matches the ` +
+		`specified database, and temporarily overrides the specified session variable for that ` +
+		`statement only. Safe variables can be hinted without restrictions. Unsafe variables ` +
+		`cannot be hinted when sql_safe_updates is enabled.`,
 	Volatility: volatility.Volatile,
 }

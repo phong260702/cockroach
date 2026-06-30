@@ -327,15 +327,26 @@ func runOneRoundQueryComparison(
 
 		setup := sqlsmith.Setups[qct.setupName](rnd)
 
-		t.Status("executing setup")
-		t.L().Printf("setup:\n%s", strings.Join(setup, "\n"))
-		for _, stmt := range setup {
-			if _, err := conn.Exec(stmt); err != nil {
-				t.Fatal(err)
-			} else {
-				logStmt(stmt)
+		// The seed setup is executed as a multi-statement batch, against
+		// which statement_timeout applies cumulatively and can be exceeded
+		// on slow hardware. For multi-region setups, bump the timeout 3x
+		// for the duration of setup, mirroring the bump inside
+		// setupMultiRegionDatabase. The IIFE scopes the deferred restore
+		// to the setup phase only.
+		func() {
+			if qct.isMultiRegion {
+				defer withIncreasedStmtTimeout(t, conn, logStmt, 3)()
 			}
-		}
+			t.Status("executing setup")
+			t.L().Printf("setup:\n%s", strings.Join(setup, "\n"))
+			for _, stmt := range setup {
+				if _, err := conn.Exec(stmt); err != nil {
+					t.Fatal(err)
+				} else {
+					logStmt(stmt)
+				}
+			}
+		}()
 
 		conn2 := conn
 		node2 := 1
@@ -366,6 +377,7 @@ func runOneRoundQueryComparison(
 			sqlsmith.SetComplexity(.3),
 			sqlsmith.SetScalarComplexity(.1),
 			sqlsmith.SimpleNames(),
+			sqlsmith.SetLogger(t.L().Printf),
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -445,6 +457,7 @@ func newMutatingSmither(
 		sqlsmith.SetComplexity(.05),
 		sqlsmith.SetScalarComplexity(.01),
 		sqlsmith.SimpleNames(),
+		sqlsmith.SetLogger(t.L().Printf),
 	)
 	if disableDelete {
 		smitherOpts = append(smitherOpts, sqlsmith.InsUpdOnly())
@@ -625,6 +638,15 @@ func joinAndSortRows(rowMatrix1, rowMatrix2 [][]string, sep string) (rows1, rows
 	return rows1, rows2
 }
 
+func isFloat(colType string) bool {
+	switch colType {
+	case "FLOAT4", "FLOAT8":
+		return true
+	default:
+		return false
+	}
+}
+
 func isFloatArray(colType string) bool {
 	switch colType {
 	case "[]FLOAT4", "[]FLOAT8", "_FLOAT4", "_FLOAT8":
@@ -657,7 +679,7 @@ func needApproximateMatch(colType string) bool {
 	// approximately equal to take into account platform differences in floating
 	// point calculations. On other architectures, check float values only.
 	return (runtime.GOARCH == "s390x" && (isDecimal(colType) || isDecimalArray(colType))) ||
-		colType == "FLOAT4" || colType == "FLOAT8" || isFloatArray(colType)
+		isFloat(colType) || isFloatArray(colType)
 }
 
 // sortRowsWithFloatComp is similar to joinAndSortRows, but it uses float
@@ -759,8 +781,12 @@ func unsortedMatricesDiffWithFloatComp(
 					cmpFn = floatcmp.FloatArraysMatchApprox
 				case runtime.GOARCH == "s390x" && !isFloatOrDecimalArray:
 					cmpFn = floatcmp.FloatsMatchApprox
-				case isFloatOrDecimalArray:
+				case isDecimalArray(colType):
 					cmpFn = floatcmp.FloatArraysMatch
+				case isFloatArray(colType):
+					cmpFn = floatcmp.FloatArraysMatchApprox
+				case isFloat(colType):
+					cmpFn = floatcmp.FloatsMatchApprox
 				}
 				match, err := cmpFn(row1[j], row2[j])
 				if err != nil {

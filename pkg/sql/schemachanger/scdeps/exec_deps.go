@@ -34,6 +34,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 )
 
@@ -53,8 +55,9 @@ var batchFlushThresholdSize = settings.RegisterByteSizeSetting(
 type JobRegistry interface {
 	MakeJobID() jobspb.JobID
 	CreateJobWithTxn(ctx context.Context, record jobs.Record, jobID jobspb.JobID, txn isql.Txn) (*jobs.Job, error)
-	UpdateJobWithTxn(
-		ctx context.Context, jobID jobspb.JobID, txn isql.Txn, updateFunc jobs.UpdateFn,
+	DeprecatedUpdateJobWithTxn(
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		ctx context.Context, jobID jobspb.JobID, txn isql.Txn, updateFunc jobs.DeprecatedUpdateFn,
 	) error
 	CheckPausepoint(name string) error
 }
@@ -146,8 +149,8 @@ func (t nameEntry) GetID() descpb.ID {
 func (d *txnDeps) UpdateSchemaChangeJob(
 	ctx context.Context, id jobspb.JobID, callback scexec.JobUpdateCallback,
 ) error {
-	return d.jobRegistry.UpdateJobWithTxn(ctx, id, d.txn, func(
-		txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+	return d.jobRegistry.DeprecatedUpdateJobWithTxn(ctx, id, d.txn, func(
+		txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater,
 	) error {
 		return callback(md, ju.UpdateProgress, ju.UpdatePayload)
 	})
@@ -213,6 +216,37 @@ func (d *txnDeps) MustReadMutableDescriptor(
 	ctx context.Context, id descpb.ID,
 ) (catalog.MutableDescriptor, error) {
 	return d.descsCollection.MutableByID(d.txn.KV()).Desc(ctx, id)
+}
+
+// TestingEnsureLatestLeaseIsAvailable implements the scexec.Catalog interface
+func (d *txnDeps) TestingEnsureLatestLeaseIsAvailable(ctx context.Context, ids descpb.IDs) error {
+	// First read the target versions.
+	descs, err := d.descsCollection.ByIDWithoutLeased(d.txn.KV()).Get().Descs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	latestTS := hlc.Timestamp{}
+	for _, desc := range descs {
+		if latestTS.IsEmpty() || latestTS.Less(desc.GetModificationTime()) {
+			latestTS = desc.GetModificationTime()
+		}
+	}
+
+	// Next confirm the lease manager knows about these versions.
+	r := retry.StartWithCtx(ctx, retry.Options{
+		MaxDuration: time.Minute, // Limit retries to a minute.
+	})
+	for r.Next() {
+		// Validate the lease manager knows about the current descriptor version.
+		leaseTS := d.descsCollection.GetLatestLeaseReadTimestamp(ctx, d.txn.KV().DB().Clock().Now())
+		if !leaseTS.Less(latestTS) {
+			break
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // CreateOrUpdateDescriptor implements the scexec.Catalog interface.

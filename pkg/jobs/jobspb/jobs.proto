@@ -260,6 +260,7 @@ message LogicalReplicationDetails {
   enum ApplyMode {
     Immediate = 0;
     Validated = 1;
+    Transactional = 2;
   }
 
   ApplyMode mode = 9;
@@ -295,7 +296,9 @@ message LogicalReplicationDetails {
 
   bool skip_schema_check = 17;
 
-  // Next ID: 17.
+  bool skip_foreign_keys = 18;
+
+  // Next ID: 19.
 }
 
 message LogicalReplicationProgress {
@@ -503,7 +506,22 @@ message BackupDetails {
   // with locality tag X.
   bool strict_locality_filtering = 28;
 
-  // NEXT ID: 29;
+  // CreateRevlogJob is set on a regular BACKUP that was invoked with
+  // `WITH REVISION STREAM`. During execution the BACKUP resumer performs a
+  // create-or-noop dance that establishes a sibling revlog (continuous
+  // backup) job for this destination if one does not already exist. See
+  // the "Job creation" subsection of the continuous backup RFC
+  // (docs/RFCS/20260420_continuous_backup.md) for details.
+  bool create_revlog_job = 29;
+
+  // RevLogJob is set on the sibling job created by the `CreateRevlogJob`
+  // dance. The BACKUP resumer keys off this flag at the top of Resume to
+  // dispatch to the revlog execution path instead of the normal
+  // incremental-backup path. The job remains a BACKUP job in the job
+  // table; this is just a flag on its details.
+  bool rev_log_job = 30;
+
+  // NEXT ID: 31;
 }
 
 message BackupProgress {
@@ -664,7 +682,34 @@ message RestoreDetails {
 
   bool experimental_copy = 37;
 
-  // NEXT ID: 38.
+  uint32 temp_system_id = 38 [
+    (gogoproto.customname) = "TempSystemID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
+  ];
+
+  // Grants, when true, directs the restore job to restore privileges on descriptors it restores
+  // for users that are in the restoring cluster.
+  bool grants = 39;
+
+  // RevisionLogTimestamp, when non-empty, tells the restore job to replay the
+  // revision log from the backup's end time through this timestamp after the
+  // normal restore completes.
+  util.hlc.Timestamp revision_log_timestamp = 40 [(gogoproto.nullable) = false];
+
+  // DefaultCollectionURI is the collection root URI. Set during planning
+  // so the execution path can access the collection (e.g. to open the
+  // revision log) without re-deriving it.
+  string default_collection_uri = 41 [(gogoproto.customname) = "DefaultCollectionURI"];
+
+  // RevlogNewTableIDs lists the NEW (post-rewrite) table descriptor IDs
+  // for tables added by revision log schema changes that have no backup
+  // data. Their spans need split/scatter during revlog restore.
+  repeated uint32 revlog_new_table_ids = 42 [
+    (gogoproto.customname) = "RevlogNewTableIDs",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"
+  ];
+
+  // NEXT ID: 43.
 }
 
 
@@ -692,7 +737,11 @@ message ImportDetails {
     sqlbase.TableDescriptor desc = 1;
     string name = 18;
     int64 seq_val = 19;
-    bool was_empty = 22;
+    // WasEmpty is true if the table was empty at the start of the import. It is
+    // deprecated; use InitialRowCount.
+    // TODO(bghal): remove when v26.1 is past support.
+    bool was_empty = 22 [deprecated = true];
+    uint64 initial_row_count = 23;
     repeated string target_cols = 21;
     reserved 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20;
   }
@@ -784,6 +833,14 @@ message ImportProgress {
   // distributed-merge SSTs for this import. These prefixes are used to clean
   // up job-scoped files on completion or cancellation.
   repeated string sst_storage_prefixes = 8 [(gogoproto.customname) = "SSTStoragePrefixes"];
+
+  reserved 9;
+
+  // DistributedMergePhase tracks import progress through the distributed merge
+  // pipeline. Values: 0 = map complete (or no merge iterations done yet),
+  // N (N >= 1) = merge iteration N completed. Used on resume to skip completed
+  // iterations.
+  int32 distributed_merge_phase = 10;
 }
 
 // TypeSchemaChangeDetails is the job detail information for a type schema change job.
@@ -810,6 +867,7 @@ message TypeSchemaChangeProgress {
 enum IndexBackfillDistributedMergeMode {
   INDEX_BACKFILL_DISTRIBUTED_MERGE_MODE_DISABLED = 0 [(gogoproto.enumvalue_customname) = "Disabled"];
   INDEX_BACKFILL_DISTRIBUTED_MERGE_MODE_ENABLED = 1 [(gogoproto.enumvalue_customname) = "Enabled"];
+  INDEX_BACKFILL_DISTRIBUTED_MERGE_MODE_FORCE = 2 [(gogoproto.enumvalue_customname) = "Force"];
 }
 
 // NewSchemaChangeDetails is the job detail information for the new schema change job.
@@ -873,13 +931,7 @@ message BackfillProgress {
   // tenant prefixes even if the data corresponds to a secondary tenant.
   repeated roachpb.Span completed_spans = 5 [(gogoproto.nullable) = false];
 
-  // SSTManifests contains metadata for SST files produced during backfill
-  // with the distributed merge pipeline. Each entry corresponds to one flushed
-  // SST. The slice is reset as outputs are produced for each phase or iteration.
-  // For example, after the map phase it holds all SSTs generated by that phase.
-  // As those SSTs are consumed by the first merge iteration, they are replaced
-  // by the outputs of that iteration.
-  repeated IndexBackfillSSTManifest sst_manifests = 6 [(gogoproto.nullable) = false, (gogoproto.customname) = "SSTManifests"];
+  reserved 6;
 
   // SSTStoragePrefixes identifies the external storage prefixes used to write
   // distributed-merge SSTs for this backfill. These prefixes are used to clean
@@ -894,10 +946,24 @@ message BackfillProgress {
   //   0: Map phase complete, no merge iterations completed yet.
   //   N (N >= 1): Merge iteration N completed.
   int32 distributed_merge_phase = 8;
+
+  // MergeIterationTasksTotal is the total number of tasks in the current merge
+  // iteration. Used for progress calculation.
+  int64 merge_iteration_tasks_total = 9;
+
+  // MergeIterationCompletedTasks contains the task IDs that have been
+  // completed in the current merge iteration.
+  repeated int64 merge_iteration_completed_tasks = 10;
 }
 
-// IndexBackfillSSTManifest describes an SST produced by the backfill map stage.
-message IndexBackfillSSTManifest {
+// BulkSSTManifests is a wrapper around a list of BulkSSTManifest messages,
+// used for serialization when storing manifests in job info keys.
+message BulkSSTManifests {
+  repeated BulkSSTManifest manifests = 1 [(gogoproto.nullable) = false];
+}
+
+// BulkSSTManifest describes an SST produced by bulk operations (backfill, import).
+message BulkSSTManifest {
   string uri = 1 [(gogoproto.customname) = "URI"];
   roachpb.Span span = 2;
   uint64 file_size = 3;
@@ -966,10 +1032,7 @@ message KeyVisualizerProgress {}
 
 message ResumeSpanList {
   repeated roachpb.Span resume_spans = 1 [(gogoproto.nullable) = false];
-  repeated IndexBackfillSSTManifest sst_manifests = 2 [
-    (gogoproto.nullable) = false,
-    (gogoproto.customname) = "SSTManifests"
-  ];
+  reserved 2;
 }
 
 enum Status {
@@ -1248,11 +1311,7 @@ message ResolvedSpan {
 message ResolvedSpans {
   repeated ResolvedSpan resolved_spans = 1 [(gogoproto.nullable) = false];
 
-  message Stats {
-    uint64 recent_kv_count = 1;
-  }
-
-  Stats stats = 2 [(gogoproto.nullable) = false];
+  reserved 2;
 }
 
 // TimestampSpansMap is a map from timestamps to lists of spans.
@@ -1299,9 +1358,8 @@ message ChangefeedProgress {
   // than the overall resolved timestamp and thus allow us to do less work.
   // This is especially useful during backfills or if some spans are lagging.
   //
-  // Invariant: At most one of Checkpoint and SpanLevelCheckpoint should be
-  // non-nil at any time.
-  TimestampSpansMap span_level_checkpoint = 5;
+  // TODO(#163256): Remove (and reserve) this field once MinSupported = 26.2.
+  TimestampSpansMap span_level_checkpoint = 5 [deprecated = true];
 }
 
 // CreateStatsDetails are used for the CreateStats job, which is triggered
@@ -1534,6 +1592,9 @@ message InspectDetails {
 
       // INSPECT_CHECK_ROW_COUNT validates a table has the expected number of rows.
       INSPECT_CHECK_ROW_COUNT = 2 [(gogoproto.enumvalue_customname) = "InspectCheckRowCount"];
+
+      // INSPECT_CHECK_UNIQUENESS validates an index's unique column is unique across regions.
+      INSPECT_CHECK_UNIQUENESS = 3 [(gogoproto.enumvalue_customname) = "InspectCheckUniqueness"];
     }
 
     // Type is the kind of validation to perform.

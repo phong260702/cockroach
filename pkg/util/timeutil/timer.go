@@ -7,10 +7,25 @@ package timeutil
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var timeTimerPool sync.Pool
+
+// activeSynctestBubbles counts the number of active synctest bubbles.
+// When non-zero, the timer pool is bypassed: Get returns nil (forcing a
+// fresh allocation) and Put is a no-op. This prevents non-bubble timers
+// from being reused inside the bubble (which would prevent the bubble's
+// fake clock from advancing) and prevents bubble timers from leaking
+// out.
+//
+// We intentionally do not gate on buildutil.CrdbTestBuild here. That
+// constant is tied to the crdb_test build tag, which is not set in
+// local IDE builds. Skipping the check there would silently break
+// synctest bubbles. The atomic load is cheap enough to keep
+// unconditionally.
+var activeSynctestBubbles atomic.Int32
 
 // The Timer type represents a single event. When the Timer expires,
 // the current time will be sent on Timer.C.
@@ -26,8 +41,7 @@ type Timer struct {
 	timer *time.Timer
 	// C is a local "copy" of timer.C that can be used in a select case before
 	// the timer has been initialized (via Reset).
-	C    <-chan time.Time
-	Read bool
+	C <-chan time.Time
 }
 
 // AsTimerI returns the Timer as a TimerI. This is helpful
@@ -41,11 +55,15 @@ func (t *Timer) AsTimerI() TimerI {
 // the new value of the timer.
 func (t *Timer) Reset(d time.Duration) {
 	if t.timer == nil {
-		switch timer := timeTimerPool.Get(); timer {
+		var pooled any
+		if activeSynctestBubbles.Load() == 0 {
+			pooled = timeTimerPool.Get()
+		}
+		switch pooled {
 		case nil:
 			t.timer = time.NewTimer(d)
 		default:
-			t.timer = timer.(*time.Timer)
+			t.timer = pooled.(*time.Timer)
 			t.timer.Reset(d)
 		}
 		t.C = t.timer.C
@@ -62,7 +80,9 @@ func (t *Timer) Stop() bool {
 	var res bool
 	if t.timer != nil {
 		res = t.timer.Stop()
-		timeTimerPool.Put(t.timer)
+		if activeSynctestBubbles.Load() == 0 {
+			timeTimerPool.Put(t.timer)
+		}
 	}
 	*t = Timer{}
 	return res

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -36,7 +37,7 @@ type truncateNode struct {
 }
 
 // Truncate deletes all rows from a table.
-// Privileges: DROP on table.
+// Privileges: TRUNCATE or DROP on table.
 //
 //	Notes: postgres requires TRUNCATE.
 //	       mysql requires DROP (for mysql >= 5.1.16, DELETE before that).
@@ -64,7 +65,7 @@ func (t *truncateNode) startExec(params runParams) error {
 			return err
 		}
 
-		if err := p.CheckPrivilege(ctx, tableDesc, privilege.DROP); err != nil {
+		if err := p.checkTruncatePrivilege(ctx, tableDesc); err != nil {
 			return err
 		}
 
@@ -96,7 +97,7 @@ func (t *truncateNode) startExec(params runParams) error {
 				return errors.WithHintf(pgerror.Newf(pgcode.FeatureNotSupported, "%q is %s table %q", tableDesc.Name, msg, other.Name),
 					"truncate dependent tables at the same time or specify the CASCADE option")
 			}
-			if err := p.CheckPrivilege(ctx, other, privilege.DROP); err != nil {
+			if err := p.checkTruncatePrivilege(ctx, other); err != nil {
 				return err
 			}
 			otherName, err := p.getQualifiedTableName(ctx, other)
@@ -143,6 +144,31 @@ func (t *truncateNode) Next(runParams) (bool, error) { return false, nil }
 func (t *truncateNode) Values() tree.Datums          { return tree.Datums{} }
 func (t *truncateNode) Close(context.Context)        {}
 
+// checkTruncatePrivilege checks that the user has TRUNCATE or DROP privilege
+// on the given table. DROP is accepted for backward compatibility.
+func (p *planner) checkTruncatePrivilege(
+	ctx context.Context, tableDesc catalog.TableDescriptor,
+) error {
+	hasTruncate, err := p.HasPrivilege(ctx, tableDesc, privilege.TRUNCATE, p.User())
+	if err != nil {
+		return err
+	}
+	if hasTruncate {
+		return nil
+	}
+	hasDrop, err := p.HasPrivilege(ctx, tableDesc, privilege.DROP, p.User())
+	if err != nil {
+		return err
+	}
+	if hasDrop {
+		return nil
+	}
+	return sqlerrors.NewInsufficientPrivilegeOnDescriptorError(
+		p.User(), []privilege.Kind{privilege.TRUNCATE, privilege.DROP},
+		"relation", tableDesc.GetName(),
+	)
+}
+
 // PreservedSplitCountMultiple is the setting that configures the number of
 // split points that we re-create on a table after a truncate, or that we
 // create in an index backfill . It's scaled by the number of nodes in the cluster.
@@ -154,9 +180,10 @@ var PreservedSplitCountMultiple = settings.RegisterIntSetting(
 		"from the table's indexes or copy them from the primary index. The multiple "+
 		"given will be multiplied with the number of nodes in the cluster to produce "+
 		"the number of preserved range splits. This can improve performance when "+
-		"truncating or backlling an index from a table with significant write traffic.",
+		"truncating or backfilling an index from a table with significant write traffic.",
 	4,
 	settings.WithName("sql.schema.preserved_split_count_multiple"),
+	settings.IntWithMinimum(0),
 )
 
 // truncateTable truncates the data of a table in a single transaction. It does

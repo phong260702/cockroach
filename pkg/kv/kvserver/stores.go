@@ -11,7 +11,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
@@ -48,7 +47,7 @@ type Stores struct {
 	sendQueueLogger *rac2.SendQueueLogger
 }
 
-var _ kv.Sender = &Stores{}      // Stores implements the client.Sender interface
+var _ SenderWithWorkStats = &Stores{}
 var _ gossip.Storage = &Stores{} // Stores implements the gossip.Storage interface
 
 // NewStores returns a local-only sender which directly accesses
@@ -176,35 +175,28 @@ func (ls *Stores) GetReplicaForRangeID(
 	return replica, store, nil
 }
 
-// Send implements the client.Sender interface. The store is looked up from the
+// SendWithWorkStats sends a batch request. The store is looked up from the
 // store map using the ID specified in the request.
-func (ls *Stores) Send(
-	ctx context.Context, ba *kvpb.BatchRequest,
+func (ls *Stores) SendWithWorkStats(
+	ctx context.Context,
+	ba *kvpb.BatchRequest,
+	stats *StoreWorkStats,
+	admissionInfo kvadmission.AdmissionInfo,
 ) (*kvpb.BatchResponse, *kvpb.Error) {
-	br, writeBytes, pErr := ls.SendWithWriteBytes(ctx, ba)
-	writeBytes.Release()
-	return br, pErr
-}
-
-// SendWithWriteBytes is the implementation of Send with an additional
-// *StoreWriteBytes return value.
-func (ls *Stores) SendWithWriteBytes(
-	ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchResponse, *kvadmission.StoreWriteBytes, *kvpb.Error) {
 	if err := ba.ValidateForEvaluation(); err != nil {
-		return nil, nil, kvpb.NewError(errors.Wrapf(err, "invalid batch (%s)", ba))
+		return nil, kvpb.NewError(errors.Wrapf(err, "invalid batch (%s)", ba))
 	}
 
 	store, err := ls.GetStore(ba.Replica.StoreID)
 	if err != nil {
-		return nil, nil, kvpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 
-	br, writeBytes, pErr := store.SendWithWriteBytes(ctx, ba)
+	br, pErr := store.SendWithWorkStats(ctx, ba, stats, admissionInfo)
 	if br != nil && br.Error != nil {
 		panic(kvpb.ErrorUnexpectedlySet(store, br))
 	}
-	return br, writeBytes, pErr
+	return br, pErr
 }
 
 // RangeFeed registers a rangefeed over the specified span. It sends
@@ -303,6 +295,7 @@ func (ls *Stores) updateBootstrapInfoLocked(bi *gossip.BootstrapInfo) error {
 
 // DiskStatsMonitor abstracts disk.Monitor for testing purposes.
 type DiskStatsMonitor interface {
+	DeviceID() disk.DeviceID
 	CumulativeStats() (disk.Stats, error)
 	Clone() *disk.Monitor
 	Close()

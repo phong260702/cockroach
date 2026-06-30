@@ -325,6 +325,28 @@ func TestBasicDatums(t *testing.T) {
 			},
 		},
 		{
+			// Regression test for #137757. The SQL layer produces BIT(0) values
+			// with a non-nil empty words slice, while the parquet decoder's
+			// bitarray.Parse("") returns a nil words slice. Both are semantically
+			// equivalent. Use FromEncodingParts to construct the expected value
+			// with a non-nil empty words slice, matching what the SQL layer
+			// produces.
+			name: "bitarray_empty",
+			sch: &colSchema{
+				columnTypes: []*types.T{types.MakeBit(0), types.MakeBit(0)},
+				columnNames: []string{"a", "b"},
+			},
+			datums: func() ([][]tree.Datum, error) {
+				ba, err := bitarray.FromEncodingParts([]uint64{}, 0)
+				if err != nil {
+					return nil, err
+				}
+				return [][]tree.Datum{
+					{&tree.DBitArray{BitArray: ba}, tree.DNull},
+				}, nil
+			},
+		},
+		{
 			name: "bytes",
 			sch: &colSchema{
 				columnTypes: []*types.T{types.Bytes, types.Bytes},
@@ -846,4 +868,22 @@ func TestBufferedBytes(t *testing.T) {
 			require.Equal(t, writer.BufferedBytesEstimate(), int64(0))
 		})
 	}
+}
+
+// TestDefaultDataPageSize is a regression test for #140030. The Apache Arrow
+// parquet library internally uses int32 for buffer size calculations
+// (column_writer.go). If the data page size exceeds MaxInt32, the int64-to-int32
+// cast overflows, producing a negative value passed to bytes.Buffer.Grow(),
+// causing a panic. This test asserts that the default data page size is capped
+// to prevent this overflow.
+func TestDefaultDataPageSize(t *testing.T) {
+	schemaDef, err := NewSchema([]string{"a"}, []*types.T{types.Int})
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	writer, err := NewWriter(schemaDef, &buf)
+	require.NoError(t, err)
+	defer func() { _ = writer.Close() }()
+
+	require.LessOrEqual(t, writer.cfg.dataPageSize, int64(math.MaxInt32))
 }

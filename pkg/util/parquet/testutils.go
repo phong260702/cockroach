@@ -393,7 +393,7 @@ func ValidateDatum(t *testing.T, expected tree.Datum, actual tree.Datum) {
 			// test does it manually :(
 			// https://github.com/cockroachdb/cockroach/issues/73743
 			e := float32(*expected.(*tree.DFloat))
-			a := float32(*expected.(*tree.DFloat))
+			a := float32(*actual.(*tree.DFloat))
 			require.Equal(t, e, a)
 		} else {
 			require.Equal(t, expected.String(), actual.String())
@@ -419,8 +419,16 @@ func ValidateDatum(t *testing.T, expected tree.Datum, actual tree.Datum) {
 		require.Equal(t, expected.(*tree.DEnum).LogicalRep, actual.(*tree.DEnum).LogicalRep)
 	case types.CollatedStringFamily:
 		require.Equal(t, expected.(*tree.DCollatedString).Contents, actual.(*tree.DCollatedString).Contents)
+	case types.BitFamily:
+		// Compare using string representation to avoid nil vs empty slice
+		// mismatch. BIT(0) produces a BitArray with an empty words slice from
+		// SQL, but the parquet decoder's bitarray.Parse("") returns a nil words
+		// slice. Both are semantically equivalent.
+		require.Equal(t, expected.String(), actual.String())
 	case types.OidFamily:
 		require.Equal(t, expected.(*tree.DOid).Oid, actual.(*tree.DOid).Oid)
+	case types.DecimalFamily:
+		require.Equal(t, expected.String(), actual.String())
 	default:
 		require.Equal(t, expected, actual)
 	}

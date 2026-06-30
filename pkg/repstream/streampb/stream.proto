@@ -1,3 +1,4 @@
+
 // Copyright 2021 The Cockroach Authors.
 //
 // Use of this software is governed by the CockroachDB Software License
@@ -14,6 +15,7 @@ import "roachpb/data.proto";
 import "jobs/jobspb/jobs.proto";
 import "roachpb/metadata.proto";
 import "util/hlc/timestamp.proto";
+import "util/rangescanstats/rangescanstatspb/stats.proto";
 import "util/unresolved_addr.proto";
 import "gogoproto/gogo.proto";
 import "google/protobuf/duration.proto";
@@ -149,7 +151,11 @@ message StreamPartitionSpec {
 
   ReplicationType type = 12;
 
-  // NEXT ID: 13.
+  // When true and type is LOGICAL (LDR), the producer buffers rangefeed KVs and
+  // emits in (timestamp, key) order on frontier advancement.
+  bool with_mvcc_ordering = 13;
+
+  // NEXT ID: 14.
 }
 
 // SpanConfigEventStreamSpec is the span config event stream specification.
@@ -236,19 +242,17 @@ message StreamEvent {
     repeated KV kvs = 6 [(gogoproto.nullable) = false, (gogoproto.customname) = "KVs"];
   }
 
+  // RangeStats contains statistics about ranges being scanned during initial
+  // and catchup scans. This message is kept for mixed-version compatibility
+  // with 26.1 nodes which marshal this type via MarshalAny/UnmarshalAny in
+  // DistSQL progress metadata. The canonical definition has moved to
+  // rangescanstatspb.RangeStats; this copy must remain until all nodes in
+  // the cluster are running 26.2.
+  //
+  // TODO(kev-cao): Remove when deleting the 26.2 version gates.
   message RangeStats {
-    // RangeCount is the number of ranges covered by the spans specified when
-    // starting the event stream. The number of ranges is counted per requested
-    // span, so the count will be an overestimate if a range is shared between
-    // multiple requested spans.
     int64 range_count = 1;
-
-    // ScanningRangeCount is the number of ranges that have yet to complete the
-    // initial scan. ScanningRangeCount <= RangeCount.
     int64 scanning_range_count = 2;
-    
-    // LaggingRangeCount is the number of ranges that are signficantly behind,
-    // after completing the initial scan.
     int64 lagging_range_count = 3;
   }
 
@@ -256,7 +260,7 @@ message StreamEvent {
   message StreamCheckpoint {
     reserved 1;
     repeated cockroach.sql.jobs.jobspb.ResolvedSpan resolved_spans = 2  [(gogoproto.nullable) = false];
-    RangeStats range_stats = 3;
+    cockroach.util.rangescanstatspb.RangeStats range_stats = 3;
   }
 
   // Only 1 field ought to be set.

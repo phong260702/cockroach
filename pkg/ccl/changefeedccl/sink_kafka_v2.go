@@ -77,13 +77,16 @@ func newKafkaSinkClientV2(
 	baseOpts := []kgo.Opt{
 		// Disable idempotency to maintain parity with the v1 sink and not add surface area for unknowns.
 		kgo.DisableIdempotentWrite(),
+		// Allow up to 5 concurrent produce requests per broker, matching the
+		// Sarama client's default. This is safe because ParallelIO handles
+		// ordering independently of franz-go.
+		kgo.MaxProduceRequestsInflightPerBroker(5),
 
 		kgo.SeedBrokers(bootstrapBrokers...),
 		kgo.WithLogger(kgoLogAdapter{ctx: ctx}),
 		kgo.RecordPartitioner(newKgoChangefeedPartitioner(partitionAlg)),
-		// 256MiB. This is the max this library allows. Note that v1 sets the sarama equivalent to math.MaxInt32.
-		kgo.ProducerBatchMaxBytes(256 << 20), // 256MiB
-		kgo.BrokerMaxWriteBytes(1 << 30),     // 1GiB
+		kgo.ProducerBatchMaxBytes(int32(changefeedbase.KafkaMaxRequestSize.Get(&settings.SV))),
+		kgo.BrokerMaxWriteBytes(1 << 30), // 1GiB
 
 		kgo.AllowAutoTopicCreation(),
 
@@ -158,6 +161,12 @@ func (k *kafkaSinkClientV2) Flush(ctx context.Context, payload SinkPayload) (ret
 		if err := k.client.ProduceSync(ctx, msgs...).FirstErr(); err != nil {
 			if k.shouldTryResizing(err, msgs) {
 				a, b := msgs[0:len(msgs)/2], msgs[len(msgs)/2:]
+				log.Changefeed.Infof(ctx,
+					"resizing kafka batch from %d messages to halves of %d and %d due to error: %v",
+					redact.SafeInt(int64(len(msgs))),
+					redact.SafeInt(int64(len(a))),
+					redact.SafeInt(int64(len(b))),
+					err)
 				// Recurse. This is a little odd because the client's batch
 				// state doesn't consist only of this payload, but the inflight
 				// payloads of all ParallelIO workers. Therefore reducing the
@@ -491,6 +500,20 @@ func buildKgoConfig(
 	if err != nil {
 		return nil, errors.Wrapf(err,
 			"failed to parse sink config; check %s option", changefeedbase.OptKafkaSinkConfig)
+	}
+	if sinkCfg.Flush.MaxBytes != 0 {
+		if sinkCfg.Flush.MaxBytes < changefeedbase.KafkaMaxRequestSizeMin {
+			return nil, errors.Errorf(
+				"MaxBytes must be at least %d bytes, got %d",
+				changefeedbase.KafkaMaxRequestSizeMin, sinkCfg.Flush.MaxBytes)
+		}
+		if sinkCfg.Flush.MaxBytes > changefeedbase.KafkaMaxRequestSizeLimit {
+			return nil, errors.Errorf(
+				"MaxBytes must be at most %d bytes, got %d",
+				changefeedbase.KafkaMaxRequestSizeLimit, sinkCfg.Flush.MaxBytes)
+		}
+		// Override the cluster setting default set in baseOpts; kgo uses last-writer-wins.
+		opts = append(opts, kgo.ProducerBatchMaxBytes(sinkCfg.Flush.MaxBytes))
 	}
 
 	// If the user sets MaxMessages, use that as kgo's overall max batch size.

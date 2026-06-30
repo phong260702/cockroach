@@ -73,11 +73,12 @@ const cockroachDB = "github.com/cockroachdb/cockroach"
 //go:embed gcassert_paths.txt
 var rawGcassertPaths string
 
-func init() {
+func TestMain(m *testing.M) {
 	if bazel.BuiltWithBazel() {
 		goSdk := os.Getenv("GO_SDK")
 		if goSdk == "" {
-			panic("expected GO_SDK")
+			fmt.Println("GO_SDK not set; skipping lint tests (require bespoke CI setup)")
+			os.Exit(0)
 		}
 		if err := os.Setenv("PATH", fmt.Sprintf("%s%c%s", filepath.Join(goSdk, "bin"), os.PathListSeparator, os.Getenv("PATH"))); err != nil {
 			panic(err)
@@ -86,6 +87,7 @@ func init() {
 			panic(err)
 		}
 	}
+	os.Exit(m.Run())
 }
 
 func dirCmd(
@@ -319,6 +321,8 @@ func TestLint(t *testing.T) {
 			stream.GrepNot(`^pkg/raft/.*`),
 			// Generated files for plpgsql.
 			stream.GrepNot(`sql/plpgsql/parser/plpgsqllexbase/.*.go`),
+			// Generated TypeScript types from OpenAPI schema.
+			stream.GrepNot(`db-console/src/api/api-types\.ts$`),
 		), func(filename string) {
 			file, err := os.Open(filepath.Join(crdbDir, filename))
 			if err != nil {
@@ -671,12 +675,12 @@ func TestLint(t *testing.T) {
 					":!build/bazel",
 					":!ccl/acceptanceccl/backup_test.go",
 					":!backup/backup_cloud_test.go",
+					":!backup/flaky_storage_test.go",
 					// KMS requires AWS credentials from environment variables.
 					":!backup/backup_test.go",
 					":!ccl/changefeedccl/helpers_test.go",
-					":!ccl/cloudccl",
 					":!cloud",
-					":!ccl/workloadccl/fixture_test.go",
+					":!workload/fixture/fixture_test.go",
 					":!internal/reporoot/reporoot.go",
 					":!cmd",
 					":!util/cgroups/cgroups.go",
@@ -1090,6 +1094,8 @@ func TestLint(t *testing.T) {
 			":!util/syncutil/mutex_tracing.go",
 			":!util/timeutil/time.go",
 			":!util/timeutil/zoneinfo.go",
+			":!cmd/dev/**",
+			":!cmd/tsdump2duck/**",
 			":!cmd/roachtest/tests/gorm_helpers.go",
 		)
 		if err != nil {
@@ -1256,6 +1262,39 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestSynctest", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`\bsynctest\.Test\(`,
+			"--",
+			"*.go",
+			":!util/timeutil/synctest.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'timeutil.SyncTest' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestGrpc", func(t *testing.T) {
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(
@@ -1274,9 +1313,10 @@ func TestLint(t *testing.T) {
 			":!server/server_obs_service.go",
 			":!server/testserver.go",
 			":!util/tracing/*_test.go",
-			":!ccl/sqlproxyccl/tenantdirsvr/test_directory_svr.go",
-			":!ccl/sqlproxyccl/tenantdirsvr/test_simple_directory_svr.go",
-			":!ccl/sqlproxyccl/tenantdirsvr/test_static_directory_svr.go",
+			":!cli/mt_http_test_directory.go",
+			":!sqlproxy/tenantdirsvr/test_directory_svr.go",
+			":!sqlproxy/tenantdirsvr/test_simple_directory_svr.go",
+			":!sqlproxy/tenantdirsvr/test_static_directory_svr.go",
 			":!cmd/bazci/*.go",
 		)
 		if err != nil {
@@ -1599,7 +1639,9 @@ func TestLint(t *testing.T) {
 			":!*.pb.go",
 			":!*.pb.gw.go",
 			":!ccl/changefeedccl/changefeedbase/errors.go",
+			":!crosscluster/logical/txnapply/txn_applier.go",
 			":!kv/kvclient/kvcoord/lock_spans_over_budget_error.go",
+			":!kv/kvserver/kvserverbase/bulk_adder.go",
 			":!spanconfig/errors.go",
 			":!kv/kvpb/replica_unavailable_error.go",
 			":!kv/kvpb/ambiguous_result_error.go",
@@ -2514,6 +2556,10 @@ func TestLint(t *testing.T) {
 		require.NoError(t, err)
 		const verbose = false
 		codeowners.LintEverythingIsOwned(t, verbose, co, crdbDir, "pkg")
+		if stale := codeowners.LintNoStalePaths(co, crdbDir); len(stale) > 0 {
+			t.Errorf("stale paths in CODEOWNERS (no longer exist in repo):\n%s",
+				strings.Join(stale, "\n"))
+		}
 	})
 
 	t.Run("cookie construction is forbidden", func(t *testing.T) {
@@ -2687,7 +2733,7 @@ func TestLint(t *testing.T) {
 			stream.Sort(),
 			stream.Uniq(),
 			stream.Grep(`cockroach/pkg/cmd/roachtest/.*: `),
-			stream.GrepNot(`cockroach/pkg/cmd/roachtest/roachtestutil/(mixedversion|task): `),
+			stream.GrepNot(`cockroach/pkg/cmd/roachtest/roachtestutil/(artifactsutil|mixedversion|task): `),
 		), func(s string) {
 			pkgStr := strings.Split(s, ": ")
 			_, importedPkg := pkgStr[0], pkgStr[1]

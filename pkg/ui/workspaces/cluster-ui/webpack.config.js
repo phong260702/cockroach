@@ -19,6 +19,9 @@ module.exports = (env, argv) => {
   env = env || {};
 
   return {
+    stats: {
+      errorDetails: true,
+    },
     context: __dirname,
     name: "cluster-ui",
     entry: path.resolve(__dirname, "./src/index.ts"),
@@ -54,7 +57,7 @@ module.exports = (env, argv) => {
       rules: [
         {
           test: /\.(png|jpg|gif|svg|eot|ttf|woff|woff2)$/,
-          type: "asset",
+          type: env["inline-assets"] ? "asset/inline" : "asset",
           exclude: /node_modules/,
         },
         // Styles in current project use SCSS preprocessing language with CSS modules.
@@ -67,6 +70,7 @@ module.exports = (env, argv) => {
             {
               loader: "css-loader",
               options: {
+                sourceMap: false,
                 modules: {
                   localIdentName: "[local]--[hash:base64:5]",
                 }
@@ -81,7 +85,7 @@ module.exports = (env, argv) => {
         // dir so it can access external dependencies.
         {
           test: /(?<!\.module)\.scss/,
-          use: ["style-loader", "css-loader", "sass-loader"],
+          use: ["style-loader", { loader: "css-loader", options: { sourceMap: false } }, "sass-loader"],
           exclude: /node_modules/,
         },
         {
@@ -139,6 +143,7 @@ module.exports = (env, argv) => {
             {
               loader: "esbuild-loader",
               options: {
+                sourceMap: false,
                 loader: "css",
                 minify: true,
               },
@@ -213,7 +218,6 @@ module.exports = (env, argv) => {
       "react-router": "react-router",
       "react-router-dom": "react-router-dom",
       "react-redux": "react-redux",
-      "redux-saga": "redux-saga",
       "redux": "redux",
     },
   };

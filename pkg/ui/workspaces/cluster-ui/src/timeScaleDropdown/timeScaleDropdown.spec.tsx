@@ -3,18 +3,15 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
+import "@testing-library/jest-dom";
 import { render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { assert } from "chai";
-import { mount } from "enzyme";
 import moment from "moment-timezone";
 import React, { useState } from "react";
 import { MemoryRouter } from "react-router";
 
 import { timeFormat as customMenuTimeFormat } from "../dateRangeMenu";
 
-import RangeSelect from "./rangeSelect";
-import { TimeFrameControls } from "./timeFrameControls";
 import {
   formatRangeSelectSelected,
   generateDisabledArrows,
@@ -197,7 +194,7 @@ describe("<TimeScaleDropdown> component", function () {
 
   it("opens directly to the custom menu when a custom time interval is currently selected", async () => {
     const mockSetTimeScale = jest.fn();
-    const { getByText, getByRole, baseElement } = render(
+    const { getByText, getByRole, getByTestId, baseElement } = render(
       <MemoryRouter>
         <TimeScaleDropdownWrapper
           currentScale={new timescale.TimeScaleState().scale}
@@ -211,12 +208,15 @@ describe("<TimeScaleDropdown> component", function () {
     getByText("Past 30 Minutes");
     getByText("Past 6 Hours");
 
-    // Change to a custom selection
+    // Change to a custom selection by clicking the previous time interval arrow.
+    // In antd 5.x, clicking outside the dropdown overlay (the arrow button) closes
+    // the dropdown, so we re-open it afterward.
     userEvent.click(
       getByRole("button", {
         name: "previous time interval",
       }),
     );
+    userEvent.click(getByTestId("dropdown-button"));
 
     // When a custom option is selected, the dropdown should open to the custom selector.
     const expectedText = getExpectedCustomText(
@@ -288,11 +288,11 @@ describe("TimeScaleDropdown functions", function () {
     };
   };
 
-  const makeTimeScaleDropdown = (
+  const renderTimeScaleDropdown = (
     props: Omit<TimeScaleDropdownProps, "setTimeScale">,
   ) => {
     setCurrentWindowFromTimeScale(props.currentScale);
-    return mount(
+    return render(
       <MemoryRouter initialEntries={initialEntries}>
         <TimeScaleDropdownWrapper {...props} />
       </MemoryRouter>,
@@ -305,14 +305,15 @@ describe("TimeScaleDropdown functions", function () {
     setCurrentWindowFromTimeScale(timeScaleState.scale);
     state = {
       currentScale: timeScaleState.scale,
-      // setTimeScale: () => {},
     };
   });
 
   it("valid path should not redirect to 404", () => {
-    const wrapper = makeTimeScaleDropdown(state);
-    assert.equal(wrapper.find(RangeSelect).length, 1);
-    assert.equal(wrapper.find(TimeFrameControls).length, 1);
+    const { container } = renderTimeScaleDropdown(state);
+    // The component renders a range select trigger and time frame controls.
+    // If routing failed, none of these would render.
+    expect(container.querySelector(".trigger")).toBeInTheDocument();
+    expect(container.querySelector(".controls-content")).toBeInTheDocument();
   });
 
   describe("formatRangeSelectSelected", () => {
@@ -322,7 +323,7 @@ describe("TimeScaleDropdown functions", function () {
         state.currentScale,
         "UTC",
       );
-      assert.deepEqual(title, {
+      expect(title).toEqual({
         key: "Past Hour",
         timeLabel: "1h",
         timeWindow: currentWindow,
@@ -340,12 +341,11 @@ describe("TimeScaleDropdown functions", function () {
         .utc(currentWindow.start)
         .format(dropdownTimeFormat);
       const timeEnd = moment.utc(currentWindow.end).format(dropdownTimeFormat);
-      const wrapper = makeTimeScaleDropdown({ ...state, currentScale });
-      assert.equal(
-        wrapper.find(".trigger .Select-value-label").first().text(),
-        ` ${timeStart} -  ${timeEnd} (UTC)`,
-      );
-      assert.deepEqual(title, {
+      const { container } = renderTimeScaleDropdown({ ...state, currentScale });
+      expect(
+        container.querySelector(".trigger .Select-value-label").textContent,
+      ).toBe(` ${timeStart} -  ${timeEnd} (UTC)`);
+      expect(title).toEqual({
         dateStart: "",
         dateEnd: "",
         timeStart,
@@ -375,15 +375,14 @@ describe("TimeScaleDropdown functions", function () {
       const timeEnd = moment.utc(window.end).format(dropdownTimeFormat);
       const dateStart = moment.utc(window.start).format(dropdownDateFormat);
       const dateEnd = moment.utc(window.end).format(dropdownDateFormat);
-      const wrapper = makeTimeScaleDropdown({
+      const { container } = renderTimeScaleDropdown({
         ...state,
         currentScale,
       });
-      assert.equal(
-        wrapper.find(".trigger .Select-value-label").first().text(),
-        `${dateStart} ${timeStart} - ${dateEnd} ${timeEnd} (UTC)`,
-      );
-      assert.deepEqual(title, {
+      expect(
+        container.querySelector(".trigger .Select-value-label").textContent,
+      ).toBe(`${dateStart} ${timeStart} - ${dateEnd} ${timeEnd} (UTC)`);
+      expect(title).toEqual({
         dateStart,
         dateEnd,
         timeStart,
@@ -410,11 +409,13 @@ describe("TimeScaleDropdown functions", function () {
       fixedWindowEnd: window.end,
     };
     const arrows = generateDisabledArrows(window);
-    const wrapper = makeTimeScaleDropdown({
+    const { container } = renderTimeScaleDropdown({
       ...state,
       currentScale: currentTimeScale,
     });
-    assert.equal(wrapper.find(".controls-content ._action.disabled").length, 0);
-    assert.deepEqual(arrows, []);
+    expect(
+      container.querySelectorAll(".controls-content ._action.disabled"),
+    ).toHaveLength(0);
+    expect(arrows).toEqual([]);
   });
 });

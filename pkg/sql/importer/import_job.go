@@ -12,6 +12,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/ingeststopped"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -36,7 +38,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/besteffort"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -58,6 +62,19 @@ type importTestingKnobs struct {
 	beforeRunDSP           func() error
 	onSetupFinish          func(flowinfra.Flow)
 	alwaysFlushJobProgress bool
+	beforeInitialRowCount  func() error
+	// expectedRowCountOffset is added to the expected row count passed to the
+	// inspect row count check.
+	expectedRowCountOffset int64
+	// afterDistImport, if set, is called after each successful distImport
+	// call inside ingestWithRetry. If it returns an error, that error
+	// replaces the nil err and triggers a retry.
+	afterDistImport func() error
+	// duringDistImport, if set, is called during distImport processing
+	// after each batch's progress has been recorded (and persisted, if
+	// alwaysFlushJobProgress is true). If it returns a non-nil error,
+	// distImport fails with that error.
+	duringDistImport func() error
 }
 
 type importResumer struct {
@@ -65,11 +82,35 @@ type importResumer struct {
 	settings *cluster.Settings
 	res      roachpb.RowCount
 
+	// inspectJobID is the ID of the background INSPECT job triggered for row
+	// count validation, if any. Zero means no INSPECT job was triggered.
+	inspectJobID jobspb.JobID
+
 	testingKnobs importTestingKnobs
 }
 
 func (r *importResumer) TestingSetAfterImportKnob(fn func(summary roachpb.RowCount) error) {
 	r.testingKnobs.afterImport = fn
+}
+
+func (r *importResumer) TestingSetBeforeInitialRowCountKnob(fn func() error) {
+	r.testingKnobs.beforeInitialRowCount = fn
+}
+
+func (r *importResumer) TestingSetExpectedRowCountOffset(offset int64) {
+	r.testingKnobs.expectedRowCountOffset = offset
+}
+
+func (r *importResumer) TestingSetAlwaysFlushJobProgress() {
+	r.testingKnobs.alwaysFlushJobProgress = true
+}
+
+func (r *importResumer) TestingSetAfterDistImportKnob(fn func() error) {
+	r.testingKnobs.afterDistImport = fn
+}
+
+func (r *importResumer) TestingSetDuringDistImportKnob(fn func() error) {
+	r.testingKnobs.duringDistImport = fn
 }
 
 var _ jobs.TraceableJob = &importResumer{}
@@ -125,15 +166,15 @@ const (
 
 // importRowCountValidationMetamorphicValue determines the default value for
 // importRowCountValidation in metamorphic test builds. It randomly selects
-// between "off", "async", and "sync" modes to increase test coverage.
+// between "async" and "sync" modes to increase test coverage.
 var importRowCountValidationMetamorphicValue = metamorphic.ConstantWithTestChoice(
 	"import-row-count-validation",
-	"off",   // no validation
-	"async", // background validation
+	"async", // background validation (default)
 	"sync",  // blocking validation for tests
 )
 
-// TODO(janexing): tune the default to async when INSPECT is merged in stable release.
+// Note: the internal key retains "unsafe" for backward compatibility, but the
+// setting is no longer unsafe. The public name is set via WithName below.
 var importRowCountValidation = settings.RegisterEnumSetting(
 	settings.ApplicationLevel,
 	"bulkio.import.row_count_validation.unsafe.mode",
@@ -147,7 +188,8 @@ var importRowCountValidation = settings.RegisterEnumSetting(
 		ImportRowCountValidationAsync: "async",
 		ImportRowCountValidationSync:  "sync",
 	},
-	settings.WithUnsafe,
+	settings.WithName("bulkio.import.row_count_validation.mode"),
+	settings.WithPublic,
 	settings.WithRetiredName("bulkio.import.row_count_validation.unsafe.enabled"),
 )
 
@@ -168,6 +210,25 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	details := r.job.Details().(jobspb.ImportDetails)
 	files := details.URIs
 	format := details.Format
+
+	updateDetails := func(txn isql.Txn, details jobspb.ImportDetails) error {
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		return r.job.DeprecatedWithTxn(txn).Update(ctx, func(
+			txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater,
+		) error {
+			pl := md.Payload
+			*pl.GetImport() = details
+
+			// Update the set of descriptors for later observability.
+			// TODO(ajwerner): Do we need this idempotence test?
+			prev := md.Payload.DescriptorIDs
+			if prev == nil {
+				pl.DescriptorIDs = []descpb.ID{details.Table.Desc.ID}
+			}
+			ju.UpdatePayload(pl)
+			return nil
+		})
+	}
 
 	// Skip prepare stage on job resumption, if it has already been completed.
 	if !details.PrepareComplete {
@@ -194,35 +255,66 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 
 			// Update the job details now that the schemas and table descs have
 			// been "prepared".
-			return r.job.WithTxn(txn).Update(ctx, func(
-				txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
-			) error {
-				pl := md.Payload
-				*pl.GetImport() = preparedDetails
-
-				// Update the set of descriptors for later observability.
-				// TODO(ajwerner): Do we need this idempotence test?
-				prev := md.Payload.DescriptorIDs
-				if prev == nil {
-					pl.DescriptorIDs = []descpb.ID{table.Desc.GetID()}
-				}
-				ju.UpdatePayload(pl)
-				return nil
-			})
+			return updateDetails(txn, preparedDetails)
 		}); err != nil {
 			return err
 		}
 
 		// Re-initialize details after prepare step.
 		details = r.job.Details().(jobspb.ImportDetails)
+	}
+
+	if r.testingKnobs.beforeInitialRowCount != nil {
+		if err := r.testingKnobs.beforeInitialRowCount(); err != nil {
+			return err
+		}
+	}
+
+	if details.Table.InitialRowCount == 0 && details.Walltime == 0 {
+		// Check if the table being imported into is starting empty, in which case
+		// we can cheaply clear-range instead of DeleteRange to cleanup.
+		//
+		// Run the count after the table has been taken offline.
+		//
+		// The count is low-cost for empty tables and otherwise the expensive
+		// full scan is only run the one time.
+		//
+		// We also check that the walltime has not been set yet. The walltime is
+		// set later in this function, after the count. If the walltime is
+		// already set, the count has already been performed in a previous
+		// attempt. Without this check, resuming an import into an empty table
+		// would re-count and include the already-ingested import data in the
+		// initial row count.
+		// Split the row count read and job details update into separate txns.
+		// The read can be large (full table scan) and should run at BulkNormalPri,
+		// but the updateDetails write to the jobs table should not be subject to
+		// bulk admission control queuing to avoid priority inversion — holding a
+		// lock on the jobs table while waiting in an AC queue would block
+		// higher-priority work.
+		var rowCountDetails jobspb.ImportDetails
+		if err := p.ExecCfg().InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
+			var err error
+			rowCountDetails, err = r.detailsWithInitialRowCount(ctx, txn, details)
+			if err != nil {
+				return err
+			}
+			return nil
+		}, isql.WithPriority(admissionpb.BulkNormalPri)); err != nil {
+			return err
+		}
+		// The table is offline at this point, the row count won't change even if
+		// we use a separate txn (by passing nil) to update it.
+		if err := updateDetails(nil /* txn */, rowCountDetails); err != nil {
+			return err
+		}
+
+		// Re-initialize details after the row count update.
+		details = r.job.Details().(jobspb.ImportDetails)
 		besteffort.Warning(ctx, "import-event", func(ctx context.Context) error {
 			return emitImportJobEvent(ctx, p, jobs.StateRunning, r.job)
 		})
 	}
 
-	// Note that this getTable call has to be separate from the one we did for
-	// multi-region telemetry above since we've just updated the details after
-	// the prepare step.
 	table, err := getTable(details)
 	if err != nil {
 		return err
@@ -248,34 +340,41 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		// will write.
 		details.Walltime = p.ExecCfg().Clock.Now().WallTime
 
-		// Check if the table being imported into is starting empty, in which case
-		// we can cheaply clear-range instead of revert-range to cleanup (or if the
-		// cluster has finalized to 22.1, use DeleteRange without predicate
-		// filtering).
-		tblDesc := tabledesc.NewBuilder(table.Desc).BuildImmutableTable()
-		tblSpan := tblDesc.TableSpan(p.ExecCfg().Codec)
-		res, err := p.ExecCfg().DB.Scan(ctx, tblSpan.Key, tblSpan.EndKey, 1 /* maxRows */)
-		if err != nil {
-			return errors.Wrap(err, "checking if existing table is empty")
-		}
-		details.Table.WasEmpty = len(res) == 0
-		details.Tables[0].WasEmpty = len(res) == 0
-
 		// Update the descriptor in the job record and in the database
 		details.Table.Desc.ImportStartWallTime = details.Walltime
 		details.Tables[0].Desc.ImportStartWallTime = details.Walltime
 
-		if err := bindTableDescImportProperties(ctx, p, tblDesc.GetID(), details.Walltime); err != nil {
-			return err
-		}
-
-		if err := r.job.NoTxn().SetDetails(ctx, details); err != nil {
+		// Write the import start walltime to both the table descriptor and the job
+		// record atomically. If these writes are not atomic, a pause between them
+		// can leave the descriptor with ImportStartWallTime set while the job record
+		// still has Walltime == 0. On resume, InitializeImport would then fire an
+		// assertion because ImportStartWallTime is already non-zero.
+		if err := sql.DescsTxn(ctx, p.ExecCfg(), func(
+			ctx context.Context, txn isql.Txn, descsCol *descs.Collection,
+		) error {
+			mutableDesc, err := descsCol.MutableByID(txn.KV()).Table(ctx, table.Desc.ID)
+			if err != nil {
+				return err
+			}
+			if err := mutableDesc.InitializeImport(details.Walltime); err != nil {
+				return err
+			}
+			if err := descsCol.WriteDesc(
+				ctx, false /* kvTrace */, mutableDesc, txn.KV(),
+			); err != nil {
+				return err
+			}
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			return r.job.DeprecatedWithTxn(txn).SetDetails(ctx, details)
+		}); err != nil {
 			return err
 		}
 	}
 
 	procsPerNode := int(processorsPerNode.Get(&p.ExecCfg().Settings.SV))
 	initialSplitsPerProc := int(initialSplitsPerProcessor.Get(&p.ExecCfg().Settings.SV))
+
+	pkID := kvpb.BulkOpSummaryID(uint64(table.Desc.ID), uint64(table.Desc.PrimaryIndex.ID))
 
 	res, err := ingestWithRetry(
 		ctx, p, r.job, importTable, typeDescs, files, format, details.Walltime,
@@ -285,7 +384,14 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		return err
 	}
 
-	pkID := kvpb.BulkOpSummaryID(uint64(table.Desc.ID), uint64(table.Desc.PrimaryIndex.ID))
+	// Reload the job to pick up progress updates that may have been
+	// written to a reloaded job pointer during ingestWithRetry retries.
+	reloadedJob, err := p.ExecCfg().JobRegistry.LoadClaimedJob(ctx, r.job.ID())
+	if err != nil {
+		return err
+	}
+	r.job = reloadedJob
+
 	r.res.DataSize = res.DataSize
 	for id, count := range res.EntryCounts {
 		if id == pkID {
@@ -323,8 +429,7 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		return err
 	}
 
-	validationMode := importRowCountValidation.Get(&p.ExecCfg().Settings.SV)
-	switch validationMode {
+	switch validationMode := importRowCountValidation.Get(&p.ExecCfg().Settings.SV); validationMode {
 	case ImportRowCountValidationOff:
 	// No validation required.
 	case ImportRowCountValidationAsync, ImportRowCountValidationSync:
@@ -334,28 +439,58 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		}
 
 		var checks []*jobspb.InspectDetails_Check
-		var tableName string
+		var dbName, schemaName, tableName string
+		var expectedRowCount uint64
 		if err := p.ExecCfg().InternalDB.DescsTxn(ctx, func(
 			ctx context.Context, txn descs.Txn,
 		) error {
 			// INSPECT requires the latest descriptor. The one cached in the job is
 			// out of date as it has an old table version.
-			tblDesc, err := txn.Descriptors().ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, table.Desc.ID)
+			descriptors := txn.Descriptors().ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get()
+			tblDesc, err := descriptors.Table(ctx, table.Desc.ID)
 			if err != nil {
 				return err
 			}
 			tableName = tblDesc.GetName()
-			expectedRowCount := uint64(r.res.Rows)
-			checks, err = inspect.ChecksForTable(ctx, nil /* p */, tblDesc, &expectedRowCount)
+			dbDesc, err := descriptors.Database(ctx, tblDesc.GetParentID())
+			if err != nil {
+				return err
+			}
+			dbName = dbDesc.GetName()
+			scDesc, err := descriptors.Schema(ctx, tblDesc.GetParentSchemaID())
+			if err != nil {
+				return err
+			}
+			schemaName = scDesc.GetName()
+
+			if creationVersion := r.job.Payload().CreationClusterVersion; !details.Table.WasEmpty && creationVersion.Less(clusterversion.V26_2.Version()) {
+				log.Eventf(ctx, "skipping row count on table %q: the table was not empty and the job was started in an unsupported version", tableName)
+
+				checks, err = inspect.ChecksForTable(ctx, p.ExecCfg(), tblDesc, nil /* expectedRowCount */)
+				return err
+			}
+
+			prog := r.job.Progress()
+			var totalImportedRows int64
+			if importProgress := prog.GetImport(); importProgress != nil {
+				totalImportedRows = importProgress.Summary.EntryCounts[pkID]
+			}
+			expectedRowCount = uint64(totalImportedRows + int64(table.InitialRowCount) + r.testingKnobs.expectedRowCountOffset)
+			checks, err = inspect.ChecksForTable(ctx, p.ExecCfg(), tblDesc, &expectedRowCount)
 			return err
 		}); err != nil {
 			return err
 		}
 
 		if len(checks) > 0 {
-			job, err := inspect.TriggerJob(
+			tn := tree.MakeTableNameWithSchema(
+				tree.Name(dbName),
+				tree.Name(schemaName),
+				tree.Name(tableName),
+			)
+			inspectJob, err := inspect.TriggerJob(
 				ctx,
-				fmt.Sprintf("import-validation-%s", tableName),
+				fmt.Sprintf("Validating IMPORT of %s (IMPORT job %d)", tn.FQString(), r.job.ID()),
 				p.ExecCfg(),
 				checks,
 				setPublicTimestamp,
@@ -363,14 +498,109 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			if err != nil {
 				return errors.Wrapf(err, "failed to trigger inspect for import validation for table %s", tableName)
 			}
-			log.Eventf(ctx, "triggered inspect job %d for import validation for table %s with AOST %s", job.ID(), tableName, setPublicTimestamp)
+			r.inspectJobID = inspectJob.ID()
+			log.Eventf(ctx, "triggered inspect job %d for import validation for table %s with AOST %s", inspectJob.ID(), tableName, setPublicTimestamp)
 
-			// For sync mode, wait for the inspect job to complete.
-			if validationMode == ImportRowCountValidationSync {
-				if err := p.ExecCfg().JobRegistry.WaitForJobs(ctx, []jobspb.JobID{job.ID()}); err != nil {
-					return errors.Wrapf(err, "failed to wait for inspect job %d for table %s", job.ID(), tableName)
+			switch validationMode {
+			case ImportRowCountValidationSync:
+				// validateInspectRowCount runs a separate row count for
+				// debugging the importer's use of inspect.
+				validateInspectRowCount := func() (err error) {
+					if err := p.ExecCfg().JobRegistry.WaitForJobsIgnoringJobErrors(ctx, []jobspb.JobID{inspectJob.ID()}); err != nil {
+						return errors.Wrapf(err, "failed to wait for inspect job %d for table %s", inspectJob.ID(), tableName)
+					}
+
+					completedJob, err := p.ExecCfg().JobRegistry.LoadJob(ctx, inspectJob.ID())
+					if err != nil {
+						return errors.Wrapf(err, "failed to load inspect job %d for table %s", inspectJob.ID(), tableName)
+					}
+
+					var inspectRowCount uint64
+					completedProgress := completedJob.Progress()
+					if inspectProgress := completedProgress.GetInspect(); inspectProgress != nil {
+						inspectRowCount = inspectProgress.RowCount
+					}
+
+					payload := completedJob.Payload()
+					if payload.FinalResumeError != nil {
+						decodedErr := errors.DecodeError(ctx, *payload.FinalResumeError)
+
+						if jobs.HasErrJobCanceled(decodedErr) {
+							return nil
+						}
+
+						log.Eventf(ctx,
+							"inspect job %d found issues for table %s (inspectRowCount=%d, expectedRowCount=%d)",
+							inspectJob.ID(), tableName, inspectRowCount, expectedRowCount,
+						)
+
+						// rowCountTable runs a count(*) to independently
+						// validate the inspect row count.
+						rowCountTable := func() error {
+							query := fmt.Sprintf(
+								`SELECT count(*) FROM [%d AS t] AS OF SYSTEM TIME '%s'`,
+								table.Desc.ID, setPublicTimestamp.AsOfSystemTime(),
+							)
+							row, err := p.ExecCfg().InternalDB.Executor().QueryRowEx(
+								ctx, "import-count-validation", nil, /* txn */
+								sessiondata.InternalExecutorOverride{
+									User: username.NodeUserName(),
+								},
+								query,
+							)
+							if err != nil {
+								return err
+							}
+							if row == nil {
+								return errors.AssertionFailedf("row count query returned no rows")
+							}
+							if len(row) != 1 {
+								return errors.AssertionFailedf("row count query returned unexpected column count: %d", len(row))
+							}
+							actualCount := uint64(tree.MustBeDInt(row[0]))
+
+							prog := r.job.Progress()
+							var totalImportedRows int64
+							if importProgress := prog.GetImport(); importProgress != nil {
+								totalImportedRows = importProgress.Summary.EntryCounts[pkID]
+							}
+
+							log.Ops.Infof(ctx,
+								"import row count validation for table %s (id=%d): count(*)=%d, inspectRowCount=%d, expected=%d (imported=%d + initial=%d)",
+								tableName, table.Desc.ID, actualCount, inspectRowCount, expectedRowCount,
+								totalImportedRows, table.InitialRowCount,
+							)
+
+							if actualCount != expectedRowCount {
+								return errors.Errorf("import row count validation failed for table %s (id=%d): count(*)=%d, expected=%d", tableName, table.Desc.ID, actualCount, expectedRowCount)
+							}
+
+							return nil
+						}
+						rowCountTableErr := rowCountTable()
+
+						inspectErr := errors.Wrapf(decodedErr,
+							"inspect job %d found issues for table %s", inspectJob.ID(), tableName)
+
+						return errors.WithHintf(
+							errors.CombineErrors(rowCountTableErr, inspectErr),
+							"Run 'SHOW INSPECT ERRORS FOR JOB %d WITH DETAILS' for more information.",
+							inspectJob.ID())
+					}
+
+					return nil
 				}
-				log.Eventf(ctx, "inspect job %d completed for table %s", job.ID(), tableName)
+				if err := validateInspectRowCount(); err != nil {
+					return err
+				}
+
+				// The broader second wait captures errors from the job
+				// cancellation or pause.
+				if err := p.ExecCfg().JobRegistry.WaitForJobs(ctx, []jobspb.JobID{inspectJob.ID()}); err != nil {
+					return errors.Wrapf(err, "failed to wait for inspect job %d for table %s", inspectJob.ID(), tableName)
+				}
+
+				log.Eventf(ctx, "inspect job %d completed for table %s", inspectJob.ID(), tableName)
 			}
 		}
 	}
@@ -403,6 +633,63 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	r.cleanupTempStorage(ctx, p.ExecCfg())
 
 	return nil
+}
+
+// detailsWithInitialRowCount checks if the table being imported into is empty
+// and return an updated details with the initial row count.
+func (r *importResumer) detailsWithInitialRowCount(
+	ctx context.Context, txn descs.Txn, details jobspb.ImportDetails,
+) (jobspb.ImportDetails, error) {
+	rowCountDetails := details
+
+	// Create an untracked copy for synthetic use.
+	mut, err := txn.Descriptors().MutableByID(txn.KV()).Table(ctx, details.Table.Desc.ID)
+	if err != nil {
+		return jobspb.ImportDetails{}, err
+	}
+	synthMut := tabledesc.NewBuilder(mut.TableDesc()).BuildExistingMutableTable()
+	synthMut.SetPublic()
+
+	query := fmt.Sprintf(`
+SELECT
+  count(*) AS row_count
+FROM [%d AS t]`,
+		mut.GetID(),
+	)
+
+	rowCount := uint64(0)
+	if err := txn.WithSyntheticDescriptors([]catalog.Descriptor{synthMut}, func() error {
+		row, err := txn.QueryRowEx(
+			ctx,
+			"import-initial-row-count",
+			txn.KV(),
+			sessiondata.InternalExecutorOverride{
+				User: username.NodeUserName(),
+			},
+			query,
+		)
+		if err != nil {
+			return errors.Wrap(err, "counting rows via synthetic descriptor")
+		}
+		if row == nil {
+			return errors.AssertionFailedf("row count query returned no rows")
+		}
+		if len(row) != 1 {
+			return errors.AssertionFailedf("row count query returned unexpected column count: %d", len(row))
+		}
+		rowCount = uint64(tree.MustBeDInt(row[0]))
+
+		return nil
+	}); err != nil {
+		return jobspb.ImportDetails{}, err
+	}
+
+	rowCountDetails.Table.WasEmpty = rowCount == 0
+	rowCountDetails.Tables[0].WasEmpty = rowCount == 0
+	rowCountDetails.Table.InitialRowCount = rowCount
+	rowCountDetails.Tables[0].InitialRowCount = rowCount
+
+	return rowCountDetails, nil
 }
 
 // prepareTableForIngestion prepare the table descriptor for the ingestion
@@ -452,10 +739,12 @@ func (r *importResumer) prepareTableForIngestion(
 	}
 
 	importDetails.Table = jobspb.ImportDetails_Table{
-		Desc:       importing.TableDesc(),
-		Name:       table.Name,
-		SeqVal:     table.SeqVal,
-		TargetCols: table.TargetCols,
+		Desc:            importing.TableDesc(),
+		Name:            table.Name,
+		SeqVal:          table.SeqVal,
+		WasEmpty:        table.WasEmpty,
+		InitialRowCount: table.InitialRowCount,
+		TargetCols:      table.TargetCols,
 	}
 	importDetails.Tables = []jobspb.ImportDetails_Table{importDetails.Table}
 
@@ -465,33 +754,6 @@ func (r *importResumer) prepareTableForIngestion(
 	// choosing our Walltime.
 	importDetails.Walltime = 0
 	return importDetails, nil
-}
-
-// bindTableDescImportProperties updates the table descriptor at the start of an
-// import for a table that existed before the import.
-func bindTableDescImportProperties(
-	ctx context.Context, p sql.JobExecContext, id catid.DescID, startWallTime int64,
-) error {
-	if err := sql.DescsTxn(ctx, p.ExecCfg(), func(
-		ctx context.Context, txn isql.Txn, descsCol *descs.Collection,
-	) error {
-		mutableDesc, err := descsCol.MutableByID(txn.KV()).Table(ctx, id)
-		if err != nil {
-			return err
-		}
-		if err := mutableDesc.InitializeImport(startWallTime); err != nil {
-			return err
-		}
-		if err := descsCol.WriteDesc(
-			ctx, false /* kvTrace */, mutableDesc, txn.KV(),
-		); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return nil
 }
 
 // publishTable updates the status of the imported table from OFFLINE to PUBLIC.
@@ -559,7 +821,8 @@ func (r *importResumer) publishTable(
 
 		// Update job record to mark table published state as complete.
 		details.TablePublished = true
-		err = r.job.WithTxn(txn).SetDetails(ctx, details)
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		err = r.job.DeprecatedWithTxn(txn).SetDetails(ctx, details)
 		if err != nil {
 			return errors.Wrap(err, "updating job details after publishing the table")
 		}
@@ -600,7 +863,8 @@ func (r *importResumer) checkVirtualConstraints(
 
 	if sql.HasVirtualUniqueConstraints(desc) {
 		status := jobs.StatusMessage(fmt.Sprintf("re-validating %s", desc.GetName()))
-		if err := job.NoTxn().UpdateStatusMessage(ctx, status); err != nil {
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		if err := job.DeprecatedNoTxn().UpdateStatusMessage(ctx, status); err != nil {
 			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(job.ID()))
 		}
 	}
@@ -750,7 +1014,8 @@ func ingestWithRetry(
 	var res kvpb.BulkOpSummary
 	var err error
 	// State to decide when to exit the retry loop.
-	lastProgressChange, lastProgress := timeutil.Now(), getFractionCompleted(job)
+	var lastProgressChange time.Time
+	lastProgress := getFractionCompleted(job)
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
 			res, err = distImport(
@@ -761,6 +1026,9 @@ func ingestWithRetry(
 			if err == nil || !errors.Is(err, sql.ErrPlanChanged) {
 				break
 			}
+		}
+		if err == nil && testingKnobs.afterDistImport != nil {
+			err = testingKnobs.afterDistImport()
 		}
 		if err == nil {
 			break
@@ -804,7 +1072,10 @@ func ingestWithRetry(
 		}
 
 		maxRetryDuration := retryDuration.Get(&execCtx.ExecCfg().Settings.SV)
-		if timeutil.Since(lastProgressChange) > maxRetryDuration {
+		if lastProgressChange.IsZero() {
+			lastProgressChange = timeutil.Now()
+			log.Dev.Warningf(ctx, "encountered retryable error, starting retry duration timer: %+v", err)
+		} else if timeutil.Since(lastProgressChange) > maxRetryDuration {
 			log.Dev.Warningf(ctx, "encountered retryable error but exceeded retry duration, stopping: %+v", err)
 			break
 		} else {
@@ -930,6 +1201,16 @@ func (r *importResumer) cleanupTempStorage(ctx context.Context, execCfg *sql.Exe
 	if !details.UseDistributedMerge {
 		return
 	}
+
+	// Clean up SST manifest job info keys.
+	besteffort.Warning(ctx, "import-manifest-cleanup", func(ctx context.Context) error {
+		return execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			return jobs.InfoStorageForJob(txn, r.job.ID()).DeleteRange(
+				ctx, importSSTManifestsInfoKey, importSSTManifestsInfoKey+"~", 0,
+			)
+		})
+	})
+
 	progress := r.job.Progress()
 	importProgress := progress.GetImport()
 	if importProgress == nil {
@@ -979,8 +1260,9 @@ func truncateTable(ctx context.Context, execCfg *sql.ExecutorConfig, id catid.De
 		return err
 	}
 
+	unsafeAlways := sessiondatapb.UseNewSchemaChangerUnsafeAlways
 	override := sessiondata.NodeUserSessionDataOverride
-	override.MultiOverride = "use_declarative_schema_changer=unsafe_always"
+	override.NewSchemaChangerMode = &unsafeAlways
 	_, err = execCfg.InternalDB.Executor().ExecParsed(
 		ctx,
 		redact.RedactableString("import-truncate-table"),
@@ -1038,8 +1320,9 @@ func (r *importResumer) markOnline(
 			return errors.Wrap(err, "bringing IMPORT INTO table back online")
 		}
 
-		err = r.job.WithTxn(txn).Update(ctx, func(
-			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		err = r.job.DeprecatedWithTxn(txn).Update(ctx, func(
+			txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater,
 		) error {
 			// Mark the table as published to avoid running cleanup again.
 			details := md.Payload.GetImport()
@@ -1057,6 +1340,10 @@ func (r *importResumer) markOnline(
 
 // ReportResults implements JobResultsReporter interface.
 func (r *importResumer) ReportResults(ctx context.Context, resultsCh chan<- tree.Datums) error {
+	var inspectJobIDDatum tree.Datum = tree.DNull
+	if r.inspectJobID != 0 {
+		inspectJobIDDatum = tree.NewDInt(tree.DInt(r.inspectJobID))
+	}
 	select {
 	case resultsCh <- tree.Datums{
 		tree.NewDInt(tree.DInt(r.job.ID())),
@@ -1065,6 +1352,7 @@ func (r *importResumer) ReportResults(ctx context.Context, resultsCh chan<- tree
 		tree.NewDInt(tree.DInt(r.res.Rows)),
 		tree.NewDInt(tree.DInt(r.res.IndexEntries)),
 		tree.NewDInt(tree.DInt(r.res.DataSize)),
+		inspectJobIDDatum,
 	}:
 		return nil
 	case <-ctx.Done():

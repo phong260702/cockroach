@@ -58,7 +58,9 @@ type mmaState interface {
 	// MMARebalanceAdvisor for the given existing store and candidates. The
 	// advisor should be later passed to IsInConflictWithMMA to determine if a
 	// given candidate is in conflict with the existing store.
-	BuildMMARebalanceAdvisor(existing roachpb.StoreID, cands []roachpb.StoreID) *mmaprototype.MMARebalanceAdvisor
+	BuildMMARebalanceAdvisor(
+		ctx context.Context, existing roachpb.StoreID, cands []roachpb.StoreID,
+	) *mmaprototype.MMARebalanceAdvisor
 	// IsInConflictWithMMA is called by the allocator sync to determine if the
 	// given candidate is in conflict with the existing store.
 	IsInConflictWithMMA(ctx context.Context, cand roachpb.StoreID, advisor *mmaprototype.MMARebalanceAdvisor, cpuOnly bool) bool
@@ -107,20 +109,18 @@ func NewAllocatorSync(
 	return as
 }
 
-// mmaRangeLoad converts range load usage to mma range load.
-//
-// TODO(wenyihu6): This is bit redundant to mmaRangeLoad in kvserver. See if we
-// can refactor to use the same helper function.
-func mmaRangeLoad(rangeUsageInfo allocator.RangeUsageInfo) mmaprototype.RangeLoad {
-	var rl mmaprototype.RangeLoad
-	rl.Load[mmaprototype.CPURate] = mmaprototype.LoadValue(
-		rangeUsageInfo.RequestCPUNanosPerSecond + rangeUsageInfo.RaftCPUNanosPerSecond)
-	rl.RaftCPU = mmaprototype.LoadValue(rangeUsageInfo.RaftCPUNanosPerSecond)
-	rl.Load[mmaprototype.WriteBandwidth] = mmaprototype.LoadValue(rangeUsageInfo.WriteBytesPerSecond)
-	// Note that LogicalBytes is already populated as enginepb.MVCCStats.Total()
-	// in repl.RangeUsageInfo().
-	rl.Load[mmaprototype.ByteSize] = mmaprototype.LoadValue(rangeUsageInfo.LogicalBytes)
-	return rl
+// mmaRangeLoad constructs a RangeLoad from replica load stats and MVCC stats,
+// converting logical loads to physical units via the given amplification factors.
+func mmaRangeLoad(
+	rangeUsageInfo allocator.RangeUsageInfo, amp mmaprototype.AmpVector,
+) mmaprototype.RangeLoad {
+	return MakePhysicalRangeLoad(
+		rangeUsageInfo.RequestCPUNanosPerSecond,
+		rangeUsageInfo.RaftCPUNanosPerSecond,
+		rangeUsageInfo.WriteBytesPerSecond,
+		rangeUsageInfo.LogicalBytes,
+		amp,
+	)
 }
 
 // addTrackedChange adds a tracked change to the allocator sync.
@@ -155,12 +155,13 @@ func (as *AllocatorSync) NonMMAPreTransferLease(
 	localStoreID roachpb.StoreID,
 	desc *roachpb.RangeDescriptor,
 	usage allocator.RangeUsageInfo,
+	amp mmaprototype.AmpVector,
 	transferFrom, transferTo roachpb.ReplicationTarget,
 ) SyncChangeID {
 	var isMMARegistered bool
 	var mmaChange mmaprototype.ExternalRangeChange
-	if kvserverbase.LoadBasedRebalancingModeIsMMA(&as.st.SV) {
-		change := convertLeaseTransferToMMA(desc, usage, transferFrom, transferTo)
+	if kvserverbase.LoadBasedRebalancingModeIsMMA(ctx, as.st) {
+		change := convertLeaseTransferToMMA(desc, usage, amp, transferFrom, transferTo)
 		mmaChange, isMMARegistered = as.mmaAllocator.RegisterExternalChange(ctx, localStoreID, change)
 	}
 	trackedChange := trackedAllocatorChange{
@@ -185,14 +186,15 @@ func (as *AllocatorSync) NonMMAPreChangeReplicas(
 	localStoreID roachpb.StoreID,
 	desc *roachpb.RangeDescriptor,
 	usage allocator.RangeUsageInfo,
+	amp mmaprototype.AmpVector,
 	changes kvpb.ReplicationChanges,
 	leaseholderStoreID roachpb.StoreID,
 ) SyncChangeID {
 	var isMMARegistered bool
 	var mmaChange mmaprototype.ExternalRangeChange
-	if kvserverbase.LoadBasedRebalancingModeIsMMA(&as.st.SV) {
+	if kvserverbase.LoadBasedRebalancingModeIsMMA(ctx, as.st) {
 		var err error
-		change, err := convertReplicaChangeToMMA(desc, usage, changes, leaseholderStoreID)
+		change, err := convertReplicaChangeToMMA(desc, usage, amp, changes, leaseholderStoreID)
 		if err != nil {
 			log.KvDistribution.Errorf(ctx, "failed to convert replica change to mma: %v", err)
 		} else {

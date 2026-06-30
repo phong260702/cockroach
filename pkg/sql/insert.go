@@ -168,7 +168,7 @@ func (r *insertRun) init(params runParams, columns colinfo.ResultColumns) {
 		return
 	}
 	r.rows = rowcontainer.NewRowContainer(
-		params.p.Mon().MakeBoundAccount(),
+		params.p.ExecMon().MakeBoundAccount(),
 		colinfo.ColTypeInfoFromResCols(columns),
 	)
 
@@ -393,4 +393,8 @@ func (n *insertNode) returnsRowsAffected() bool {
 
 func (n *insertNode) kvCPUTime() int64 {
 	return n.run.ti.kvCPUTime
+}
+
+func (n *insertNode) localKVCPUTime() int64 {
+	return n.run.ti.localKVCPUTime
 }

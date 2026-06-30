@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
@@ -34,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
@@ -68,10 +72,11 @@ func TestMaybeRefreshStats(t *testing.T) {
 	internalDB := s.InternalDB().(descs.DB)
 	descA := desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "t", "a")
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
@@ -84,7 +89,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// There are no stats yet, so this must refresh the full statistics on table t
 	// even though rowsAffected=0.
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
+		ctx, descA.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -98,7 +103,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// Try to refresh again. With rowsAffected=0, the probability of a refresh
 	// is 0, so refreshing will not succeed.
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
+		ctx, descA.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -110,7 +115,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	minStaleRows := int64(100000000)
 	explicitSettings := catpb.AutoStatsSettings{MinStaleRows: &minStaleRows}
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), &explicitSettings, 10, /* rowsAffected */
+		ctx, descA.GetID(), &explicitSettings, 10, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expectedFull */, 1 /* expectedPartial */); err != nil {
@@ -120,7 +125,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// Do the same for partialMinStaleRows to also prevent a partial refresh.
 	explicitSettings.PartialMinStaleRows = &minStaleRows
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), &explicitSettings, 10, /* rowsAffected */
+		ctx, descA.GetID(), &explicitSettings, 10, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expectedFull */, 1 /* expectedPartial */); err != nil {
@@ -133,7 +138,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	fractionStaleRows := float64(100000000)
 	explicitSettings = catpb.AutoStatsSettings{FractionStaleRows: &fractionStaleRows}
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), &explicitSettings, 10, /* rowsAffected */
+		ctx, descA.GetID(), &explicitSettings, 10, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expectedFull */, 2 /* expectedPartial */); err != nil {
@@ -143,7 +148,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// Do the same for partialFractionStaleRows to also prevent a partial refresh.
 	explicitSettings.PartialFractionStaleRows = &fractionStaleRows
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), &explicitSettings, 10, /* rowsAffected */
+		ctx, descA.GetID(), &explicitSettings, 10, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expectedFull */, 2 /* expectedPartial */); err != nil {
@@ -155,7 +160,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// Partial stats should not be refreshed since full stats are being refreshed,
 	// and stale partial stats should be cleared.
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descA.GetID(), nil /* explicitSettings */, 10, /* rowsAffected */
+		ctx, descA.GetID(), nil /* explicitSettings */, 10, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 2 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -167,7 +172,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	descRoleOptions :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "system", "role_options")
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descRoleOptions.GetID(), nil /* explicitSettings */, 10000, /* rowsAffected */
+		ctx, descRoleOptions.GetID(), nil /* explicitSettings */, 10000, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descRoleOptions, 5 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -178,7 +183,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	descLease :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "system", "lease")
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descLease.GetID(), nil /* explicitSettings */, 10000, /* rowsAffected */
+		ctx, descLease.GetID(), nil /* explicitSettings */, 10000, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descLease, 0 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -189,7 +194,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	descTableStats :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "system", "table_statistics")
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descTableStats.GetID(), nil /* explicitSettings */, 10000, /* rowsAffected */
+		ctx, descTableStats.GetID(), nil /* explicitSettings */, 10000, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, descTableStats, 0 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -201,7 +206,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// TODO(rytaft): Should not enqueue views to begin with.
 	descVW := desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "t", "vw")
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), descVW.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
+		ctx, descVW.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	select {
@@ -230,10 +235,11 @@ func TestEnsureAllTablesQueries(t *testing.T) {
 
 	internalDB := s.InternalDB().(descs.DB)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	r := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
@@ -332,10 +338,11 @@ func BenchmarkEnsureAllTables(b *testing.B) {
 
 			internalDB := s.InternalDB().(descs.DB)
 			cache := NewTableStatisticsCache(
-				10, /* cacheSize */
+				ctx,
 				s.ClusterSettings(),
 				s.InternalDB().(descs.DB),
 				s.AppStopper(),
+				nil, /* parentMon */
 			)
 			require.NoError(b, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 			r := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
@@ -406,10 +413,11 @@ func TestAverageRefreshTime(t *testing.T) {
 	internalDB := s.InternalDB().(descs.DB)
 	table := desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "t", "a")
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
@@ -421,7 +429,7 @@ func TestAverageRefreshTime(t *testing.T) {
 
 	checkAverageRefreshTime := func(expected time.Duration) error {
 		return testutils.SucceedsSoonError(func() error {
-			stats, err := cache.GetTableStats(ctx, table, nil /* typeResolver */)
+			stats, err := cache.GetFreshTableStats(ctx, table, nil /* typeResolver */)
 			if err != nil {
 				return err
 			}
@@ -437,7 +445,7 @@ func TestAverageRefreshTime(t *testing.T) {
 	// expectedAge time ago if lessThan is true (false).
 	checkMostRecentStat := func(expectedAge time.Duration, lessThan bool) error {
 		return testutils.SucceedsSoonError(func() error {
-			stats, err := cache.GetTableStats(ctx, table, nil /* typeResolver */)
+			stats, err := cache.GetFreshTableStats(ctx, table, nil /* typeResolver */)
 			if err != nil {
 				return err
 			}
@@ -570,7 +578,7 @@ func TestAverageRefreshTime(t *testing.T) {
 	// the statistics on table t. With rowsAffected=0, the probability of refresh
 	// is 0.
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), table.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
+		ctx, table.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, table, 20 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -621,7 +629,7 @@ func TestAverageRefreshTime(t *testing.T) {
 	// remain (5 from column k and 5 from column v), since the old stats on k
 	// and v were deleted.
 	refresher.maybeRefreshStats(
-		ctx, s.AppStopper(), table.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
+		ctx, table.GetID(), nil /* explicitSettings */, 0, /* rowsAffected */
 		time.Microsecond /* asOf */, true /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 	if err := checkStatsCount(ctx, cache, table, 10 /* expectedFull */, 0 /* expectedPartial */); err != nil {
@@ -656,10 +664,11 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 
 	internalDB := s.InternalDB().(descs.DB)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
@@ -712,10 +721,11 @@ func TestAutoStatsOnStartupClusterSettingOff(t *testing.T) {
 
 	internalDB := s.InternalDB().(descs.DB)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
@@ -760,17 +770,18 @@ func TestNoRetryOnFailure(t *testing.T) {
 
 	internalDB := s.InternalDB().(descs.DB)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	r := MakeRefresher(s.AmbientCtx(), st, internalDB, cache, time.Microsecond /* asOfTime */, nil /* knobs */, false /* readOnlyTenant */)
 
 	// Try to refresh stats on a table that doesn't exist.
 	r.maybeRefreshStats(
-		ctx, s.AppStopper(), 100 /* tableID */, nil /* explicitSettings */, math.MaxInt32,
+		ctx, 100 /* tableID */, nil /* explicitSettings */, math.MaxInt32,
 		time.Microsecond /* asOfTime */, false /* partialStatsEnabled */, true, /* fullStatsEnabled */
 	)
 
@@ -792,8 +803,8 @@ func TestMutationsAndSettingOverrideChannels(t *testing.T) {
 	AutomaticStatisticsClusterMode.Override(ctx, &st.SV, true)
 	r := Refresher{
 		st:        st,
-		mutations: make(chan mutation, refreshChanBufferLen),
-		settings:  make(chan settingOverride, refreshChanBufferLen),
+		mutations: make(chan mutation, mutationsChanBufferLen),
+		settings:  make(chan settingOverride, settingsChanBufferLen),
 	}
 
 	tbl := descpb.TableDescriptor{ID: 53, ParentID: 52, Name: "foo"}
@@ -801,11 +812,11 @@ func TestMutationsAndSettingOverrideChannels(t *testing.T) {
 
 	// Test that the mutations channel doesn't block even when we add 10 more
 	// items than can fit in the buffer.
-	for i := 0; i < refreshChanBufferLen+10; i++ {
+	for i := 0; i < mutationsChanBufferLen+10; i++ {
 		r.NotifyMutation(ctx, tableDesc, 5 /* rowsAffected */)
 	}
 
-	if expected, actual := refreshChanBufferLen, len(r.mutations); expected != actual {
+	if expected, actual := mutationsChanBufferLen, len(r.mutations); expected != actual {
 		t.Fatalf("expected channel size %d but found %d", expected, actual)
 	}
 
@@ -815,13 +826,13 @@ func TestMutationsAndSettingOverrideChannels(t *testing.T) {
 	tableDesc.TableDesc().AutoStatsSettings = autoStatsSettings
 	minStaleRows := int64(1)
 	autoStatsSettings.MinStaleRows = &minStaleRows
-	for i := 0; i < refreshChanBufferLen+10; i++ {
+	for i := 0; i < settingsChanBufferLen+10; i++ {
 		int64CurrIteration := int64(i)
 		autoStatsSettings.MinStaleRows = &int64CurrIteration
 		r.NotifyMutation(ctx, tableDesc, 5 /* rowsAffected */)
 	}
 
-	if expected, actual := refreshChanBufferLen, len(r.settings); expected != actual {
+	if expected, actual := settingsChanBufferLen, len(r.settings); expected != actual {
 		t.Fatalf("expected channel size %d but found %d", expected, actual)
 	}
 }
@@ -878,10 +889,11 @@ func TestAnalyzeSystemTables(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	executor := s.InternalExecutor().(isql.Executor)
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 
@@ -927,7 +939,7 @@ func checkStatsCount(
 	return testutils.SucceedsSoonError(func() error {
 		cache.InvalidateTableStats(ctx, table.GetID())
 
-		stats, err := cache.GetTableStats(ctx, table, nil /* typeResolver */)
+		stats, err := cache.GetFreshTableStats(ctx, table, nil /* typeResolver */)
 		if err != nil {
 			return err
 		}
@@ -960,7 +972,7 @@ func compareStatsCountWithZero(
 	desc :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), "system", tableName)
 	return testutils.SucceedsSoonError(func() error {
-		stats, err := cache.GetTableStats(ctx, desc, nil /* typeResolver */)
+		stats, err := cache.GetFreshTableStats(ctx, desc, nil /* typeResolver */)
 		if err != nil {
 			return err
 		}
@@ -999,10 +1011,11 @@ func TestAutoStatsDisabledReadOnlyTenant(t *testing.T) {
 	internalDB := s.InternalDB().(descs.DB)
 	descA := desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "t", "a")
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, internalDB, cache,
@@ -1075,10 +1088,11 @@ func TestEstimateStaleness(t *testing.T) {
 	internalDB := s.InternalDB().(descs.DB)
 	table := desctestutils.TestingGetPublicTableDescriptor(s.DB(), codec, "t", "a")
 	cache := NewTableStatisticsCache(
-		10, /* cacheSize */
+		ctx,
 		s.ClusterSettings(),
 		s.InternalDB().(descs.DB),
 		s.AppStopper(),
+		nil, /* parentMon */
 	)
 	require.NoError(t, cache.Start(ctx, codec, s.RangeFeedFactory().(*rangefeed.Factory), s.SystemTableIDResolver().(catalog.SystemTableIDResolver)))
 
@@ -1093,8 +1107,7 @@ func TestEstimateStaleness(t *testing.T) {
 
 	checkEstimatedStaleness := func(expected float64) error {
 		return testutils.SucceedsSoonError(func() error {
-			actual, err := refresher.EstimateStaleness(ctx,
-				table.GetID())
+			actual, err := refresher.EstimateStaleness(ctx, table)
 			if err != nil {
 				return err
 			}
@@ -1165,7 +1178,7 @@ func TestEstimateStaleness(t *testing.T) {
 	}
 
 	// Ensure that we return an error if estimating staleness without any stats.
-	_, err := refresher.EstimateStaleness(ctx, table.GetID())
+	_, err := refresher.EstimateStaleness(ctx, table)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no full statistics available")
 
@@ -1173,7 +1186,7 @@ func TestEstimateStaleness(t *testing.T) {
 	// doesn't allow auto stats.
 	descTableStats := desctestutils.TestingGetPublicTableDescriptor(s.DB(),
 		codec, "system", "table_statistics")
-	_, err = refresher.EstimateStaleness(ctx, descTableStats.GetID())
+	_, err = refresher.EstimateStaleness(ctx, descTableStats)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "automatic stats collection is not allowed for this table")
 
@@ -1188,7 +1201,7 @@ func TestEstimateStaleness(t *testing.T) {
 	}
 
 	err = testutils.SucceedsSoonError(func() error {
-		_, err := refresher.EstimateStaleness(ctx, table.GetID())
+		_, err := refresher.EstimateStaleness(ctx, table)
 		if err == nil {
 			return fmt.Errorf("expected error but got nil")
 		}
@@ -1260,5 +1273,173 @@ func TestEstimateStaleness(t *testing.T) {
 	// 150% staleness.
 	if err = checkEstimatedStaleness(1.5); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAddMisestimate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	span := func(start, end string) roachpb.Span {
+		return roachpb.Span{Key: roachpb.Key(start), EndKey: roachpb.Key(end)}
+	}
+	spanFromPoint := func(start string, endByte byte) roachpb.Span {
+		return roachpb.Span{Key: roachpb.Key(start), EndKey: []byte{endByte, 0}}
+	}
+	id := indexInfo{tableID: descpb.ID(1), indexID: descpb.IndexID(1)}
+
+	for _, tc := range []struct {
+		name     string
+		old      roachpb.Spans
+		new      misestimate
+		expected roachpb.Spans
+	}{
+		{
+			name: "add to empty map",
+			new: misestimate{
+				Spans: roachpb.Spans{span("a", "b")},
+			},
+			expected: roachpb.Spans{span("a", "b")},
+		},
+		{
+			name: "point Gets",
+			new: misestimate{
+				Spans: roachpb.Spans{span("a", ""), span("b", "c"), span("d", "")},
+			},
+			expected: roachpb.Spans{spanFromPoint("a", 'a'), span("b", "c"), spanFromPoint("d", 'd')},
+		},
+		{
+			name: "merge adjacent spans",
+			old:  roachpb.Spans{span("b", "c"), span("e", "f")},
+			new: misestimate{
+				Spans: roachpb.Spans{span("a", "b"), span("f", "g")},
+			},
+			expected: roachpb.Spans{span("a", "c"), span("e", "g")},
+		},
+		{
+			name: "non-adjacent span",
+			old:  roachpb.Spans{span("a", "b")},
+			new: misestimate{
+				Spans: roachpb.Spans{span("d", "e")},
+			},
+			expected: roachpb.Spans{span("a", "b"), span("d", "e")},
+		},
+		{
+			name: "all spans are duplicates",
+			old:  roachpb.Spans{span("a", "b"), span("c", "d"), span("e", "f")},
+			new: misestimate{
+				Spans: roachpb.Spans{span("a", "b"), span("e", "f")},
+			},
+			expected: roachpb.Spans{span("a", "b"), span("c", "d"), span("e", "f")},
+		},
+		{
+			name: "spans and point Gets intertwined",
+			old:  roachpb.Spans{span("a", ""), span("c", "d"), span("f", "g"), span("j", "")},
+			new: misestimate{
+				Spans: roachpb.Spans{span("a", "b"), span("c", ""), span("e", "f"), span("i", "j")},
+			},
+			expected: roachpb.Spans{span("a", "b"), span("c", "d"), span("e", "g"), spanFromPoint("i", 'j')},
+		},
+		{
+			name: "multiple spans with different properties",
+			old: roachpb.Spans{
+				span("a", "b"),
+				span("d", "e"),
+				span("i", "o"),
+				span("x", "y"),
+			},
+			new: misestimate{
+				Spans: roachpb.Spans{
+					span("a", "b"), // duplicate
+					span("e", "f"), // adjacent after
+					span("h", "j"), // partial overlap
+					span("k", "l"), // fully contained
+					span("m", "n"), // fully contained
+					span("v", "z"), // fully contains existing one
+				},
+			},
+			expected: roachpb.Spans{
+				span("a", "b"),
+				span("d", "f"),
+				span("h", "o"),
+				span("v", "z"),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Swapping old and new shouldn't change the result.
+			for _, swapped := range []bool{false, true} {
+				old, new := tc.old, tc.new.Spans
+				if swapped {
+					old, new = new, old
+				}
+				t.Run(fmt.Sprintf("swapped=%t", swapped), func(t *testing.T) {
+					r := &Refresher{misestimateSpans: make(map[indexInfo]roachpb.Spans)}
+					if old != nil {
+						r.addMisestimate(misestimate{
+							indexInfo: id,
+							Spans:     old,
+						})
+					}
+					r.addMisestimate(misestimate{
+						indexInfo: id,
+						Spans:     new,
+					})
+
+					result := r.misestimateSpans[id]
+					require.Equal(t, tc.expected, result)
+				})
+			}
+		})
+	}
+}
+
+func TestAddMisestimateRandomized(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	rng, _ := randutil.NewTestRand()
+	span := func(start, end byte) roachpb.Span {
+		return roachpb.Span{Key: roachpb.Key(string(start)), EndKey: roachpb.Key(string(end))}
+	}
+	dedupAndMerge := func(spans roachpb.Spans) roachpb.Spans {
+		sort.Sort(spans)
+		var result roachpb.Spans
+		result = append(result, spans[0])
+		for i := 1; i < len(spans); i++ {
+			prev := result[len(result)-1]
+			if prev.Contains(spans[i]) {
+				continue
+			}
+			if prev.EndKey.Compare(spans[i].Key) >= 0 {
+				result[len(result)-1].EndKey = spans[i].EndKey
+				continue
+			}
+			result = append(result, spans[i])
+		}
+		return result
+	}
+	makeSpans := func() roachpb.Spans {
+		spans := make(roachpb.Spans, rng.Intn(50)+1)
+		for i := range spans {
+			start, end := 'a'+byte(rng.Intn(26)), 'a'+byte(rng.Intn(26))
+			if start > end {
+				start, end = end, start
+			} else if start == end {
+				end = start + 1
+			}
+			spans[i] = span(start, end)
+		}
+		return dedupAndMerge(spans)
+	}
+	id := indexInfo{tableID: descpb.ID(1), indexID: descpb.IndexID(1)}
+
+	for range 100 {
+		r := &Refresher{misestimateSpans: make(map[indexInfo]roachpb.Spans)}
+		old, new := makeSpans(), makeSpans()
+		r.misestimateSpans[id] = old
+		r.addMisestimate(misestimate{
+			indexInfo: id,
+			Spans:     new,
+		})
+		require.Equal(t, dedupAndMerge(append(slices.Clone(old), new...)), r.misestimateSpans[id])
 	}
 }

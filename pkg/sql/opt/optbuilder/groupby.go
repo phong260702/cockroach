@@ -711,6 +711,17 @@ func (b *Builder) buildAggregateFunction(
 		info.args[i] = b.buildAggArg(pexpr.(tree.TypedExpr), &info, tempScope, fromScope)
 	}
 
+	// Pad st_asmvt optional args with typed NULLs so that columns for the
+	// default values are added to the scope before the projection is built.
+	if def.Name == "st_asmvt" {
+		padded := padSTAsMVTArgs(getTypedExprs(f.Exprs))
+		for j := len(f.Exprs); j < len(padded); j++ {
+			info.args = append(
+				info.args, b.buildAggArg(padded[j], &info, tempScope, fromScope),
+			)
+		}
+	}
+
 	// If we have a filter, add it to tempScope after all the arguments. We'll
 	// later extract the column that gets added here in buildAggregation.
 	if f.Filter != nil {
@@ -872,6 +883,8 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructSTExtent(args[0])
 	case "st_union", "st_memunion":
 		return b.factory.ConstructSTUnion(args[0])
+	case "st_asmvt":
+		return b.factory.ConstructSTAsMVT(args[0], args[1], args[2], args[3], args[4])
 	case "xor_agg":
 		return b.factory.ConstructXorAgg(args[0])
 	case "json_agg":
@@ -903,6 +916,24 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 
 func isAggregate(def *tree.ResolvedFunctionDefinition) bool {
 	return isClass(def, tree.AggregateClass)
+}
+
+// padSTAsMVTArgs pads the argument list for st_asmvt with typed NULL defaults
+// for any missing optional arguments, ensuring all 5 arguments are present.
+func padSTAsMVTArgs(argExprs []tree.TypedExpr) []tree.TypedExpr {
+	if len(argExprs) < 2 {
+		argExprs = append(argExprs, reType(tree.DNull, types.String)) // layerName
+	}
+	if len(argExprs) < 3 {
+		argExprs = append(argExprs, reType(tree.DNull, types.Int)) // extent
+	}
+	if len(argExprs) < 4 {
+		argExprs = append(argExprs, reType(tree.DNull, types.String)) // geomColumn
+	}
+	if len(argExprs) < 5 {
+		argExprs = append(argExprs, reType(tree.DNull, types.String)) // featureIDColumn
+	}
+	return argExprs
 }
 
 func isGenerator(def *tree.ResolvedFunctionDefinition) bool {

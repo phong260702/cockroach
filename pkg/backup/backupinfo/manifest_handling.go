@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/backup/backupencryption"
 	"github.com/cockroachdb/cockroach/pkg/backup/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/backup/backuputils"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -42,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -329,7 +329,7 @@ func readManifest(
 		if err != nil {
 			return backuppb.BackupManifest{}, 0, err
 		}
-		plaintextBytes, err := storageccl.DecryptFile(ctx, descBytes, encryptionKey, mem)
+		plaintextBytes, err := storage.DecryptFile(ctx, descBytes, encryptionKey, mem)
 		if err != nil {
 			return backuppb.BackupManifest{}, 0, err
 		}
@@ -358,7 +358,7 @@ func readManifest(
 	var backupManifest backuppb.BackupManifest
 	if err := protoutil.Unmarshal(descBytes, &backupManifest); err != nil {
 		mem.Shrink(ctx, approxMemSize)
-		if encryption == nil && storageccl.AppearsEncrypted(descBytes) {
+		if encryption == nil && storage.AppearsEncrypted(descBytes) {
 			return backuppb.BackupManifest{}, 0, errors.Wrapf(
 				err, "file appears encrypted -- try specifying one of \"%s\" or \"%s\"",
 				backupencryption.BackupOptEncPassphrase, backupencryption.BackupOptEncKMS)
@@ -418,7 +418,7 @@ func readBackupPartitionDescriptor(
 		if err != nil {
 			return backuppb.BackupPartitionDescriptor{}, err
 		}
-		plaintextData, err := storageccl.DecryptFile(ctx, descBytes, encryptionKey, memAcc)
+		plaintextData, err := storage.DecryptFile(ctx, descBytes, encryptionKey, memAcc)
 		if err != nil {
 			return backuppb.BackupPartitionDescriptor{}, err
 		}
@@ -467,7 +467,7 @@ func readTableStatistics(
 		if err != nil {
 			return nil, err
 		}
-		statsBytes, err = storageccl.DecryptFile(ctx, statsBytes, encryptionKey, mon.NewStandaloneUnlimitedAccount())
+		statsBytes, err = storage.DecryptFile(ctx, statsBytes, encryptionKey, mon.NewStandaloneUnlimitedAccount())
 		if err != nil {
 			return nil, err
 		}
@@ -643,7 +643,7 @@ func WriteBackupManifest(
 		if err != nil {
 			return err
 		}
-		descBuf, err = storageccl.EncryptFile(descBuf, encryptionKey)
+		descBuf, err = storage.EncryptFile(descBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
@@ -705,7 +705,7 @@ func WriteBackupPartitionDescriptor(
 		if err != nil {
 			return err
 		}
-		descBuf, err = storageccl.EncryptFile(descBuf, encryptionKey)
+		descBuf, err = storage.EncryptFile(descBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
@@ -736,7 +736,7 @@ func WriteTableStatistics(
 		if err != nil {
 			return err
 		}
-		statsBuf, err = storageccl.EncryptFile(statsBuf, encryptionKey)
+		statsBuf, err = storage.EncryptFile(statsBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
@@ -948,10 +948,11 @@ func UnzipBackupTreeEntries(
 	return defaultURIs, mainBackupManifests, localityInfo
 }
 
-// ValidateEndTimeAndTruncate checks that the requested target time, if
-// specified, is valid for the list of incremental backups resolved, truncating
-// the results to the backup that contains the target time.
-// The method also performs additional sanity checks to ensure the backups cover
+// ValidateEndTimeAndTruncate checks that the requested target time is valid for
+// the list of incremental backups resolved, truncating the results to the
+// backup that contains the target time. If the endTime is empty, it is assumed
+// that the endTime is the end time of the last backup in the chain. The
+// function also performs additional sanity checks to ensure the backups cover
 // the requested time.
 //
 // Note: This function assumes that the manifests in the chain are sorted by end
@@ -1525,7 +1526,7 @@ func WriteBackupManifestCheckpoint(
 		if err != nil {
 			return err
 		}
-		descBuf, err = storageccl.EncryptFile(descBuf, encryptionKey)
+		descBuf, err = storage.EncryptFile(descBuf, encryptionKey)
 		if err != nil {
 			return err
 		}
@@ -1787,7 +1788,7 @@ func (f *IterFactory) NewFileIter(
 	ctx context.Context,
 ) (bulk.Iterator[*backuppb.BackupManifest_File], error) {
 	if f.m.HasExternalManifestSSTs {
-		storeFile := storageccl.StoreFile{
+		storeFile := storage.StoreFile{
 			Store:    f.store,
 			FilePath: f.fileSSTPath,
 		}
@@ -1813,8 +1814,15 @@ func GetBackupManifestIterFactories(
 	backupManifests []backuppb.BackupManifest,
 	encryption *jobspb.BackupEncryptionOptions,
 	kmsEnv cloud.KMSEnv,
-) (map[int]*IterFactory, error) {
+) (_ map[int]*IterFactory, err error) {
 	layerToFileIterFactory := make(map[int]*IterFactory)
+	defer func() {
+		if err != nil {
+			for _, f := range layerToFileIterFactory {
+				f.store.Close()
+			}
+		}
+	}()
 	for layer := range backupManifests {
 		es, err := storeFactory(ctx, backupManifests[layer].Dir)
 		if err != nil {
@@ -1934,6 +1942,7 @@ func WriteBackupMetadata(
 			execCtx.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
 			details,
 			backupManifest.RevisionStartTime,
+			kmsEnv,
 		),
 		"writing backup index metadata",
 	)

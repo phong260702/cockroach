@@ -8,7 +8,6 @@ package bulkmerge
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -16,9 +15,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -31,12 +31,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/taskset"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,19 +68,7 @@ func TestDistributedMergeThreeNodes(t *testing.T) {
 	ctx := context.Background()
 	instanceCount := 3
 
-	dir, cleanup := testutils.TempDir(t)
-	defer cleanup()
-
-	args := base.TestClusterArgs{
-		ServerArgsPerNode: map[int]base.TestServerArgs{},
-	}
-	for i := 0; i < 3; i++ {
-		args.ServerArgsPerNode[i] = base.TestServerArgs{
-			ExternalIODir: fmt.Sprintf("%s/node-%d", dir, i),
-		}
-	}
-
-	tc := serverutils.StartCluster(t, instanceCount, args)
+	tc := serverutils.StartCluster(t, instanceCount, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 
 	// Pick a random node to connect to
@@ -101,7 +93,7 @@ func TestDistributedMergeProcessorFailurePropagates(t *testing.T) {
 			DistSQL: &execinfra.TestingKnobs{
 				BulkMergeTestingKnobs: &TestingKnobs{
 					RunBeforeMergeTask: func(
-						ctx context.Context, flowID execinfrapb.FlowID, taskID taskset.TaskID,
+						_ context.Context, _ *execinfra.FlowCtx, _ taskset.TaskID, _ execinfrapb.BulkMergeSpec,
 					) error {
 						return injectedErr
 					},
@@ -118,7 +110,7 @@ func TestDistributedMergeProcessorFailurePropagates(t *testing.T) {
 	defer cleanupJob()
 
 	tsa := newTestServerAllocator(t, ctx, execCfg)
-	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, srv.Clock())
+	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, srv.Clock(), base.SQLInstanceID(1))
 	batcher := bulksst.NewUnsortedSSTBatcher(srv.ClusterSettings(), fileAllocator)
 	writeSSTs(t, ctx, batcher, 3)
 	ssts := importToMerge(fileAllocator.GetFileList())
@@ -127,7 +119,11 @@ func TestDistributedMergeProcessorFailurePropagates(t *testing.T) {
 	writeTS := hlc.Timestamp{WallTime: 1}
 	_, err := Merge(ctx, jobExecCtx, ssts, spans, func(instanceID base.SQLInstanceID) (string, error) {
 		return fmt.Sprintf("nodelocal://%d/merge/out/", instanceID), nil
-	}, 1 /* iteration */, 1 /* maxIterations */, &writeTS)
+	}, MergeOptions{
+		Iteration:      1,
+		MaxIterations:  1,
+		WriteTimestamp: &writeTS,
+	})
 	require.ErrorIs(t, err, injectedErr)
 }
 
@@ -141,9 +137,6 @@ func TestDistributedMergeMultiPassIngestsIntoKV(t *testing.T) {
 
 	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
 		ExternalIODir: dir,
-		// These tests write directly into KV, so they must run against the system
-		// tenant.
-		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 	})
 	defer srv.Stopper().Stop(ctx)
 	s := srv.ApplicationLayer()
@@ -156,35 +149,32 @@ func TestDistributedMergeMultiPassIngestsIntoKV(t *testing.T) {
 	defer jobCleanup()
 
 	targetFileSize.Override(ctx, &s.ClusterSettings().SV, 1<<20)
-	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock())
+	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock(), base.SQLInstanceID(1))
 	batcher := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator)
 
 	prefix := "merge-multi/"
 	const keyCount = 10
 	expected := make(map[string]string, keyCount)
 	for i := 0; i < keyCount; i++ {
-		key := fmt.Sprintf("%skey-%d", prefix, i)
+		keyStr := fmt.Sprintf("%skey-%d", prefix, i)
 		val := fmt.Sprintf("value-%d", i)
-		expected[key] = val
+		mvccKey := storageutils.PointKey(s.Codec(), keyStr, 1)
+		expected[string(mvccKey.Key)] = val
 
 		mvccVal := roachpb.MakeValueFromBytes([]byte(val))
 		encMVCCVal, err := storage.EncodeMVCCValue(storage.MVCCValue{Value: mvccVal})
 		require.NoError(t, err)
-		mvccKey := storage.MVCCKey{
-			Key:       []byte(key),
-			Timestamp: hlc.Timestamp{WallTime: 1},
-		}
 		require.NoError(t, batcher.AddMVCCKey(ctx, mvccKey, encMVCCVal))
 	}
 	require.NoError(t, batcher.CloseWithError(ctx))
 
 	inputSSTs := importToMerge(fileAllocator.GetFileList())
-	start := roachpb.Key(prefix)
+	start := append(s.Codec().TenantPrefix(), []byte(prefix)...)
 	end := start.PrefixEnd()
 	spans := []roachpb.Span{{Key: start, EndKey: end}}
 
 	// First iteration produces merged SSTs to external storage.
-	iter1Out, err := Merge(
+	iter1Result, err := Merge(
 		ctx,
 		jobExecCtx,
 		inputSSTs,
@@ -192,29 +182,32 @@ func TestDistributedMergeMultiPassIngestsIntoKV(t *testing.T) {
 		func(instanceID base.SQLInstanceID) (string, error) {
 			return fmt.Sprintf("nodelocal://%d/merge/iter-1/", instanceID), nil
 		},
-		1, /* iteration */
-		2, /* maxIterations */
-		nil,
+		MergeOptions{
+			Iteration:     1,
+			MaxIterations: 2,
+		},
 	)
 	require.NoError(t, err)
-	require.NotEmpty(t, iter1Out)
+	require.NotEmpty(t, iter1Result.SSTs)
 
 	// Second (final) iteration ingests directly into KV.
 	writeTS := execCfg.Clock.Now()
-	iter2Out, err := Merge(
+	iter2Result, err := Merge(
 		ctx,
 		jobExecCtx,
-		iter1Out,
+		iter1Result.SSTs,
 		spans,
 		func(instanceID base.SQLInstanceID) (string, error) {
 			return fmt.Sprintf("nodelocal://%d/merge/iter-2/", instanceID), nil
 		},
-		2, /* iteration */
-		2, /* maxIterations */
-		&writeTS,
+		MergeOptions{
+			Iteration:      2,
+			MaxIterations:  2,
+			WriteTimestamp: &writeTS,
+		},
 	)
 	require.NoError(t, err)
-	require.Nil(t, iter2Out, "final iteration should not produce SST outputs")
+	require.Nil(t, iter2Result.SSTs, "final iteration should not produce SST outputs")
 
 	rows, err := s.DB().Scan(ctx, start, end, 0 /* maxRows */)
 	require.NoError(t, err)
@@ -312,7 +305,7 @@ func testMergeProcessors(
 	// Override the target size of our merged SSTs to ensure we are flushing
 	// correctly.
 	targetFileSize.Override(ctx, &s.ClusterSettings().SV, 30)
-	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock())
+	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock(), base.SQLInstanceID(1))
 	batcher := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator)
 	ls := writeSSTs(t, ctx, batcher, 13)
 
@@ -338,17 +331,23 @@ func testMergeProcessors(
 		}
 	}
 
-	plan, planCtx, err := newBulkMergePlan(
+	planCtx, sqlInstanceIDs, err := jobExecCtx.DistSQLPlanner().SetupAllNodesPlanning(
+		ctx, jobExecCtx.ExtendedEvalContext(), jobExecCtx.ExecCfg())
+	require.NoError(t, err)
+	plan, err := newBulkMergePlan(
 		ctx,
 		jobExecCtx,
+		planCtx,
+		sqlInstanceIDs,
 		ssts,
 		spans,
 		func(instanceID base.SQLInstanceID) (string, error) {
 			return fmt.Sprintf("nodelocal://%d/merge/out/", instanceID), nil
 		},
-		1,   /* iteration */
-		2,   /* maxIterations */
-		nil, /* writeTS */
+		MergeOptions{
+			Iteration:     1,
+			MaxIterations: 2,
+		},
 	)
 	require.NoError(t, err)
 	defer plan.Release()
@@ -425,7 +424,7 @@ func verifySSTs(
 			UpperBound: sst.EndKey,
 		}
 
-		iter, err := storageccl.ExternalSSTReader(ctx, []storageccl.StoreFile{file}, nil, iterOpts)
+		iter, err := storage.ExternalSSTReader(ctx, []storage.StoreFile{file}, nil, iterOpts)
 		require.NoError(t, err)
 		defer iter.Close()
 
@@ -508,7 +507,7 @@ func TestMergeSSTsSplitsAtRowBoundaries(t *testing.T) {
 	targetFileSize.Override(ctx, &srv.ClusterSettings().SV, 150)
 
 	tsa := newTestServerAllocator(t, ctx, execCfg)
-	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, srv.Clock())
+	fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, srv.Clock(), base.SQLInstanceID(1))
 	batcher := bulksst.NewUnsortedSSTBatcher(srv.ClusterSettings(), fileAllocator)
 
 	ts := hlc.Timestamp{WallTime: 1}
@@ -544,17 +543,24 @@ func TestMergeSSTsSplitsAtRowBoundaries(t *testing.T) {
 	defer cleanup()
 
 	writeTS := hlc.Timestamp{WallTime: 1}
-	plan, planCtx, err := newBulkMergePlan(
+	planCtx, sqlInstanceIDs, err := jobExecCtx.DistSQLPlanner().SetupAllNodesPlanning(
+		ctx, jobExecCtx.ExtendedEvalContext(), jobExecCtx.ExecCfg())
+	require.NoError(t, err)
+	plan, err := newBulkMergePlan(
 		ctx,
 		jobExecCtx,
+		planCtx,
+		sqlInstanceIDs,
 		ssts,
 		spans,
 		func(instanceID base.SQLInstanceID) (string, error) {
 			return fmt.Sprintf("nodelocal://%d/merge/out/", instanceID), nil
 		},
-		1,        /* iteration */
-		2,        /* maxIterations */
-		&writeTS, /* writeTS */
+		MergeOptions{
+			Iteration:      1,
+			MaxIterations:  2,
+			WriteTimestamp: &writeTS,
+		},
 	)
 	require.NoError(t, err)
 	defer plan.Release()
@@ -604,7 +610,7 @@ func TestMergeSSTsSplitsAtRowBoundaries(t *testing.T) {
 			UpperBound: sst.EndKey,
 		}
 
-		iter, err := storageccl.ExternalSSTReader(ctx, []storageccl.StoreFile{file}, nil, iterOpts)
+		iter, err := storage.ExternalSSTReader(ctx, []storage.StoreFile{file}, nil, iterOpts)
 		require.NoError(t, err)
 		defer iter.Close()
 
@@ -671,4 +677,436 @@ func TestMergeSSTsSplitsAtRowBoundaries(t *testing.T) {
 				"SST %d endKey should be at row boundary (safeKey.PrefixEnd())", i)
 		}
 	}
+}
+
+// TestKVWritePreexistingKeyConflictDetection verifies that duplicate keys are
+// detected during KV write when EnforceUniqueness is enabled and the key
+// already exists in KV.
+func TestKVWritePreexistingKeyConflictDetection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	dir, cleanup := testutils.TempDir(t)
+	defer cleanup()
+
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		ExternalIODir: dir,
+	})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+
+	jobExecCtx, jobCleanup := sql.MakeJobExecContext(
+		ctx, "test-uniqueness", username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
+	)
+	defer jobCleanup()
+
+	tsa := newTestServerAllocator(t, ctx, execCfg)
+
+	// Step 1: First merge to populate KV with some keys.
+	// Write keys [key-0, key-1, key-2] to an SST and ingest into KV.
+	writeTS1 := hlc.Timestamp{WallTime: 1}
+	fileAllocator1 := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock(), base.SQLInstanceID(1))
+	batcher1 := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator1)
+	writeSpecificKeys(t, ctx, batcher1, []int{0, 1, 2}, writeTS1, s.Codec())
+
+	ssts1 := importToMerge(fileAllocator1.GetFileList())
+	spans := []roachpb.Span{{Key: roachpb.KeyMin, EndKey: roachpb.KeyMax}}
+
+	// First merge: ingest without uniqueness enforcement (initial data load).
+	mergeWriteTS1 := execCfg.Clock.Now()
+	_, err := Merge(
+		ctx,
+		jobExecCtx,
+		ssts1,
+		spans,
+		func(instanceID base.SQLInstanceID) (string, error) {
+			return fmt.Sprintf("nodelocal://%d/merge/out1/", instanceID), nil
+		},
+		MergeOptions{
+			Iteration:         1,
+			MaxIterations:     1,
+			WriteTimestamp:    &mergeWriteTS1,
+			EnforceUniqueness: false,
+		},
+	)
+	require.NoError(t, err, "first merge should succeed")
+
+	// Step 2: Second merge with overlapping keys and EnforceUniqueness=true.
+	// Write keys [key-2, key-3, key-4] to an SST - key-2 overlaps with existing data.
+	writeTS2 := hlc.Timestamp{WallTime: 2}
+	fileAllocator2 := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock(), base.SQLInstanceID(1))
+	batcher2 := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator2)
+	writeSpecificKeys(t, ctx, batcher2, []int{2, 3, 4}, writeTS2, s.Codec())
+
+	ssts2 := importToMerge(fileAllocator2.GetFileList())
+
+	// Second merge with uniqueness enforcement. This should detect that key-2
+	// already exists in KV and fail with a KeyCollisionError.
+	mergeWriteTS2 := execCfg.Clock.Now()
+	_, err = Merge(
+		ctx,
+		jobExecCtx,
+		ssts2,
+		spans,
+		func(instanceID base.SQLInstanceID) (string, error) {
+			return fmt.Sprintf("nodelocal://%d/merge/out2/", instanceID), nil
+		},
+		MergeOptions{
+			Iteration:         1,
+			MaxIterations:     1,
+			WriteTimestamp:    &mergeWriteTS2,
+			EnforceUniqueness: true,
+		},
+	)
+
+	// Verify that a uniqueness violation error was returned. The error should be
+	// a KeyCollisionError since the duplicate is detected during SST ingestion
+	// when DisallowShadowingBelow finds an existing key.
+	require.Error(t, err, "expected uniqueness violation error for duplicate key")
+	isCollisionErr := errors.HasType(err, &kvpb.KeyCollisionError{})
+	require.True(t, isCollisionErr,
+		"expected KeyCollisionError, got: %+v", err)
+}
+
+// writeSpecificKeys writes SST entries for the given key indices with properly
+// encoded MVCC values. Uses the codec to apply tenant-aware key encoding.
+// The batcher is closed after writing all keys.
+func writeSpecificKeys(
+	t *testing.T,
+	ctx context.Context,
+	batcher *bulksst.Writer,
+	keyIndices []int,
+	ts hlc.Timestamp,
+	codec keys.SQLCodec,
+) {
+	t.Helper()
+	writeSpecificKeysWithValuePrefix(t, ctx, batcher, keyIndices, ts, codec, "value")
+}
+
+func writeSpecificKeysWithValuePrefix(
+	t *testing.T,
+	ctx context.Context,
+	batcher *bulksst.Writer,
+	keyIndices []int,
+	ts hlc.Timestamp,
+	codec keys.SQLCodec,
+	valuePrefix string,
+) {
+	t.Helper()
+	for _, i := range keyIndices {
+		keyStr := fmt.Sprintf("key-%d", i)
+		key := storageutils.PointKey(codec, keyStr, int(ts.WallTime))
+		// Properly encode the value as an MVCC value.
+		mvccVal := roachpb.MakeValueFromBytes([]byte(fmt.Sprintf("%s-%d", valuePrefix, i)))
+		encMVCCVal, err := storage.EncodeMVCCValue(storage.MVCCValue{Value: mvccVal})
+		require.NoError(t, err)
+		require.NoError(t, batcher.AddMVCCKey(ctx, key, encMVCCVal))
+	}
+	require.NoError(t, batcher.CloseWithError(ctx))
+}
+
+// TestCrossSSTDuplicateHandling verifies duplicate key behavior across SSTs
+// under various configurations of EnforceUniqueness.
+//
+// When EnforceUniqueness is true, identical duplicates (same key and value)
+// are tolerated because they arise naturally from checkpoint-and-resume
+// overlap. Only true conflicts (same key, different value) produce an error.
+func TestCrossSSTDuplicateHandling(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name              string
+		enforceUniqueness bool
+		// useDifferentValues causes the overlapping key to have a different
+		// value in the second SST, simulating a real uniqueness violation
+		// rather than a checkpoint-and-resume repeat.
+		useDifferentValues bool
+		expectDupError     bool
+	}{
+		{
+			name:              "identical_duplicates_skipped_with_uniqueness",
+			enforceUniqueness: true,
+			expectDupError:    false,
+		},
+		{
+			name:               "different_value_duplicates_detected_with_uniqueness",
+			enforceUniqueness:  true,
+			useDifferentValues: true,
+			expectDupError:     true,
+		},
+		{
+			name:              "non_unique_allows_duplicates",
+			enforceUniqueness: false,
+			expectDupError:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir, cleanup := testutils.TempDir(t)
+			defer cleanup()
+
+			srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+				ExternalIODir: dir,
+			})
+			defer srv.Stopper().Stop(ctx)
+			s := srv.ApplicationLayer()
+			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+
+			jobExecCtx, jobCleanup := sql.MakeJobExecContext(
+				ctx, "test-cross-sst-dup", username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
+			)
+			defer jobCleanup()
+
+			// Create two separate SST files with overlapping keys.
+			// SST 1: keys [key-0, key-1, key-2]
+			// SST 2: keys [key-2, key-3, key-4]
+			// key-2 is the duplicate.
+			writeTS := hlc.Timestamp{WallTime: 1}
+
+			// First SST.
+			prefixURI1 := "nodelocal://1/merge/sst1/"
+			store1, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, prefixURI1, username.RootUserName())
+			require.NoError(t, err)
+			fileAllocator1 := bulksst.NewExternalFileAllocator(store1, prefixURI1, s.Clock(), base.SQLInstanceID(1))
+			batcher1 := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator1)
+			writeSpecificKeys(t, ctx, batcher1, []int{0, 1, 2}, writeTS, s.Codec())
+
+			// Second SST.
+			prefixURI2 := "nodelocal://1/merge/sst2/"
+			store2, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, prefixURI2, username.RootUserName())
+			require.NoError(t, err)
+			fileAllocator2 := bulksst.NewExternalFileAllocator(store2, prefixURI2, s.Clock(), base.SQLInstanceID(1))
+			batcher2 := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator2)
+			if tc.useDifferentValues {
+				writeSpecificKeysWithValuePrefix(
+					t, ctx, batcher2, []int{2, 3, 4}, writeTS, s.Codec(), "other-value",
+				)
+			} else {
+				writeSpecificKeys(t, ctx, batcher2, []int{2, 3, 4}, writeTS, s.Codec())
+			}
+
+			// Combine SSTs from both allocators.
+			ssts1 := importToMerge(fileAllocator1.GetFileList())
+			ssts2 := importToMerge(fileAllocator2.GetFileList())
+			allSSTs := append(ssts1, ssts2...)
+
+			spans := []roachpb.Span{{Key: roachpb.KeyMin, EndKey: roachpb.KeyMax}}
+
+			mergeWriteTS := execCfg.Clock.Now()
+			_, err = Merge(
+				ctx,
+				jobExecCtx,
+				allSSTs,
+				spans,
+				func(instanceID base.SQLInstanceID) (string, error) {
+					return fmt.Sprintf("nodelocal://%d/merge/cross-sst/", instanceID), nil
+				},
+				MergeOptions{
+					Iteration:         1,
+					MaxIterations:     1,
+					WriteTimestamp:    &mergeWriteTS,
+					EnforceUniqueness: tc.enforceUniqueness,
+				},
+			)
+
+			if tc.expectDupError {
+				require.Error(t, err, "expected DuplicateKeyError for cross-SST duplicate key")
+				isDupKeyErr := errors.HasType(err, &kvserverbase.DuplicateKeyError{})
+				require.True(t, isDupKeyErr, "expected DuplicateKeyError, got: %+v", err)
+
+				var dupKeyErr *kvserverbase.DuplicateKeyError
+				require.True(t, errors.As(err, &dupKeyErr), "should be able to extract DuplicateKeyError")
+				require.Contains(t, string(dupKeyErr.Key), "key-2",
+					"duplicate key error should reference key-2")
+			} else {
+				require.NoError(t, err, "merge without uniqueness enforcement should succeed")
+			}
+		})
+	}
+}
+
+func TestMergeMemoryMonitorSelection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name    string
+		monitor execinfrapb.BulkMergeSpec_MemoryMonitor
+	}{
+		{
+			name:    "bulk_monitor",
+			monitor: execinfrapb.BulkMergeSpec_BULK_MONITOR,
+		},
+		{
+			name:    "backfill_monitor",
+			monitor: execinfrapb.BulkMergeSpec_BACKFILL_MONITOR,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir, cleanup := testutils.TempDir(t)
+			defer cleanup()
+
+			var capturedMonitor execinfrapb.BulkMergeSpec_MemoryMonitor
+			var capturedMonitorPtr *mon.BytesMonitor
+			var knobCalled bool
+			srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+				ExternalIODir: dir,
+				Knobs: base.TestingKnobs{
+					DistSQL: &execinfra.TestingKnobs{
+						BulkMergeTestingKnobs: &TestingKnobs{
+							RunBeforeMergeTask: func(
+								_ context.Context, flowCtx *execinfra.FlowCtx, _ taskset.TaskID, spec execinfrapb.BulkMergeSpec,
+							) error {
+								capturedMonitor = spec.MemoryMonitor
+								capturedMonitorPtr = resolveMemoryMonitor(flowCtx, spec.MemoryMonitor)
+								knobCalled = true
+								return nil
+							},
+						},
+					},
+				},
+			})
+			defer srv.Stopper().Stop(ctx)
+			s := srv.ApplicationLayer()
+			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+
+			tsa := newTestServerAllocator(t, ctx, execCfg)
+			fileAllocator := bulksst.NewExternalFileAllocator(tsa.es, tsa.prefixUri, s.Clock(), base.SQLInstanceID(1))
+			batcher := bulksst.NewUnsortedSSTBatcher(s.ClusterSettings(), fileAllocator)
+			writeTS := hlc.Timestamp{WallTime: 1}
+			writeSpecificKeys(t, ctx, batcher, []int{0, 1, 2}, writeTS, s.Codec())
+			ssts := importToMerge(fileAllocator.GetFileList())
+			spans := []roachpb.Span{{Key: roachpb.KeyMin, EndKey: roachpb.KeyMax}}
+
+			jobExecCtx, jobCleanup := sql.MakeJobExecContext(
+				ctx, "test-mon-selection", username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
+			)
+			defer jobCleanup()
+
+			mergeWriteTS := execCfg.Clock.Now()
+			_, err := Merge(ctx, jobExecCtx, ssts, spans,
+				func(instanceID base.SQLInstanceID) (string, error) {
+					return fmt.Sprintf("nodelocal://%d/merge/mon-test/", instanceID), nil
+				},
+				MergeOptions{
+					Iteration:      1,
+					MaxIterations:  1,
+					WriteTimestamp: &mergeWriteTS,
+					MemoryMonitor:  tc.monitor,
+				},
+			)
+			require.NoError(t, err)
+			require.True(t, knobCalled, "RunBeforeMergeTask was not called")
+			require.Equal(t, tc.monitor, capturedMonitor,
+				"spec.MemoryMonitor should match the enum passed via MergeOptions")
+
+			// Verify that the captured monitor pointer matches the expected
+			// server-level monitor.
+			switch tc.monitor {
+			case execinfrapb.BulkMergeSpec_BULK_MONITOR:
+				require.Same(t, execCfg.DistSQLSrv.BulkMonitor, capturedMonitorPtr)
+			default:
+				require.Same(t, execCfg.DistSQLSrv.BackfillerMonitor, capturedMonitorPtr)
+			}
+		})
+	}
+}
+
+// TestWaitForViablePlan exercises the retry loop that drives the merge
+// plan's instance set until it covers every SST-referenced instance.
+func TestWaitForViablePlan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// riggedRetry is used by subtests that intentionally exhaust the retry
+	// budget so the test itself doesn't block for long.
+	riggedRetry := retry.Options{
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     5 * time.Millisecond,
+		Multiplier:     2,
+		MaxDuration:    100 * time.Millisecond,
+	}
+	// generousRetry is used by subtests that expect the retry loop to succeed.
+	generousRetry := retry.Options{
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     5 * time.Millisecond,
+		Multiplier:     2,
+		MaxDuration:    30 * time.Second,
+	}
+
+	sstsRequiringInstance2 := []execinfrapb.BulkMergeSpec_SST{
+		{URI: "nodelocal://2/job/1/map/a.sst"},
+	}
+
+	t.Run("succeeds on first attempt", func(t *testing.T) {
+		var attempts int
+		plan := func(ctx context.Context) (*sql.PlanningCtx, []base.SQLInstanceID, error) {
+			attempts++
+			return nil, []base.SQLInstanceID{1, 2, 3}, nil
+		}
+
+		_, _, err := waitForViablePlan(
+			context.Background(), sstsRequiringInstance2, generousRetry, plan)
+		require.NoError(t, err)
+		require.Equal(t, 1, attempts)
+	})
+
+	t.Run("retries until coverage is reached", func(t *testing.T) {
+		var attempts int
+		plan := func(ctx context.Context) (*sql.PlanningCtx, []base.SQLInstanceID, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, []base.SQLInstanceID{1, 3}, nil // missing 2
+			}
+			return nil, []base.SQLInstanceID{1, 2, 3}, nil
+		}
+
+		_, _, err := waitForViablePlan(
+			context.Background(), sstsRequiringInstance2, generousRetry, plan)
+		require.NoError(t, err)
+		require.Equal(t, 2, attempts)
+	})
+
+	t.Run("times out and returns InstanceUnavailableError", func(t *testing.T) {
+		plan := func(ctx context.Context) (*sql.PlanningCtx, []base.SQLInstanceID, error) {
+			return nil, []base.SQLInstanceID{1, 3}, nil // never covers 2
+		}
+
+		_, _, err := waitForViablePlan(
+			context.Background(), sstsRequiringInstance2, riggedRetry, plan)
+		require.Error(t, err)
+		var unavailErr *InstanceUnavailableError
+		require.True(t, errors.As(err, &unavailErr))
+		require.Equal(t, []base.SQLInstanceID{2}, unavailErr.UnavailableInstances)
+	})
+
+	t.Run("propagates non-coverage error from plan", func(t *testing.T) {
+		boom := errors.New("planner exploded")
+		plan := func(ctx context.Context) (*sql.PlanningCtx, []base.SQLInstanceID, error) {
+			return nil, nil, boom
+		}
+
+		_, _, err := waitForViablePlan(
+			context.Background(), sstsRequiringInstance2, generousRetry, plan)
+		require.ErrorIs(t, err, boom)
+	})
+
+	t.Run("returns ctx.Err on cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		plan := func(ctx context.Context) (*sql.PlanningCtx, []base.SQLInstanceID, error) {
+			cancel()
+			return nil, []base.SQLInstanceID{1, 3}, nil // never covers 2
+		}
+
+		_, _, err := waitForViablePlan(ctx, sstsRequiringInstance2, generousRetry, plan)
+		require.ErrorIs(t, err, context.Canceled)
+	})
 }

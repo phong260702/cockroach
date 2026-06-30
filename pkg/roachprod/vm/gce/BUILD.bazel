@@ -3,12 +3,14 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "gce",
     srcs = [
+        "capacity_error.go",
         "create_sdk.go",
         "dns.go",
         "dns_sdk.go",
         "fast_dns.go",
         "gcloud.go",
         "infra_provider.go",
+        "machine_type.go",
         "provider_options.go",
         "sdk.go",
         "utils.go",
@@ -50,12 +52,14 @@ go_test(
     size = "small",
     srcs = [
         "gcloud_test.go",
+        "machine_type_test.go",
         "utils_test.go",
     ],
     data = glob(["testdata/**"]),
     embed = [":gce"],
     deps = [
         "//pkg/roachprod/config",
+        "//pkg/roachprod/logger",
         "//pkg/roachprod/vm",
         "//pkg/testutils/datapathutils",
         "//pkg/testutils/echotest",
@@ -64,5 +68,6 @@ go_test(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@com_google_cloud_go_compute//apiv1/computepb",
     ],
 )

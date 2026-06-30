@@ -100,6 +100,51 @@ SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'on';
 - Implement operations in `scop/` and execution in `scexec/`
 - More modular and composable approach
 
+**Element Query API — Avoid Deprecated Functions:**
+
+The top-level `scpb.Find*` and `scpb.ForEach*` functions (e.g. `scpb.FindNamespace`, `scpb.ForEachColumn`) in `elements_generated.go` are deprecated. Use the fluent `Filter*().MustGetOneElement()` or `Filter*().ForEach()` methods on `ElementCollection` instead:
+
+```go
+// DEPRECATED — do not use:
+_, _, ns := scpb.FindNamespace(tableElts)
+scpb.ForEachColumn(tableElts, func(current Status, target TargetStatus, e *scpb.Column) { ... })
+
+// PREFERRED — use the fluent API on ElementCollection:
+ns := tableElts.FilterNamespace().MustGetOneElement()
+tableElts.FilterColumn().ForEach(func(current Status, target TargetStatus, e *scpb.Column) { ... })
+```
+
+Common patterns for looking up name parts:
+```go
+// Table name from table ID.
+tableElts := b.QueryByID(tableID)
+ns := tableElts.FilterNamespace().MustGetOneElement()
+scNs := b.QueryByID(ns.SchemaID).FilterNamespace().MustGetOneElement()
+dbNs := b.QueryByID(ns.DatabaseID).FilterNamespace().MustGetOneElement()
+
+// Function name from function ID.
+fnElts := b.QueryByID(fnID)
+fnName := fnElts.FilterFunctionName().MustGetOneElement()
+fnParent := fnElts.FilterSchemaChild().MustGetOneElement()
+fnScNs := b.QueryByID(fnParent.SchemaID).FilterNamespace().MustGetOneElement()
+fnDbNs := b.QueryByID(fnScNs.DatabaseID).FilterNamespace().MustGetOneElement()
+```
+
+### Keeping pg_dump compatibility tests in sync
+
+When adding a new PostgreSQL-compatible schema feature (new column type,
+constraint type, schema object like DOMAIN or TRIGGER, etc.), update the
+pg_dump round-trip roachtest so it exercises the new feature:
+
+- Add a representative use of the feature to `pgDumpTestSchema` in
+  `pkg/cmd/roachtest/tests/pg_dump.go`.
+- Add a matching entry to `pgDumpExpectedPatterns` so the test verifies
+  the dump output contains the expected declaration (use
+  `knownFailure: true` if pg_dump support is still incomplete).
+
+This prevents pg_dump compatibility from silently regressing as new
+schema features land.
+
 ### Code Organization
 
 **Legacy Schema Changer:**

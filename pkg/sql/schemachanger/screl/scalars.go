@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
+	"github.com/cockroachdb/cockroach/pkg/util/walkutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -55,7 +56,7 @@ func AllTargetDescIDs(e scpb.Element) (ids catalog.DescriptorIDSet) {
 		// database won't have back-references to any tables.
 		ids.Add(te.TableID)
 	default:
-		_ = WalkDescIDs(e, func(id *catid.DescID) error {
+		_ = walkutil.Walk(e, func(id *catid.DescID) error {
 			ids.Add(*id)
 			return nil
 		})
@@ -70,7 +71,7 @@ func AllDescIDs(e scpb.Element) (ids catalog.DescriptorIDSet) {
 	}
 	// For certain elements the references needed will not be attributes, so manually
 	// include these.
-	_ = WalkDescIDs(e, func(id *catid.DescID) error {
+	_ = walkutil.Walk(e, func(id *catid.DescID) error {
 		ids.Add(*id)
 		return nil
 	})
@@ -79,7 +80,7 @@ func AllDescIDs(e scpb.Element) (ids catalog.DescriptorIDSet) {
 
 // ContainsDescID searches the element to see if it contains a descriptor id.
 func ContainsDescID(haystack scpb.Element, needle catid.DescID) (contains bool) {
-	_ = WalkDescIDs(haystack, func(id *catid.DescID) error {
+	_ = walkutil.Walk(haystack, func(id *catid.DescID) error {
 		if contains = *id == needle; contains {
 			return iterutil.StopIteration()
 		}
@@ -107,7 +108,7 @@ func VersionSupportsElementUse(el scpb.Element, version clusterversion.ClusterVe
 		*scpb.SchemaParent, *scpb.SchemaComment, *scpb.SchemaChild:
 		// These elements need v22.1 so they can be used without checking any version gates.
 		return true
-	case *scpb.IndexColumn, *scpb.EnumTypeValue, *scpb.TableZoneConfig:
+	case *scpb.IndexColumn, *scpb.TableZoneConfig:
 		// These elements need v22.2 so they can be used without checking any version gates.
 		return true
 	case *scpb.DatabaseData, *scpb.TableData, *scpb.IndexData, *scpb.TablePartitioning,
@@ -131,13 +132,22 @@ func VersionSupportsElementUse(el scpb.Element, version clusterversion.ClusterVe
 		// These elements need v24.3 so they can be used without checking any version gates.
 		return true
 	case *scpb.NamedRangeZoneConfig, *scpb.Policy, *scpb.PolicyName:
-		return version.IsActive(clusterversion.V25_1)
+		// These elements need v25.1 so they can be used without checking any version gates.
+		return true
 	case *scpb.PolicyRole, *scpb.PolicyUsingExpr, *scpb.PolicyWithCheckExpr, *scpb.PolicyDeps, *scpb.RowLevelSecurityEnabled, *scpb.RowLevelSecurityForced:
-		return version.IsActive(clusterversion.V25_2)
+		// These elements need v25.2 so they can be used without checking any version gates.
+		return true
 	case *scpb.TableLocalityRegionalByRowUsingConstraint:
-		return version.IsActive(clusterversion.V25_3)
+		// These elements need v25.3 so they can be used without checking any version gates.
+		return true
 	case *scpb.ColumnGeneratedAsIdentity, *scpb.ColumnHidden, *scpb.SequenceValue, *scpb.TableStorageParam:
 		return version.IsActive(clusterversion.V26_1)
+	case *scpb.FunctionParams:
+		return version.IsActive(clusterversion.V26_2)
+	case *scpb.DomainType, *scpb.EnumTypeValue, *scpb.DomainDefault, *scpb.DomainNotNull,
+		*scpb.DomainCheckConstraint, *scpb.DomainCheckConstraintUnvalidated,
+		*scpb.DomainConstraintName, *scpb.FunctionComment:
+		return version.IsActive(clusterversion.V26_3)
 	default:
 		panic(errors.AssertionFailedf("unknown element %T", el))
 	}

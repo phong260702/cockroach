@@ -49,6 +49,12 @@ func (w index) IndexDescDeepCopy() descpb.IndexDescriptor {
 	return *protoutil.Clone(w.desc).(*descpb.IndexDescriptor)
 }
 
+// Adding returns true if this index is not yet usable for reads. This is
+// the case either when the index is in an ADD mutation (not yet public) or
+// when it is a secondary index being recreated during an ALTER PRIMARY KEY
+// operation and the new primary key has not yet become public. In the
+// latter case, the recreated index may lack key columns from the old
+// primary key and cannot serve correct results.
 func (w index) Adding() bool {
 	// Either the index is adding or is a recreated index that needs
 	// to be temporarily hidden.
@@ -100,6 +106,12 @@ func (w index) IsUnique() bool {
 	return w.desc.Unique
 }
 
+// SkipUniqueChecks returns true iff unique checks should be skipped for this
+// index.
+func (w index) SkipUniqueChecks() bool {
+	return w.desc.SkipUniqueChecks
+}
+
 // IsDisabled returns true iff the index is disabled.
 func (w index) IsDisabled() bool {
 	return w.desc.Disabled
@@ -129,7 +141,7 @@ func (w index) IsCreatedExplicitly() bool {
 // GetPredicate returns the empty string when the index is not partial,
 // otherwise it returns the corresponding expression of the partial index.
 // Columns are referred to in the expression by their name.
-func (w index) GetPredicate() string {
+func (w index) GetPredicate() catpb.Expression {
 	return w.desc.Predicate
 }
 
@@ -177,8 +189,10 @@ func (w index) IsValidOriginIndex(fk catalog.ForeignKeyConstraint) bool {
 
 // IsValidReferencedUniqueConstraint implements the catalog.UniqueConstraint
 // interface.
-func (w index) IsValidReferencedUniqueConstraint(fk catalog.ForeignKeyConstraint) bool {
-	return w.desc.IsValidReferencedUniqueConstraint(fk.ForeignKeyDesc().ReferencedColumnIDs)
+func (w index) IsValidReferencedUniqueConstraint(
+	fk catalog.ForeignKeyConstraint, asSubset bool,
+) bool {
+	return w.desc.IsValidReferencedUniqueConstraint(fk.ForeignKeyDesc().ReferencedColumnIDs, asSubset)
 }
 
 // HasOldStoredColumns returns whether the index has stored columns in the old

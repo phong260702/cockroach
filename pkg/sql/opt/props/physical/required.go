@@ -62,6 +62,10 @@ type Required struct {
 	// locality-optimized search. If the local branch fulfills the query, the
 	// remote branch is not executed.
 	RemoteBranch bool
+
+	// PlanGram is a pattern describing the approved optimizer plans. If possible,
+	// the optimizer will favor expressions matching the PlanGram.
+	PlanGram PlanGram
 }
 
 // MinRequired are the default physical properties that require nothing and
@@ -72,7 +76,7 @@ var MinRequired = &Required{}
 // this is an instance of MinRequired.
 func (p *Required) Defined() bool {
 	return !p.Presentation.Any() || !p.Ordering.Any() || !p.Distribution.Any() ||
-		p.LimitHint != 0 || p.RemoteBranch
+		p.LimitHint != 0 || p.RemoteBranch || !p.PlanGram.Any()
 }
 
 // ColSet returns the set of columns used by any of the physical properties.
@@ -112,6 +116,9 @@ func (p *Required) String() string {
 	if p.RemoteBranch {
 		output("remote branch", func(buf *bytes.Buffer) { buf.WriteString("true") })
 	}
+	if !p.PlanGram.Any() {
+		output("plangram", p.PlanGram.Format)
+	}
 
 	// Handle empty properties case.
 	if buf.Len() == 0 {
@@ -124,7 +131,8 @@ func (p *Required) String() string {
 func (p *Required) Equals(rhs *Required) bool {
 	return p.Presentation.Equals(rhs.Presentation) && p.Ordering.Equals(&rhs.Ordering) &&
 		p.Distribution.Equals(rhs.Distribution) &&
-		p.LimitHint == rhs.LimitHint && p.RemoteBranch == rhs.RemoteBranch
+		p.LimitHint == rhs.LimitHint && p.RemoteBranch == rhs.RemoteBranch &&
+		p.PlanGram.Equals(rhs.PlanGram)
 }
 
 // LimitHintInt64 returns the limit hint converted to an int64.

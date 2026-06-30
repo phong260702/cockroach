@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
+	"github.com/gogo/protobuf/proto"
 )
 
 // createViewNode represents a CREATE VIEW statement.
@@ -78,7 +80,8 @@ func (n *createViewNode) startExec(params runParams) error {
 	}
 	createView := n.createView
 
-	if !params.SessionData().AllowViewWithSecurityInvokerClause && createView.Options != nil && createView.Options.SecurityInvoker {
+	if !params.p.execCfg.Settings.Version.IsActive(params.ctx, clusterversion.V26_2) &&
+		createView.Options != nil && createView.Options.SecurityInvoker {
 		return pgerror.Newf(pgcode.FeatureNotSupported,
 			"security invoker views are not supported")
 	}
@@ -291,6 +294,11 @@ func (n *createViewNode) startExec(params runParams) error {
 					}
 				}
 
+				// Set view options if specified.
+				if createView.Options != nil {
+					desc.SecurityInvoker = proto.Bool(createView.Options.SecurityInvoker)
+				}
+
 				// Collect all the tables/views this view depends on.
 				orderedDependsOn := catalog.DescriptorIDSet{}
 				for backrefID := range n.planDeps {
@@ -444,7 +452,7 @@ func makeViewTableDesc(
 		privileges,
 		persistence,
 	)
-	desc.ViewQuery = viewQuery
+	desc.ViewQuery = descpb.Statement(viewQuery)
 	if isMultiRegion {
 		desc.SetTableLocalityRegionalByTable(tree.PrimaryRegionNotSpecifiedName)
 	}
@@ -454,15 +462,15 @@ func makeViewTableDesc(
 		if err != nil {
 			return tabledesc.Mutable{}, err
 		}
-		desc.ViewQuery = sequenceReplacedQuery
+		desc.ViewQuery = descpb.Statement(sequenceReplacedQuery)
 	}
 
-	typeReplacedQuery, err := serializeUserDefinedTypes(ctx, semaCtx, desc.ViewQuery,
+	typeReplacedQuery, err := serializeUserDefinedTypes(ctx, semaCtx, string(desc.ViewQuery),
 		false /* multiStmt */, "view queries")
 	if err != nil {
 		return tabledesc.Mutable{}, err
 	}
-	desc.ViewQuery = typeReplacedQuery
+	desc.ViewQuery = descpb.Statement(typeReplacedQuery)
 
 	if err := addResultColumns(ctx, semaCtx, evalCtx, st, &desc, resultColumns); err != nil {
 		return tabledesc.Mutable{}, err
@@ -729,22 +737,29 @@ func (p *planner) replaceViewDesc(
 	backRefMutables map[descpb.ID]*tabledesc.Mutable,
 ) (*tabledesc.Mutable, error) {
 	// Set the query to the new query.
-	toReplace.ViewQuery = n.viewQuery
+	toReplace.ViewQuery = descpb.Statement(n.viewQuery)
 
 	if sc != nil {
 		updatedQuery, err := replaceSeqNamesWithIDs(ctx, sc, n.viewQuery, false /* multiStmt */)
 		if err != nil {
 			return nil, err
 		}
-		toReplace.ViewQuery = updatedQuery
+		toReplace.ViewQuery = descpb.Statement(updatedQuery)
 	}
 
-	typeReplacedQuery, err := serializeUserDefinedTypes(ctx, p.SemaCtx(), toReplace.ViewQuery,
+	typeReplacedQuery, err := serializeUserDefinedTypes(ctx, p.SemaCtx(), string(toReplace.ViewQuery),
 		false /* multiStmt */, "view queries")
 	if err != nil {
 		return nil, err
 	}
-	toReplace.ViewQuery = typeReplacedQuery
+	toReplace.ViewQuery = descpb.Statement(typeReplacedQuery)
+
+	// Update view options if specified in the replacement.
+	if n.createView.Options != nil {
+		toReplace.SecurityInvoker = proto.Bool(n.createView.Options.SecurityInvoker)
+	} else {
+		toReplace.SecurityInvoker = nil
+	}
 
 	// Check that the new view has at least as many columns as the old view before
 	// adding result columns.

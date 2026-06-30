@@ -28,7 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -39,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -72,7 +71,8 @@ import (
 var settingDistSQLNumRunners = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
 	"sql.distsql.num_runners",
-	"determines the number of DistSQL runner goroutines used for issuing SetupFlow RPCs",
+	"determines the number of DistSQL runner goroutines used for issuing SetupFlow RPCs. "+
+		"The default value is computed as the number of vCPUs in a node times 4.",
 	// We use GOMAXPROCS instead of NumCPU because the former could be adjusted
 	// based on cgroup limits (see cgroups.AdjustMaxProcs).
 	//
@@ -123,11 +123,11 @@ func (req runnerRequest) run() error {
 	res := runnerResult{nodeID: req.sqlInstanceID}
 	defer func() {
 		req.resultChan <- res
-		physicalplan.ReleaseFlowSpec(&req.flowReq.Flow)
 	}()
 
 	client, err := execinfrapb.DialDistSQLClient(req.sqlInstanceDialer, req.ctx, roachpb.NodeID(req.sqlInstanceID), rpcbase.DefaultClass)
 	if err != nil {
+		err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "dial error")
 		// Mark this error as special runnerDialErr so that we could retry this
 		// distributed query as local.
 		err = &runnerDialErr{err: err}
@@ -137,7 +137,7 @@ func (req runnerRequest) run() error {
 	// TODO(radu): do we want a timeout here?
 	resp, err := client.SetupFlow(req.ctx, req.flowReq)
 	if err != nil {
-		res.err = err
+		res.err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "SetupFlow RPC error")
 	} else {
 		res.err = resp.Error.ErrorDetail(req.ctx)
 	}
@@ -396,6 +396,9 @@ func serializeEvalContext(evalCtx *eval.Context) execinfrapb.EvalContext {
 		StmtTimestampNanos:                evalCtx.StmtTimestamp.UnixNano(),
 		TxnTimestampNanos:                 evalCtx.TxnTimestamp.UnixNano(),
 		TestingKnobsForceProductionValues: evalCtx.TestingKnobs.ForceProductionValues,
+		WorkloadID:                        evalCtx.WorkloadID,
+		AppNameID:                         evalCtx.AppNameID,
+		WorkloadType:                      evalCtx.WorkloadType.ToUint32(),
 	}
 }
 
@@ -475,9 +478,13 @@ func (dsp *DistSQLPlanner) setupFlows(
 		StatementSQL:      statementSQL,
 	}
 	if localState.IsLocal {
-		// VectorizeMode is the only field that the setup code expects to be set
-		// in the local flows.
+		// VectorizeMode, workloadID, appNameID, and workloadType are
+		// the only fields that the setup code expects to be set in the
+		// local flows.
 		setupReq.EvalContext.SessionData.VectorizeMode = evalCtx.SessionData().VectorizeMode
+		setupReq.EvalContext.WorkloadID = evalCtx.WorkloadID
+		setupReq.EvalContext.AppNameID = evalCtx.AppNameID
+		setupReq.EvalContext.WorkloadType = evalCtx.WorkloadType.ToUint32()
 	} else {
 		// In distributed plans populate some extra state.
 		setupReq.EvalContext = serializeEvalContext(evalCtx)
@@ -525,9 +532,9 @@ func (dsp *DistSQLPlanner) setupFlows(
 		batchReceiver = recv
 	}
 	origCtx := ctx
-	parentMonitor := evalCtx.Planner.Mon()
-	if planCtx.OverridePlannerMon != nil {
-		parentMonitor = planCtx.OverridePlannerMon
+	parentMonitor := evalCtx.Planner.ExecMon()
+	if planCtx.OverridePlannerExecMon != nil {
+		parentMonitor = planCtx.OverridePlannerExecMon
 	}
 	ctx, flow, opChains, err := dsp.distSQLSrv.SetupLocalSyncFlow(ctx, parentMonitor, &setupReq, recv, batchReceiver, localState)
 	if err == nil && planCtx.saveFlows != nil {
@@ -733,17 +740,12 @@ func (dsp *DistSQLPlanner) Run(
 	evalCtx *eval.Context,
 	finishedSetupFn func(localFlow flowinfra.Flow),
 ) {
-	// Ignore the cleanup function since we will release each spec separately.
-	flows, _ := plan.GenerateFlowSpecs()
-	gatewayFlowSpec, ok := flows[dsp.gatewaySQLInstanceID]
-	if !ok {
+	flows, cleanup := plan.GenerateFlowSpecs()
+	defer cleanup(flows)
+	if _, ok := flows[dsp.gatewaySQLInstanceID]; !ok {
 		recv.SetError(errors.Errorf("expected to find gateway flow"))
 		return
 	}
-	// Specs of the remote flows are released after performing the corresponding
-	// SetupFlow RPCs. This is needed in case the local flow is canceled before
-	// the SetupFlow RPCs are issued (which might happen in parallel).
-	defer physicalplan.ReleaseFlowSpec(gatewayFlowSpec)
 
 	var (
 		localState     distsql.LocalState
@@ -1169,6 +1171,7 @@ type DistSQLReceiver struct {
 	// scanStageEstimateMap maps stage IDs for logical scans to their
 	// corresponding scanStageEstimate.
 	scanStageEstimateMap map[int32]scanStageEstimate
+	logMisestimates      bool
 
 	// isTenantExplainAnalyze is used to indicate that network egress should be
 	// collected in order to estimate RU consumption for a tenant that is running
@@ -1193,6 +1196,8 @@ type DistSQLReceiver struct {
 }
 
 var _ metadataForwarder = &DistSQLReceiver{}
+var _ execinfra.RowReceiver = &DistSQLReceiver{}
+var _ execinfra.BatchReceiver = &DistSQLReceiver{}
 
 // rowResultWriter is a subset of CommandResult to be used with the
 // DistSQLReceiver. It's implemented by RowResultWriter.
@@ -1407,7 +1412,7 @@ func (c *CallbackResultWriter) Err() error {
 type scanStageEstimate struct {
 	estimatedRowCount uint64
 	statsCreatedAt    time.Time
-	tableID           descpb.ID
+	tableDesc         catalog.TableDescriptor
 	indexName         string
 
 	rowsRead uint64
@@ -1416,7 +1421,9 @@ type scanStageEstimate struct {
 var misestimateLogLimiter = log.Every(10 * time.Second)
 
 func (s *scanStageEstimate) logMisestimate(ctx context.Context, planner *planner) {
-	tn, err := planner.GetQualifiedTableNameByID(ctx, int64(s.tableID), tree.ResolveAnyTableKind)
+	// TODO(yuzefovich): we have the table descriptor, so we can probably
+	// simplify this.
+	tn, err := planner.GetQualifiedTableNameByID(ctx, int64(s.tableDesc.GetID()), tree.ResolveAnyTableKind)
 	if err != nil {
 		return
 	}
@@ -1434,16 +1441,13 @@ func (s *scanStageEstimate) logMisestimate(ctx context.Context, planner *planner
 		event.NanosSinceStatsCollected = nanosSinceStats
 
 		if estimatedStaleness, err :=
-			planner.ExecCfg().StatsRefresher.EstimateStaleness(ctx, s.tableID); err == nil {
+			planner.ExecCfg().StatsRefresher.EstimateStaleness(ctx, s.tableDesc); err == nil {
 			event.EstimatedStaleness = estimatedStaleness
 		}
 	}
 
 	log.StructuredEvent(ctx, severity.WARNING, event)
 }
-
-var _ execinfra.RowReceiver = &DistSQLReceiver{}
-var _ execinfra.BatchReceiver = &DistSQLReceiver{}
 
 var receiverSyncPool = sync.Pool{
 	New: func() interface{} {
@@ -1640,6 +1644,11 @@ func forwardInnerQueryStats(f metadataForwarder, stats topLevelQueryStats) {
 	meta.Metrics.IndexRowsWritten = stats.indexRowsWritten
 	meta.Metrics.IndexBytesWritten = stats.indexBytesWritten
 	meta.Metrics.KVCPUTime = int64(stats.kvCPUTimeNanos)
+	meta.Metrics.LocalKVCPUTime = int64(stats.localKVCPUTime)
+	// Do not forward rawSQLCPUTime: the outer query's gateway grunning
+	// already includes the inner query's CPU (same goroutine), so
+	// forwarding it would double-count.
+	//
 	// stats.networkEgressEstimate and stats.clientTime are ignored since they
 	// only matter at the "true" top-level query (and actually should be zero
 	// here anyway).
@@ -1681,6 +1690,13 @@ func (r *DistSQLReceiver) pushMeta(meta *execinfrapb.ProducerMetadata) execinfra
 	}
 	if len(meta.TraceData) > 0 {
 		if span := tracing.SpanFromContext(r.ctx); span != nil {
+			// Note(davidh): I believe this import can be triggered multiple times
+			// during distsql execution and cause duplicate spans. This has only
+			// been triggered by test flakes so far. If we observe this in production
+			// we should consider adding some deduplication logic or accept that
+			// duplicate spans can occur. For now I'm leaving the behavior as-is
+			// because I don't introduce more allocation to the tracing logic.
+			// see also: exec_util.go:getMessagesForSubtrace which detects the dupe.
 			span.ImportRemoteRecording(meta.TraceData)
 		}
 	}
@@ -1691,6 +1707,8 @@ func (r *DistSQLReceiver) pushMeta(meta *execinfrapb.ProducerMetadata) execinfra
 		r.stats.indexRowsWritten += meta.Metrics.IndexRowsWritten
 		r.stats.indexBytesWritten += meta.Metrics.IndexBytesWritten
 		r.stats.kvCPUTimeNanos += time.Duration(meta.Metrics.KVCPUTime)
+		r.stats.localKVCPUTime += time.Duration(meta.Metrics.LocalKVCPUTime)
+		r.stats.rawSQLCPUTime += time.Duration(meta.Metrics.RawSQLCPUTime)
 
 		if sm, ok := r.scanStageEstimateMap[meta.Metrics.StageID]; ok {
 			sm.rowsRead += uint64(meta.Metrics.RowsRead)
@@ -1925,32 +1943,68 @@ func (r *DistSQLReceiver) ProducerDone() {
 	r.closed = true
 }
 
-func (r *DistSQLReceiver) makeScanEstimates(physPlan *PhysicalPlan, st *cluster.Settings) {
-	if !execinfra.LogScanRowCountMisestimate.Get(&st.SV) {
+// logScanRowCountMisestimate controls whether we log a warning when the
+// actual row count observed by a scan differs significantly from the optimizer
+// estimate.
+var logScanRowCountMisestimate = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.log.scan_row_count_misestimate.enabled",
+	"when set to true, log a warning when a scan's actual row count differs "+
+		"significantly from the optimizer's estimate",
+	false,
+	settings.WithPublic,
+)
+
+func (r *DistSQLReceiver) makeScanEstimates(
+	ctx context.Context, planner *planner, physPlan *PhysicalPlan, st *cluster.Settings,
+) {
+	if planner.SessionData().Internal {
+		// Internal queries should only touch the system tables which we exempt
+		// from the scan estimates.
+		return
+	}
+	r.logMisestimates = logScanRowCountMisestimate.Get(&st.SV)
+	if !r.logMisestimates {
 		return
 	}
 
 	for _, p := range physPlan.Processors {
-		if p.Spec.Core.TableReader == nil {
+		core := p.Spec.Core.TableReader
+		if core == nil {
 			continue
 		}
 		stageID := p.Spec.StageID
-		if _, exists := r.scanStageEstimateMap[stageID]; !exists {
-			r.scanStageEstimateMap[stageID] = scanStageEstimate{
-				estimatedRowCount: p.Spec.EstimatedRowCount,
-				statsCreatedAt:    p.Spec.StatsCreatedAt,
-				tableID:           p.Spec.Core.TableReader.FetchSpec.TableID,
-				indexName:         p.Spec.Core.TableReader.FetchSpec.IndexName,
-			}
+		if _, exists := r.scanStageEstimateMap[stageID]; exists {
+			continue
+		}
+		tableID := core.FetchSpec.TableID
+		tableDesc, err := planner.LookupTableByID(ctx, tableID)
+		if err != nil {
+			continue
+		}
+		// Exempt the following:
+		// - system tables since we hope to have the internal queries touching
+		//   them to be resilient / agnostic to table stats and the users
+		//   shouldn't be touching the system tables.
+		// - virtual tables and views since we cannot collect stats on them.
+		if catalog.IsSystemDescriptor(tableDesc) || tableDesc.IsVirtualTable() || tableDesc.IsView() {
+			continue
+		}
+		r.scanStageEstimateMap[stageID] = scanStageEstimate{
+			estimatedRowCount: p.Spec.EstimatedRowCount,
+			statsCreatedAt:    p.Spec.StatsCreatedAt,
+			tableDesc:         tableDesc,
+			indexName:         core.FetchSpec.IndexName,
 		}
 	}
 }
 
-func (r *DistSQLReceiver) maybeLogMisestimates(ctx context.Context, planner *planner) {
-	if !execinfra.LogScanRowCountMisestimate.Get(&planner.ExecCfg().Settings.SV) {
+// TODO(yuzefovich): consider whether we want to handle misestimates for
+// postqueries too.
+func (r *DistSQLReceiver) handleMisestimates(ctx context.Context, planner *planner) {
+	if !r.logMisestimates {
 		return
 	}
-
 	checkedLimiter := false
 	for _, s := range r.scanStageEstimateMap {
 		actualRowCount := s.rowsRead
@@ -1967,18 +2021,17 @@ func (r *DistSQLReceiver) maybeLogMisestimates(ctx context.Context, planner *pla
 		if !inaccurateEstimate {
 			continue
 		}
-		if isSystemTable, err := planner.IsSystemTable(ctx, int64(s.tableID)); err != nil || isSystemTable {
-			continue
-		}
 
-		// Log all or none of the misestimated scans in the query.
-		if !checkedLimiter {
-			if !misestimateLogLimiter.ShouldLog() {
-				return
+		if r.logMisestimates {
+			if !checkedLimiter {
+				// Log all or none of the misestimated scans in the query.
+				if !misestimateLogLimiter.ShouldLog() {
+					return
+				}
+				checkedLimiter = true
 			}
-			checkedLimiter = true
+			s.logMisestimate(ctx, planner)
 		}
-		s.logMisestimate(ctx, planner)
 	}
 }
 
@@ -2027,7 +2080,7 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
 		// return from this method (after the main query is executed).
-		subqueryResultMemAcc := planner.Mon().MakeBoundAccount()
+		subqueryResultMemAcc := planner.ExecMon().MakeBoundAccount()
 		defer subqueryResultMemAcc.Close(ctx)
 		if !dsp.PlanAndRunSubqueries(
 			ctx,
@@ -2174,7 +2227,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	// receiver, and use it and serialize the results of the subquery. The type
 	// of the results stored in the container depends on the type of the subquery.
 	subqueryRecv := recv.clone()
-	subqueryRecv.makeScanEstimates(subqueryPhysPlan, dsp.st)
+	subqueryRecv.makeScanEstimates(ctx, planner, subqueryPhysPlan, dsp.st)
 	defer subqueryRecv.Release()
 	defer recv.stats.add(&subqueryRecv.stats)
 	var typs []*types.T
@@ -2300,7 +2353,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		// with many duplicate elements.
 		subqueryResultMemAcc.Shrink(ctx, alreadyAccountedFor-actualSize)
 	}
-	subqueryRecv.maybeLogMisestimates(ctx, planner)
+	subqueryRecv.handleMisestimates(ctx, planner)
 	return nil
 }
 
@@ -2348,7 +2401,7 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 	} else {
 		finalizePlanWithRowCount(ctx, planCtx, physPlan, planCtx.planner.curPlan.mainRowCount)
 		recv.expectedRowsRead = int64(physPlan.TotalEstimatedScannedRows)
-		recv.makeScanEstimates(physPlan, dsp.st)
+		recv.makeScanEstimates(ctx, planCtx.planner, physPlan, dsp.st)
 		dsp.Run(ctx, planCtx, txn, physPlan, recv, &extEvalCtx.Context, finishedSetupFn)
 	}
 	if planCtx.isLocal {
@@ -2421,7 +2474,7 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 		}
 		finalizePlanWithRowCount(ctx, localPlanCtx, localPhysPlan, localPlanCtx.planner.curPlan.mainRowCount)
 		recv.expectedRowsRead = int64(localPhysPlan.TotalEstimatedScannedRows)
-		recv.makeScanEstimates(localPhysPlan, dsp.st)
+		recv.makeScanEstimates(ctx, localPlanCtx.planner, localPhysPlan, dsp.st)
 		// We already called finishedSetupFn in the previous call to Run, since we
 		// only got here if we got a distributed error, not an error during setup.
 		dsp.Run(ctx, localPlanCtx, txn, localPhysPlan, recv, &extEvalCtx.Context, nil /* finishedSetupFn */)
@@ -2433,18 +2486,26 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 // Because cascades and triggers can themselves generate more cascades, check,
 // or trigger queries, this method can append to plan.cascades, plan.checkPlans,
 // and plan.triggers (and all these plans must be closed later).
-//
-// Returns false if an error was encountered and sets that error in the provided
-// receiver.
 func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 	ctx context.Context,
 	planner *planner,
 	evalCtxFactory func(usedConcurrently bool) *extendedEvalContext,
 	plan *planComponents,
 	recv *DistSQLReceiver,
-) bool {
-	if len(plan.cascades) == 0 && len(plan.checkPlans) == 0 && len(plan.triggers) == 0 {
-		return false
+) {
+	if len(plan.checkPlans) == 0 {
+		if len(plan.cascades) == 0 && len(plan.triggers) == 0 {
+			// We have no postqueries to run.
+			return
+		}
+		if rcr, ok := recv.resultWriter.(RestrictedCommandResult); ok && rcr.RowsAffected() == 0 {
+			// We have some cascades and / or row-level triggers, but the main
+			// query didn't modify any rows, meaning that cascades / row-level
+			// triggers would no-op, so we simply short-circuit their execution.
+			// TODO(#126362): once we support statement-level triggers, this
+			// might need to be adjusted.
+			return
+		}
 	}
 
 	prevSteppingMode := planner.Txn().ConfigureStepping(ctx, kv.SteppingEnabled)
@@ -2480,7 +2541,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 			// run as part of the same statement as the corresponding mutations.
 			if err := planner.Txn().Step(ctx, false /* allowReadTimestampStep */); err != nil {
 				recv.SetError(err)
-				return false
+				return
 			}
 
 			// The cascading query is allowed to autocommit only if it is the last
@@ -2502,7 +2563,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 				&plan.cascades[cascadesIdx], defaultGetSaveFlowsFunc,
 			)
 			if !ok {
-				return false
+				return
 			}
 			checksContainLocking = checksContainLocking || newChecksContainLocking
 		}
@@ -2525,7 +2586,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 			// part of the same statement as the corresponding mutations.
 			if err := planner.Txn().Step(ctx, false /* allowReadTimestampStep */); err != nil {
 				recv.SetError(err)
-				return false
+				return
 			}
 
 			// We'll run the checks in parallel if the parallelization is enabled, we have
@@ -2551,7 +2612,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 				checksToRun := plan.checkPlans[checksIdx:]
 				if err := dsp.planAndRunChecksInParallel(ctx, checksToRun, planner, evalCtxFactory, recv); err != nil {
 					recv.SetError(err)
-					return false
+					return
 				}
 			} else {
 				if (len(plan.checkPlans) - checksIdx) > 1 {
@@ -2571,7 +2632,7 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 						recv.stats.add,
 					); err != nil {
 						recv.SetError(err)
-						return false
+						return
 					}
 				}
 			}
@@ -2605,12 +2666,11 @@ func (dsp *DistSQLPlanner) PlanAndRunPostQueries(
 				&plan.triggers[triggersIdx], defaultGetSaveFlowsFunc,
 			)
 			if !ok {
-				return false
+				return
 			}
 			checksContainLocking = checksContainLocking || newChecksContainLocking
 		}
 	}
-	return true
 }
 
 // checkPostQueryBuffer checks whether the given post-query has an input buffer
@@ -2730,11 +2790,12 @@ var parallelizeChecks = settings.RegisterBoolSetting(
 var parallelChecksConcurrencyLimit = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
 	"sql.distsql.parallelize_checks.concurrency_limit",
-	"maximum number of additional goroutines to run checks in parallel",
+	"maximum number of additional goroutines to run checks in parallel. "+
+		"The default value is computed as the number of vCPUs in a node times 16.",
 	// The default here is picked somewhat arbitrarily - the thinking is that we
 	// want it to be proportional to the number of CPUs we have, yet this limit
-	// should probably be smaller than kvcoord.senderConcurrencyLimit (which is
-	// 64 x CPUs).
+	// should probably be smaller than kvcoord.senderConcurrencyLimit (which
+	// used to be 64 x CPUs).
 	int64(16*runtime.GOMAXPROCS(0)),
 	settings.NonNegativeInt,
 )
@@ -2950,7 +3011,20 @@ func (dsp *DistSQLPlanner) planAndRunChecksInParallel(
 			},
 			func(ctx context.Context) {
 				defer wg.Done()
+				// Measure this worker goroutine's CPU time. It is not
+				// captured by the main cpuStopWatch in
+				// dispatchToExecutionEngine since it runs on a separate
+				// goroutine. We add raw grunning here; the gateway's
+				// sqlCPUTime() helper will subtract localKVCPUTime (which
+				// is propagated via addTopLevelQueryStats).
+				var cpuStopWatch timeutil.CPUStopWatch
+				cpuStopWatch.Start()
 				runCheck(ctx, checkPlanIdx, parallelCheckWorkerGoroutine)
+				if workerGrunning := cpuStopWatch.Stop(); workerGrunning > 0 {
+					mu.Lock()
+					recv.stats.rawSQLCPUTime += workerGrunning
+					mu.Unlock()
+				}
 			}); err != nil {
 			// The server is quiescing, so we just make sure to wait for all
 			// already started checks to complete after canceling them.

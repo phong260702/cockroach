@@ -369,7 +369,7 @@ GRANT UPDATE ON top_secret TO agent_bond;
 		want := [][]string{
 			{`mi5`, `database`, `GRANT ALL ON DATABASE mi5 TO admin WITH GRANT OPTION; ` +
 				`GRANT ALL ON DATABASE mi5 TO agents; ` +
-				`GRANT CONNECT ON DATABASE mi5 TO public; ` +
+				`GRANT CONNECT, TEMPORARY ON DATABASE mi5 TO public; ` +
 				`GRANT ALL ON DATABASE mi5 TO root WITH GRANT OPTION; `, `root`},
 			{`public`, `schema`, `GRANT ALL ON SCHEMA public TO admin WITH GRANT OPTION; ` +
 				`GRANT CREATE, USAGE ON SCHEMA public TO public; ` +
@@ -894,7 +894,7 @@ func TestShowBackupsWithIDs(t *testing.T) {
 
 	t.Run("backup times are in descending order", func(t *testing.T) {
 		shownTimes := sqlDB.QueryStr(
-			t, fmt.Sprintf(`SELECT backup_time FROM [SHOW BACKUPS IN '%s']`, collectionURI),
+			t, `SELECT backup_time FROM [SHOW BACKUPS IN $1]`, collectionURI,
 		)
 		require.Equal(t, len(times), len(shownTimes))
 		require.True(
@@ -921,10 +921,8 @@ func TestShowBackupsWithIDs(t *testing.T) {
 			var count int
 			sqlDB.QueryRow(
 				t,
-				fmt.Sprintf(
-					`SELECT count(*) FROM [SHOW BACKUPS IN '%s' OLDER THAN %d]`,
-					collectionURI, filterTime,
-				),
+				fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUPS IN $1 OLDER THAN %d]`, filterTime),
+				collectionURI,
 			).Scan(&count)
 
 			var expected int
@@ -946,10 +944,8 @@ func TestShowBackupsWithIDs(t *testing.T) {
 			var count int
 			sqlDB.QueryRow(
 				t,
-				fmt.Sprintf(
-					`SELECT count(*) FROM [SHOW BACKUPS IN '%s' NEWER THAN %d]`,
-					collectionURI, filterTime,
-				),
+				fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUPS IN $1 NEWER THAN %d]`, filterTime),
+				collectionURI,
 			).Scan(&count)
 
 			var expected int
@@ -980,10 +976,8 @@ func TestShowBackupsWithIDs(t *testing.T) {
 			var count int
 			sqlDB.QueryRow(
 				t,
-				fmt.Sprintf(
-					`SELECT count(*) FROM [SHOW BACKUPS IN '%s' OLDER THAN %d NEWER THAN %d]`,
-					collectionURI, newerTime, olderTime,
-				),
+				fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUPS IN $1 OLDER THAN %d NEWER THAN %d]`, newerTime, olderTime),
+				collectionURI,
 			).Scan(&count)
 
 			var expected int
@@ -999,6 +993,145 @@ func TestShowBackupsWithIDs(t *testing.T) {
 				olderTime, newerTime,
 			)
 		})
+	})
+}
+
+func TestShowBackupsWithIDsAndRevisionHistory(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numAccounts = 11
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+	sqlDB.Exec(t, "SET SESSION use_backups_with_ids = true")
+
+	const collectionURI = "nodelocal://1/backup"
+
+	sqlDB.Exec(t, `BACKUP INTO $1 WITH revision_history`, collectionURI)
+	// We add a short sleep between backups so they show up with different times.
+	time.Sleep(time.Second)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN $1 WITH revision_history`, collectionURI)
+	time.Sleep(time.Second)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN $1 WITH revision_history`, collectionURI)
+
+	t.Run("WITH REVISION START TIME", func(t *testing.T) {
+		revStartTimes := sqlDB.QueryStr(
+			t,
+			`SELECT backup_time, revision_start_time FROM [SHOW BACKUPS IN $1 WITH REVISION START TIME]`,
+			collectionURI,
+		)
+		require.Len(t, revStartTimes, 3, "expected 3 backups")
+		for idx, row := range revStartTimes {
+			require.NotEqual(t, "NULL", row[1], "expected non-empty revision start time (row %d)", idx)
+
+			require.Less(
+				t, row[1], row[0], "expected revision start time to be before backup time (row %d)", idx,
+			)
+			if idx < len(revStartTimes)-1 {
+				require.Less(
+					t,
+					revStartTimes[idx+1][1], row[1],
+					"expected revision start times to be in descending order (row %d)", idx,
+				)
+			}
+		}
+	})
+
+	t.Run("WITHOUT REVISION START TIME", func(t *testing.T) {
+		rows := sqlDB.QueryStr(t, `SHOW BACKUPS IN $1`, collectionURI)
+		require.Len(t, rows, 3, "expected 3 backups")
+		for _, row := range rows {
+			require.Len(t, row, 2, "expected 2 columns (id, backup_time)")
+		}
+	})
+}
+
+func TestShowBackupsWithDebug(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numAccounts = 11
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+	sqlDB.Exec(t, "SET SESSION use_backups_with_ids = true")
+
+	const collectionURI = "nodelocal://1/backup-debug"
+
+	sqlDB.Exec(t, `BACKUP INTO $1`, collectionURI)
+	// Sleep between backups so they have different times.
+	time.Sleep(time.Second)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN $1`, collectionURI)
+	time.Sleep(time.Second)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN $1`, collectionURI)
+
+	t.Run("WITH DEBUG", func(t *testing.T) {
+		rows := sqlDB.QueryStr(
+			t,
+			`SELECT id, full_subdir, start_time, path FROM [SHOW BACKUPS IN $1 WITH DEBUG]`,
+			collectionURI,
+		)
+		require.Len(t, rows, 3, "expected 3 backups")
+
+		// All backups in this chain should share the same full_subdir.
+		fullSubdir := rows[0][1]
+		for idx, row := range rows {
+			require.Equal(
+				t, fullSubdir, row[1],
+				"expected all backups to share the same full_subdir (row %d)", idx,
+			)
+			// The full subdir should be a date-based path like /YYYY/MM/DD-HHMMSS.SS.
+			require.Regexp(
+				t, `/\d{4}/\d{2}/\d{2}-\d{6}\.\d{2}`, row[1],
+				"expected full_subdir to be a date-based path (row %d)", idx,
+			)
+			// path should be non-empty.
+			require.NotEqual(t, "", row[3], "expected non-empty path (row %d)", idx)
+		}
+
+		// The full backup's path should equal the full_subdir.
+		lastRow := rows[len(rows)-1]
+		require.Equal(
+			t, fullSubdir, lastRow[3],
+			"expected full backup path to equal full_subdir",
+		)
+
+		// The full backup (last row, since results are in descending order)
+		// should have a NULL start_time.
+		require.Equal(
+			t, "NULL", lastRow[2],
+			"expected full backup to have NULL start_time",
+		)
+
+		// Incremental backups should have non-NULL start times and paths
+		// different from the full_subdir.
+		for idx := len(rows) - 2; idx >= 0; idx-- {
+			require.NotEqual(
+				t, "NULL", rows[idx][2],
+				"expected incremental backup to have non-NULL start_time (row %d)", idx,
+			)
+			require.NotEqual(
+				t, fullSubdir, rows[idx][3],
+				"expected incremental backup path to differ from full_subdir (row %d)", idx,
+			)
+		}
+	})
+
+	t.Run("WITH DEBUG, REVISION START TIME", func(t *testing.T) {
+		// DEBUG can be combined with REVISION START TIME.
+		rows := sqlDB.QueryStr(
+			t,
+			`SELECT id, revision_start_time, full_subdir, start_time, path FROM [SHOW BACKUPS IN $1 WITH DEBUG, REVISION START TIME]`,
+			collectionURI,
+		)
+		require.Len(t, rows, 3, "expected 3 backups")
+		for idx, row := range rows {
+			// revision_start_time should be NULL since these backups don't have
+			// revision_history.
+			require.Equal(t, "NULL", row[1], "expected NULL revision_start_time (row %d)", idx)
+			// full_subdir and path should still be populated.
+			require.NotEqual(t, "NULL", row[2], "expected non-NULL full_subdir (row %d)", idx)
+			require.NotEqual(t, "", row[4], "expected non-empty path (row %d)", idx)
+		}
 	})
 }
 
@@ -1054,7 +1187,7 @@ func TestShowBackupWithIDs(t *testing.T) {
 		sqlDB.Exec(t, "BACKUP DATABASE foo INTO LATEST IN $1 AS OF SYSTEM TIME $2::STRING", localFoo, t3.AsOfSystemTime())
 
 		sqlDB.QueryRow(
-			t, fmt.Sprintf(`SELECT path FROM [SHOW BACKUPS IN '%s']`, localFoo),
+			t, `SELECT path FROM [SHOW BACKUPS IN $1]`, localFoo,
 		).Scan(&fullSubdir)
 		require.NotEmpty(t, fullSubdir)
 
@@ -1092,12 +1225,12 @@ func TestShowBackupWithIDs(t *testing.T) {
 	}
 
 	sqlDB.Exec(t, "SET SESSION use_backups_with_ids = true")
-	idRows := sqlDB.Query(t, fmt.Sprintf(`SHOW BACKUPS IN '%s'`, localFoo))
+	idRows := sqlDB.Query(t, `SHOW BACKUPS IN $1`, localFoo)
 	var ids []string // All ids in sorted chronological order
 	for idRows.Next() {
 		var id string
 		var unused any
-		if err := idRows.Scan(&id, &unused, &unused); err != nil {
+		if err := idRows.Scan(&id, &unused); err != nil {
 			t.Fatal(err)
 		}
 		ids = append([]string{id}, ids...)
@@ -1217,13 +1350,63 @@ func TestShowBackupWithIDs(t *testing.T) {
 		}
 	})
 
-	t.Run("passing subdir fails", func(t *testing.T) {
-		// Ensure that if use_backups_with_ids is set, passing a subdirectory fails.
-		sqlDB.ExpectErr(
-			t,
-			"failed decoding backup ID",
-			`SHOW BACKUP FROM $1 IN $2`,
-			fullSubdir, localFoo,
-		)
+	t.Run("legacy behavior", func(t *testing.T) {
+		t.Run("passing subdir", func(t *testing.T) {
+			var uniqueTimes int
+			sqlDB.QueryRow(
+				t,
+				`SELECT count(DISTINCT (start_time, end_time)) FROM [SHOW BACKUP FROM $1 IN $2]`,
+				fullSubdir, localFoo,
+			).Scan(&uniqueTimes)
+			require.Equal(t, 12, uniqueTimes, "expected to see all 12 backups in the chain")
+		})
+
+		t.Run("passing latest", func(t *testing.T) {
+			sqlDB.Exec(t, "SET SESSION use_backups_with_ids = false")
+			defer sqlDB.Exec(t, "SET SESSION use_backups_with_ids = true")
+
+			var uniqueTimes int
+			sqlDB.QueryRow(
+				t,
+				`SELECT count(DISTINCT (start_time, end_time)) FROM [SHOW BACKUP FROM LATEST IN $1]`,
+				localFoo,
+			).Scan(&uniqueTimes)
+			require.Equal(t, 12, uniqueTimes, "expected to see all 12 backups in the chain")
+
+		})
 	})
+}
+
+// This tests that if SHOW BACKUPS is used in a subquery and the parent query
+// runs into the error, we properly close the subquery and exit instead of
+// hanging. See issue #166581.
+func TestShowBackupsSubqueryClose(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numAccounts = 11
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+	defer cleanupFn()
+
+	sqlDB.Exec(t, `SET use_backups_with_ids = true`)
+	sqlDB.Exec(t, `BACKUP INTO 'nodelocal://1/backup'`)
+	sqlDB.Exec(t, `BACKUP INTO LATEST IN 'nodelocal://1/backup'`)
+	var ts int64
+	sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()::INT`).Scan(&ts)
+	// Casting a nanosecond timestamp to timestamptz will fail due to exceeding
+	// the bounds, which should cause the query to error and not consume from the
+	// SHOW BACKUPS subquery. We test both the old and new SHOW BACKUPS syntax as
+	// both are susceptible to this issue.
+	sqlDB.ExpectErrWithTimeout(
+		t,
+		"exceeds supported timestamp bounds",
+		fmt.Sprintf(`SELECT * FROM [SHOW BACKUPS IN 'nodelocal://1/backup'] WHERE %d::TIMESTAMPTZ < 1000::TIMESTAMPTZ`, ts),
+	)
+
+	sqlDB.Exec(t, `SET use_backups_with_ids = true`)
+	sqlDB.ExpectErrWithTimeout(
+		t,
+		"exceeds supported timestamp bounds",
+		fmt.Sprintf(`SELECT * FROM [SHOW BACKUPS IN 'nodelocal://1/backup'] WHERE %d::TIMESTAMPTZ < backup_time`, ts),
+	)
 }

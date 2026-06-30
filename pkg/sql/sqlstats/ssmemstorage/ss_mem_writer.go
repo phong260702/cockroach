@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
@@ -49,12 +50,13 @@ func (s *Container) RecordStatement(ctx context.Context, value *sqlstats.Recorde
 		fingerprintID:            value.FingerprintID,
 		planHash:                 value.PlanHash,
 		transactionFingerprintID: value.TransactionFingerprintID,
+		aggregatedTs:             value.AggregatedTs,
+		aggInterval:              value.AggInterval,
 	}
 
 	// Get the statistics object.
 	stats, created, throttled := s.tryCreateStatsForStmtWithKey(statementKey, sampledPlanKey{
 		stmtNoConstants: value.Query,
-		implicitTxn:     value.ImplicitTxn,
 		database:        value.Database,
 	})
 
@@ -82,6 +84,21 @@ func (s *Container) RecordStatement(ctx context.Context, value *sqlstats.Recorde
 	}
 	if value.AppliedStmtHints {
 		stats.mu.data.StmtHintsCount++
+	}
+	// Track canary and stable stats separately: these latencies use their own
+	// counts (not the overall Count) for Welford's running average, since they
+	// represent only the subsets of executions that participated in the canary
+	// experiment. Executions where the experiment is off (canary_fraction = 0)
+	// are counted in neither bucket.
+	switch value.StatsRollout {
+	case eval.StatsRolloutCanary:
+		stats.mu.data.CanaryStats.Count++
+		stats.mu.data.CanaryStats.RunLat.Record(stats.mu.data.CanaryStats.Count, value.RunLatencySec)
+		stats.mu.data.CanaryStats.PlanLat.Record(stats.mu.data.CanaryStats.Count, value.PlanLatencySec)
+	case eval.StatsRolloutStable:
+		stats.mu.data.StableStats.Count++
+		stats.mu.data.StableStats.RunLat.Record(stats.mu.data.StableStats.Count, value.RunLatencySec)
+		stats.mu.data.StableStats.PlanLat.Record(stats.mu.data.StableStats.Count, value.PlanLatencySec)
 	}
 	if value.AutoRetryCount == 0 {
 		stats.mu.data.FirstAttemptCount++
@@ -157,10 +174,9 @@ func (s *Container) RecordStatement(ctx context.Context, value *sqlstats.Recorde
 
 // StatementSampled returns true if the statement with the given fingerprint
 // exists in the sampled statement cache.
-func (s *Container) StatementSampled(fingerprint string, implicitTxn bool, database string) bool {
+func (s *Container) StatementSampled(fingerprint string, database string) bool {
 	key := sampledPlanKey{
 		stmtNoConstants: fingerprint,
-		implicitTxn:     implicitTxn,
 		database:        database,
 	}
 	s.mu.Lock()
@@ -171,12 +187,9 @@ func (s *Container) StatementSampled(fingerprint string, implicitTxn bool, datab
 
 // TrySetStatementSampled attempts to add the statement to the sampled
 // statement cache. If the statement is already in the cache, it returns false.
-func (s *Container) TrySetStatementSampled(
-	fingerprint string, implicitTxn bool, database string,
-) bool {
+func (s *Container) TrySetStatementSampled(fingerprint string, database string) bool {
 	key := sampledPlanKey{
 		stmtNoConstants: fingerprint,
-		implicitTxn:     implicitTxn,
 		database:        database,
 	}
 	s.mu.Lock()
@@ -193,7 +206,12 @@ func (s *Container) RecordTransaction(ctx context.Context, value *sqlstats.Recor
 	s.recordTransactionHighLevelStats(value.TransactionTimeSec, value.Committed, value.ImplicitTxn)
 
 	// Get the statistics object.
-	stats, created, throttled := s.tryCreateStatsForTxnWithKey(value.FingerprintID, value.StatementFingerprintIDs)
+	key := txnKey{
+		transactionFingerprintID: value.FingerprintID,
+		aggregatedTs:             value.AggregatedTs,
+		aggInterval:              value.AggInterval,
+	}
+	stats, created, throttled := s.tryCreateStatsForTxnWithKey(key, value.StatementFingerprintIDs)
 
 	if throttled {
 		return ErrFingerprintLimitReached
@@ -210,14 +228,14 @@ func (s *Container) RecordTransaction(ctx context.Context, value *sqlstats.Recor
 	// fingerprints for this app. We also abort the operation and return an error.
 	if created {
 		estimatedMemAllocBytes :=
-			stats.sizeUnsafeLocked() + value.FingerprintID.Size() + 8 /* hash of transaction key */
+			stats.sizeUnsafeLocked() + key.size() + 8 /* hash of transaction key */
 		if err := func() error {
 			// If the monitor is nil, we do not track memory usage.
 			if s.acc != nil {
 				if err := s.acc.Grow(ctx, estimatedMemAllocBytes); err != nil {
 					s.mu.Lock()
 					defer s.mu.Unlock()
-					delete(s.mu.txns, value.FingerprintID)
+					delete(s.mu.txns, key)
 					return ErrMemoryPressure
 				}
 			}

@@ -51,6 +51,9 @@ type dataset interface {
 	// getFingerprint() returns a map containing the expected fingerprint for this
 	// dataset, or 'nil' if the table has not been calibrated yet.
 	getFingerprint() map[string]string
+
+	// getDataFormat() returns the SQL data format keyword (e.g. "CSV", "PARQUET").
+	getDataFormat() string
 }
 
 // staticDataset represents a statically created dataset stored in external
@@ -62,6 +65,7 @@ type staticDataset struct {
 	createTableStmt string
 	dataURLs        []string
 	fingerprint     map[string]string
+	dataFormat      string
 }
 
 func (sd *staticDataset) init(_ context.Context, _ cluster.Cluster, _ *logger.Logger) error {
@@ -71,25 +75,48 @@ func (sd staticDataset) getTableName() string              { return sd.tableName
 func (sd staticDataset) getCreateTableStmt() string        { return sd.createTableStmt }
 func (sd staticDataset) getDataURLs() []string             { return sd.dataURLs }
 func (sd staticDataset) getFingerprint() map[string]string { return sd.fingerprint }
+func (sd staticDataset) getDataFormat() string             { return sd.dataFormat }
 
-// tpchDataset represents a TPC-H dataset file stored on external storage.
+// tpchDataset represents a TPC-H dataset stored on external storage. The
+// format field determines whether data files are CSV or Parquet; schemas and
+// fingerprints are always read from the CSV bucket (the calibration master).
 type tpchDataset struct {
 	staticDataset
+	// dataBaseURL is the GCS bucket prefix where data files are stored.
+	dataBaseURL string
+	// fileExt is the data file extension (e.g. "tbl" for CSV, "parquet").
+	fileExt string
 }
 
-// init() implements the dataset interface. We use scale factor 1 for local clusters and scale
-// factor 100 for roachprod clusters.
+const (
+	tpchCSVBaseURL     = "gs://cockroach-fixtures-us-east1/tpch-csv/"
+	tpchParquetBaseURL = "gs://cockroach-fixtures-us-east1/tpch-parquet/"
+)
+
+// tpchFingerprintURL returns the GCS URL for a table's fingerprint file.
+// Fingerprints are always stored in the CSV bucket, which is the calibration
+// master for all formats.
+func tpchFingerprintURL(scale, tableName string) string {
+	return fmt.Sprintf("%s%s/%s.fingerprint?AUTH=implicit",
+		tpchCSVBaseURL, scale, tableName)
+}
+
+// init implements the dataset interface. We use scale factor 1 for local
+// clusters and scale factor 100 for roachprod clusters. Schemas and
+// fingerprints are always read from the CSV bucket so that all formats share
+// a single calibration source.
 func (tpch *tpchDataset) init(
 	ctx context.Context, c cluster.Cluster, l *logger.Logger,
 ) (err error) {
 	defer func() {
 		if err != nil {
-			err = errors.Wrapf(err, "initializing %s", tpch.tableName)
+			err = errors.Wrapf(err, "initializing %s %s",
+				tpch.dataFormat, tpch.tableName)
 		}
 	}()
 	conn := c.Conn(ctx, l, 1)
 	defer conn.Close()
-	baseURL := "gs://cockroach-fixtures-us-east1/tpch-csv/"
+
 	var scale string
 	if c.IsLocal() {
 		scale = "sf-1"
@@ -98,52 +125,81 @@ func (tpch *tpchDataset) init(
 	}
 
 	tpch.createTableStmt, err = readFileFromFixture(
-		fmt.Sprintf("%s/schema/%s.sql?AUTH=implicit", baseURL, tpch.tableName), conn)
+		fmt.Sprintf("%s/schema/%s.sql?AUTH=implicit",
+			tpchCSVBaseURL, tpch.tableName), conn)
 	if err != nil {
 		return err
 	}
 
-	fingerprintURL := fmt.Sprintf("%s/%s/%s.fingerprint?AUTH=implicit", baseURL, scale, tpch.tableName)
+	// Fingerprints are always read from the CSV bucket, which serves as the
+	// calibration master for all formats.
+	fingerprintURL := tpchFingerprintURL(scale, tpch.tableName)
 	var fingerprint string
 	fingerprint, err = readFileFromFixture(fingerprintURL, conn)
 	if err != nil {
-		// It's okay to not have fingerprints here because we may be doing a calibration run.
+		// It's okay to not have fingerprints here because we may be
+		// doing a calibration run.
 		if !strings.Contains(err.Error(), "gcs object does not exist") {
 			return err
 		}
 	} else {
 		err = json.Unmarshal([]byte(fingerprint), &tpch.fingerprint)
 		if err != nil {
-			return errors.Wrapf(err, "error unmarshalling expected table fingerprint: %s", fingerprint)
+			return errors.Wrapf(err, "error unmarshalling expected table fingerprint: %s",
+				fingerprint)
 		}
 	}
 
 	tpch.dataURLs = make([]string, 0, 8)
 	for i := 1; i <= 8; i++ {
 		tpch.dataURLs = append(tpch.dataURLs,
-			fmt.Sprintf("%s/%s/%s.tbl.%d?AUTH=implicit", baseURL, scale, tpch.tableName, i))
+			fmt.Sprintf("%s/%s/%s.%s.%d?AUTH=implicit",
+				tpch.dataBaseURL, scale, tpch.tableName,
+				tpch.fileExt, i))
 	}
 
 	return nil
 }
 
-// newTPCHDataset() is a convenience function to quickly declare a TPC-H dataset by name.
-func newTPCHDataset(name string) *tpchDataset {
+// newTPCHCSVDataset creates a TPC-H dataset backed by CSV files.
+func newTPCHCSVDataset(name string) *tpchDataset {
 	return &tpchDataset{
 		staticDataset: staticDataset{
-			tableName: name,
+			tableName:  name,
+			dataFormat: "CSV",
 		},
+		dataBaseURL: tpchCSVBaseURL,
+		fileExt:     "tbl",
+	}
+}
+
+// newTPCHParquetDataset creates a TPC-H dataset backed by Parquet files.
+func newTPCHParquetDataset(name string) *tpchDataset {
+	return &tpchDataset{
+		staticDataset: staticDataset{
+			tableName:  name,
+			dataFormat: "PARQUET",
+		},
+		dataBaseURL: tpchParquetBaseURL,
+		fileExt:     "parquet",
 	}
 }
 
 // datasets is the set of all known datasets to test with.
 var datasets = map[string]dataset{
-	"tpch/customer": newTPCHDataset("customer"),
-	"tpch/lineitem": newTPCHDataset("lineitem"),
-	"tpch/orders":   newTPCHDataset("orders"),
-	"tpch/part":     newTPCHDataset("part"),
-	"tpch/partsupp": newTPCHDataset("partsupp"),
-	"tpch/supplier": newTPCHDataset("supplier"),
+	"tpch/customer": newTPCHCSVDataset("customer"),
+	"tpch/lineitem": newTPCHCSVDataset("lineitem"),
+	"tpch/orders":   newTPCHCSVDataset("orders"),
+	"tpch/part":     newTPCHCSVDataset("part"),
+	"tpch/partsupp": newTPCHCSVDataset("partsupp"),
+	"tpch/supplier": newTPCHCSVDataset("supplier"),
+
+	"tpch-parquet/customer": newTPCHParquetDataset("customer"),
+	"tpch-parquet/lineitem": newTPCHParquetDataset("lineitem"),
+	"tpch-parquet/orders":   newTPCHParquetDataset("orders"),
+	"tpch-parquet/part":     newTPCHParquetDataset("part"),
+	"tpch-parquet/partsupp": newTPCHParquetDataset("partsupp"),
+	"tpch-parquet/supplier": newTPCHParquetDataset("supplier"),
 }
 
 // readFileFromFixture() reads a URI by routing through the read_file() internal
@@ -171,24 +227,98 @@ type FromFunc func(rng *rand.Rand) []string
 
 func (f FromFunc) Strings(rng *rand.Rand) []string { return f(rng) }
 
+// allDatasets returns the names of all registered datasets, regardless of
+// format. Tests that use this pool exercise both CSV and Parquet paths via
+// randomization.
 func allDatasets(_ *rand.Rand) []string {
 	return slices.Collect(maps.Keys(datasets))
 }
 
+// nDatasets returns n randomly chosen dataset names with distinct table names.
+// This prevents conflicts when multiple datasets are imported concurrently
+// into the same database (e.g. both tpch/orders and tpch-parquet/orders
+// target import_test.orders).
 func nDatasets(rng *rand.Rand, n int) []string {
-	allDatasets := allDatasets(rng)
-	rng.Shuffle(len(allDatasets), func(i, j int) {
-		allDatasets[i], allDatasets[j] = allDatasets[j], allDatasets[i]
+	all := allDatasets(rng)
+	rng.Shuffle(len(all), func(i, j int) {
+		all[i], all[j] = all[j], all[i]
 	})
-	return allDatasets[:n]
-}
-
-func anyThreeDatasets(rng *rand.Rand) []string {
-	return nDatasets(rng, 3)
+	seen := make(map[string]bool)
+	var result []string
+	for _, name := range all {
+		tbl := datasets[name].getTableName()
+		if seen[tbl] {
+			continue
+		}
+		seen[tbl] = true
+		result = append(result, name)
+		if len(result) == n {
+			break
+		}
+	}
+	return result
 }
 
 func anyDataset(rng *rand.Rand) []string {
 	return nDatasets(rng, 1)
+}
+
+// allCSVDatasets returns only CSV-format dataset names. Used for calibration
+// since CSV is the fingerprint master.
+func allCSVDatasets(_ *rand.Rand) []string {
+	var csvDatasets []string
+	for name := range datasets {
+		if strings.HasPrefix(name, "tpch/") {
+			csvDatasets = append(csvDatasets, name)
+		}
+	}
+	return csvDatasets
+}
+
+func anyCSVSmallDataset(rng *rand.Rand) []string {
+	all := allCSVDatasets(rng)
+	small := slices.DeleteFunc(all, func(name string) bool {
+		return name == "tpch/lineitem"
+	})
+	rng.Shuffle(len(small), func(i, j int) {
+		small[i], small[j] = small[j], small[i]
+	})
+	return small[:1]
+}
+
+// nSmallDatasets returns n randomly chosen datasets, excluding lineitem in
+// any format. Use for subtests whose extra work would push a lineitem import
+// past importTestTimeout. Like nDatasets, the returned names have distinct
+// table names so concurrent imports do not collide.
+func nSmallDatasets(rng *rand.Rand, n int) []string {
+	small := slices.DeleteFunc(allDatasets(rng), func(name string) bool {
+		return datasets[name].getTableName() == "lineitem"
+	})
+	rng.Shuffle(len(small), func(i, j int) {
+		small[i], small[j] = small[j], small[i]
+	})
+	seen := make(map[string]bool)
+	var result []string
+	for _, name := range small {
+		tbl := datasets[name].getTableName()
+		if seen[tbl] {
+			continue
+		}
+		seen[tbl] = true
+		result = append(result, name)
+		if len(result) == n {
+			break
+		}
+	}
+	return result
+}
+
+func anySmallDataset(rng *rand.Rand) []string {
+	return nSmallDatasets(rng, 1)
+}
+
+func anyThreeSmallDatasets(rng *rand.Rand) []string {
+	return nSmallDatasets(rng, 3)
 }
 
 // importTestSpec represents a subtest within the import test.
@@ -208,6 +338,14 @@ type importTestSpec struct {
 	// datasetNames is a list or generator of datasets that can be used
 	// with this test.
 	datasetNames stringSource
+
+	// skipDistMerge, when true, skips registration of the distmerge=true
+	// variant. Use this for tests that are incompatible with distributed
+	// merge, e.g. node shutdown tests where the merge phase requires SSTs
+	// from all participating instances.
+	skipDistMerge bool
+	// disableEncryption, when true, disables encryption for this test.
+	disableEncryption bool
 
 	// preTestHook is run after tables are created, but before the import starts.
 	preTestHook func(context.Context, test.Test, cluster.Cluster, *rand.Rand)
@@ -229,7 +367,7 @@ var tests = []importTestSpec{
 		nodes:        []int{4},
 		manualOnly:   true,
 		calibrate:    true,
-		datasetNames: FromFunc(allDatasets),
+		datasetNames: FromFunc(allCSVDatasets),
 	},
 	// Small dataset for quickly iterating while developing this test.
 	{
@@ -238,7 +376,8 @@ var tests = []importTestSpec{
 		manualOnly:   true,
 		datasetNames: One("tpch/supplier"),
 	},
-	// Basic test w/o injected failures.
+	// Basic test w/o injected failures. Draws from all formats so that both
+	// CSV and Parquet paths are exercised via randomization.
 	{
 		subtestName:  "basic",
 		nodes:        []int{4},
@@ -251,17 +390,19 @@ var tests = []importTestSpec{
 		nodes:        []int{4},
 		datasetNames: One("tpch/lineitem"),
 	},
-	// Basic test importing three datasets concurrently.
+	// Basic test importing three datasets concurrently. Draws from all
+	// formats so that both CSV and Parquet paths are exercised.
 	{
 		subtestName:  "concurrency",
 		nodes:        []int{4},
-		datasetNames: FromFunc(anyThreeDatasets),
+		datasetNames: FromFunc(anyThreeSmallDatasets),
 	},
-	// Test with a decommissioned node.
+	// Test with a decommissioned node. Exclude lineitem (the largest dataset)
+	// to avoid timeouts when running with only 3 active nodes.
 	{
 		subtestName:  "decommissioned",
 		nodes:        []int{4},
-		datasetNames: FromFunc(anyDataset),
+		datasetNames: FromFunc(anyCSVSmallDataset),
 		preTestHook: func(ctx context.Context, t test.Test, c cluster.Cluster, _ *rand.Rand) {
 			nodeToDecommission := 2
 			t.Status(fmt.Sprintf("decommissioning node %d", nodeToDecommission))
@@ -273,11 +414,16 @@ var tests = []importTestSpec{
 			time.Sleep(10 * time.Second)
 		},
 	},
-	// Test job survival if a worker node is shutdown.
+	// Test job survival if a worker node is shutdown. Exclude lineitem (the
+	// largest dataset) to avoid timeouts when running with only 3 active nodes.
+	// Distributed merge requires SSTs from all participating instances, so a
+	// permanently downed node causes merge to time out waiting for the missing
+	// instance.
 	{
-		subtestName:  "nodeShutdown/worker",
-		nodes:        []int{4},
-		datasetNames: FromFunc(anyDataset),
+		subtestName:   "nodeShutdown/worker",
+		nodes:         []int{4},
+		skipDistMerge: true,
+		datasetNames:  FromFunc(anyCSVSmallDataset),
 		importRunner: func(ctx context.Context, t test.Test, c cluster.Cluster, l *logger.Logger, _ *rand.Rand, ds dataset) error {
 			importConn := c.Conn(ctx, l, 2 /* gateway node */)
 			defer importConn.Close()
@@ -287,11 +433,14 @@ var tests = []importTestSpec{
 				})
 		},
 	},
-	// Test job survival if the coordinator node is shutdown.
+	// Test job survival if the coordinator node is shutdown. Exclude lineitem
+	// (the largest dataset) to avoid timeouts when running with only 3 active
+	// nodes. See nodeShutdown/worker above for why distmerge is skipped.
 	{
-		subtestName:  "nodeShutdown/coordinator",
-		nodes:        []int{4},
-		datasetNames: FromFunc(anyDataset),
+		subtestName:   "nodeShutdown/coordinator",
+		nodes:         []int{4},
+		skipDistMerge: true,
+		datasetNames:  FromFunc(anyCSVSmallDataset),
 		importRunner: func(ctx context.Context, t test.Test, c cluster.Cluster, l *logger.Logger, _ *rand.Rand, ds dataset) error {
 			importConn := c.Conn(ctx, l, 2 /* gateway node */)
 			defer importConn.Close()
@@ -305,23 +454,54 @@ var tests = []importTestSpec{
 	{
 		subtestName:  "cancellation",
 		nodes:        []int{4},
-		datasetNames: FromFunc(anyThreeDatasets),
+		datasetNames: FromFunc(anyThreeSmallDatasets),
 		importRunner: importCancellationRunner,
 	},
 	// Test column families.
 	{
 		subtestName:  "colfam",
 		nodes:        []int{4},
-		datasetNames: FromFunc(anyDataset),
+		datasetNames: FromFunc(anySmallDataset),
 		preTestHook:  makeColumnFamilies,
+	},
+	// Test pause and resume of import jobs.
+	{
+		subtestName:  "pause",
+		nodes:        []int{4},
+		datasetNames: FromFunc(anyDataset),
+		importRunner: importPauseRunner,
+	},
+	// Test importing a table in two separate IMPORT jobs (split files).
+	{
+		subtestName:  "split",
+		nodes:        []int{4},
+		datasetNames: FromFunc(anySmallDataset),
+		importRunner: splitImportRunner,
+	},
+	// Parquet import: small dataset for quick iteration.
+	{
+		subtestName:  "parquet/smoke",
+		nodes:        []int{4},
+		manualOnly:   true,
+		datasetNames: One("tpch-parquet/supplier"),
+	},
+	// Parquet import: benchmarking with Parquet-specific dataset.
+	{
+		subtestName:  "parquet/benchmark",
+		benchmark:    true,
+		nodes:        []int{4},
+		datasetNames: One("tpch-parquet/lineitem"),
+		// Encryption disabled due to timeouts (#170044).
+		disableEncryption: true,
 	},
 }
 
+// importTestTimeout is the timeout for import roachtests. This is
+// conservatively large because lineitem SF-100 can take about four hours to
+// import, with about another hour and a half to fingerprint. See #68117.
+const importTestTimeout = 10 * time.Hour
+
 func registerImport(r registry.Registry) {
-	// This may be excessively conservative. During a calibration run, lineitem
-	// IMPORT took about four hours, with about another hour and a half to
-	// fingerprint the imported table. See #68117.
-	timeout := 10 * time.Hour
 	for _, testSpec := range tests {
 		suites := registry.Suites(registry.Nightly)
 		if testSpec.manualOnly {
@@ -329,26 +509,33 @@ func registerImport(r registry.Registry) {
 		}
 
 		for _, distMerge := range []bool{false, true} {
+			if distMerge && testSpec.skipDistMerge {
+				continue
+			}
 			for _, numNodes := range testSpec.nodes {
 				ts := testSpec
 				numNodes := numNodes
 
 				name := fmt.Sprintf("import/%s/distmerge=%v/nodes=%d", ts.subtestName, distMerge, numNodes)
+				encryption := registry.EncryptionMetamorphic
+				if ts.disableEncryption {
+					encryption = registry.EncryptionAlwaysDisabled
+				}
 				r.Add(registry.TestSpec{
 					Name:              name,
-					Owner:             registry.OwnerSQLQueries,
+					Owner:             registry.OwnerSQLFoundations,
 					Benchmark:         testSpec.benchmark,
-					Timeout:           timeout,
+					Timeout:           importTestTimeout,
 					Cluster:           r.MakeClusterSpec(numNodes),
 					CompatibleClouds:  registry.Clouds(spec.GCE, spec.Local),
 					Suites:            suites,
-					EncryptionSupport: registry.EncryptionMetamorphic,
+					EncryptionSupport: encryption,
 					Leases:            registry.MetamorphicLeases,
 					// Never run with runtime assertions as this makes this test
 					// take too long to complete.
 					CockroachBinary: registry.StandardCockroach,
 					Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-						runImportTest(ctx, t, c, ts, numNodes, timeout, distMerge)
+						runImportTest(ctx, t, c, ts, numNodes, importTestTimeout, distMerge)
 					},
 				})
 			}
@@ -648,7 +835,8 @@ func importCancellationRunner(
 
 	numAttempts := randutil.RandIntInRange(rng, 2, 5)
 	finalAttempt := numAttempts - 1
-	urlsToImport := ds.getDataURLs()
+	allURLs := ds.getDataURLs()
+	urlsToImport := slices.Clone(allURLs)
 	for attempt := range numAttempts {
 		if len(urlsToImport) == 0 {
 			break
@@ -668,8 +856,16 @@ func importCancellationRunner(
 		t.WorkerStatus(fmt.Sprintf("beginning attempt %d for %s using files: %s", attempt+1, ds.getTableName(),
 			strings.Join(urls, ", ")))
 
+		var rowCountBefore int64
+		err = conn.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM import_test.%s`, ds.getTableName()),
+		).Scan(&rowCountBefore)
+		if err != nil {
+			return err
+		}
+
 		var jobID jobspb.JobID
-		jobID, err = runRawAsyncImportJob(ctx, conn, ds.getTableName(), urls)
+		jobID, err = runRawAsyncImportJob(ctx, conn, ds.getTableName(), urls, ds.getDataFormat())
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
@@ -715,17 +911,37 @@ func importCancellationRunner(
 		t.WorkerStatus(fmt.Sprintf("Import job for attempt %d/%d for table %s (%d files) completed with status %s.",
 			attempt+1, numAttempts, ds.getTableName(), len(urls), status))
 
-		// If the IMPORT was successful (eg, our cancellation came in too late),
-		// remove the files that succeeded so we don't try to import them again.
-		// If this was the last attempt, this should remove all the remaining
-		// files and `filesToImport` should be empty.
-		if status == "succeeded" {
+		// Remove files whose data is now in the table so we don't re-import
+		// them. On the final attempt all remaining files should be removed.
+		switch status {
+		case "succeeded":
 			t.L().PrintfCtx(ctx, "Removing files [%s] from consideration; completed", strings.Join(urls, ", "))
 			urlsToImport = slices.DeleteFunc(urlsToImport, func(url string) bool {
 				return slices.Contains(urls, url)
 			})
-		} else if status == "failed" {
+		case "canceled":
+			// A canceled import may have published data before the
+			// cancellation completed. Compare row counts to detect this;
+			// a table-wide exists check would be confused by rows from
+			// earlier succeeded attempts.
+			var rowCountAfter int64
+			err = conn.QueryRowContext(ctx,
+				fmt.Sprintf(`SELECT count(*) FROM import_test.%s`, ds.getTableName()),
+			).Scan(&rowCountAfter)
+			if err != nil {
+				return err
+			}
+			if rowCountAfter > rowCountBefore {
+				t.L().PrintfCtx(ctx, "Canceled import job %s published data before cancellation; removing files [%s] from consideration",
+					jobID, strings.Join(urls, ", "))
+				urlsToImport = slices.DeleteFunc(urlsToImport, func(url string) bool {
+					return slices.Contains(urls, url)
+				})
+			}
+		case "failed":
 			return errors.Newf("Job %s failed with error: %s\n", jobID, errorMsg)
+		default:
+			return errors.Newf("job %s in unexpected state %q after completion", jobID, status)
 		}
 	}
 	if len(urlsToImport) != 0 {
@@ -736,6 +952,147 @@ func importCancellationRunner(
 	// Restore GC TTLs so we don't interfere with post-import table validation.
 	_, err = conn.ExecContext(ctx, ttl_stmt, 60*60*4 /* 4 hours */)
 	return err
+}
+
+// importPauseRunner() is the test runner for the import pause test.
+// This test starts an import job, pauses it multiple times during execution,
+// resumes it, and verifies successful completion.
+func importPauseRunner(
+	ctx context.Context, t test.Test, c cluster.Cluster, l *logger.Logger, rng *rand.Rand, ds dataset,
+) error {
+	conn := c.Conn(ctx, l, 1)
+	defer conn.Close()
+
+	// Start async import job
+	jobID, err := runAsyncImportJob(ctx, conn, ds)
+	if err != nil {
+		return err
+	}
+
+	// Wait for job to start running
+	if err := WaitForRunning(ctx, conn, jobID, time.Minute); err != nil {
+		return errors.Wrapf(err, "waiting for job %d to start running", jobID)
+	}
+
+	// Determine number of pause cycles (2-4 times)
+	numPauses := randutil.RandIntInRange(rng, 2, 5)
+	t.WorkerStatus(fmt.Sprintf("will pause/resume job %d %d times", jobID, numPauses))
+
+	// Perform multiple pause/resume cycles
+	for i := 0; i < numPauses; i++ {
+		// Wait before pausing (random duration)
+		var waitBeforePause time.Duration
+		if c.IsLocal() {
+			// Local tests run faster, shorter wait
+			waitBeforePause = time.Duration(randutil.RandIntInRange(rng, 5, 15)) * time.Second
+		} else {
+			// Longer wait for roachprod clusters
+			waitBeforePause = time.Duration(randutil.RandIntInRange(rng, 10, 45)) * time.Second
+		}
+
+		select {
+		case <-time.After(waitBeforePause):
+			// Continue to pause
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// Check if job is still running before attempting to pause.
+		var status string
+		err = conn.QueryRowContext(ctx, `SELECT status FROM [SHOW JOB $1]`, jobID).Scan(&status)
+		if err != nil {
+			return errors.Wrapf(err, "checking job status before pause %d", i+1)
+		}
+		switch status {
+		case "running":
+			// Expected — proceed to pause.
+		case "succeeded":
+			t.WorkerStatus(fmt.Sprintf("job %d completed before pause %d/%d", jobID, i+1, numPauses))
+			return nil
+		default:
+			return errors.Newf("job %d in unexpected state %q before pause %d/%d",
+				jobID, status, i+1, numPauses)
+		}
+
+		// Pause the job
+		t.WorkerStatus(fmt.Sprintf("pausing job %d (pause %d/%d)", jobID, i+1, numPauses))
+		_, err = conn.ExecContext(ctx, `PAUSE JOB $1`, jobID)
+		if err != nil {
+			return errors.Wrapf(err, "pausing job %d", jobID)
+		}
+
+		// Wait for paused state
+		if err := WaitForPaused(ctx, conn, jobID, 2*time.Minute); err != nil {
+			return errors.Wrapf(err, "waiting for job %d to pause", jobID)
+		}
+
+		// Keep paused for a bit
+		var pauseDuration time.Duration
+		if c.IsLocal() {
+			pauseDuration = time.Duration(randutil.RandIntInRange(rng, 3, 10)) * time.Second
+		} else {
+			pauseDuration = time.Duration(randutil.RandIntInRange(rng, 5, 20)) * time.Second
+		}
+		t.WorkerStatus(fmt.Sprintf("job %d paused, keeping paused for %v", jobID, pauseDuration))
+		time.Sleep(pauseDuration)
+
+		// Resume the job
+		t.WorkerStatus(fmt.Sprintf("resuming job %d (pause %d/%d)", jobID, i+1, numPauses))
+		_, err = conn.ExecContext(ctx, `RESUME JOB $1`, jobID)
+		if err != nil {
+			return errors.Wrapf(err, "resuming job %d", jobID)
+		}
+
+		// Wait for job to be running again
+		if err := WaitForResume(ctx, conn, jobID, 2*time.Minute); err != nil {
+			return errors.Wrapf(err, "waiting for job %d to resume", jobID)
+		}
+		t.WorkerStatus(fmt.Sprintf("job %d resumed successfully", jobID))
+	}
+
+	t.WorkerStatus(fmt.Sprintf("waiting for job %d to complete after %d pause cycles", jobID, numPauses))
+	if err := WaitForSucceeded(ctx, conn, jobID, importTestTimeout); err != nil {
+		return errors.Wrapf(err, "waiting for job %d to succeed", jobID)
+	}
+
+	t.WorkerStatus(fmt.Sprintf("job %d completed successfully after %d pause/resume cycles", jobID, numPauses))
+	return nil
+}
+
+// splitImportRunner imports a table's data in two separate IMPORT jobs,
+// splitting the data files at a random point and in a randomized order.
+// This verifies that successive imports into the same table produce a
+// correct, complete dataset.
+func splitImportRunner(
+	ctx context.Context, t test.Test, c cluster.Cluster, l *logger.Logger, rng *rand.Rand, ds dataset,
+) error {
+	conn := c.Conn(ctx, l, 1)
+	defer conn.Close()
+
+	urls := slices.Clone(ds.getDataURLs())
+	rng.Shuffle(len(urls), func(i, j int) { urls[i], urls[j] = urls[j], urls[i] })
+	// Split at a random point, ensuring each half gets at least one file.
+	splitIdx := rng.Intn(len(urls)-1) + 1
+	first := urls[:splitIdx]
+	second := urls[splitIdx:]
+
+	t.WorkerStatus(fmt.Sprintf("importing first batch (%d files) of %s",
+		len(first), ds.getTableName()))
+	importStmt := formatImportStmt(ds.getTableName(), first, ds.getDataFormat(), false)
+	l.Printf("first import: %s", importStmt)
+	if _, err := conn.ExecContext(ctx, importStmt); err != nil {
+		return errors.Wrapf(err, "%s", importStmt)
+	}
+
+	t.WorkerStatus(fmt.Sprintf("importing second batch (%d files) of %s",
+		len(second), ds.getTableName()))
+	importStmt = formatImportStmt(ds.getTableName(), second, ds.getDataFormat(), false)
+	l.Printf("second import: %s", importStmt)
+	if _, err := conn.ExecContext(ctx, importStmt); err != nil {
+		return errors.Wrapf(err, "%s", importStmt)
+	}
+
+	return nil
 }
 
 // makeColumnFamilies() is a pre-test hook that changes the tables
@@ -783,9 +1140,10 @@ func makeColumnFamilies(ctx context.Context, t test.Test, c cluster.Cluster, rng
 	}
 }
 
-// runSyncImportJob() runs an import job and waits for it to complete.
+// runSyncImportJob runs an import job and waits for it to complete.
 func runSyncImportJob(ctx context.Context, conn *gosql.DB, ds dataset) error {
-	importStmt := formatImportStmt(ds.getTableName(), ds.getDataURLs(), false)
+	importStmt := formatImportStmt(
+		ds.getTableName(), ds.getDataURLs(), ds.getDataFormat(), false)
 	_, err := conn.ExecContext(ctx, importStmt)
 	if err != nil {
 		err = errors.Wrapf(err, "%s", importStmt)
@@ -793,16 +1151,18 @@ func runSyncImportJob(ctx context.Context, conn *gosql.DB, ds dataset) error {
 	return err
 }
 
-// runAsyncImportJob() runs an import job and returns the job id immediately.
+// runAsyncImportJob runs an import job and returns the job id immediately.
 func runAsyncImportJob(ctx context.Context, conn *gosql.DB, ds dataset) (jobspb.JobID, error) {
-	return runRawAsyncImportJob(ctx, conn, ds.getTableName(), ds.getDataURLs())
+	return runRawAsyncImportJob(
+		ctx, conn, ds.getTableName(), ds.getDataURLs(), ds.getDataFormat())
 }
 
-// runRawAsyncImportJob() runs an import job using the table name and files provided.
+// runRawAsyncImportJob runs an import job using the table name and files
+// provided. The format parameter determines the SQL data format keyword.
 func runRawAsyncImportJob(
-	ctx context.Context, conn *gosql.DB, tableName string, urls []string,
+	ctx context.Context, conn *gosql.DB, tableName string, urls []string, format string,
 ) (jobspb.JobID, error) {
-	importStmt := formatImportStmt(tableName, urls, true)
+	importStmt := formatImportStmt(tableName, urls, format, true)
 
 	var jobID jobspb.JobID
 	err := conn.QueryRowContext(ctx, importStmt).Scan(&jobID)
@@ -813,15 +1173,22 @@ func runRawAsyncImportJob(
 	return jobID, err
 }
 
-// formatImportStmt() takes a dataset and formats a SQL import statment for that
-// dataset.
-func formatImportStmt(tableName string, urls []string, detached bool) string {
+// formatImportStmt builds a SQL IMPORT INTO statement for the given format.
+// CSV imports include a delimiter option; other formats do not.
+func formatImportStmt(tableName string, urls []string, format string, detached bool) string {
 	var stmt strings.Builder
-	fmt.Fprintf(&stmt, `IMPORT INTO import_test.%s CSV DATA ('%s') WITH delimiter='|'`,
-		tableName, strings.Join(urls, "', '"))
+	fmt.Fprintf(&stmt, `IMPORT INTO import_test.%s %s DATA ('%s')`,
+		tableName, format, strings.Join(urls, "', '"))
 
+	var options []string
+	if format == "CSV" {
+		options = append(options, "delimiter='|'")
+	}
 	if detached {
-		stmt.WriteString(", detached")
+		options = append(options, "detached")
+	}
+	if len(options) > 0 {
+		fmt.Fprintf(&stmt, " WITH %s", strings.Join(options, ", "))
 	}
 
 	return stmt.String()
@@ -869,7 +1236,7 @@ func registerImportTPCC(r registry.Registry) {
 		timeout := 5 * time.Hour
 		r.Add(registry.TestSpec{
 			Name:              testName,
-			Owner:             registry.OwnerSQLQueries,
+			Owner:             registry.OwnerSQLFoundations,
 			Benchmark:         true,
 			Cluster:           r.MakeClusterSpec(numNodes),
 			CompatibleClouds:  registry.AllExceptAWS,
@@ -901,11 +1268,11 @@ func registerImportTPCC(r registry.Registry) {
 		})
 	}
 	const geoWarehouses = 4000
-	const geoZones = "europe-west2-b,europe-west4-b,asia-northeast1-b,us-west1-b"
+	const geoZones = "europe-west2-b,europe-west4-b,asia-northeast1-b,us-west1-c"
 	testName := fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses)
 	r.Add(registry.TestSpec{
 		Name:              testName,
-		Owner:             registry.OwnerSQLQueries,
+		Owner:             registry.OwnerSQLFoundations,
 		Cluster:           r.MakeClusterSpec(8, spec.CPU(16), spec.Geo(), spec.GCEZones(geoZones)),
 		CompatibleClouds:  registry.OnlyGCE,
 		Suites:            registry.Suites(registry.Nightly),

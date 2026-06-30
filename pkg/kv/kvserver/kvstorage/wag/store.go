@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag/wagpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 )
 
@@ -19,14 +20,40 @@ import (
 // assist the writes of the WAG nodes in a topologically sorted order.
 type Seq struct {
 	// index is the last allocated index into the WAG nodes sequence.
-	// TODO(pav-kv): initialize it on store restarts.
 	index atomic.Uint64
 }
 
-// Next allocates the given number of consecutive WAG nodes in the sequence, and
-// returns the index of the first allocated node. The caller can subsequently
-// use indices [Next, Next+count) for writing WAG nodes, and must not use
-// indices outside this span.
+// Init initializes the sequencer from the last WAG node index persisted in the
+// log engine, ensuring that subsequent calls to Next return indices above all
+// existing WAG nodes. Must be called before any calls to Next, typically during
+// store startup.
+func (s *Seq) Init(ctx context.Context, logEngine storage.Reader) error {
+	prefix := keys.StoreWAGPrefix()
+	prefixEnd := prefix.PrefixEnd()
+	mi, err := logEngine.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixEnd,
+	})
+	if err != nil {
+		return err
+	}
+	defer mi.Close()
+	mi.SeekLT(storage.MakeMVCCMetadataKey(prefixEnd))
+	if ok, err := mi.Valid(); err != nil {
+		return err
+	} else if !ok {
+		return nil // no WAG nodes; index stays at 0
+	}
+	index, err := keys.DecodeWAGNodeKey(mi.UnsafeKey().Key)
+	if err != nil {
+		return err
+	}
+	s.index.Store(index)
+	return nil
+}
+
+// Next allocates the next WAG node sequence number. The caller can subsequently
+// use this index for writing a WAG node, and must not use any other index.
 //
 // The caller must make sure that conflicting writers call Next and do the
 // corresponding writes according to the topological ordering of these
@@ -34,8 +61,13 @@ type Seq struct {
 // ordered. Independent / concurrent writers can call Next and perform the
 // corresponding writes in any order (e.g. different ranges can write their
 // events concurrently).
-func (s *Seq) Next(count uint64) uint64 {
-	return s.index.Add(count) - count + 1
+func (s *Seq) Next() uint64 {
+	return s.index.Add(1)
+}
+
+// Load returns the last used WAG sequence number.
+func (s *Seq) Load() uint64 {
+	return s.index.Load()
 }
 
 // Write puts the WAG node under the specific sequence number into the given
@@ -48,24 +80,39 @@ func Write(w storage.Writer, index uint64, node wagpb.Node) error {
 	return w.PutUnversioned(keys.StoreWAGNodeKey(index), data)
 }
 
+// Delete removes the WAG node at the given sequence number.
+// TODO(ibrahim): Consider SingleClearEngineKey if we can guarantee that the
+// index is written only once (even after restarts).
+func Delete(w storage.Writer, index uint64) error {
+	return w.ClearUnversioned(keys.StoreWAGNodeKey(index), storage.ClearOptions{})
+}
+
 // Iterator helps to scan the WAG sequence.
 //
 //	var iter wag.Iterator
-//	for node := range iter.Iter(ctx, reader) {
-//		// process node
+//	for index, node := range iter.Iter(ctx, reader) {
+//		// process index, node
 //	}
 //	if err := iter.Error(); err != nil {
 //		return err
 //	}
-//
-// TODO(pav-kv): make it more flexible, e.g. iterate from a particular index.
 type Iterator struct {
 	// err is the last error encountered during the WAG iteration.
 	err error
 }
 
-// Iter returns an iterator that scans the WAG sequence.
-func (it *Iterator) Iter(ctx context.Context, r storage.Reader) iter.Seq[wagpb.Node] {
+// Iter returns an iterator that scans the WAG sequence. The iterator yields a
+// pair containing the WAG node index and the WAG node itself.
+func (it *Iterator) Iter(ctx context.Context, r storage.Reader) iter.Seq2[uint64, wagpb.Node] {
+	return it.IterFrom(ctx, r, keys.StoreWAGPrefix())
+}
+
+// IterFrom is similar to Iter, but allows specifying a starting point for the
+// iteration.
+// TODO(ibrahim): Make this function take a WAG index instead of a key.
+func (it *Iterator) IterFrom(
+	ctx context.Context, r storage.Reader, seekKey roachpb.Key,
+) iter.Seq2[uint64, wagpb.Node] {
 	prefix := keys.StoreWAGPrefix()
 	mi, err := r.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
 		UpperBound: prefix.PrefixEnd(),
@@ -74,12 +121,17 @@ func (it *Iterator) Iter(ctx context.Context, r storage.Reader) iter.Seq[wagpb.N
 		it.err = err
 		return nil
 	}
-	mi.SeekGE(storage.MakeMVCCMetadataKey(prefix))
+	mi.SeekGE(storage.MakeMVCCMetadataKey(seekKey))
 
-	return func(yield func(wagpb.Node) bool) {
+	return func(yield func(uint64, wagpb.Node) bool) {
 		defer mi.Close()
 		for ; ; mi.Next() {
 			if ok, err := mi.Valid(); err != nil || !ok {
+				it.err = err
+				return
+			}
+			index, err := keys.DecodeWAGNodeKey(mi.UnsafeKey().Key)
+			if err != nil {
 				it.err = err
 				return
 			}
@@ -92,7 +144,7 @@ func (it *Iterator) Iter(ctx context.Context, r storage.Reader) iter.Seq[wagpb.N
 			if it.err = node.Unmarshal(v); it.err != nil { // nolint:protounmarshal
 				return
 			}
-			if !yield(node) {
+			if !yield(index, node) {
 				return
 			}
 		}

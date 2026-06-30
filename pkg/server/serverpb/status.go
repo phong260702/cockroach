@@ -18,6 +18,8 @@ import (
 type SQLStatusServer interface {
 	ListSessions(context.Context, *ListSessionsRequest) (*ListSessionsResponse, error)
 	ListLocalSessions(context.Context, *ListSessionsRequest) (*ListSessionsResponse, error)
+	ListActiveSessionHistory(context.Context, *ListActiveSessionHistoryRequest) (*ListActiveSessionHistoryResponse, error)
+	ListLocalActiveSessionHistory(context.Context, *ListActiveSessionHistoryRequest) (*ListActiveSessionHistoryResponse, error)
 	CancelQuery(context.Context, *CancelQueryRequest) (*CancelQueryResponse, error)
 	CancelQueryByKey(context.Context, *CancelQueryByKeyRequest) (*CancelQueryByKeyResponse, error)
 	CancelSession(context.Context, *CancelSessionRequest) (*CancelSessionResponse, error)
@@ -98,10 +100,10 @@ type TenantStatusServer interface {
 }
 
 // OptionalNodesStatusServer returns the wrapped NodesStatusServer, if it is
-// available. If it is not, an error referring to the optionally supplied issues
-// is returned.
+// available. If it is not, an error indicating that the feature is not
+// supported under cluster virtualization is returned.
 func (s *OptionalNodesStatusServer) OptionalNodesStatusServer() (NodesStatusServer, error) {
-	v, err := s.w.OptionalErr(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
+	v, err := s.w.OptionalErr()
 	if err != nil {
 		return nil, err
 	}

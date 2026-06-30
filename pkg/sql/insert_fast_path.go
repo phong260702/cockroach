@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -87,6 +88,16 @@ type insertFastPathRun struct {
 	// in BatchResponse headers for FK and uniqueness check batches. The KVCPUTime
 	// performed by the INSERT is tracked by the table inserter (insertRun.ti.kvCPUTime).
 	kvCPUTime int64
+
+	// localKVCPUTime tracks the cumulative SQL goroutine CPU time (in
+	// nanoseconds) spent inside FK and uniqueness check KV calls, as measured
+	// by the grunning library. This is the portion of SQL goroutine CPU that
+	// overlapped with KV work, not the CPU consumed on KV servers. The local
+	// KV CPU time for the INSERT itself is tracked by the table inserter
+	// (insertRun.ti.localKVCPUTime).
+	localKVCPUTime int64
+	// cpuStopWatch measures grunning time around FK/uniqueness check KV calls.
+	cpuStopWatch timeutil.CPUStopWatch
 }
 
 // insertFastPathFKUniqSpanInfo records information about each Request in the
@@ -314,7 +325,11 @@ func (n *insertFastPathNode) runUniqChecks(params runParams) error {
 	// Run the uniqueness checks batch.
 	ba := n.run.uniqBatch.ShallowCopy()
 	log.VEventf(params.ctx, 2, "uniqueness check: sending a batch with %d requests", len(ba.Requests))
+	n.run.cpuStopWatch.Start()
 	br, err := params.p.txn.Send(params.ctx, ba)
+	if delta := n.run.cpuStopWatch.Stop(); delta > 0 {
+		n.run.localKVCPUTime += int64(delta)
+	}
 	if err != nil {
 		return err.GoError()
 	}
@@ -347,7 +362,11 @@ func (n *insertFastPathNode) runFKChecks(params runParams) error {
 	// Run the FK checks batch.
 	ba := n.run.fkBatch.ShallowCopy()
 	log.VEventf(params.ctx, 2, "fk check: sending a batch with %d requests", len(ba.Requests))
+	n.run.cpuStopWatch.Start()
 	br, err := params.p.txn.Send(params.ctx, ba)
+	if delta := n.run.cpuStopWatch.Stop(); delta > 0 {
+		n.run.localKVCPUTime += int64(delta)
+	}
 	if err != nil {
 		return err.GoError()
 	}
@@ -383,8 +402,17 @@ func (n *insertFastPathNode) runFKUniqChecks(params runParams) error {
 
 	// Run the combined uniqueness and FK checks batch.
 	ba := n.run.uniqBatch.ShallowCopy()
+	// Copy the locking-related header fields from the FK batch so that the
+	// combined batch honors lock_timeout and deadlock_timeout for FK checks.
+	ba.Header.WaitPolicy = n.run.fkBatch.Header.WaitPolicy
+	ba.Header.LockTimeout = n.run.fkBatch.Header.LockTimeout
+	ba.Header.DeadlockTimeout = n.run.fkBatch.Header.DeadlockTimeout
 	log.VEventf(params.ctx, 2, "fk / uniqueness check: sending a batch with %d requests", len(ba.Requests))
+	n.run.cpuStopWatch.Start()
 	br, err := params.p.txn.Send(params.ctx, ba)
+	if delta := n.run.cpuStopWatch.Stop(); delta > 0 {
+		n.run.localKVCPUTime += int64(delta)
+	}
 	if err != nil {
 		return err.GoError()
 	}
@@ -436,6 +464,8 @@ func (n *insertFastPathNode) startExec(params runParams) error {
 		maxSpans := len(n.run.fkChecks) * len(n.input)
 		// Any FK checks using locking should have lock wait policy BLOCK.
 		n.run.fkBatch.Header.WaitPolicy = lock.WaitPolicy_Block
+		n.run.fkBatch.Header.LockTimeout = params.SessionData().LockTimeout
+		n.run.fkBatch.Header.DeadlockTimeout = params.SessionData().DeadlockTimeout
 		n.run.fkBatch.Requests = make([]kvpb.RequestUnion, 0, maxSpans)
 		n.run.fkSpanInfo = make([]insertFastPathFKUniqSpanInfo, 0, maxSpans)
 		if len(n.input) > 1 {
@@ -574,6 +604,10 @@ func (n *insertFastPathNode) returnsRowsAffected() bool {
 
 func (n *insertFastPathNode) kvCPUTime() int64 {
 	return n.run.ti.kvCPUTime + n.run.kvCPUTime
+}
+
+func (n *insertFastPathNode) localKVCPUTime() int64 {
+	return n.run.ti.localKVCPUTime + n.run.localKVCPUTime
 }
 
 // See planner.autoCommit.

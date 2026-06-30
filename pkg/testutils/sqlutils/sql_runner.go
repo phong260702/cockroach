@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/stretchr/testify/require"
 )
 
 // SQLRunner wraps a Fataler and *gosql.DB connection and provides
@@ -109,16 +108,18 @@ func (sr *SQLRunner) ExecMultiple(t Fataler, queries ...string) {
 	}
 }
 
-type requireT struct {
+// testFataler adapts a Fataler to a testutils.TestFataler so that
+// succeedsWithin can delegate to testutils.SucceedsWithin.
+type testFataler struct {
 	Fataler
 }
 
-func (t requireT) Errorf(format string, args ...interface{}) {
-	t.Fatalf(format, args...)
+func (t testFataler) Fatal(args ...interface{}) {
+	t.Fatalf("%s", fmt.Sprint(args...))
 }
 
-func (t requireT) FailNow() {
-	t.Fatalf("failing")
+func (t testFataler) Helper() {
+	helperOrNoop(t.Fataler)()
 }
 
 func (sr *SQLRunner) succeedsWithin(t Fataler, f func() error) {
@@ -127,7 +128,7 @@ func (sr *SQLRunner) succeedsWithin(t Fataler, f func() error) {
 	if d == 0 {
 		d = testutils.SucceedsSoonDuration()
 	}
-	require.NoError(requireT{t}, testutils.SucceedsWithinError(f, d))
+	testutils.SucceedsWithin(testFataler{t}, f, d)
 }
 
 // ExecSucceedsSoon is a wrapper around gosql.Exec that wraps
@@ -224,7 +225,8 @@ func (sr *SQLRunner) ExpectErrSucceedsSoon(
 	})
 }
 
-// ExpectErrWithTimeout wraps ExpectErr with a timeout.
+// ExpectErrWithTimeout wraps ExpectErr with a timeout. On timeout, a
+// goroutine dump is written to help debug.
 func (sr *SQLRunner) ExpectErrWithTimeout(
 	t Fataler, errRE string, query string, args ...interface{},
 ) {
@@ -235,13 +237,18 @@ func (sr *SQLRunner) ExpectErrWithTimeout(
 	}
 	err := timeutil.RunWithTimeout(context.Background(), "expect-err", d, func(ctx context.Context) error {
 		_, err := sr.DB.ExecContext(ctx, query, args...)
+		if ctx.Err() != nil {
+			// The context timed out; return the error so RunWithTimeout can
+			// wrap it as a TimeoutError and we can dump goroutine stacks.
+			return err
+		}
 		sr.expectErr(t, query, err, errRE)
 		return nil
 	})
 
-	// Fail the test on unexpected error message OR execution timeout
 	if err != nil {
-		t.Fatalf("failed assert error: %s", err)
+		dumpFile := testutils.WriteGoroutineDump()
+		t.Fatalf("failed assert error: %s\n\ngoroutine dump: %s", err, dumpFile)
 	}
 }
 

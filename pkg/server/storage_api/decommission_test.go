@@ -319,7 +319,7 @@ func waitForSpanConfig(
 			if err != nil {
 				return errors.Wrapf(err, "missing store on server %d", i)
 			}
-			conf, _, err := store.GetStoreConfig().SpanConfigSubscriber.GetSpanConfigForKey(context.Background(), key)
+			conf, err := store.GetStoreConfig().SpanConfigSubscriber.GetSpanConfigForKey(context.Background(), key)
 			if err != nil {
 				return errors.Wrapf(err, "missing span config for %s on server %d", key, i)
 			}
@@ -818,7 +818,6 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 		ReplicationMode: base.ReplicationManual, // saves time
 		ServerArgs: base.TestServerArgs{
 			DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(81590),
-			DefaultDRPCOption: base.TestDRPCDisabled,
 		},
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -916,7 +915,9 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.Jobs(ctx, &serverpb.JobsRequest{})
 			return err
 		}},
-		{"Liveness", codes.PermissionDenied, func(ctx context.Context, c serverpb.RPCAdminClient) error {
+		// Liveness reads from the local cache and does not require cluster
+		// (KV) access, so it succeeds even on a decommissioned node.
+		{"Liveness", codes.OK, func(ctx context.Context, c serverpb.RPCAdminClient) error {
 			_, err := c.Liveness(ctx, &serverpb.LivenessRequest{})
 			return err
 		}},

@@ -3,27 +3,23 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
+import { message } from "antd";
 import classNames from "classnames/bind";
-import isNil from "lodash/isNil";
-import merge from "lodash/merge";
 import moment from "moment-timezone";
-import React from "react";
-import { RouteComponentProps } from "react-router-dom";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useHistory } from "react-router-dom";
 
-import { SessionsRequest } from "src/api/sessionsApi";
+import { useSessions } from "src/api/sessionsApi";
+import {
+  terminateSession,
+  terminateQuery,
+  CancelSessionRequestMessage,
+  CancelQueryRequestMessage,
+} from "src/api/terminateQueryApi";
 import { Loading } from "src/loading";
 import { Pagination } from "src/pagination";
-import {
-  SortSetting,
-  ISortedTablePagination,
-  updateSortSettingQueryParamsOnTab,
-  ColumnDescriptor,
-} from "src/sortedtable";
+import { SortSetting, ColumnDescriptor } from "src/sortedtable";
 import statementsPageStyles from "src/statementsPage/statementsPage.module.scss";
-import {
-  ICancelSessionRequest,
-  ICancelQueryRequest,
-} from "src/store/terminateQuery";
 import { TimestampToMoment, unset } from "src/util";
 import { syncHistory } from "src/util/query";
 
@@ -35,16 +31,19 @@ import {
   defaultFilters,
   Filter,
   Filters,
+  getFullFiltersAsStringRecord,
   getTimeValueInSeconds,
-  handleFiltersFromQueryString,
   SelectedFilters,
 } from "../queryFilter";
-import LoadingError, { mergeErrors } from "../sqlActivity/errorComponent";
+import { getFiltersFromURL } from "../queryFilter/utils";
+import { getTableSortFromURL } from "../sortedtable/getTableSortFromURL";
+import LoadingError from "../sqlActivity/errorComponent";
 import {
   getLabel,
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
 import { TableStatistics } from "../tableStatistics";
+import { usePagination } from "../util";
 
 import { EmptySessionsTablePlaceholder } from "./emptySessionsTablePlaceholder";
 import sessionPageStyles from "./sessionPage.module.scss";
@@ -64,58 +63,29 @@ import TerminateSessionModal, {
 const statementsPageCx = classNames.bind(statementsPageStyles);
 const sessionsPageCx = classNames.bind(sessionPageStyles);
 
+const PAGE_SIZE = 20;
 const sessionStatusFilterOptions = ["Active", "Closed", "Idle"];
 
-// Default filters for sessions page - Active and Idle selected by default
+const DEFAULT_SORT_SETTING: SortSetting = {
+  ascending: false,
+  columnTitle: "statementAge",
+};
+
+// Default filters for sessions page - Active and Idle selected by default.
 export const defaultFiltersForSessionsPage: Filters = {
   ...defaultFilters,
   sessionStatus: "Active,Idle",
 };
 
-// Helper function to determine if closed sessions should be excluded based on filter
+// Helper function to determine if closed sessions should be excluded
+// based on the current filter selection.
 export const shouldExcludeClosedSessions = (filters: Filters): boolean => {
-  // If no session status filter is set or it's empty (user cleared filters),
-  // show all sessions including closed (don't exclude)
   if (!filters?.sessionStatus || filters.sessionStatus === "") {
     return false;
   }
-  // If "Closed" is explicitly selected in the filter, include closed sessions
-  // Otherwise, exclude closed sessions (e.g., when only "Active,Idle" is selected)
   const selectedStatuses = filters.sessionStatus.split(",");
   return !selectedStatuses.includes("Closed");
 };
-
-export interface OwnProps {
-  sessions: SessionInfo[];
-  internalAppNamePrefix: string;
-  sessionsError: Error | Error[];
-  sortSetting: SortSetting;
-  refreshSessions: (req?: SessionsRequest) => void;
-  cancelSession: (payload: ICancelSessionRequest) => void;
-  cancelQuery: (payload: ICancelQueryRequest) => void;
-  onPageChanged?: (newPage: number) => void;
-  onSortingChange?: (
-    name: string,
-    columnTitle: string,
-    ascending: boolean,
-  ) => void;
-  onSessionClick?: () => void;
-  onTerminateSessionClick?: () => void;
-  onTerminateStatementClick?: () => void;
-  onColumnsChange?: (selectedColumns: string[]) => void;
-  onFilterChange?: (value: Filters) => void;
-  columns: string[];
-  filters: Filters;
-}
-
-export interface SessionsPageState {
-  apps: string[];
-  pagination: ISortedTablePagination;
-  filters: Filters;
-  activeFilters?: number;
-}
-
-export type SessionsPageProps = OwnProps & RouteComponentProps;
 
 function getSessionAppFilterOptions(sessions: SessionInfo[]): string[] {
   const uniqueAppNames = new Set(
@@ -136,219 +106,95 @@ function getSessionUsernameFilterOptions(sessions: SessionInfo[]): string[] {
   return Array.from(uniqueUsernames).sort();
 }
 
-export class SessionsPage extends React.Component<
-  SessionsPageProps,
-  SessionsPageState
-> {
-  terminateSessionRef: React.RefObject<TerminateSessionModalRef>;
-  terminateQueryRef: React.RefObject<TerminateQueryModalRef>;
-  refreshDataInterval: NodeJS.Timeout;
+export const SessionsPage: React.FC = () => {
+  const history = useHistory();
 
-  constructor(props: SessionsPageProps) {
-    super(props);
-    this.state = {
-      filters: defaultFiltersForSessionsPage,
-      apps: [],
-      pagination: {
-        pageSize: 20,
-        current: 1,
-      },
-    };
+  const terminateSessionRef = useRef<TerminateSessionModalRef>(null);
+  const terminateQueryRef = useRef<TerminateQueryModalRef>(null);
 
-    const stateFromHistory = this.getStateFromHistory();
-    this.state = merge(this.state, stateFromHistory);
+  // Initialize sort and filters from URL params, falling back to defaults.
+  const [sortSetting, setSortSetting] = useState<SortSetting>(
+    () => getTableSortFromURL(history.location) ?? DEFAULT_SORT_SETTING,
+  );
+  const [filters, setFilters] = useState<Filters>(
+    () =>
+      ({
+        ...defaultFiltersForSessionsPage,
+        ...getFiltersFromURL(history.location),
+      }) as Filters,
+  );
+  const [selectedColumns, setSelectedColumns] = useState<string[] | null>(null);
 
-    // If sessionStatus is not set or empty, use the sessions page default (Active,Idle)
-    if (!this.state.filters?.sessionStatus) {
-      this.state = {
-        ...this.state,
-        filters: {
-          ...this.state.filters,
-          sessionStatus: defaultFiltersForSessionsPage.sessionStatus,
-        },
-      };
-    }
+  const [pagination, updatePagination, resetPagination] = usePagination(
+    1,
+    PAGE_SIZE,
+  );
 
-    this.terminateSessionRef = React.createRef();
-    this.terminateQueryRef = React.createRef();
+  // Fetch sessions data via SWR. The excludeClosedSessions param is
+  // derived from the current filter state so that changing the filter
+  // automatically triggers a fetch with the correct params.
+  const {
+    data: sessionsResponse,
+    isLoading: sessionsLoading,
+    error: sessionsError,
+    refresh,
+  } = useSessions({
+    excludeClosedSessions: shouldExcludeClosedSessions(filters),
+    refreshInterval: 10_000,
+  });
 
-    const { history } = this.props;
-    const searchParams = new URLSearchParams(history.location.search);
-    const ascending = (searchParams.get("ascending") || undefined) === "true";
-    const columnTitle = searchParams.get("columnTitle") || undefined;
-    const sortSetting = this.props.sortSetting;
+  const sessions: SessionInfo[] | null = useMemo(() => {
+    if (!sessionsResponse) return null;
+    return sessionsResponse.sessions.map(session => ({ session }));
+  }, [sessionsResponse]);
 
-    if (
-      this.props.onSortingChange &&
-      columnTitle &&
-      (sortSetting.columnTitle !== columnTitle ||
-        sortSetting.ascending !== ascending)
-    ) {
-      this.props.onSortingChange("Sessions", columnTitle, ascending);
-    }
-  }
+  const internalAppNamePrefix: string | null =
+    sessionsResponse?.internal_app_name_prefix ?? null;
 
-  getStateFromHistory = (): Partial<SessionsPageState> => {
-    const { history, filters, onFilterChange } = this.props;
-
-    // Filters.
-    const latestFilter = handleFiltersFromQueryString(
-      history,
-      filters,
-      onFilterChange,
-    );
-
-    return {
-      filters: latestFilter,
-    };
-  };
-
-  changeSortSetting = (ss: SortSetting): void => {
-    if (this.props.onSortingChange) {
-      this.props.onSortingChange("Sessions", ss.columnTitle, ss.ascending);
-    }
-
+  // Sync sort and filters to URL whenever they change.
+  useEffect(() => {
     syncHistory(
       {
-        ascending: ss.ascending.toString(),
-        columnTitle: ss.columnTitle,
-      },
-      this.props.history,
-    );
-  };
-
-  resetPagination = (): void => {
-    this.setState(prevState => {
-      return {
-        pagination: {
-          current: 1,
-          pageSize: prevState.pagination.pageSize,
-        },
-      };
-    });
-  };
-
-  getSessionsRequest = (): SessionsRequest => {
-    const filters = this.state.filters || this.props.filters;
-    return {
-      excludeClosedSessions: shouldExcludeClosedSessions(filters),
-    };
-  };
-
-  componentDidMount(): void {
-    // If no filters are stored in localStorage, set the default filters
-    if (!this.props.filters || !this.props.filters.sessionStatus) {
-      this.props.onFilterChange?.(defaultFiltersForSessionsPage);
-    }
-
-    if (!this.props.sessions || this.props.sessions.length === 0) {
-      this.props.refreshSessions(this.getSessionsRequest());
-    }
-
-    this.refreshDataInterval = setInterval(() => {
-      this.props.refreshSessions(this.getSessionsRequest());
-    }, 10 * 1000);
-  }
-
-  componentWillUnmount(): void {
-    if (!this.refreshDataInterval) return;
-    clearInterval(this.refreshDataInterval);
-  }
-
-  componentDidUpdate = (): void => {
-    const { history, sortSetting } = this.props;
-
-    updateSortSettingQueryParamsOnTab(
-      "Sessions",
-      sortSetting,
-      {
-        ascending: false,
-        columnTitle: "statementAge",
+        ascending: sortSetting.ascending.toString(),
+        columnTitle: sortSetting.columnTitle,
+        ...getFullFiltersAsStringRecord(filters),
       },
       history,
+      true,
     );
+  }, [history, filters, sortSetting.ascending, sortSetting.columnTitle]);
+
+  const onSortClick = (ss: SortSetting): void => {
+    setSortSetting(ss);
+    resetPagination();
   };
 
-  onChangePage = (current: number, pageSize: number): void => {
-    const { pagination } = this.state;
-    this.setState({ pagination: { ...pagination, current, pageSize } });
-    if (this.props.onPageChanged) {
-      this.props.onPageChanged(current);
-    }
+  const onSubmitFilters = (newFilters: Filters): void => {
+    setFilters(newFilters);
+    resetPagination();
   };
 
-  onSubmitFilters = (filters: Filters): void => {
-    if (this.props.onFilterChange) {
-      this.props.onFilterChange(filters);
-    }
-
-    this.setState(
-      {
-        filters: filters,
-      },
-      () => {
-        // Refresh sessions with the new filter settings
-        this.props.refreshSessions(this.getSessionsRequest());
-      },
-    );
-    this.resetPagination();
-    syncHistory(
-      {
-        app: filters.app,
-        timeNumber: filters.timeNumber,
-        timeUnit: filters.timeUnit,
-        sessionStatus: filters.sessionStatus,
-      },
-      this.props.history,
-    );
+  const onClearFilters = (): void => {
+    setFilters({ ...defaultFilters });
+    resetPagination();
   };
 
-  onClearFilters = (): void => {
-    if (this.props.onFilterChange) {
-      this.props.onFilterChange(defaultFilters);
-    }
-
-    this.setState(
-      {
-        filters: {
-          ...defaultFilters,
-        },
-      },
-      () => {
-        // Refresh sessions with cleared filters (include all sessions)
-        this.props.refreshSessions(this.getSessionsRequest());
-      },
-    );
-    this.resetPagination();
-    syncHistory(
-      {
-        app: undefined,
-        timeNumber: undefined,
-        timeUnit: undefined,
-        sessionStatus: undefined,
-      },
-      this.props.history,
-    );
-  };
-
-  getFilteredSessionsData = (): {
+  const filteredSessionsData = useMemo((): {
     sessions: SessionInfo[];
     activeFilters: number;
   } => {
-    const { filters } = this.state;
-    const { sessions, internalAppNamePrefix } = this.props;
+    if (!sessions) {
+      return { sessions: [], activeFilters: 0 };
+    }
     if (!filters) {
-      return {
-        sessions: sessions,
-        activeFilters: 0,
-      };
+      return { sessions, activeFilters: 0 };
     }
     const activeFilters = calculateActiveFilters(filters);
     const timeValue = getTimeValueInSeconds(filters);
     const filteredSessions = sessions
       .filter((s: SessionInfo) => {
-        const isInternal = (s: SessionInfo) =>
-          s.session.application_name.startsWith(internalAppNamePrefix);
+        const isInternal = (si: SessionInfo) =>
+          si.session.application_name.startsWith(internalAppNamePrefix);
         if (filters.app && filters.app !== "All") {
           const apps = filters.app.split(",");
           let showInternal = false;
@@ -389,37 +235,24 @@ export class SessionsPage extends React.Component<
         return true;
       });
 
-    return {
-      sessions: filteredSessions,
-      activeFilters,
-    };
-  };
+    return { sessions: filteredSessions, activeFilters };
+  }, [filters, sessions, internalAppNamePrefix]);
 
-  renderSessions = (): React.ReactElement => {
-    const sessionsData = this.props.sessions;
-    const { pagination, filters } = this.state;
-    const { columns: userSelectedColumnsToShow, onColumnsChange } = this.props;
+  const renderSessions = (): React.ReactElement => {
+    const { sessions: sessionsToDisplay, activeFilters } = filteredSessionsData;
 
-    const { sessions: sessionsToDisplay, activeFilters } =
-      this.getFilteredSessionsData();
-
-    const appNames = getSessionAppFilterOptions(sessionsData);
-    const usernames = getSessionUsernameFilterOptions(sessionsData);
-    const sessionStatuses = sessionStatusFilterOptions;
+    const appNames = getSessionAppFilterOptions(sessions);
+    const usernames = getSessionUsernameFilterOptions(sessions);
     const columns = makeSessionsColumns(
       "session",
-      this.terminateSessionRef,
-      this.terminateQueryRef,
-      this.props.onSessionClick,
-      this.props.onTerminateStatementClick,
-      this.props.onTerminateSessionClick,
+      terminateSessionRef,
+      terminateQueryRef,
     );
 
     const isColumnSelected = (c: ColumnDescriptor<SessionInfo>) => {
       return (
-        (userSelectedColumnsToShow === null && c.showByDefault !== false) ||
-        (userSelectedColumnsToShow &&
-          userSelectedColumnsToShow.includes(c.name)) ||
+        (selectedColumns === null && c.showByDefault !== false) ||
+        (selectedColumns && selectedColumns.includes(c.name)) ||
         c.alwaysShow
       );
     };
@@ -440,20 +273,20 @@ export class SessionsPage extends React.Component<
       <>
         <div className={sessionsPageCx("sessions-filter")}>
           <Filter
-            onSubmitFilters={this.onSubmitFilters}
+            onSubmitFilters={onSubmitFilters}
             appNames={appNames}
             usernames={usernames}
             showUsername={true}
             showSessionStatus={true}
-            sessionStatuses={sessionStatuses}
+            sessionStatuses={sessionStatusFilterOptions}
             activeFilters={activeFilters}
             filters={filters}
             timeLabel={"Session duration"}
           />
           <SelectedFilters
             filters={filters}
-            onRemoveFilter={this.onSubmitFilters}
-            onClearFilters={this.onClearFilters}
+            onRemoveFilter={onSubmitFilters}
+            onClearFilters={onClearFilters}
           />
         </div>
         <section className={sessionsPageCx("sessions-table-area")}>
@@ -461,7 +294,7 @@ export class SessionsPage extends React.Component<
             <div className={"session-column-selector"}>
               <ColumnsSelector
                 options={tableColumns}
-                onSubmitColumns={onColumnsChange}
+                onSubmitColumns={setSelectedColumns}
                 size={"small"}
               />
               <TableStatistics
@@ -483,8 +316,8 @@ export class SessionsPage extends React.Component<
                 }
               />
             }
-            sortSetting={this.props.sortSetting}
-            onChangeSortSetting={this.changeSortSetting}
+            sortSetting={sortSetting}
+            onChangeSortSetting={onSortClick}
             pagination={pagination}
           />
         </section>
@@ -492,40 +325,53 @@ export class SessionsPage extends React.Component<
           pageSize={pagination.pageSize}
           current={pagination.current}
           total={sessionsToDisplay.length}
-          onChange={this.onChangePage}
-          onShowSizeChange={this.onChangePage}
+          onChange={updatePagination}
+          onShowSizeChange={updatePagination}
         />
       </>
     );
   };
 
-  render(): React.ReactElement {
-    const { cancelSession, cancelQuery } = this.props;
-    return (
-      <div className={sessionsPageCx("sessions-page")}>
-        <Loading
-          loading={isNil(this.props.sessions)}
-          page={"sessions"}
-          error={this.props.sessionsError}
-          render={this.renderSessions}
-          renderError={() =>
-            LoadingError({
-              statsType: "sessions",
-              error: mergeErrors(this.props.sessionsError),
-            })
-          }
-        />
-        <TerminateSessionModal
-          ref={this.terminateSessionRef}
-          cancel={cancelSession}
-        />
-        <TerminateQueryModal
-          ref={this.terminateQueryRef}
-          cancel={cancelQuery}
-        />
-      </div>
-    );
-  }
-}
+  return (
+    <div className={sessionsPageCx("sessions-page")}>
+      <Loading
+        loading={sessionsLoading}
+        page={"sessions"}
+        error={sessionsError}
+        render={renderSessions}
+        renderError={() =>
+          LoadingError({
+            statsType: "sessions",
+            error: sessionsError,
+          })
+        }
+      />
+      <TerminateSessionModal
+        ref={terminateSessionRef}
+        cancel={(req: CancelSessionRequestMessage) =>
+          terminateSession(req).then(
+            () => {
+              refresh();
+              message.success("Session cancelled.");
+            },
+            () => message.error("There was an error cancelling the session."),
+          )
+        }
+      />
+      <TerminateQueryModal
+        ref={terminateQueryRef}
+        cancel={(req: CancelQueryRequestMessage) =>
+          terminateQuery(req).then(
+            () => {
+              refresh();
+              message.success("Session cancelled.");
+            },
+            () => message.error("There was an error cancelling the statement."),
+          )
+        }
+      />
+    </div>
+  );
+};
 
 export default SessionsPage;

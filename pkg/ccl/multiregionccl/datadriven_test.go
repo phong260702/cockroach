@@ -226,7 +226,8 @@ SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '0.1s';
 SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s';
 SET CLUSTER SETTING kv.allocator.load_based_rebalancing = 'off';
 SET CLUSTER SETTING kv.allocator.load_based_lease_rebalancing.enabled = false;
-SET CLUSTER SETTING kv.allocator.min_lease_transfer_interval = '5m'
+SET CLUSTER SETTING kv.allocator.min_lease_transfer_interval = '5m';
+SET CLUSTER SETTING kv.closed_timestamp.lead_for_global_reads_auto_tune.enabled = false
 `,
 					";") {
 					_, err := sysConn.Exec(stmt)
@@ -358,7 +359,7 @@ SET CLUSTER SETTING kv.allocator.min_lease_transfer_interval = '5m'
 				s := ds.tc.ApplicationLayer(idx)
 				cache := s.DistSenderI().(*kvcoord.DistSender).RangeDescriptorCache()
 				tablePrefix := keys.MustAddr(s.Codec().TablePrefix(tableID))
-				entry, err := cache.TestingGetCached(ctx, tablePrefix, false, roachpb.LAG_BY_CLUSTER_SETTING)
+				entry, err := cache.TestingGetCached(ctx, tablePrefix, false, roachpb.LEAD_FOR_GLOBAL_READS)
 				if err != nil {
 					return err.Error()
 				}

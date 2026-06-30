@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -28,8 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/kr/pretty"
@@ -201,13 +201,25 @@ func evaluateBatch(
 	readWriter storage.ReadWriter,
 	rec batcheval.EvalContext,
 	ms *enginepb.MVCCStats,
+	ss *kvpb.ScanStats,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	evalPath batchEvalPath,
 	omitInRangefeeds bool, // only relevant for transactional writes
 ) (_ *kvpb.BatchResponse, _ result.Result, retErr *kvpb.Error) {
+	tenantID, _ := roachpb.ClientTenantFromContext(ctx)
+	cleanup := ash.SetWorkState(
+		tenantID, ash.WorkloadInfo{
+			WorkloadID:    ba.WorkloadID,
+			AppNameID:     ba.AppNameID,
+			GatewayNodeID: ba.GatewayNodeID,
+			WorkloadType:  workloadid.WorkloadType(ba.WorkloadType),
+		},
+		ash.WorkIO, "KVEval")
+	defer cleanup()
+
 	// NB: Don't mutate BatchRequest directly.
 	baReqs := ba.Requests
 
@@ -276,21 +288,6 @@ func evaluateBatch(
 	// conflicts and chose the highest timestamp to return for more efficient
 	// retries.
 	var deferredWriteTooOldErr *kvpb.WriteTooOldError
-
-	// Only collect the scan stats if the tracing is enabled.
-	var ss *kvpb.ScanStats
-	if sp := tracing.SpanFromContext(ctx); sp.RecordingType() != tracingpb.RecordingOff {
-		ss = &kvpb.ScanStats{}
-		defer func() {
-			if ss.NumGets != 0 || ss.NumScans != 0 || ss.NumReverseScans != 0 {
-				// Only record non-empty ScanStats.
-				ss.NodeID = rec.NodeID()
-				locality := rec.GetNodeLocality()
-				ss.Region, _ = locality.Find("region")
-				sp.RecordStructured(ss)
-			}
-		}()
-	}
 
 	// TODO(tbg): if we introduced an "executor" helper here that could carry state
 	// across the slots in the batch while we execute them, this code could come
@@ -512,7 +509,7 @@ func evaluateCommand(
 	h kvpb.Header,
 	args kvpb.Request,
 	reply kvpb.Response,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	evalPath batchEvalPath,
@@ -605,7 +602,7 @@ func canDoServersideRetry(
 	ctx context.Context,
 	pErr *kvpb.Error,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	deadline hlc.Timestamp,
 ) (*kvpb.BatchRequest, bool) {
 	if pErr == nil {
@@ -655,7 +652,7 @@ func canDoServersideRetry(
 // table first), bump the ts cache, release latches and then proceed with
 // evaluation. Only non-locking read requests that aren't being evaluated under
 // the `OptimisticEval` path are eligible for this optimization.
-func canReadOnlyRequestDropLatchesBeforeEval(ba *kvpb.BatchRequest, g *concurrency.Guard) bool {
+func canReadOnlyRequestDropLatchesBeforeEval(ba *kvpb.BatchRequest, g concurrency.Guard) bool {
 	if g == nil {
 		// NB: A nil guard indicates that the caller is not holding latches.
 		return false
@@ -672,7 +669,7 @@ func canReadOnlyRequestDropLatchesBeforeEval(ba *kvpb.BatchRequest, g *concurren
 	default:
 		panic(fmt.Sprintf("unexpected ReadConsistency: %s", ba.Header.ReadConsistency))
 	}
-	switch g.EvalKind {
+	switch g.EvalKind() {
 	case concurrency.PessimisticEval, concurrency.PessimisticAfterFailedOptimisticEval:
 	case concurrency.OptimisticEval:
 		// Requests going through the optimistic path are not allowed to drop their
@@ -681,7 +678,7 @@ func canReadOnlyRequestDropLatchesBeforeEval(ba *kvpb.BatchRequest, g *concurren
 		// the timestamp cache to update.
 		return false
 	default:
-		panic(fmt.Sprintf("unexpected EvalKind: %v", g.EvalKind))
+		panic(fmt.Sprintf("unexpected EvalKind: %v", g.EvalKind()))
 	}
 	// Only non-locking reads are eligible. This is because requests that need to
 	// lock the keys that they end up reading need to be isolated against other

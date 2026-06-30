@@ -27,7 +27,7 @@ import {
 
 export type PlanHashStats =
   cockroach.server.serverpb.StatementDetailsResponse.ICollectedStatementGroupedByPlanHash;
-export class PlansSortedTable extends SortedTable<PlanHashStats> {}
+export const PlansSortedTable = SortedTable<PlanHashStats>;
 
 const planDetailsColumnLabels = {
   avgExecTime: "Average Execution Time",
@@ -298,6 +298,7 @@ export function formatIndexes(indexes: string[], database: string): ReactNode {
 
 export function makeExplainPlanColumns(
   handleDetails: (plan: PlanHashStats) => void,
+  database: string,
 ): ColumnDescriptor<PlanHashStats>[] {
   const duration = (v: number) => Duration(v * 1e9);
   const count = (v: number) => v.toFixed(1);
@@ -319,7 +320,7 @@ export function makeExplainPlanColumns(
       name: "indexes",
       title: planDetailsTableTitles.indexes(),
       cell: (item: PlanHashStats) =>
-        formatIndexes(item.stats.indexes, item.metadata.databases[0]),
+        formatIndexes(item.stats.indexes, database),
       sort: (item: PlanHashStats) => item.stats.indexes?.join(""),
     },
     {

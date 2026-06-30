@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/cgroups"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/gcassist"
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -168,11 +169,24 @@ var (
 		Measurement: "CPU Time",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
+	metaGCAssistEnabled = metric.Metadata{
+		Name:        "sys.gc.assist.enabled",
+		Help:        "Indicates whether GC assist is currently enabled (1) or disabled (0)",
+		Measurement: "GC Assist",
+		Unit:        metric.Unit_CONST,
+	}
 	metaGCTotalNS = metric.Metadata{
 		Name:        "sys.gc.total.ns",
 		Help:        "Estimated total CPU time spent performing GC tasks",
 		Measurement: "CPU Time",
 		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaGCCPUPercent = metric.Metadata{
+		Name:        "sys.gc.cpu.percent",
+		Help:        "Current GC CPU usage as a fraction of total available CPU capacity",
+		Measurement: "CPU Time",
+		Unit:        metric.Unit_PERCENT,
+		Visibility:  metric.Metadata_SUPPORT,
 	}
 	metaNonGCPauseNS = metric.Metadata{
 		Name:        "sys.go.pause.other.ns",
@@ -809,6 +823,7 @@ type RuntimeStatSampler struct {
 		cgoCall     int64
 		gcCount     int64
 		gcPauseTime uint64
+		gcTotalCPU  float64
 		disk        DiskStats
 		net         netCounters
 		runnableSum float64
@@ -846,7 +861,9 @@ type RuntimeStatSampler struct {
 	NonGcStopNS              *metric.Gauge
 	GcPausePercent           *metric.GaugeFloat64
 	GcAssistNS               *metric.Counter
+	GcAssistEnabled          *metric.Gauge
 	GcTotalNS                *metric.Counter
+	GcCPUPercent             *metric.GaugeFloat64
 	// CPU stats for the CRDB process usage.
 	CPUUserNS              *metric.Counter
 	CPUUserPercent         *metric.GaugeFloat64
@@ -901,7 +918,10 @@ func NewRuntimeStatSampler(ctx context.Context, clock hlc.WallClock) *RuntimeSta
 		log.Dev.Warningf(ctx, "could not parse build timestamp: %v", err)
 	}
 
-	// Build information.
+	// Build information. The labels on this metric enable Prometheus/Datadog
+	// queries to filter or group by CockroachDB version — for example, to
+	// identify which nodes are running a particular release series.
+	year, release := build.BranchReleaseSeries()
 	metaBuildTimestamp := metric.Metadata{
 		Name:        "build.timestamp",
 		Help:        "Build information",
@@ -910,6 +930,8 @@ func NewRuntimeStatSampler(ctx context.Context, clock hlc.WallClock) *RuntimeSta
 	}
 	metaBuildTimestamp.AddLabel("tag", info.Tag)
 	metaBuildTimestamp.AddLabel("go_version", info.GoVersion)
+	metaBuildTimestamp.AddLabel("major", strconv.Itoa(year))
+	metaBuildTimestamp.AddLabel("minor", strconv.Itoa(release))
 
 	buildTimestamp := metric.NewGauge(metaBuildTimestamp)
 	buildTimestamp.Update(timestamp)
@@ -949,7 +971,9 @@ func NewRuntimeStatSampler(ctx context.Context, clock hlc.WallClock) *RuntimeSta
 		GcStopNS:                 metric.NewGauge(metaGCStopNS),
 		GcPausePercent:           metric.NewGaugeFloat64(metaGCPausePercent),
 		GcAssistNS:               metric.NewCounter(metaGCAssistNS),
+		GcAssistEnabled:          metric.NewGauge(metaGCAssistEnabled),
 		GcTotalNS:                metric.NewCounter(metaGCTotalNS),
+		GcCPUPercent:             metric.NewGaugeFloat64(metaGCCPUPercent),
 		NonGcPauseNS:             metric.NewGauge(metaNonGCPauseNS),
 		NonGcStopNS:              metric.NewGauge(metaNonGCStopNS),
 
@@ -1153,7 +1177,7 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, cs *CGoMem
 	hostNiceTime := int64(cpuUsage.Nice * 1.e9)
 
 	var procUrate, procSrate, hostUrate, hostSrate, hostIrqrate, hostSoftIrqrate, hostNiceRate float64
-	if rsr.last.now != 0 { // We cannot compute these rates on the first iteration.
+	if rsr.last.now != 0 && dur > 0 { // We cannot compute these rates on the first iteration or if no time elapsed.
 		procUrate = float64(procUtime-rsr.last.procUtime) / dur
 		procSrate = float64(procStime-rsr.last.procStime) / dur
 		hostUrate = float64(hostUtime-rsr.last.hostUtime) / dur
@@ -1175,14 +1199,28 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, cs *CGoMem
 	gcStopTotalNs := int64(gcStopTotal * 1.e9)
 	nonGcStopTotalNs := int64(nonGcStopTotal * 1.e9)
 	gcCount := rsr.goRuntimeSampler.uint64(runtimeMetricGCCount)
-	gcPauseRatio := float64(gcPauseTotalNs-rsr.last.gcPauseTime) / dur
+	var gcPauseRatio float64
+	if dur > 0 {
+		gcPauseRatio = float64(gcPauseTotalNs-rsr.last.gcPauseTime) / dur
+	}
+	gcTotalCPUSeconds := rsr.goRuntimeSampler.float64(runtimeMetricGCTotal)
+	var gcCPURatio float64
+	if rsr.last.now != 0 && dur > 0 && cpuCapacity > 0 {
+		// TODO: initalize right after `dur` and use with other metrics too
+		perNs := 1.0 / dur
+		deltaGCNs := max(gcTotalCPUSeconds-rsr.last.gcTotalCPU, 0) * 1e9
+		gcCPURatio = min(deltaGCNs*perNs/cpuCapacity, 1.0)
+	}
 	runnableSum := goschedstats.CumulativeNormalizedRunnableGoroutines()
 	gcAssistSeconds := rsr.goRuntimeSampler.float64(runtimeMetricGCAssist)
 	gcAssistNS := int64(gcAssistSeconds * 1e9)
 	// The number of runnable goroutines per CPU is a count, but it can vary
 	// quickly. We don't just want to get a current snapshot of it, we want the
 	// average value since the last sampling.
-	runnableAvg := (runnableSum - rsr.last.runnableSum) * 1e9 / dur
+	var runnableAvg float64
+	if dur > 0 {
+		runnableAvg = (runnableSum - rsr.last.runnableSum) * 1e9 / dur
+	}
 	rsr.last.now = now
 	rsr.last.procUtime = procUtime
 	rsr.last.procStime = procStime
@@ -1192,11 +1230,15 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, cs *CGoMem
 	rsr.last.hostSoftIrqtime = hostSoftIrqtime
 	rsr.last.hostNiceTime = hostNiceTime
 	rsr.last.gcPauseTime = gcPauseTotalNs
+	rsr.last.gcTotalCPU = gcTotalCPUSeconds
 	rsr.last.runnableSum = runnableSum
 
 	// Log summary of statistics to console.
 	osStackBytes := rsr.goRuntimeSampler.uint64(runtimeMetricMemStackOSBytes)
-	cgoRate := float64((numCgoCall-rsr.last.cgoCall)*int64(time.Second)) / dur
+	var cgoRate float64
+	if dur > 0 {
+		cgoRate = float64((numCgoCall-rsr.last.cgoCall)*int64(time.Second)) / dur
+	}
 	goAlloc := rsr.goRuntimeSampler.uint64(runtimeMetricHeapAlloc)
 	goTotal := rsr.goRuntimeSampler.uint64(runtimeMetricGoTotal) -
 		rsr.goRuntimeSampler.uint64(runtimeMetricHeapReleasedBytes)
@@ -1255,7 +1297,13 @@ func (rsr *RuntimeStatSampler) SampleEnvironment(ctx context.Context, cs *CGoMem
 	rsr.GcStopNS.Update(gcStopTotalNs)
 	rsr.GcPausePercent.Update(gcPauseRatio)
 	rsr.GcAssistNS.Update(gcAssistNS)
-	rsr.GcTotalNS.Update(int64(rsr.goRuntimeSampler.float64(runtimeMetricGCTotal) * 1e9))
+	if gcassist.Enabled() {
+		rsr.GcAssistEnabled.Update(1)
+	} else {
+		rsr.GcAssistEnabled.Update(0)
+	}
+	rsr.GcTotalNS.Update(int64(gcTotalCPUSeconds * 1e9))
+	rsr.GcCPUPercent.Update(gcCPURatio)
 	rsr.NonGcPauseNS.Update(nonGcPauseTotalNs)
 	rsr.NonGcStopNS.Update(nonGcStopTotalNs)
 
@@ -1337,7 +1385,20 @@ type netCounters struct {
 
 var mockableMaybeReadProcStatFile = maybeReadProcStatFile
 
-func getSummedNetStats(ctx context.Context) (netCounters, error) {
+func getSummedNetStats(ctx context.Context) (result netCounters, err error) {
+	// Recover from panics in gopsutil. The library has known bugs where it
+	// accesses slice indices without bounds checks when parsing OS command
+	// output (e.g. netstat on darwin). Since this is a metrics sampling path,
+	// returning zero counters is acceptable.
+	// See: https://github.com/cockroachdb/cockroach/issues/164074
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.Newf("panic in gopsutil: %v", r)
+			log.Ops.Warningf(ctx, "recovered from %s", err)
+			result = netCounters{}
+		}
+	}()
+
 	c, err := net.IOCountersWithContext(ctx, true /* per NIC */)
 	if err != nil {
 		log.Dev.VWarningf(ctx, 1, "error reading network IO counters: %v", err)
@@ -1498,38 +1559,49 @@ func sumAndFilterDiskCounters(disksStats []DiskStats) (DiskStats, error) {
 	return output, nil
 }
 
-// subtractDiskCounters subtracts the counters in `baseline` from the
-// counters in `stats`, saving the results in `stats`. If any counter
-// in `stats` is lower than the corresponding counter in `baseline`
-// (indicating a reset), the value for all metrics in `baseline`
-// is updated to the current value in `stats` to establish a new
-// baseline.
-func subtractDiskCounters(ctx context.Context, stats *DiskStats, baseline *DiskStats) {
-	if stats.WriteBytes < baseline.WriteBytes ||
-		stats.writeCount < baseline.writeCount ||
-		stats.writeTime < baseline.writeTime ||
-		stats.ReadBytes < baseline.ReadBytes ||
-		stats.readCount < baseline.readCount ||
-		stats.readTime < baseline.readTime ||
-		stats.ioTime < baseline.ioTime ||
-		stats.weightedIOTime < baseline.weightedIOTime {
-		*baseline = *stats
-		*stats = DiskStats{}
-		log.Ops.Info(ctx, "runtime: new baseline in disk stats from host. disk metric counters have been reset.")
-		return
+// subtractDiskStat subtracts base from stat. If stat < base (indicating a
+// counter wrap, e.g. on s390x where /proc/diskstats counters are 32-bit
+// unsigned), base is reset to stat and stat is zeroed.
+func subtractDiskStat(ctx context.Context, stat, base *int64, name string) {
+	if *stat < *base {
+		log.Ops.Infof(ctx,
+			"runtime: disk stats counter wrap detected for %s, resetting baseline", name)
+		*base = *stat
+		*stat = 0
+	} else {
+		*stat -= *base
 	}
+}
 
-	// Perform normal subtraction
-	stats.writeCount -= baseline.writeCount
-	stats.WriteBytes -= baseline.WriteBytes
-	stats.writeTime -= baseline.writeTime
+// subtractDiskStatDuration is like subtractDiskStat but for time.Duration
+// fields.
+func subtractDiskStatDuration(ctx context.Context, stat, base *time.Duration, name string) {
+	if *stat < *base {
+		log.Ops.Infof(ctx,
+			"runtime: disk stats counter wrap detected for %s, resetting baseline", name)
+		*base = *stat
+		*stat = 0
+	} else {
+		*stat -= *base
+	}
+}
 
-	stats.readCount -= baseline.readCount
-	stats.ReadBytes -= baseline.ReadBytes
-	stats.readTime -= baseline.readTime
-
-	stats.ioTime -= baseline.ioTime
-	stats.weightedIOTime -= baseline.weightedIOTime
+// subtractDiskCounters subtracts the counters in `baseline` from the
+// counters in `stats`, saving the results in `stats`. Each counter is
+// handled independently: if a counter in `stats` is lower than the
+// corresponding counter in `baseline` (indicating a wrap on s390x
+// where /proc/diskstats counters are 32-bit unsigned), that counter's
+// baseline is reset to the current value and the result for that
+// counter is zeroed. Counters that haven't wrapped subtract normally.
+func subtractDiskCounters(ctx context.Context, stats *DiskStats, baseline *DiskStats) {
+	subtractDiskStat(ctx, &stats.ReadBytes, &baseline.ReadBytes, "host-disk-read-bytes")
+	subtractDiskStat(ctx, &stats.readCount, &baseline.readCount, "host-disk-read-count")
+	subtractDiskStatDuration(ctx, &stats.readTime, &baseline.readTime, "host-disk-read-time")
+	subtractDiskStat(ctx, &stats.WriteBytes, &baseline.WriteBytes, "host-disk-write-bytes")
+	subtractDiskStat(ctx, &stats.writeCount, &baseline.writeCount, "host-disk-write-count")
+	subtractDiskStatDuration(ctx, &stats.writeTime, &baseline.writeTime, "host-disk-write-time")
+	subtractDiskStatDuration(ctx, &stats.ioTime, &baseline.ioTime, "host-disk-io-time")
+	subtractDiskStatDuration(ctx, &stats.weightedIOTime, &baseline.weightedIOTime, "host-disk-weighted-io-time")
 }
 
 // sumNetworkCounters returns a new net.IOCountersStat whose values are the sum of the

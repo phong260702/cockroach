@@ -1104,6 +1104,12 @@ select relname, relrowsecurity, relforcerowsecurity from pg_class where relname 
 ----
 roaches  true  true
 
+# pg_tables.rowsecurity should agree with pg_class.relrowsecurity.
+query TB
+select tablename, rowsecurity from pg_tables where tablename = 'roaches';
+----
+roaches  true
+
 skipif config schema-locked-disabled
 query T
 select create_statement from crdb_internal.create_statements where descriptor_name='roaches'
@@ -3441,6 +3447,354 @@ REVOKE CREATE ON SCHEMA public FROM bob, alice;
 statement ok
 DROP ROLE alice, bob;
 
+subtest refresh_mv_rls_definer_semantics
+
+# Regression tests for #167327: REFRESH MATERIALIZED VIEW uses the invoker's
+# RLS policies instead of the view owner's (definer semantics).
+#
+# In PostgreSQL, REFRESH MATERIALIZED VIEW uses definer semantics: the view
+# owner's privileges determine which rows are materialized, regardless of who
+# runs REFRESH. This test confirms CockroachDB uses the same semantics.
+
+statement ok
+CREATE ROLE mv_alice LOGIN;
+
+statement ok
+CREATE ROLE mv_bob LOGIN;
+
+statement ok
+CREATE TABLE rls_docs (
+    id INT PRIMARY KEY,
+    visible_to TEXT NOT NULL,
+    content TEXT NOT NULL
+);
+
+statement ok
+INSERT INTO rls_docs (id, visible_to, content) VALUES
+  (1, 'mv_alice', 'Alice secret 1'),
+  (2, 'mv_alice', 'Alice secret 2'),
+  (3, 'mv_bob',   'Bob secret 1'),
+  (4, 'everyone', 'Public doc');
+
+statement ok
+GRANT SELECT ON rls_docs TO mv_alice;
+
+statement ok
+GRANT SELECT ON rls_docs TO mv_bob;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO mv_alice;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO mv_bob;
+
+statement ok
+ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+
+statement ok
+CREATE POLICY see_alice ON rls_docs TO mv_alice
+  USING (visible_to = 'mv_alice' OR visible_to = 'everyone');
+
+statement ok
+CREATE POLICY see_bob ON rls_docs TO mv_bob
+  USING (visible_to = 'mv_bob' OR visible_to = 'everyone');
+
+# Verify that mv_bob sees only their rows (3, 4).
+statement ok
+SET ROLE mv_bob;
+
+query ITT
+SELECT * FROM rls_docs ORDER BY id;
+----
+3  mv_bob    Bob secret 1
+4  everyone  Public doc
+
+# mv_bob creates a materialized view. The MV should contain only the rows
+# visible to mv_bob through RLS (rows 3 and 4).
+statement ok
+CREATE MATERIALIZED VIEW mv_bob_view AS SELECT * FROM rls_docs;
+
+query ITT
+SELECT * FROM mv_bob_view ORDER BY id;
+----
+3  mv_bob    Bob secret 1
+4  everyone  Public doc
+
+# Create a second MV for the non-owner refresh test below.
+statement ok
+CREATE MATERIALIZED VIEW mv_bob_view2 AS SELECT * FROM rls_docs;
+
+query ITT
+SELECT * FROM mv_bob_view2 ORDER BY id;
+----
+3  mv_bob    Bob secret 1
+4  everyone  Public doc
+
+statement ok
+RESET ROLE;
+
+# Run the refresh as root (admin). The row visibility should match the owner
+# mv_bob's RLS policies, not the admin invoker's (which would see all rows).
+statement ok
+REFRESH MATERIALIZED VIEW mv_bob_view;
+
+query ITT
+SELECT * FROM mv_bob_view ORDER BY id;
+----
+3  mv_bob    Bob secret 1
+4  everyone  Public doc
+
+# Non-owner (mv_alice) refresh uses owner's (mv_bob) RLS policies.
+#
+# Grant MAINTAIN on mv_bob_view2 to mv_alice so she can refresh it.
+statement ok
+GRANT MAINTAIN ON mv_bob_view2 TO mv_alice;
+
+# Verify the MV still has mv_bob's rows before the refresh.
+query ITT
+SELECT * FROM mv_bob_view2 ORDER BY id;
+----
+3  mv_bob    Bob secret 1
+4  everyone  Public doc
+
+statement ok
+SET ROLE mv_alice;
+
+# Verify mv_alice sees different rows than mv_bob.
+query ITT
+SELECT * FROM rls_docs ORDER BY id;
+----
+1  mv_alice  Alice secret 1
+2  mv_alice  Alice secret 2
+4  everyone  Public doc
+
+# mv_alice refreshes mv_bob's MV using MAINTAIN privilege.
+statement ok
+REFRESH MATERIALIZED VIEW mv_bob_view2;
+
+statement ok
+RESET ROLE;
+
+# The MV still contains mv_bob's rows because REFRESH uses definer semantics
+# (the view owner mv_bob's RLS policies apply, not mv_alice's).
+query ITT
+SELECT * FROM mv_bob_view2 ORDER BY id;
+----
+3  mv_bob    Bob secret 1
+4  everyone  Public doc
+
+# Cleanup.
+statement ok
+DROP MATERIALIZED VIEW mv_bob_view;
+
+statement ok
+DROP MATERIALIZED VIEW mv_bob_view2;
+
+statement ok
+DROP TABLE rls_docs;
+
+statement ok
+REVOKE CREATE ON SCHEMA public FROM mv_alice, mv_bob;
+
+statement ok
+DROP ROLE mv_alice, mv_bob;
+
+subtest refresh_mv_rls_table_owner_exemption
+
+# When the MV owner is also the table owner, they are exempt from RLS
+# (unless FORCE ROW LEVEL SECURITY is set). REFRESH should use definer
+# semantics, and the owner exemption should apply -- all rows are
+# materialized regardless of policies.
+
+statement ok
+CREATE ROLE mv_tblowner LOGIN;
+
+statement ok
+CREATE ROLE mv_helper LOGIN;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO mv_tblowner;
+
+statement ok
+SET ROLE mv_tblowner;
+
+statement ok
+CREATE TABLE rls_owned (
+    id INT PRIMARY KEY,
+    category TEXT NOT NULL,
+    content TEXT NOT NULL
+);
+
+statement ok
+INSERT INTO rls_owned VALUES
+  (1, 'public', 'Public doc 1'),
+  (2, 'secret', 'Secret doc 1'),
+  (3, 'public', 'Public doc 2'),
+  (4, 'secret', 'Secret doc 2');
+
+statement ok
+ALTER TABLE rls_owned ENABLE ROW LEVEL SECURITY;
+
+# Create a restrictive policy, but as table owner mv_tblowner is exempt.
+statement ok
+CREATE POLICY public_only ON rls_owned TO mv_tblowner
+  USING (category = 'public');
+
+# mv_tblowner sees all rows despite the policy (table owner exemption).
+query ITT
+SELECT * FROM rls_owned ORDER BY id;
+----
+1  public  Public doc 1
+2  secret  Secret doc 1
+3  public  Public doc 2
+4  secret  Secret doc 2
+
+statement ok
+CREATE MATERIALIZED VIEW mv_owned_view AS SELECT * FROM rls_owned;
+
+query ITT
+SELECT * FROM mv_owned_view ORDER BY id;
+----
+1  public  Public doc 1
+2  secret  Secret doc 1
+3  public  Public doc 2
+4  secret  Secret doc 2
+
+statement ok
+RESET ROLE;
+
+# Grant MAINTAIN to mv_helper so they can refresh.
+statement ok
+GRANT MAINTAIN ON mv_owned_view TO mv_helper;
+
+statement ok
+SET ROLE mv_helper;
+
+statement ok
+REFRESH MATERIALIZED VIEW mv_owned_view;
+
+statement ok
+RESET ROLE;
+
+# MV still has all rows because definer semantics uses mv_tblowner's
+# identity, and mv_tblowner is exempt from RLS as the table owner.
+query ITT
+SELECT * FROM mv_owned_view ORDER BY id;
+----
+1  public  Public doc 1
+2  secret  Secret doc 1
+3  public  Public doc 2
+4  secret  Secret doc 2
+
+# Cleanup.
+statement ok
+DROP MATERIALIZED VIEW mv_owned_view;
+
+statement ok
+DROP TABLE rls_owned;
+
+statement ok
+REVOKE CREATE ON SCHEMA public FROM mv_tblowner;
+
+statement ok
+DROP ROLE mv_tblowner, mv_helper;
+
+subtest refresh_mv_rls_force_overrides_owner_exemption
+
+# When FORCE ROW LEVEL SECURITY is set, even the table owner is subject to
+# RLS policies. REFRESH should apply the owner's policies via definer
+# semantics, so only policy-filtered rows are materialized.
+
+statement ok
+CREATE ROLE mv_forcedowner LOGIN;
+
+statement ok
+CREATE ROLE mv_forcehelper LOGIN;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO mv_forcedowner;
+
+statement ok
+SET ROLE mv_forcedowner;
+
+statement ok
+CREATE TABLE rls_forced (
+    id INT PRIMARY KEY,
+    category TEXT NOT NULL,
+    content TEXT NOT NULL
+);
+
+statement ok
+INSERT INTO rls_forced VALUES
+  (1, 'public', 'Public doc 1'),
+  (2, 'secret', 'Secret doc 1'),
+  (3, 'public', 'Public doc 2'),
+  (4, 'secret', 'Secret doc 2');
+
+statement ok
+ALTER TABLE rls_forced ENABLE ROW LEVEL SECURITY;
+
+statement ok
+ALTER TABLE rls_forced FORCE ROW LEVEL SECURITY;
+
+# Create a policy that only shows public rows to the owner.
+statement ok
+CREATE POLICY public_only ON rls_forced TO mv_forcedowner
+  USING (category = 'public');
+
+# Despite being the table owner, FORCE RLS makes policies apply.
+query ITT
+SELECT * FROM rls_forced ORDER BY id;
+----
+1  public  Public doc 1
+3  public  Public doc 2
+
+statement ok
+CREATE MATERIALIZED VIEW mv_forced_view AS SELECT * FROM rls_forced;
+
+query ITT
+SELECT * FROM mv_forced_view ORDER BY id;
+----
+1  public  Public doc 1
+3  public  Public doc 2
+
+statement ok
+RESET ROLE;
+
+# Grant MAINTAIN to helper so they can refresh.
+statement ok
+GRANT MAINTAIN ON mv_forced_view TO mv_forcehelper;
+
+statement ok
+SET ROLE mv_forcehelper;
+
+statement ok
+REFRESH MATERIALIZED VIEW mv_forced_view;
+
+statement ok
+RESET ROLE;
+
+# MV has only public rows because FORCE RLS applies to the owner
+# through definer semantics.
+query ITT
+SELECT * FROM mv_forced_view ORDER BY id;
+----
+1  public  Public doc 1
+3  public  Public doc 2
+
+# Cleanup.
+statement ok
+DROP MATERIALIZED VIEW mv_forced_view;
+
+statement ok
+DROP TABLE rls_forced;
+
+statement ok
+REVOKE CREATE ON SCHEMA public FROM mv_forcedowner;
+
+statement ok
+DROP ROLE mv_forcedowner, mv_forcehelper;
+
 subtest show_policies_edge_cases
 
 statement error pq: relation "nonexistent_table" does not exist
@@ -5703,29 +6057,6 @@ DROP FUNCTION fail, divbyzero;
 statement ok
 DROP ROLE alice;
 
-subtest unimplemented_alter_view_with_security_invoker
-
-statement ok
-CREATE TABLE roach_pg_table ( count INT )
-
-statement ok
-SET allow_view_with_security_invoker_clause = on
-
-statement ok
-CREATE VIEW security_invoker_view WITH ( security_invoker = true ) AS SELECT * FROM roach_pg_table
-
-statement error pq: at or near "\)": syntax error: unimplemented: this syntax\nHINT: You have attempted to use a feature that is not yet implemented\.\n\nPlease check the public issue tracker to check whether this problem is\nalready tracked\. If you cannot find it there, please report the error\nwith details by creating a new issue\.\n\nIf you would rather not post publicly, please contact us directly\nusing the support form\.\n\nWe appreciate your feedback\.\n\nDETAIL: source SQL:\nALTER VIEW security_invoker_view SET \( security_invoker = false \)
-ALTER VIEW security_invoker_view SET ( security_invoker = false )
-
-statement ok
-DROP VIEW security_invoker_view
-
-statement ok
-DROP TABLE roach_pg_table
-
-statement ok
-SET allow_view_with_security_invoker_clause = off
-
 subtest end
 
 subtest row_security_off
@@ -5985,5 +6316,146 @@ DROP TABLE t158154;
 
 statement ok
 DROP ROLE user_158154;
+
+subtest end
+
+# Regression test for #146722. DROP TABLE CASCADE should drop only the policy,
+# not the table that owns the policy.
+subtest drop_referenced_table_cascade_policy
+
+statement ok
+CREATE TABLE ref_table (id INT PRIMARY KEY, allowed_user TEXT);
+
+statement ok
+INSERT INTO ref_table VALUES (1, 'testuser'), (2, 'admin');
+
+statement ok
+CREATE TABLE policy_table (id INT PRIMARY KEY, data TEXT);
+
+statement ok
+ALTER TABLE policy_table ENABLE ROW LEVEL SECURITY;
+
+# Create a function that references ref_table.
+statement ok
+CREATE FUNCTION check_ref_table(check_id INT) RETURNS BOOL AS $$
+  SELECT EXISTS (SELECT 1 FROM ref_table WHERE id = check_id)
+$$ LANGUAGE SQL;
+
+# Create a policy that uses the function (which references ref_table).
+statement ok
+CREATE POLICY check_access ON policy_table
+  FOR ALL
+  USING (check_ref_table(id));
+
+# Verify both tables and the policy exist.
+query T
+SELECT tablename FROM pg_tables WHERE tablename IN ('policy_table', 'ref_table') ORDER BY tablename;
+----
+policy_table
+ref_table
+
+query T
+SELECT polname FROM pg_policy WHERE polname = 'check_access';
+----
+check_access
+
+# DROP TABLE without CASCADE should fail due to dependency (function depends on it).
+statement error pq: cannot drop table ref_table because other objects depend on it
+DROP TABLE ref_table;
+
+# DROP TABLE with CASCADE should succeed. The function is dropped, which causes
+# the policy to be dropped, but policy_table should remain.
+statement ok
+DROP TABLE ref_table CASCADE;
+
+# Verify policy_table still exists.
+query T
+SELECT tablename FROM pg_tables WHERE tablename = 'policy_table';
+----
+policy_table
+
+# Verify the policy was dropped (because the function it depends on was dropped).
+query T
+SELECT polname FROM pg_policy WHERE polname = 'check_access';
+----
+
+# Verify policy_table still works for owner.
+statement ok
+INSERT INTO policy_table VALUES (1, 'test');
+
+query IT
+SELECT * FROM policy_table;
+----
+1  test
+
+# Verify RLS is still enabled on the table.
+query TBB
+SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'policy_table';
+----
+policy_table  true  false
+
+# Verify deny-by-default behavior for non-owner users. With RLS enabled and no
+# policy, regular users should not be able to see any data.
+statement ok
+CREATE USER cascade_test_user;
+
+statement ok
+GRANT SELECT ON policy_table TO cascade_test_user;
+
+statement ok
+SET ROLE cascade_test_user;
+
+# Non-owner should see no rows due to deny-by-default.
+query IT
+SELECT * FROM policy_table;
+----
+
+statement ok
+SET ROLE root;
+
+statement ok
+DROP TABLE policy_table;
+
+statement ok
+DROP USER cascade_test_user;
+
+subtest end
+
+# Regression test: ALTER FUNCTION RENAME/SET SCHEMA should be blocked when the
+# function is referenced in a policy expression.
+subtest regression_policy_udf_rename_dep
+
+statement ok
+CREATE TABLE t_rls_dep (k INT PRIMARY KEY, v INT);
+
+statement ok
+CREATE FUNCTION rls_dep_fn(v INT) RETURNS BOOL LANGUAGE SQL AS $$ SELECT v > 0 $$;
+
+statement ok
+ALTER TABLE t_rls_dep ENABLE ROW LEVEL SECURITY;
+
+statement ok
+CREATE POLICY p_rls_dep ON t_rls_dep USING (public.rls_dep_fn(v));
+
+# Renaming the function referenced by the policy should be blocked.
+# In mixed-version clusters (before V26_3_Start), the policy dependency
+# check is skipped, so the rename succeeds.
+skipif config local-mixed-25.4 local-mixed-26.1 local-mixed-26.2
+statement error cannot rename function "rls_dep_fn" because other objects \(\[policy "p_rls_dep" on .*t_rls_dep\]\) still depend on it
+ALTER FUNCTION rls_dep_fn(INT) RENAME TO rls_dep_fn_renamed;
+
+# Moving the function to another schema should also be blocked.
+statement ok
+CREATE SCHEMA sc_rls_dep;
+
+skipif config local-mixed-25.4 local-mixed-26.1 local-mixed-26.2
+statement error cannot set schema for function "rls_dep_fn" because other objects \(\[policy "p_rls_dep" on .*t_rls_dep\]\) still depend on it
+ALTER FUNCTION rls_dep_fn(INT) SET SCHEMA sc_rls_dep;
+
+statement ok
+DROP POLICY p_rls_dep ON t_rls_dep;
+DROP TABLE t_rls_dep;
+DROP FUNCTION rls_dep_fn;
+DROP SCHEMA sc_rls_dep;
 
 subtest end

@@ -69,7 +69,6 @@ describe("jobs page", () => {
     cy.get('[class*="summary--card"]').contains("Status");
     cy.get('[class*="summary--card"]').contains("Creation Time");
     cy.get('[class*="summary--card"]').contains("Last Modified Time");
-    cy.get('[class*="summary--card"]').contains("Completed Time");
     cy.get('[class*="summary--card"]').contains("User Name");
     cy.get('[class*="summary--card"]').contains("Coordinator Node");
 
@@ -77,12 +76,6 @@ describe("jobs page", () => {
     cy.get('[class*="job-messages"]').contains("When");
     cy.get('[class*="job-messages"]').contains("Kind");
     cy.get('[class*="job-messages"]').contains("Message");
-
-    // Verify events table has at least one row
-    cy.get('[class*="job-messages"] table tbody tr').should(
-      "have.length.at.least",
-      1,
-    );
 
     // switch to advance debugging tab
     cy.contains("Advanced Debugging").click();

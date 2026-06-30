@@ -52,7 +52,11 @@ func TestTrace(t *testing.T) {
 		"local proposal",
 		"admissionWorkQueueWait",
 		"index recommendation",
-		"/cockroach.roachpb.KVBatch/Batch", // present with dRPC, absent with gRPC
+		"/cockroach.roachpb.Internal/Batch",
+		// Internal queries (e.g. statement hints lookups) may produce
+		// spans in the session trace before their cache is initialized.
+		"get-plan-hints",
+		"prepare stmt",
 	}
 	// Depending on whether the data is local or not, we may not see these
 	// spans. Only applicable with distsql=on.
@@ -67,6 +71,13 @@ func TestTrace(t *testing.T) {
 		"/cockroach.roachpb.Internal/RangeLookup",
 		"executeWriteBatch",
 	}
+	// KVBatch spans are optional since they may or may not appear depending
+	// on whether DRPC is enabled and which nodes handle the request.
+	drpcOptionalSpans := []string{
+		"/cockroach.roachpb.KVBatch/Batch",
+		"/cockroach.roachpb.KVBatch/BatchStream",
+		"/cockroach.roachpb.TenantService/RangeLookup",
+	}
 	commonExpSpans := []string{
 		"session recording",
 		"sql txn",
@@ -76,7 +87,6 @@ func TestTrace(t *testing.T) {
 		"consuming rows",
 		"txn coordinator send",
 		"dist sender send",
-		"/cockroach.roachpb.Internal/Batch",
 		"commit sql txn",
 	}
 	nonVectorizedExpSpans := append(append([]string(nil), commonExpSpans...), []string{
@@ -204,8 +214,22 @@ func TestTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Wait for each node's statement_hints rangefeed to complete its initial
+	// scan. Otherwise, the first query on a node will fall through to a DB read
+	// in MaybeGetStatementHints (because hintedHashes is still nil) and pollute
+	// the trace with internal-query spans like colbatchscan / colindexjoin.
+	for i := 0; i < numNodes; i++ {
+		hc := cluster.ApplicationLayer(i).ExecutorConfig().(sql.ExecutorConfig).StatementHintsCache
+		hc.Await(context.Background())
+	}
+
 	for _, test := range testData {
 		optionalSpans := append([]string{}, alwaysOptionalSpans...)
+		// Check if DRPC is enabled. When DRPC is enabled, remote KV requests
+		// produce DRPC-style span names (/cockroach.roachpb.KVBatch/Batch).
+		if cluster.IsDRPCEnabled() {
+			optionalSpans = append(optionalSpans, drpcOptionalSpans...)
+		}
 		if test.distSQL == "on" {
 			optionalSpans = append(optionalSpans, distsqlOptionalSpans...)
 		}

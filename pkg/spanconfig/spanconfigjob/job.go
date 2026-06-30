@@ -165,7 +165,8 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 			}
 
 			lastCheckpoint = rc.Checkpoint()
-			return r.job.NoTxn().SetProgress(ctx, jobspb.AutoSpanConfigReconciliationProgress{
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			return r.job.DeprecatedNoTxn().SetProgress(ctx, jobspb.AutoSpanConfigReconciliationProgress{
 				Checkpoint: rc.Checkpoint(),
 			})
 		}); err != nil {
@@ -195,8 +196,8 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 		return nil // we're done here (the stopper was stopped, Reconcile exited cleanly)
 	}
 
-	if lastErr != nil {
-		return errors.Wrap(lastErr, "reconciliation unsuccessful, failing job")
+	if err := errors.CombineErrors(lastErr, ctx.Err()); err != nil {
+		return errors.Wrap(err, "reconciliation unsuccessful, failing job")
 	}
 	return errors.Newf("reconciliation unsuccessful, failing job")
 }

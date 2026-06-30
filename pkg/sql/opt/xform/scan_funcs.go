@@ -28,8 +28,13 @@ import (
 // that always evaluate to true are considered. Such an index is pseudo-partial
 // in that it behaves the exactly the same as a non-partial secondary index.
 //
-// NOTE: This does not generate index joins for non-covering indexes (except in
-// case of ForceIndex). Index joins are usually only introduced "one level up",
+// NOTE: This does not generate index joins for non-covering indexes unless:
+//   - ForceIndex is set,
+//   - AllowUnconstrainedNonCoveringIndexScan is enabled, or
+//   - the index's first column is bounded by check constraints (to enable
+//     SplitLimitedScanIntoUnionScans for hash-sharded and partitioned indexes).
+//
+// Index joins are usually only introduced "one level up",
 // when the Scan operator is wrapped by an operator that constrains or limits
 // scan output in some way (e.g. Select, Limit, InnerJoin). Index joins are only
 // lower cost when their input does not include all rows from the table. See
@@ -75,7 +80,13 @@ func (c *CustomFuncs) GenerateIndexScans(
 		// be explored, even when non-covering and unconstrained, without forcing a
 		// particular index.
 		if !scanPrivate.Flags.ForceIndex && !c.e.mem.AllowUnconstrainedNonCoveringIndexScan() {
-			return
+			// Allow non-covering scans for indexes whose first column is bounded
+			// by check constraints. This enables SplitLimitedScanIntoUnionScans
+			// to generate union-all plans for hash-sharded and partitioned indexes.
+			firstColID := scanPrivate.Table.IndexColumnID(index, 0)
+			if _, ok := c.numAllowedValues(firstColID, scanPrivate.Table); !ok {
+				return
+			}
 		}
 
 		var sb indexScanBuilder
@@ -136,6 +147,7 @@ func (c *CustomFuncs) CanMaybeGenerateLocalityOptimizedScan(scanPrivate *memo.Sc
 
 		// Don't apply the rule if there are too many spans, since the rule code is
 		// O(# spans * # prefixes * # datums per prefix).
+		// TODO(michae2): Consider also bounding this by optimizer_span_limit.
 		if scanPrivate.Constraint.Spans.Count() > 10000 {
 			return false
 		}
@@ -428,9 +440,13 @@ func (c *CustomFuncs) buildAllPartitionsConstraint(
 	optionalFilters, filterColumns :=
 		c.GetOptionalFiltersAndFilterColumns(nil /* explicitFilters */, sp)
 
+	// TODO(michae2): We should probably be passing optimizer_span_limit to
+	// MakeCombinedFiltersConstraint, but it doesn't seem too dangerous to assume
+	// the number of partitions will be reasonable.
 	if _, remainingFilters, combinedConstraint, ok = c.MakeCombinedFiltersConstraint(
 		tabMeta, index, sp, ps,
 		nil /* explicitFilters */, optionalFilters, filterColumns,
+		0, /* spanLimit */
 	); !ok {
 		return nil, false
 	}

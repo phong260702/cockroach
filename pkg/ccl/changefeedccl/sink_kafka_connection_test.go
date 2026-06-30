@@ -15,7 +15,6 @@ import (
 	"github.com/IBM/sarama"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -73,6 +72,7 @@ func (e *externalConnectionKafkaSink) EmitRow(
 	_ context.Context,
 	_ TopicDescriptor,
 	_, _ []byte,
+	_ []byte,
 	_, _ hlc.Timestamp,
 	_ kvevent.Alloc,
 	_ rowHeaders,
@@ -116,8 +116,6 @@ func TestChangefeedExternalConnections(t *testing.T) {
 
 	sqlDB := sqlutils.MakeSQLRunner(s.DB)
 	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
-	enableEnterprise := utilccl.TestingDisableEnterprise()
-	enableEnterprise()
 	unknownParams := func(sink string, params ...string) string {
 		return fmt.Sprintf(`unknown %s sink query parameters: [%s]`, sink, strings.Join(params, ", "))
 	}
@@ -252,6 +250,11 @@ func TestChangefeedExternalConnections(t *testing.T) {
 			uri:           "kafka://nope/?sasl_enabled=true&sasl_mechanism=AWS_MSK_IAM&sasl_aws_iam_session_name=foo&sasl_aws_iam_role_arn=foo",
 			expectedError: "sasl_aws_region must be provided when SASL is enabled using mechanism AWS_MSK_IAM",
 		},
+		{
+			name:          "empty topic_name rejected for kafka",
+			uri:           "kafka://nope/?topic_name=",
+			expectedError: "param topic_name must not be empty",
+		},
 		// confluent-cloud scheme tests
 		{
 			name:          "requires parameter api_key",
@@ -287,6 +290,11 @@ func TestChangefeedExternalConnections(t *testing.T) {
 			name:          "invalid query parameters",
 			uri:           "confluent-cloud://nope?api_key=fee&api_secret=bar&ca_cert=abcd",
 			expectedError: "invalid query parameters",
+		},
+		{
+			name:          "empty topic_name rejected for confluent-cloud",
+			uri:           "confluent-cloud://nope?api_key=fee&api_secret=bar&topic_name=",
+			expectedError: "param topic_name must not be empty",
 		},
 		// azure-event-hub scheme tests
 		{
@@ -328,6 +336,11 @@ func TestChangefeedExternalConnections(t *testing.T) {
 			name:          "test error with entity_path",
 			uri:           "azure-event-hub://nope?shared_access_key_name=saspolicytpcc&shared_access_key=123&entity_path=history",
 			expectedError: "invalid query parameters",
+		},
+		{
+			name:          "empty topic_name rejected for azure-event-hub",
+			uri:           "azure-event-hub://nope?shared_access_key_name=fee&shared_access_key=123&topic_name=",
+			expectedError: "param topic_name must not be empty",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

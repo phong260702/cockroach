@@ -153,18 +153,15 @@ func (s *topLevelServer) isAutoUpgradeEnabled(currentClusterVersion string) upgr
 func (s *topLevelServer) upgradeStatus(
 	ctx context.Context, clusterVersion string,
 ) (st upgradeStatus, err error) {
-	nodes, err := s.status.ListNodesInternal(ctx, nil)
+	statuses, _, err := getNodeStatuses(ctx, s.db, 0 /* limit */, 0 /* offset */)
 	if err != nil {
 		return UpgradeBlockedDueToError, err
 	}
-	vitalities, err := s.nodeLiveness.ScanNodeVitalityFromKV(ctx)
-	if err != nil {
-		return UpgradeBlockedDueToError, err
-	}
+	vitalities := s.nodeLiveness.ScanAllNodeVitalityFromCache()
 
 	var newVersion string
 	var notRunningErr error
-	for _, node := range nodes.Nodes {
+	for _, node := range statuses {
 		nodeID := node.Desc.NodeID
 		v := vitalities[nodeID]
 

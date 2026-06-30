@@ -392,7 +392,7 @@ func (c *SyncedCluster) roachprodEnvRegex(node Node) string {
 // By wrapping every command with a hostname check as is done here, we
 // ensure that the cached cluster information is still correct.
 func (c *SyncedCluster) validateHostnameCmd(cmd string, node Node) string {
-	isValidHost := fmt.Sprintf("[[ `hostname` == '%s' ]]", vm.Name(c.Name, int(node)))
+	isValidHost := fmt.Sprintf("[[ `hostname` == '%s' ]]", c.VMs[node-1].Name)
 	errMsg := fmt.Sprintf("expected host to be part of %s, but is `hostname`", c.Name)
 	elseBranch := "fi"
 	if cmd != "" {
@@ -1078,7 +1078,9 @@ func (c *SyncedCluster) RunWithDetails(
 	return results, nil
 }
 
-// Wait TODO(peter): document
+// Wait waits for all nodes in the cluster to finish initializing by
+// checking for the existence of the OS initialized file. Uses
+// exponential backoff with a 5-minute timeout.
 func (c *SyncedCluster) Wait(ctx context.Context, l *logger.Logger) error {
 	display := fmt.Sprintf("%s: waiting for nodes to start", c.Name)
 	results, hasError, err := c.ParallelE(ctx, l, WithNodes(c.Nodes).WithDisplay(display).WithRetryDisabled(),
@@ -1091,17 +1093,21 @@ func (c *SyncedCluster) Wait(ctx context.Context, l *logger.Logger) error {
 			cmd := fmt.Sprintf("test -e %s", vm.OSInitializedFile)
 			// N.B. we disable ssh debug output capture, lest we end up with _thousands_ of useless .log files.
 			opts := cmdOptsWithDebugDisabled()
-			for j := 0; j < 600; j++ {
+			retryOpts := retry.Options{
+				InitialBackoff: 500 * time.Millisecond,
+				MaxBackoff:     30 * time.Second,
+				Multiplier:     2,
+				MaxDuration:    5 * time.Minute,
+			}
+			for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 				res, err = c.runCmdOnSingleNode(ctx, l, node, cmd, opts)
 				if err != nil {
 					return nil, err
 				}
 
-				if res.Err != nil {
-					time.Sleep(500 * time.Millisecond)
-					continue
+				if res.Err == nil {
+					return res, nil
 				}
-				return res, nil
 			}
 			res.Err = errors.Wrapf(res.Err, "timed out after 5m")
 			logContent, err := c.runCmdOnSingleNode(ctx, nil, node, fmt.Sprintf("tail -n %d %s", 20, vm.StartupLogs), cmdOptsWithDebugDisabled())
@@ -1191,9 +1197,9 @@ tar cf - .ssh/id_rsa .ssh/id_rsa.pub .ssh/authorized_keys
 	}
 
 	// Populate the known_hosts file with both internal and external IPs of all
-	// nodes in the cluster. Internal IPs are populated within its provider peers
-	// only, and external IPs are populated for all providers. Note that as a side
-	// effect, this creates the known hosts file in unhashed format, working
+	// nodes in the cluster. Internal IPs are populated within its network peer
+	// group only, and external IPs are populated for all nodes. Note that as a
+	// side effect, this creates the known hosts file in unhashed format, working
 	// around a limitation of jsch (which is used in jepsen tests).
 
 	mu := syncutil.Mutex{}
@@ -1201,31 +1207,52 @@ tar cf - .ssh/id_rsa .ssh/id_rsa.pub .ssh/authorized_keys
 		node Node
 		ip   string
 	}
-	// Build a list of internal IPs for each provider and
+	// Build a list of internal IPs grouped by network peer group and
 	// public IPs for all nodes.
-	providerPrivateIPs := make(map[string][]nodeInfo)
+	//
+	// For most providers, VMs within the same provider can reach each other via
+	// private IPs, so they are grouped by provider. However, for AWS, each
+	// region has its own VPC, and cross-region private IP connectivity via VPC
+	// peering may not be reliably available (e.g., due to infrastructure
+	// configuration or peering state). We group AWS nodes by region to avoid
+	// ssh-keyscan timing out on potentially unreachable cross-region private
+	// IPs. This is safe because multi-region clusters advertise public IPs
+	// (see shouldAdvertisePublicIP).
+	networkPeerGroup := func(v vm.VM) string {
+		if v.Provider == aws.ProviderName {
+			// AWS zones are formatted as "<region><az-letter>" (e.g. "us-east-1a").
+			// Strip the trailing letter to get the region.
+			zone := v.Zone
+			if len(zone) > 0 {
+				return v.Provider + ":" + zone[:len(zone)-1]
+			}
+		}
+		return v.Provider
+	}
+	peerGroupPrivateIPs := make(map[string][]nodeInfo)
 	publicIPs := make([]string, 0, len(c.Nodes))
 	for _, node := range c.Nodes {
 		v := c.VMs[node-1]
-		providerPrivateIPs[v.Provider] = append(providerPrivateIPs[v.Provider], nodeInfo{node: node, ip: v.PrivateIP})
+		group := networkPeerGroup(v)
+		peerGroupPrivateIPs[group] = append(peerGroupPrivateIPs[group], nodeInfo{node: node, ip: v.PrivateIP})
 		publicIPs = append(publicIPs, c.Host(node))
 	}
 
-	providerKnownHostData := make(map[string][]byte)
-	providers := maps.Keys(providerPrivateIPs)
+	peerGroupKnownHostData := make(map[string][]byte)
+	peerGroups := maps.Keys(peerGroupPrivateIPs)
 
-	// Only need to scan on the first node of each provider.
-	firstNodes := make([]Node, len(providers))
-	for i, provider := range providers {
-		firstNodes[i] = providerPrivateIPs[provider][0].node
+	// Only need to scan on the first node of each peer group.
+	firstNodes := make([]Node, len(peerGroups))
+	for i, group := range peerGroups {
+		firstNodes[i] = peerGroupPrivateIPs[group][0].node
 	}
 	if err := c.Parallel(ctx, l, WithNodes(firstNodes).WithDisplay("scanning hosts"),
 		func(ctx context.Context, node Node) (*RunResultDetails, error) {
-			// Scan a combination of all remote IPs and local IPs pertaining to this
-			// node's cloud provider.
+			// Scan a combination of all public IPs and private IPs within this
+			// node's network peer group.
 			scanIPs := append([]string{}, publicIPs...)
-			nodeProvider := c.VMs[node-1].Provider
-			for _, nodeInfo := range providerPrivateIPs[nodeProvider] {
+			nodeGroup := networkPeerGroup(c.VMs[node-1])
+			for _, nodeInfo := range peerGroupPrivateIPs[nodeGroup] {
 				scanIPs = append(scanIPs, nodeInfo.ip)
 			}
 
@@ -1263,7 +1290,7 @@ exit 1
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			providerKnownHostData[nodeProvider] = []byte(res.Stdout)
+			peerGroupKnownHostData[nodeGroup] = []byte(res.Stdout)
 			return res, nil
 		}); err != nil {
 		return err
@@ -1271,7 +1298,7 @@ exit 1
 
 	if err := c.Parallel(ctx, l, WithNodes(c.Nodes).WithDisplay("distributing known_hosts"),
 		func(ctx context.Context, node Node) (*RunResultDetails, error) {
-			provider := c.VMs[node-1].Provider
+			group := networkPeerGroup(c.VMs[node-1])
 			const cmd = `
 known_hosts_data="$(cat)"
 set -e
@@ -1300,7 +1327,7 @@ if [[ "$(whoami)" != "` + config.SharedUser + `" ]]; then
 fi
 `
 			runOpts := defaultCmdOpts("ssh-dist-known-hosts")
-			runOpts.stdin = bytes.NewReader(providerKnownHostData[provider])
+			runOpts.stdin = bytes.NewReader(peerGroupKnownHostData[group])
 			return c.runCmdOnSingleNode(ctx, l, node, cmd, runOpts)
 		}); err != nil {
 		return err
@@ -1531,6 +1558,7 @@ fi
 %[3]s cert create-node %[4]s $SHARED_ARGS
 %[3]s cert create-tenant-client %[5]d %[4]s $SHARED_ARGS
 %[3]s cert create-client root $TENANT_SCOPE_OPT $SHARED_ARGS
+%[3]s mt cert create-tenant-signing --certs-dir=$CERT_DIR %[5]d
 tar cvf %[6]s $CERT_DIR
 `,
 				CockroachNodeTenantCertsDir,

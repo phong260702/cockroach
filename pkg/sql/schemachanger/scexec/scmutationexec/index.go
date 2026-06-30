@@ -96,6 +96,7 @@ func addNewIndexMutation(
 	if opIndex.VecConfig != nil {
 		idx.VecConfig = *opIndex.VecConfig
 	}
+	idx.SkipUniqueChecks = opIndex.SkipUniqueChecks
 	return enqueueIndexMutation(tbl, idx, state, descpb.DescriptorMutation_ADD)
 }
 
@@ -111,7 +112,7 @@ func (i *immediateVisitor) SetAddedIndexPartialPredicate(
 		return err
 	}
 	idx := mut.AsIndex().IndexDesc()
-	idx.Predicate = string(op.Expr)
+	idx.Predicate = op.Expr
 	return nil
 }
 

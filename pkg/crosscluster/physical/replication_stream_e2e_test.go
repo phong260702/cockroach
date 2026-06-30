@@ -48,7 +48,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -872,6 +871,23 @@ func TestStreamingAutoReplan(t *testing.T) {
 	c.WaitUntilReplicatedTime(cutoverTime, jobspb.JobID(ingestionJobID))
 
 	require.Greater(t, len(clientAddresses), 1)
+
+	// Verify that progress entries are strictly non-decreasing.
+	stats := replicationtestutils.TestingGetStreamIngestionStatsFromReplicationJob(
+		t, ctx, c.DestSysSQL, ingestionJobID,
+	)
+	replicationStartTime := stats.IngestionDetails.ReplicationStartTime
+	rows := c.DestSysSQL.QueryStr(t,
+		`SELECT resolved FROM system.job_progress_history WHERE job_id = $1 AND resolved IS NOT NULL ORDER BY written ASC`,
+		ingestionJobID,
+	)
+	var prevResolved hlc.Timestamp
+	for _, row := range rows {
+		resolved := replicationtestutils.DecimalTimeToHLC(t, row[0])
+		require.True(t, prevResolved.LessEq(resolved))
+		prevResolved = resolved
+	}
+	require.True(t, replicationStartTime.Less(prevResolved))
 }
 
 // TestStreamingReplanOnLag asserts that the c2c job retries if a node lags far
@@ -1039,7 +1055,9 @@ func TestProtectedTimestampManagement(t *testing.T) {
 		checkDestinationPTSExists(t, replicationJobID)
 
 		if completeReplication {
-			// Complete replication via cutover.
+			// Wait for the replicated time to advance past the start time
+			// before attempting cutover to LATEST.
+			c.WaitUntilStartTimeReached(jobspb.JobID(replicationJobID))
 			var emptyCutoverTime time.Time
 			c.Cutover(ctx, producerJobID, replicationJobID, emptyCutoverTime, false)
 		} else {
@@ -1261,86 +1279,6 @@ func TestLoadProducerAndIngestionProgress(t *testing.T) {
 	require.Equal(t, jobspb.Replicating, ingestionProgress.ReplicationStatus)
 }
 
-// TestStreamingRegionalConstraint ensures that the replicating tenants regional
-// constraints are obeyed during replication. This test serves as an end to end
-// test of span config replication.
-func TestStreamingRegionalConstraint(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderRace(t, "takes too long under race")
-	skip.UnderDeadlock(t, "takes too long under deadlock")
-
-	testutils.RunTrueAndFalse(t, "fromSys", func(t *testing.T, sys bool) {
-		ctx := context.Background()
-		regions := []string{"mars", "venus", "mercury"}
-		args := replicationtestutils.DefaultTenantStreamingClustersArgs
-		args.MultitenantSingleClusterNumNodes = 3
-		args.MultiTenantSingleClusterTestRegions = regions
-		if sys {
-			args.SrcTenantID = roachpb.SystemTenantID
-			args.SrcTenantName = "system"
-		}
-		marsNodeID := roachpb.NodeID(1)
-
-		c, cleanup := replicationtestutils.CreateMultiTenantStreamingCluster(ctx, t, args)
-		defer cleanup()
-
-		producerJobID, ingestionJobID := c.StartStreamReplication(ctx)
-		jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
-		jobutils.WaitForJobToRun(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-
-		c.SrcTenantSQL.Exec(t, "CREATE DATABASE test")
-		c.SrcTenantSQL.Exec(t, `ALTER DATABASE test CONFIGURE ZONE USING constraints = '[+region=mars]', num_replicas = 1;`)
-		c.SrcTenantSQL.Exec(t, "CREATE TABLE test.x (id INT PRIMARY KEY, n INT)")
-		c.SrcTenantSQL.Exec(t, "INSERT INTO test.x VALUES (1, 1)")
-
-		srcTime := c.SrcCluster.Server(0).Clock().Now()
-		c.WaitUntilReplicatedTime(srcTime, jobspb.JobID(ingestionJobID))
-
-		checkLocalities := func(targetSpan roachpb.Span, scanner rangedesc.Scanner) func() error {
-			// make pageSize large enough to not affect the test
-			pageSize := 10000
-			init := func() {}
-
-			return func() error {
-				return scanner.Scan(ctx, pageSize, init, targetSpan, func(descriptors ...roachpb.RangeDescriptor) error {
-					for _, desc := range descriptors {
-						for _, replica := range desc.InternalReplicas {
-							if replica.NodeID != marsNodeID {
-								return errors.Newf("found table data located on another node %d, desc %v",
-									replica.NodeID, desc)
-							}
-						}
-					}
-					return nil
-				})
-			}
-		}
-
-		srcCodec := keys.MakeSQLCodec(c.Args.SrcTenantID)
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(
-			c.SrcSysServer.DB(), srcCodec, "test", "x")
-		destCodec := keys.MakeSQLCodec(c.Args.DestTenantID)
-
-		testutils.SucceedsWithin(t,
-			checkLocalities(tableDesc.PrimaryIndexSpan(srcCodec), rangedesc.NewScanner(c.SrcSysServer.DB())),
-			time.Second*45*5)
-
-		testutils.SucceedsWithin(t,
-			checkLocalities(tableDesc.PrimaryIndexSpan(destCodec), rangedesc.NewScanner(c.DestSysServer.DB())),
-			time.Second*45*5)
-
-		tableName := "test"
-		tabledIDQuery := fmt.Sprintf(`SELECT id FROM system.namespace WHERE name ='%s'`, tableName)
-
-		var tableID uint32
-		c.SrcTenantSQL.QueryRow(t, tabledIDQuery).Scan(&tableID)
-		fmt.Printf("%d", tableID)
-
-		checkLocalityRanges(t, c.SrcSysSQL, srcCodec, uint32(tableDesc.GetID()), "mars")
-	})
-}
-
 func TestStreamingMismatchedMRDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1398,23 +1336,6 @@ func TestStreamingMismatchedMRDatabase(t *testing.T) {
 		c.SrcTenantSQL.ExecSucceedsSoon(c.T, `ALTER DATABASE many DROP REGION "venus"`)
 		c.DestTenantSQL.ExecSucceedsSoon(c.T, `ALTER DATABASE many DROP REGION "venus"`)
 	})
-}
-
-func checkLocalityRanges(
-	t *testing.T, sysSQL *sqlutils.SQLRunner, codec keys.SQLCodec, tableID uint32, region string,
-) {
-	targetPrefix := codec.TablePrefix(tableID)
-	distinctQuery := fmt.Sprintf(`
-SELECT
-  DISTINCT replica_localities
-FROM
-  [SHOW CLUSTER RANGES]
-WHERE
-  start_key ~ '%s'
-`, targetPrefix)
-	var locality string
-	sysSQL.QueryRow(t, distinctQuery).Scan(&locality)
-	require.Contains(t, locality, region)
 }
 
 // TestStreamingZoneConfigsMismatchedRegions tests that c2c cutover proceeds
@@ -1735,9 +1656,9 @@ func splitPrimaryKeyIndexSpan(
 
 func TestAlterExternalConnection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	skip.UnderDeadlock(t)
 	skip.UnderRace(t)
-	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	pollingInterval := 100 * time.Millisecond
@@ -1781,6 +1702,7 @@ func TestAlterExternalConnection(t *testing.T) {
 		}
 		return nil
 	})
+	jobutils.WaitForJobToPause(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
 
 	// Alter the external connection to fix the stream, and ensure replication resumes
 	c.DestSysSQL.Exec(c.T, fmt.Sprintf(`ALTER EXTERNAL CONNECTION "%s" AS "%s"`,

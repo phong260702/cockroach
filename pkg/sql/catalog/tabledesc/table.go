@@ -144,7 +144,7 @@ func MakeColumnDefDescs(
 		// GeneratedAsIdentitySequenceOption is used to populate the sequence options for the column information schema.
 		// An empty string will populate default values and null will generate null values.
 		s := ""
-		if genSeqOpt := d.GeneratedIdentity.SeqOptions; genSeqOpt != nil {
+		if genSeqOpt := d.GeneratedIdentity.SeqOptions; len(genSeqOpt) > 0 {
 			// Override GeneratedAsIdentitySequenceOption default values with specified SeqOptions.
 			s = tree.Serialize(&d.GeneratedIdentity.SeqOptions)
 		}
@@ -185,8 +185,7 @@ func MakeColumnDefDescs(
 		// Otherwise we want to keep the default expression nil.
 		if ret.DefaultExpr != tree.DNull {
 			d.DefaultExpr.Expr = ret.DefaultExpr
-			s := tree.Serialize(d.DefaultExpr.Expr)
-			col.DefaultExpr = &s
+			col.DefaultExpr = new(descpb.Expression(tree.Serialize(d.DefaultExpr.Expr)))
 		}
 	}
 
@@ -208,8 +207,7 @@ func MakeColumnDefDescs(
 		}
 
 		d.OnUpdateExpr.Expr = ret.OnUpdateExpr
-		s := tree.Serialize(d.OnUpdateExpr.Expr)
-		col.OnUpdateExpr = &s
+		col.OnUpdateExpr = new(descpb.Expression(tree.Serialize(d.OnUpdateExpr.Expr)))
 	}
 
 	if d.IsComputed() {
@@ -218,8 +216,7 @@ func MakeColumnDefDescs(
 		// descriptor. Callers must validate the expression with
 		// schemaexpr.ValidateComputedColumnExpression once all possible
 		// reference columns are part of the table descriptor.
-		s := tree.Serialize(d.Computed.Expr)
-		col.ComputeExpr = &s
+		col.ComputeExpr = new(descpb.Expression(tree.Serialize(d.Computed.Expr)))
 	}
 
 	if d.PrimaryKey.IsPrimaryKey || (d.Unique.IsUnique && !d.Unique.WithoutIndex) {
@@ -310,6 +307,101 @@ func EvalShardBucketCount(
 	return int32(buckets), nil
 }
 
+// EvalShardColumns extracts and validates the shard_columns storage parameter.
+// It returns the column names to use for sharding, which must be a prefix of
+// the index key. If not specified, returns nil which means all index columns
+// should be used for sharding.
+func EvalShardColumns(
+	storageParams tree.StorageParams, indexColumnNames []string,
+) ([]string, error) {
+	paramVal := storageParams.GetVal(`shard_columns`)
+	if paramVal == nil {
+		// No shard_columns specified, use all index columns (default behavior).
+		return nil, nil
+	}
+
+	// shard_columns can be either:
+	// - A single column identifier: shard_columns=c1
+	// - A tuple of identifiers: shard_columns=(c1, c2)
+	// Both delimited ("mixED CAse") and non-delimited (c1) identifiers are supported.
+	// We receive the raw unevaluated expression from storageParams.
+
+	var exprs tree.Exprs
+
+	// Handle single column case (UnresolvedName), parenthesized single column (ParenExpr),
+	// or multiple columns (Tuple).
+	switch expr := paramVal.(type) {
+	case *tree.UnresolvedName:
+		// Single column: shard_columns=c1
+		exprs = tree.Exprs{expr}
+	case *tree.ParenExpr:
+		// Parenthesized single column: shard_columns=(c1)
+		// Unwrap the parentheses to get the inner UnresolvedName.
+		unresolvedName, ok := expr.Expr.(*tree.UnresolvedName)
+		if !ok {
+			return nil, pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"shard_columns must be a column name or tuple of column names",
+			)
+		}
+		exprs = tree.Exprs{unresolvedName}
+	case *tree.Tuple:
+		// Multiple columns: shard_columns=(c1, c2, c3)
+		exprs = expr.Exprs
+	default:
+		return nil, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"shard_columns must be a column name or tuple of column names",
+		)
+	}
+
+	if len(exprs) == 0 {
+		return nil, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"shard_columns must contain at least one column name",
+		)
+	}
+
+	if len(exprs) > len(indexColumnNames) {
+		return nil, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			"shard_columns cannot contain more columns than the index (%d > %d)",
+			len(exprs),
+			len(indexColumnNames),
+		)
+	}
+
+	shardColNames := make([]string, len(exprs))
+	for i, expr := range exprs {
+		unresolvedName, ok := expr.(*tree.UnresolvedName)
+		if !ok {
+			return nil, pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"shard_columns must contain only column identifiers, got %T",
+				expr,
+			)
+		}
+		// Extract the column name from the unresolved name.
+		// This preserves the exact case for delimited identifiers.
+		shardColNames[i] = unresolvedName.Parts[0]
+	}
+
+	// Validate that shard columns are a prefix of index columns.
+	for i, shardCol := range shardColNames {
+		if shardCol != indexColumnNames[i] {
+			return nil, pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"shard_columns must be a prefix of index columns; expected %q at position %d, got %q",
+				indexColumnNames[i],
+				i+1,
+				shardCol,
+			)
+		}
+	}
+
+	return shardColNames, nil
+}
+
 // DefaultHashShardedIndexBucketCount is the cluster setting of default bucket
 // count for hash sharded index when bucket count is not specified in index
 // definition.
@@ -324,8 +416,22 @@ var DefaultHashShardedIndexBucketCount = settings.RegisterIntSetting(
 // GetShardColumnName generates a name for the hidden shard column to be used to create a
 // hash sharded index.
 func GetShardColumnName(colNames []string, buckets int32) string {
-	// We sort the `colNames` here because we want to avoid creating a duplicate shard
-	// column if one already exists for the set of columns in `colNames`.
+	// We sort the `colNames` here because we want to avoid creating a duplicate
+	// shard column if one already exists for the set of columns in `colNames`.
+	// Note this sort is in-place and modifies the array in the caller. This
+	// results in the columns also being in sorted order as input to the shard
+	// column hash expression.
+	//
+	// For example, CREATE INDEX idx1 ON t (b, a, c) USING HASH;
+	//   - Internal shard column name: crdb_internal_a_b_c_shard_16
+	//   - Hash expression: mod(fnv32(md5(crdb_internal.datums_to_bytes(a, b, c))), 16:::INT8)
+	//
+	// Column rename updates the internal column name but preserves the hash
+	// expression.
+	//
+	// For example, ALTER TABLE t RENAME COLUMN b TO x;
+	//   - Internal shard column name: crdb_internal_a_c_x_shard_16
+	//   - Hash expression: mod(fnv32(md5(crdb_internal.datums_to_bytes(a, x, c))), 16:::INT8)
 	sort.Strings(colNames)
 	return strings.Join(
 		append(append([]string{`crdb_internal`}, colNames...), fmt.Sprintf(`shard_%v`, buckets)), `_`,
@@ -465,7 +571,7 @@ func RenameColumnInTable(
 	newName tree.Name,
 	isShardColumnRenameable func(shardCol catalog.Column, newShardColName tree.Name) (bool, error),
 ) error {
-	renameInExpr := func(expr *string) error {
+	renameInExpr := func(expr *descpb.Expression) error {
 		newExpr, renameErr := schemaexpr.RenameColumn(*expr, col.ColName(), newName)
 		if renameErr != nil {
 			return renameErr
@@ -501,12 +607,10 @@ func RenameColumnInTable(
 
 	// Rename the column in the TTL expiration expression.
 	if tableDesc.HasRowLevelTTL() {
-		if expirationExpr := tableDesc.GetRowLevelTTL().ExpirationExpr; expirationExpr != "" {
-			expirationExprStr := string(expirationExpr)
-			if err := renameInExpr(&expirationExprStr); err != nil {
+		if ttl := tableDesc.GetRowLevelTTL(); ttl.ExpirationExpr != "" {
+			if err := renameInExpr(&ttl.ExpirationExpr); err != nil {
 				return err
 			}
-			tableDesc.GetRowLevelTTL().ExpirationExpr = catpb.Expression(expirationExprStr)
 		}
 	}
 

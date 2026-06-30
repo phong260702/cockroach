@@ -259,7 +259,7 @@ func TestStoreMetrics(t *testing.T) {
 			Size: storageconfig.BytesSize(512 << 20 /* 512 MiB */),
 		}
 		stickyServerArgs[i] = base.TestServerArgs{
-			CacheSize:  2 << 20, /* 2 MiB */
+			CacheSize:  4 << 20, /* 4 MiB */
 			StoreSpecs: []base.StoreSpec{spec},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
@@ -273,11 +273,10 @@ func TestStoreMetrics(t *testing.T) {
 		}
 		specs[i] = spec
 	}
-	tc := testcluster.StartTestCluster(t, numServers,
-		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
-		})
+	tc := testcluster.StartTestCluster(t, numServers, base.TestClusterArgs{
+		ReplicationMode:   base.ReplicationManual,
+		ServerArgsPerNode: stickyServerArgs,
+	})
 	defer tc.Stopper().Stop(ctx)
 
 	initialCount := tc.GetFirstStoreFromServer(t, 0).Metrics().ReplicaCount.Value()
@@ -328,7 +327,10 @@ func TestStoreMetrics(t *testing.T) {
 	verifyStatsOnServers(t, tc, specs, stickyVFSRegistry, 1, 2)
 	checkGauge(t, "store 0", tc.GetFirstStoreFromServer(t, 0).Metrics().ReplicaCount, initialCount+1)
 	tc.RemoveLeaseHolderOrFatal(t, desc, tc.Target(0), tc.Target(1))
+	// The removed replica may never learn about its own removal through raft,
+	// so force the replica GC queue to clean it up.
 	testutils.SucceedsSoon(t, func() error {
+		tc.GetFirstStoreFromServer(t, 0).MustForceReplicaGCScanAndProcess()
 		_, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
 		if err == nil {
 			return fmt.Errorf("replica still exists on dest 0")

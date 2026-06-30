@@ -6,6 +6,7 @@
 package privilege
 
 import (
+	"math"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -36,7 +37,7 @@ const (
 	USAGE                    Kind = 9
 	ZONECONFIG               Kind = 10
 	CONNECT                  Kind = 11
-	RULE                     Kind = 12
+	TRUNCATE                 Kind = 12
 	MODIFYCLUSTERSETTING     Kind = 13
 	EXTERNALCONNECTION       Kind = 14
 	VIEWACTIVITY             Kind = 15
@@ -70,7 +71,22 @@ const (
 	// as coming from a SQL-bodied builtin function. This allows the dependency to
 	// bypass unsafe internal checks during memo staleness checking.
 	BUILTIN_UNSAFE_ALLOWED Kind = 42
-	largestKind                 = BUILTIN_UNSAFE_ALLOWED
+	MAINTAIN               Kind = 43
+	TEMPORARY              Kind = 44
+	REFERENCES             Kind = 45
+	largestKind                 = REFERENCES
+
+	// RULE, SET, and ALTERSYSTEM are PostgreSQL ACL-only pseudo-privileges.
+	// They exist solely for ACL character mapping used by acldefault, aclexplode,
+	// and makeaclitem and PG-compatible privilege functions. They have no
+	// corresponding CockroachDB privilege and must never be used in
+	// bitmask operations (Mask/ToBitField/ListFromBitField). The values of these
+	// constants can be modified freely if we decide to implement these privileges
+	// for real.
+	smallestPseudoKind      = RULE
+	RULE               Kind = math.MaxUint32 - 2
+	SET                Kind = math.MaxUint32 - 1
+	ALTERSYSTEM        Kind = math.MaxUint32
 )
 
 var isDeprecatedKind = map[Kind]bool{
@@ -168,6 +184,18 @@ func (k Kind) InternalKey() KindInternalKey {
 		return "INSPECT"
 	case BUILTIN_UNSAFE_ALLOWED:
 		return "BUILTIN_UNSAFE_ALLOWED"
+	case MAINTAIN:
+		return "MAINTAIN"
+	case TEMPORARY:
+		return "TEMPORARY"
+	case REFERENCES:
+		return "REFERENCES"
+	case SET:
+		return "SET"
+	case ALTERSYSTEM:
+		return "ALTERSYSTEM"
+	case TRUNCATE:
+		return "TRUNCATE"
 	default:
 		panic(errors.AssertionFailedf("unhandled kind: %d", int(k)))
 	}
@@ -185,6 +213,8 @@ func (k Kind) DisplayName() KindDisplayName {
 		return "MANAGEVIRTUALCLUSTER"
 	case REPAIRCLUSTER:
 		return "REPAIRCLUSTER"
+	case ALTERSYSTEM:
+		return "ALTER SYSTEM"
 	default:
 		// Unless we have an exception above, the internal
 		// key is also a valid display name.
@@ -239,5 +269,17 @@ func init() {
 		// It should also be possible to look up a privilege using its internal
 		// key.
 		ByDisplayName[KindDisplayName(kind.InternalKey())] = kind
+	}
+
+	// TEMP is a PostgreSQL-compatible alias for TEMPORARY.
+	ByDisplayName["TEMP"] = TEMPORARY
+
+	// Register ACL-only pseudo-privileges. These are above largestKind
+	// so they're excluded from AllPrivileges and privilege validation,
+	// but they need ByDisplayName entries for ACL char mapping.
+	for k := ALTERSYSTEM; k >= smallestPseudoKind; k-- {
+		ByDisplayName[k.DisplayName()] = k
+		ByDisplayName[KindDisplayName(k.InternalKey())] = k
+		ByInternalKey[k.InternalKey()] = k
 	}
 }

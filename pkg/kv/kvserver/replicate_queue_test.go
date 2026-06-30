@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -82,7 +83,7 @@ func TestReplicateQueueRebalance(t *testing.T) {
 	for _, server := range tc.Servers {
 		st := server.ClusterSettings()
 		st.Manual.Store(true)
-		kvserverbase.LoadBasedRebalancingMode.Override(ctx, &st.SV, kvserverbase.LBRebalancingOff)
+		kvserverbase.OverrideLoadBasedRebalancingMode(ctx, &st.SV, kvserverbase.LBRebalancingOff)
 	}
 
 	const newRanges = 10
@@ -231,10 +232,7 @@ func TestReplicateQueueRebalanceMultiStore(t *testing.T) {
 			}
 			// Set up a test cluster with multiple stores per node if needed.
 			args := base.TestClusterArgs{
-				ReplicationMode: base.ReplicationAuto,
-				ServerArgs: base.TestServerArgs{
-					DefaultDRPCOption: base.TestDRPCDisabled,
-				},
+				ReplicationMode:   base.ReplicationAuto,
 				ServerArgsPerNode: map[int]base.TestServerArgs{},
 			}
 			for i := 0; i < testCase.nodes; i++ {
@@ -1760,11 +1758,12 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStress(t, 38565)
-	skip.UnderRaceWithIssue(t, 38565)
+	skip.UnderDuressWithIssue(t, 38565)
 	skip.UnderShort(t, 38565)
-	skip.UnderDeadlockWithIssue(t, 38565)
+
 	ctx := context.Background()
+
+	testutils.SetVModule(t, "allocator_scorer=3")
 
 	const rangeMaxSize = 64 << 20
 	zcfg := zonepb.DefaultZoneConfig()
@@ -1802,8 +1801,14 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	_, err := db.Exec("create table t (i int primary key, s string)")
 	require.NoError(t, err)
 
-	_, err = db.Exec(`ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3], 1)`)
-	require.NoError(t, err)
+	testutils.SucceedsSoon(t, func() error {
+		_, err := db.Exec(`ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[1,2,3], 1)`)
+		if kvtestutils.IsExpectedRelocateError(err) {
+			return err
+		}
+		require.NoError(t, err)
+		return nil
+	})
 	_, err = db.Exec(`ALTER TABLE t SPLIT AT VALUES (1)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`ALTER TABLE t SPLIT AT VALUES (2)`)
@@ -2121,9 +2126,19 @@ func TestPromoteNonVoterInAddVoter(t *testing.T) {
 	// SQL update, changing the span configs (which should register on all nodes),
 	// and subsequent replication changes. In failing runs, it will be interesting
 	// which prefix of events remains.
+	//
+	// `allocator_scorer=3` logs per-candidate scoring details (diversity,
+	// balance, convergence, range counts) when the allocator picks a target. This
+	// is useful for diagnosing the likely failure mode below, see #170221: when
+	// the balance scores of the existing non-voter and a fresh voter candidate
+	// diverge (e.g. because their range counts differ enough to land in
+	// different balance buckets), the allocator's promotion preference for the
+	// existing non-voter is not applied, and a brand new voter is added instead.
+	// The per-candidate scoring output makes it possible to see which inputs
+	// pushed the two candidates into different balance buckets.
 	{
 		old := log.GetVModule()
-		changed := "store=2,reconciler=3"
+		changed := "store=2,reconciler=3,allocator_scorer=3"
 		if old != "" {
 			changed = old + "," + changed
 		}
@@ -2263,11 +2278,11 @@ WHERE range_id IN (SELECT range_id FROM [SHOW RANGES FROM TABLE t] LIMIT 1);`
 			// be contained in the start key's span config. If this is not the
 			// case, it can explain why the replication changes are not being made.
 			iterateOverAllStores(t, tc, func(s *kvserver.Store) error {
-				cfg, sp, err := s.GetStoreConfig().SpanConfigSubscriber.GetSpanConfigForKey(ctx, desc.StartKey)
+				cfg, err := s.GetStoreConfig().SpanConfigSubscriber.GetSpanConfigForKey(ctx, desc.StartKey)
 				if err != nil {
 					return err
 				}
-				t.Logf("s%d: r%d %s -> span config %s %s", s.StoreID(), desc.RangeID, desc.RSpan(), sp, &cfg)
+				t.Logf("s%d: r%d %s -> span config %s", s.StoreID(), desc.RangeID, desc.RSpan(), &cfg)
 				return nil
 			})
 		}

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/server/tcpkeepalive"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -289,6 +290,25 @@ func (c *conn) sendInitialConnData(
 		_ /* err */ = c.writeErr(ctx, err, c.conn)
 		return sql.ConnectionHandler{}, err
 	}
+	sv := &sqlServer.GetExecutorConfig().Settings.SV
+	connHandler.SetOnTCPKeepAliveChange(func(
+		idle, interval time.Duration, count int, userTimeout time.Duration,
+	) {
+		if err := tcpkeepalive.ConfigureConnKeepAlive(
+			c.conn, idle, interval, count, userTimeout, sv,
+		); err != nil {
+			log.Ops.Warningf(ctx, "failed to apply TCP keepalive settings: %v", err)
+		}
+	})
+	// Apply any TCP keepalive values that were set during SetupConn from
+	// connection string options or ALTER ROLE SET defaults.
+	if idle, interval, count, userTimeout := connHandler.GetTCPKeepAliveSessionData(); idle != 0 || interval != 0 || count != 0 || userTimeout != 0 {
+		if err := tcpkeepalive.ConfigureConnKeepAlive(
+			c.conn, idle, interval, count, userTimeout, sv,
+		); err != nil {
+			log.Ops.Warningf(ctx, "failed to apply initial TCP keepalive settings: %v", err)
+		}
+	}
 
 	// Send the initial "status parameters" to the client.  This
 	// overlaps partially with session variables. The client wants to
@@ -302,10 +322,18 @@ func (c *conn) sendInitialConnData(
 			return sql.ConnectionHandler{}, err
 		}
 	}
-	// The two following status parameters have no equivalent session
-	// variable.
+	// session_authorization has no equivalent session variable.
 	if err := c.bufferParamStatus("session_authorization", c.sessionArgs.User.Normalized()); err != nil {
 		return sql.ConnectionHandler{}, err
+	}
+
+	// Deliver any notices accumulated during connection setup (e.g. defaulting
+	// pg_dump_compatibility for a dump/restore client) before signaling that the
+	// connection is ready for queries.
+	for _, notice := range connHandler.GetStartupNotices() {
+		if err := c.bufferNotice(ctx, notice); err != nil {
+			return sql.ConnectionHandler{}, err
+		}
 	}
 
 	if err := c.bufferInitialReadyForQuery(connHandler.GetQueryCancelKey()); err != nil {
@@ -1465,19 +1493,23 @@ func (r *pgwireReader) ReadByte() (byte, error) {
 // initialization.
 //
 // The standard PostgreSQL status vars are listed here:
-// https://www.postgresql.org/docs/10/static/libpq-status.html
+// https://www.postgresql.org/docs/18/libpq-status.html
 var statusReportParams = []string{
 	"server_version",
 	"server_encoding",
 	"client_encoding",
 	"application_name",
-	// Note: session_authorization is handled specially in serveImpl().
+	// Note: session_authorization is handled specially in sendInitialConnData().
 	"DateStyle",
 	"IntervalStyle",
 	"is_superuser",
 	"TimeZone",
 	"integer_datetimes",
 	"standard_conforming_strings",
+	"default_transaction_read_only",
+	"search_path",
+	"scram_iterations",
+	"in_hot_standby",
 	"crdb_version", // CockroachDB extension.
 }
 

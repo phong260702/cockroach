@@ -38,6 +38,24 @@ var DBNameLabelEnabled = settings.RegisterBoolSetting(
 	false, /* default */
 	settings.WithPublic)
 
+// RegistryReader is an interface that exposes methods to read metrics from
+// a Registry. It does not expose methods to add or remove metrics.
+type RegistryReader interface {
+	// AddLabel adds a label/value pair for this registry. Labels added here
+	// will be applied to all metrics in the registry but do not affect the
+	// metrics structs themselves.
+	AddLabel(name string, value interface{})
+	// Each calls the given callback for all metrics.
+	Each(f func(name string, val interface{}))
+	// Select calls the given callback for the selected metric names.
+	Select(metrics map[string]struct{}, f func(name string, val interface{}))
+	// GetLabels returns the labels associated with this registry.
+	GetLabels() []*prometheusgo.LabelPair
+	// WriteMetricsMetadata writes metadata from all tracked metrics to the
+	// parameter map.
+	WriteMetricsMetadata(dest map[string]Metadata)
+}
+
 // A Registry is a list of metrics. It provides a simple way of iterating over
 // them, can marshal into JSON, and generate a prometheus format.
 //
@@ -65,6 +83,21 @@ type labelPair struct {
 type Struct interface {
 	MetricStruct()
 }
+
+// NonExportableMetric is a marker interface for metrics that must not be
+// registered with metric registries. Metrics implementing this interface
+// (e.g. cluster-level metrics flushed to system.cluster_metrics) will be
+// rejected by Registry.AddMetric.
+type NonExportableMetric interface {
+	NonExportableMetric()
+}
+
+// IsNonExportableMetric is a mixin that implements NonExportableMetric.
+// Embed it in metric types that must not be added to prometheus registries.
+type IsNonExportableMetric struct{}
+
+// NonExportableMetric implements the NonExportableMetric interface.
+func (IsNonExportableMetric) NonExportableMetric() {}
 
 // NewRegistry creates a new Registry.
 func NewRegistry() *Registry {
@@ -94,8 +127,21 @@ func (r *Registry) GetLabels() []*prometheusgo.LabelPair {
 	return r.computedLabels
 }
 
-// AddMetric adds the passed-in metric to the registry.
+// AddMetric adds the passed-in metric to the registry. Metrics that
+// implement NonExportableMetric are rejected: in test builds this is
+// fatal, in production a warning is logged and the metric is skipped.
 func (r *Registry) AddMetric(metric Iterable) {
+	if _, ok := metric.(NonExportableMetric); ok {
+		name := metric.GetName(false /* useStaticLabels */)
+		if buildutil.CrdbTestBuild {
+			panicHandler(context.TODO(),
+				"non-exportable metric %s (%T) cannot be added to a prometheus registry",
+				name, metric)
+		}
+		log.Dev.Warningf(context.TODO(),
+			"skipping non-exportable metric %s (%T)", name, metric)
+		return
+	}
 	r.Lock()
 	defer r.Unlock()
 	r.tracked[metric.GetName(false /* useStaticLabels */)] = metric
@@ -274,6 +320,25 @@ func (r *Registry) ReinitialiseChildMetrics(isDBNameEnabled, isAppNameEnabled bo
 		}
 	}
 
+}
+
+type TenantRegistries struct {
+	appRegistry            *Registry
+	clusterMetricsRegistry RegistryReader
+}
+
+func (r *TenantRegistries) AppRegistry() *Registry {
+	return r.appRegistry
+}
+
+func (r *TenantRegistries) ClusterMetricsRegistry() RegistryReader {
+	return r.clusterMetricsRegistry
+}
+
+func NewTenantRegistries(
+	appRegistry *Registry, clusterMetricsRegistry RegistryReader,
+) *TenantRegistries {
+	return &TenantRegistries{appRegistry, clusterMetricsRegistry}
 }
 
 var (

@@ -14,14 +14,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/workloadindexrec"
 	"github.com/cockroachdb/cockroach/pkg/sql/parserutils"
@@ -54,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
+	"github.com/lib/pq/oid"
 )
 
 // See the comments at the start of generators.go for details about
@@ -113,14 +117,159 @@ var aclexplodeGeneratorType = types.MakeLabeledTuple(
 	[]string{"grantor", "grantee", "privilege_type", "is_grantable"},
 )
 
-// aclExplodeGenerator supports the execution of aclexplode.
-type aclexplodeGenerator struct{}
+// aclexplodeGenerator supports the execution of aclexplode.
+type aclexplodeGenerator struct {
+	// items holds the parsed ACL item rows to emit.
+	items []aclexplodeRow
+	// nextIdx is the index of the next row to emit.
+	nextIdx int
+}
 
-func (aclexplodeGenerator) ResolvedType() *types.T                   { return aclexplodeGeneratorType }
-func (aclexplodeGenerator) Start(_ context.Context, _ *kv.Txn) error { return nil }
-func (aclexplodeGenerator) Close(_ context.Context)                  {}
-func (aclexplodeGenerator) Next(_ context.Context) (bool, error)     { return false, nil }
-func (aclexplodeGenerator) Values() (tree.Datums, error)             { return nil, nil }
+type aclexplodeRow struct {
+	grantor       tree.Datum
+	grantee       tree.Datum
+	privilegeType tree.Datum
+	isGrantable   tree.Datum
+}
+
+// resolveRoleOid resolves a role name to its OID by querying
+// pg_catalog.pg_roles. Returns 0 for empty string (PUBLIC).
+func resolveRoleOid(ctx context.Context, evalCtx *eval.Context, roleName string) (oid.Oid, error) {
+	if roleName == "" {
+		return 0, nil
+	}
+	r, err := evalCtx.Planner.QueryRowEx(
+		ctx, "aclexplode-resolve-role",
+		sessiondata.NoSessionDataOverride,
+		"SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1 LIMIT 1",
+		tree.NewDString(roleName),
+	)
+	if err != nil {
+		return 0, err
+	}
+	if r == nil {
+		// Role not found — return 0 rather than erroring, matching
+		// graceful behavior for stale ACL strings.
+		return 0, nil
+	}
+	return tree.MustBeDOid(r[0]).Oid, nil
+}
+
+func newAclexplodeGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	aclArr := tree.MustBeDArray(args[0])
+	var items []aclexplodeRow
+	// Cache role name → OID lookups to avoid repeated queries for the
+	// same role across multiple aclitem entries.
+	roleOidCache := make(map[string]oid.Oid)
+	cachedResolveRoleOid := func(roleName string) (oid.Oid, error) {
+		if roleName == "" {
+			return 0, nil
+		}
+		if cached, ok := roleOidCache[roleName]; ok {
+			return cached, nil
+		}
+		resolved, err := resolveRoleOid(ctx, evalCtx, roleName)
+		if err != nil {
+			return 0, err
+		}
+		roleOidCache[roleName] = resolved
+		return resolved, nil
+	}
+
+	for _, aclDatum := range aclArr.Array {
+		var aclStr string
+		switch d := tree.UnwrapDOidWrapper(aclDatum).(type) {
+		case *tree.DString:
+			aclStr = string(*d)
+		default:
+			continue
+		}
+
+		aclItem, err := privilege.ParseACLItem(aclStr)
+		if err != nil {
+			continue
+		}
+
+		// Resolve role names to OIDs.
+		granteeStr := ""
+		if !aclItem.Grantee.IsPublicRole() {
+			granteeStr = aclItem.Grantee.Normalized()
+		}
+		granteeOid, err := cachedResolveRoleOid(granteeStr)
+		if err != nil {
+			return nil, err
+		}
+		grantorOid, err := cachedResolveRoleOid(aclItem.Grantor.Normalized())
+		if err != nil {
+			return nil, err
+		}
+
+		// Each privilege produces a row.
+		for _, kind := range aclItem.Privileges {
+			privName := string(kind.DisplayName())
+			grantable := aclItem.GrantOptions.Contains(kind)
+			items = append(items, aclexplodeRow{
+				grantor:       tree.NewDOid(grantorOid),
+				grantee:       tree.NewDOid(granteeOid),
+				privilegeType: tree.NewDString(privName),
+				isGrantable:   tree.MakeDBool(tree.DBool(grantable)),
+			})
+		}
+	}
+	return &aclexplodeGenerator{items: items}, nil
+}
+
+func (g *aclexplodeGenerator) ResolvedType() *types.T { return aclexplodeGeneratorType }
+
+func (g *aclexplodeGenerator) Start(_ context.Context, _ *kv.Txn) error { return nil }
+
+func (g *aclexplodeGenerator) Close(_ context.Context) {}
+
+func (g *aclexplodeGenerator) Next(_ context.Context) (bool, error) {
+	if g.nextIdx >= len(g.items) {
+		return false, nil
+	}
+	g.nextIdx++
+	return true, nil
+}
+
+func (g *aclexplodeGenerator) Values() (tree.Datums, error) {
+	row := g.items[g.nextIdx-1]
+	return tree.Datums{row.grantor, row.grantee, row.privilegeType, row.isGrantable}, nil
+}
+
+// tsdbQueryMaxTimeRange caps the size of a single
+// crdb_internal.tsdb_query window, measured against end_time clamped
+// to wall-clock now. The 30-day hard maximum is the largest window
+// the underlying TSDB resolutions can serve without turning the
+// default row-count cap into a guaranteed trip.
+var tsdbQueryMaxTimeRange = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
+	"sql.crdb_internal.tsdb_query.max_time_range",
+	"maximum effective time range that a single crdb_internal.tsdb_query "+
+		"call may cover; the requested end_time is first clamped to the "+
+		"current wall-clock time before this cap is checked",
+	7*24*time.Hour,
+	settings.NonNegativeDurationWithMaximum(30*24*time.Hour),
+	settings.WithPublic,
+)
+
+// tsdbQueryMaxRows caps the number of rows a single
+// crdb_internal.tsdb_query call may return. Enforced after the bridge
+// materializes rows (no streaming today), so peak memory before the
+// trip is bounded by the cap.
+var tsdbQueryMaxRows = settings.RegisterIntSetting(
+	settings.ApplicationLevel,
+	"sql.crdb_internal.tsdb_query.max_rows",
+	"maximum number of rows a single crdb_internal.tsdb_query call may "+
+		"return; queries that would return more error before any rows "+
+		"are surfaced. Set to 0 to disable the cap.",
+	500_000,
+	settings.IntInRange(0, 5_000_000),
+	settings.WithPublic,
+)
 
 // generators is a map from name to slice of Builtins for all built-in
 // generators.
@@ -131,13 +280,17 @@ var generators = map[string]builtinDefinition{
 	// See https://www.postgresql.org/docs/9.6/static/functions-info.html.
 	"aclexplode": makeBuiltin(genProps(),
 		makeGeneratorOverload(
+			tree.ParamTypes{{Name: "aclitems", Typ: types.MakeArray(types.AclItem)}},
+			aclexplodeGeneratorType,
+			newAclexplodeGenerator,
+			"Produces a virtual table containing aclitem privileges.",
+			volatility.Stable,
+		),
+		makeGeneratorOverload(
 			tree.ParamTypes{{Name: "aclitems", Typ: types.StringArray}},
 			aclexplodeGeneratorType,
-			func(_ context.Context, _ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
-				return aclexplodeGenerator{}, nil
-			},
-			"Produces a virtual table containing aclitem stuff ("+
-				"returns no rows as this feature is unsupported in CockroachDB)",
+			newAclexplodeGenerator,
+			"Produces a virtual table containing aclitem privileges.",
 			volatility.Stable,
 		),
 	),
@@ -857,6 +1010,56 @@ The last argument is a JSONB object containing the following optional fields:
 			volatility.Volatile,
 		),
 	),
+	"crdb_internal.tsdb_query": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // local-only; calls into the gateway's TSDB
+		},
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "name", Typ: types.String},
+				{Name: "start_time", Typ: types.TimestampTZ},
+				{Name: "end_time", Typ: types.TimestampTZ},
+			},
+			tsdbQueryGeneratorType,
+			makeTSDBQueryGenerator,
+			"Returns datapoints from the in-cluster TSDB for the metric "+
+				"`name` over the time window from `start_time` to "+
+				"`end_time` (both endpoints best-effort inclusive, subject "+
+				"to the underlying TSDB sample resolution). end_time must "+
+				"be strictly greater than start_time, and end_time is "+
+				"clamped to the current wall-clock time so future windows "+
+				"return zero rows. The result aggregates across all sources "+
+				"and renders the source column NULL. Requires "+
+				"VIEWCLUSTERMETADATA.",
+			volatility.Volatile,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "name", Typ: types.String},
+				{Name: "start_time", Typ: types.TimestampTZ},
+				{Name: "end_time", Typ: types.TimestampTZ},
+				{Name: "options", Typ: types.Jsonb},
+			},
+			tsdbQueryGeneratorType,
+			makeTSDBQueryGeneratorWithOptions,
+			"Returns datapoints from the in-cluster TSDB for the metric "+
+				"`name` between `start_time` and `end_time`, with `options` "+
+				"controlling downsampling, derivative, source filtering, "+
+				"and cross-source aggregation. Expressing these via "+
+				"`options` is preferred over equivalent filters or "+
+				"aggregation in the surrounding SQL query. Accepted "+
+				"option keys: downsampler (AVG|SUM|MAX|MIN), "+
+				"interval (positive multiple of 10s), derivative "+
+				"(NONE|DERIVATIVE|NON_NEGATIVE_DERIVATIVE), "+
+				"source_aggregator (AVG|SUM|MAX|MIN), "+
+				"sources (array of strings). When sources is listed without "+
+				"source_aggregator, returns per-source rows; otherwise returns "+
+				"one row per bucket with source column NULL. Requires "+
+				"VIEWCLUSTERMETADATA.",
+			volatility.Volatile,
+		),
+	),
 }
 
 var decodePlanGistGeneratorType = types.String
@@ -1274,7 +1477,11 @@ func makeVariadicUnnestGenerator(
 ) (eval.ValueGenerator, error) {
 	var arrays []*tree.DArray
 	for _, a := range args {
-		arrays = append(arrays, tree.MustBeDArray(a))
+		arr, err := checkIfDArrayErrOnDString(a)
+		if err != nil {
+			return nil, err
+		}
+		arrays = append(arrays, arr)
 	}
 	g := &multipleArrayValueGenerator{arrays: arrays}
 	return g, nil
@@ -1424,7 +1631,10 @@ func (w *WorkloadIndexRecsGenerator) Close(ctx context.Context) {
 func makeArrayGenerator(
 	_ context.Context, _ *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
-	arr := tree.MustBeDArray(args[0])
+	arr, err := checkIfDArrayErrOnDString(args[0])
+	if err != nil {
+		return nil, err
+	}
 	return &arrayValueGenerator{array: arr}, nil
 }
 
@@ -1466,7 +1676,10 @@ func (s *arrayValueGenerator) Values() (tree.Datums, error) {
 func makeExpandArrayGenerator(
 	_ context.Context, _ *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
-	arr := tree.MustBeDArray(args[0])
+	arr, err := checkIfDArrayErrOnDString(args[0])
+	if err != nil {
+		return nil, err
+	}
 	g := &expandArrayValueGenerator{avg: arrayValueGenerator{array: arr}}
 	g.buf[1] = tree.NewDInt(tree.DInt(-1))
 	return g, nil
@@ -1522,7 +1735,11 @@ func makeGenerateSubscriptsGenerator(
 	}
 	// We sadly only support 1D arrays right now.
 	if dim == 1 {
-		arr = tree.MustBeDArray(args[0])
+		var err error
+		arr, err = checkIfDArrayErrOnDString(args[0])
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		arr = &tree.DArray{}
 	}
@@ -2577,7 +2794,7 @@ type spanKeyIterator struct {
 
 func newSpanKeyIterator(evalCtx *eval.Context, span roachpb.Span) *spanKeyIterator {
 	return &spanKeyIterator{
-		acc:  evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:  evalCtx.Planner.ExecMon().MakeBoundAccount(),
 		span: span,
 	}
 }
@@ -2660,6 +2877,197 @@ func (sp *spanKeyIterator) ResolvedType() *types.T {
 	return spanKeyIteratorType
 }
 
+var tsdbQueryGeneratorType = types.MakeLabeledTuple(
+	[]*types.T{types.TimestampTZ, types.Float, types.String},
+	[]string{"timestamp", "value", "source"},
+)
+
+// tsdbQueryGenerator backs crdb_internal.tsdb_query. It calls the
+// eval.TimeSeriesQuerier once during Start, materializes the rows,
+// and serves them out via Next/Values.
+type tsdbQueryGenerator struct {
+	query    eval.TimeSeriesQuery
+	querier  eval.TimeSeriesQuerier
+	settings *cluster.Settings
+	// emptyResult is set by the factory when start_time lies at or
+	// after the clamped end (the window has collapsed). Start skips the
+	// bridge in that case, which also avoids calling UnixNano on a
+	// timestamp past year ~2262, where the int64 nanosecond
+	// representation overflows.
+	emptyResult bool
+	acc         mon.BoundAccount
+	rows        []eval.TimeSeriesRow
+	index       int
+	// buf avoids re-allocating the Datums slice on every Values call.
+	buf [3]tree.Datum
+}
+
+// tsdbQueryRowSize covers the eval.TimeSeriesRow struct only; Source
+// strings (typically a node ID as decimal) are not charged separately.
+const tsdbQueryRowSize = int64(unsafe.Sizeof(eval.TimeSeriesRow{}))
+
+// newTSDBQueryGenerator builds the per-call generator state shared by
+// both overloads of crdb_internal.tsdb_query. The caller may further
+// mutate the returned generator's eval.TimeSeriesQuery (e.g. to merge
+// JSONB options) before returning it.
+func newTSDBQueryGenerator(
+	ctx context.Context, evalCtx *eval.Context, nameArg, startArg, endArg tree.Datum,
+) (*tsdbQueryGenerator, error) {
+	// Privilege check before the version gate, so an unprivileged user
+	// can't infer cluster upgrade state from which error they receive.
+	if err := evalCtx.SessionAccessor.CheckPrivilege(
+		ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERMETADATA,
+	); err != nil {
+		return nil, err
+	}
+	// ActiveVersionOrEmpty (not IsActive): IsActive log.Fatals when the
+	// version handle is uninitialized, which is reachable from tests
+	// using a fresh cluster.Settings. Empty version sorts below any
+	// real version, so the Less check degrades to FeatureNotSupported.
+	gateVersion := clusterversion.V26_3_CrdbInternalTSDB.Version()
+	activeVersion := evalCtx.Settings.Version.ActiveVersionOrEmpty(ctx)
+	if activeVersion.Version.Less(gateVersion) {
+		return nil, errors.WithHint(
+			pgerror.Newf(pgcode.FeatureNotSupported,
+				"crdb_internal.tsdb_query requires cluster version %s to be active",
+				gateVersion),
+			"wait for the rolling upgrade to finalize and re-issue the query",
+		)
+	}
+	querier := evalCtx.Planner.TimeSeriesQuerier()
+	if querier == nil {
+		return nil, pgerror.New(pgcode.FeatureNotSupported,
+			"crdb_internal.tsdb_query is not available in this server configuration")
+	}
+	name := string(tree.MustBeDString(nameArg))
+	startTS := tree.MustBeDTimestampTZ(startArg)
+	endTS := tree.MustBeDTimestampTZ(endArg)
+	if !endTS.Time.After(startTS.Time) {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+			"crdb_internal.tsdb_query end_time (%s) must be greater than start_time (%s)",
+			endTS.Time, startTS.Time)
+	}
+	// The time-range cap is measured against the now-clamped end, so a
+	// window partially in the future is not charged for the
+	// unrealizable portion. The same clamped end is forwarded to the
+	// bridge so the cap-checked and dispatched ends match. The
+	// bridge's own start-clamp can stretch the dispatched window by up
+	// to one bucket; that's fine since this cap is a guardrail, not a
+	// hard QoS limit (the row-count cap is the operator backstop).
+	effectiveEnd := endTS.Time
+	if now := timeutil.Now(); effectiveEnd.After(now) {
+		effectiveEnd = now
+	}
+	// Short-circuit in time.Time space (not bridge-side) to avoid
+	// calling UnixNano on a startTS past year ~2262, which overflows
+	// the int64 nanosecond representation.
+	if !effectiveEnd.After(startTS.Time) {
+		return &tsdbQueryGenerator{emptyResult: true}, nil
+	}
+	effectiveSpan := effectiveEnd.Sub(startTS.Time)
+	if maxRange := tsdbQueryMaxTimeRange.Get(&evalCtx.Settings.SV); effectiveSpan > maxRange {
+		return nil, errors.WithHintf(
+			pgerror.Newf(pgcode.ProgramLimitExceeded,
+				"crdb_internal.tsdb_query effective window of %s exceeds the configured maximum of %s",
+				effectiveSpan, maxRange),
+			"raise the cluster setting %s, or shrink the requested window",
+			tsdbQueryMaxTimeRange.Name())
+	}
+	return &tsdbQueryGenerator{
+		query: eval.TimeSeriesQuery{
+			MetricName: name,
+			StartNanos: startTS.UnixNano(),
+			EndNanos:   effectiveEnd.UnixNano(),
+		},
+		querier:  querier,
+		settings: evalCtx.Settings,
+		acc:      evalCtx.Planner.ExecMon().MakeBoundAccount(),
+	}, nil
+}
+
+func makeTSDBQueryGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	return newTSDBQueryGenerator(ctx, evalCtx, args[0], args[1], args[2])
+}
+
+func makeTSDBQueryGeneratorWithOptions(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	gen, err := newTSDBQueryGenerator(ctx, evalCtx, args[0], args[1], args[2])
+	if err != nil {
+		return nil, err
+	}
+	// Generators run with calledOnNullInput=false, so any NULL arg
+	// short-circuits before we reach here.
+	if err := eval.ParseTSDBQueryOptions(tree.MustBeDJSON(args[3]).JSON, &gen.query); err != nil {
+		return nil, err
+	}
+	return gen, nil
+}
+
+// ResolvedType implements the eval.ValueGenerator interface.
+func (*tsdbQueryGenerator) ResolvedType() *types.T { return tsdbQueryGeneratorType }
+
+// Start implements the eval.ValueGenerator interface.
+func (g *tsdbQueryGenerator) Start(ctx context.Context, _ *kv.Txn) error {
+	if g.emptyResult {
+		g.index = -1
+		return nil
+	}
+	// The bridge enforces the cap (pre-check and post-check) and
+	// returns eval.ErrTooManyTimeSeriesRows on trip; we just attach
+	// the SQL-surface hint here.
+	g.query.MaxRows = tsdbQueryMaxRows.Get(&g.settings.SV)
+	rows, err := g.querier.QueryTimeSeries(ctx, g.query)
+	if err != nil {
+		if errors.Is(err, eval.ErrTooManyTimeSeriesRows) {
+			return errors.WithHintf(
+				pgerror.Wrapf(err, pgcode.ProgramLimitExceeded, "crdb_internal.tsdb_query"),
+				"raise the cluster setting %s, or shrink the requested window",
+				tsdbQueryMaxRows.Name())
+		}
+		return err
+	}
+	if err := g.acc.Grow(ctx, int64(len(rows))*tsdbQueryRowSize); err != nil {
+		return err
+	}
+	g.rows = rows
+	g.index = -1
+	return nil
+}
+
+// Next implements the eval.ValueGenerator interface.
+func (g *tsdbQueryGenerator) Next(_ context.Context) (bool, error) {
+	g.index++
+	return g.index < len(g.rows), nil
+}
+
+// Values implements the eval.ValueGenerator interface.
+func (g *tsdbQueryGenerator) Values() (tree.Datums, error) {
+	row := g.rows[g.index]
+	ts, err := tree.MakeDTimestampTZ(timeutil.Unix(0, row.TimestampNanos), time.Microsecond)
+	if err != nil {
+		return nil, err
+	}
+	g.buf[0] = ts
+	g.buf[1] = tree.NewDFloat(tree.DFloat(row.Value))
+	// Empty Source means the row was produced by an aggregating
+	// dispatch path; render NULL so the column is unambiguous.
+	if row.Source == "" {
+		g.buf[2] = tree.DNull
+	} else {
+		g.buf[2] = tree.NewDString(row.Source)
+	}
+	return g.buf[:], nil
+}
+
+// Close implements the eval.ValueGenerator interface.
+func (g *tsdbQueryGenerator) Close(ctx context.Context) {
+	g.acc.Close(ctx)
+	g.rows = nil
+}
+
 type rangeKeyIterator struct {
 	// rangeID is the ID of the range to iterate over. rangeID is set
 	// by the constructor of the rangeKeyIterator.
@@ -2683,7 +3091,7 @@ func makeRangeKeyIterator(
 	rangeID := roachpb.RangeID(tree.MustBeDInt(args[0]))
 	return &rangeKeyIterator{
 		spanKeyIterator: spanKeyIterator{
-			acc: planner.Mon().MakeBoundAccount(),
+			acc: planner.ExecMon().MakeBoundAccount(),
 		},
 		rangeID: rangeID,
 		planner: planner,
@@ -2998,7 +3406,7 @@ func makeShowCreateAllSchemasGenerator(
 	return &showCreateAllSchemasGenerator{
 		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:         evalCtx.Planner.ExecMon().MakeBoundAccount(),
 	}, nil
 }
 
@@ -3154,7 +3562,7 @@ func makeShowCreateAllTablesGenerator(
 	return &showCreateAllTablesGenerator{
 		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:         evalCtx.Planner.ExecMon().MakeBoundAccount(),
 		sessionData: evalCtx.SessionData(),
 	}, nil
 }
@@ -3232,7 +3640,7 @@ func makeShowCreateAllTriggersGenerator(
 	return &showCreateAllTriggersGenerator{
 		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:         evalCtx.Planner.ExecMon().MakeBoundAccount(),
 	}, nil
 }
 
@@ -3312,7 +3720,7 @@ func makeShowCreateAllTypesGenerator(
 	return &showCreateAllTypesGenerator{
 		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:         evalCtx.Planner.ExecMon().MakeBoundAccount(),
 	}, nil
 }
 
@@ -3404,7 +3812,7 @@ func makeShowCreateAllRoutinesGenerator(
 	return &showCreateAllRoutinesGenerator{
 		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:         evalCtx.Planner.ExecMon().MakeBoundAccount(),
 	}, nil
 }
 
@@ -3540,7 +3948,7 @@ func makeIdentGenerator(
 	rand := rand.New(rand.NewSource(seed))
 	return &identGenerator{
 		gen:   randident.NewNameGenerator(&cfg, rand, pattern),
-		acc:   evalCtx.Planner.Mon().MakeBoundAccount(),
+		acc:   evalCtx.Planner.ExecMon().MakeBoundAccount(),
 		count: count,
 	}, nil
 }
@@ -4013,8 +4421,20 @@ func makeSpanStatsGenerator(
 		if len(s.D) != 2 || s.D[0] == tree.DNull || s.D[1] == tree.DNull {
 			continue
 		}
-		startKey := roachpb.Key(tree.MustBeDBytes(s.D[0]))
-		endKey := roachpb.Key(tree.MustBeDBytes(s.D[1]))
+		startKeyBytes, ok := s.D[0].(*tree.DBytes)
+		if !ok {
+			return nil, errors.Newf(
+				"start key of span stats generator must be of *DBytes type",
+			)
+		}
+		endKeyBytes, ok := s.D[1].(*tree.DBytes)
+		if !ok {
+			return nil, errors.Newf(
+				"end key of span stats generator must be of *DBytes type",
+			)
+		}
+		startKey := roachpb.Key(*startKeyBytes)
+		endKey := roachpb.Key(*endKeyBytes)
 		spans = append(spans, roachpb.Span{
 			Key:    startKey,
 			EndKey: endKey,
@@ -4104,6 +4524,21 @@ func makeInternallyExecutedQueryGeneratorOverload(
 					return nil, errors.Newf("expected string argument for 'overrides', got %s", args[overridesIdx].ResolvedType())
 				}
 				overrides = string(*o)
+				if overrides != "" {
+					if err := sessiondata.ValidateMultiOverride(overrides); err != nil {
+						return nil, err
+					}
+					// Disallow changing identity or privilege fields
+					// via the override for security reasons.
+					for _, override := range strings.Split(overrides, ",") {
+						parts := strings.Split(override, "=")
+						if len(parts) == 2 && (parts[0] == "UserProto" || parts[0] == "SessionUserProto" || parts[0] == "SystemIdentityProto" || parts[0] == "IsSuperuser") {
+							return nil, errors.Newf(
+								"changing %q via overrides is not allowed", parts[0],
+							)
+						}
+					}
+				}
 			}
 			var useTxn bool
 			if withTxn {

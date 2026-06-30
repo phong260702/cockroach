@@ -425,6 +425,8 @@ func TestRandStep(t *testing.T) {
 			switch o.Type {
 			case ChangeSettingType_SetLeaseType:
 				counts.ChangeSetting.SetLeaseType++
+			case ChangeSettingType_ToggleVirtualIntentResolution:
+				counts.ChangeSetting.ToggleVirtualIntentResolution++
 			}
 		case *ChangeZoneOperation:
 			switch o.Type {
@@ -450,6 +452,8 @@ func TestRandStep(t *testing.T) {
 			n.mu.Lock()
 			n.crashed[int(o.NodeId)] = struct{}{}
 			n.mu.Unlock()
+		case *MvccGCOperation:
+			counts.MvccGC.MvccGC++
 		default:
 			t.Fatalf("%T", o)
 		}

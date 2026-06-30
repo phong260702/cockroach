@@ -1922,9 +1922,10 @@ func (ef *execFactory) ConstructDeleteRange(
 	}
 
 	dr := &deleteRangeNode{
-		spans:             spans,
-		desc:              tabDesc,
-		autoCommitEnabled: autoCommit,
+		spans:              spans,
+		desc:               tabDesc,
+		singleColumnFamily: tabDesc.NumFamilies() == 1,
+		autoCommitEnabled:  autoCommit,
 	}
 
 	return dr, nil
@@ -2016,6 +2017,15 @@ func (ef *execFactory) ConstructCreateTable(
 	); err != nil {
 		return nil, err
 	}
+
+	plan, err := ef.planner.SchemaChange(ef.ctx, ct)
+	if err != nil {
+		return nil, err
+	}
+	if plan != nil {
+		return plan, nil
+	}
+
 	return &createTableNode{
 		n:      ct,
 		dbDesc: schema.(*optSchema).database,
@@ -2032,6 +2042,14 @@ func (ef *execFactory) ConstructCreateTableAs(
 		"CREATE TABLE",
 	); err != nil {
 		return nil, err
+	}
+
+	plan, err := ef.planner.SchemaChange(ef.ctx, ct)
+	if err != nil {
+		return nil, err
+	}
+	if plan != nil {
+		return plan, nil
 	}
 
 	return &createTableNode{
@@ -2058,6 +2076,14 @@ func (ef *execFactory) ConstructCreateView(
 		"CREATE VIEW",
 	); err != nil {
 		return nil, err
+	}
+
+	plan, err := ef.planner.SchemaChange(ef.ctx, createView)
+	if err != nil {
+		return nil, err
+	}
+	if plan != nil {
+		return plan, nil
 	}
 
 	planDeps, typeDepSet, funcDepSet, err := toPlanDependencies(deps, typeDeps, funcDeps)

@@ -1639,6 +1639,15 @@ Disable the creation of a default dataset in the demo shell.
 This makes 'cockroach demo' faster to start.`,
 	}
 
+	DemoBackground = FlagInfo{
+		Name: "background",
+		Description: `
+Start the demo cluster in the background without opening an interactive SQL
+shell. The cluster runs until the process receives a SIGINT or SIGTERM signal.
+Use --listening-url-file to write the connection URL to a file for use by
+other tools.`,
+	}
+
 	GeoLibsDir = FlagInfo{
 		Name: "spatial-libs",
 		Description: `
@@ -1721,8 +1730,17 @@ The default is to not exclude any node.`,
 List of glob patterns that determine files that can be included
 in the output. The list can be specified as a comma-delimited
 list of patterns, or by using the flag multiple times.
-The patterns apply to the base name of the file, without
-a path prefix.
+<PRE>
+
+</PRE>
+Patterns without '/' apply to the base name of the file (e.g. '*.json').
+Patterns containing '/' are matched against the full path within the zip
+archive (e.g. 'debug/nodes/1/*.json' or 'debug/nodes/*/ranges.json').
+The path matching uses Go's filepath.Match syntax, where '*' matches
+any sequence of non-separator characters within a single path component.
+<PRE>
+
+</PRE>
 The default is to include all files.
 <PRE>
 
@@ -1744,8 +1762,14 @@ List of glob patterns that determine files that are to
 be excluded from the output. The list can be specified
 as a comma-delimited list of patterns, or by using the
 flag multiple times.
-The patterns apply to the base name of the file, without
-a path prefix.
+<PRE>
+
+</PRE>
+Patterns without '/' apply to the base name of the file (e.g. '*.log').
+Patterns containing '/' are matched against the full path within the zip
+archive (e.g. 'debug/nodes/*/ranges.json').
+The path matching uses Go's filepath.Match syntax, where '*' matches
+any sequence of non-separator characters within a single path component.
 <PRE>
 
 </PRE>
@@ -1863,6 +1887,21 @@ pause -- remains enabled regardless of this flag's value.
 Include information about each running, traceable job in jobs/*/*/trace.zip
 files. This involves collecting cluster-wide traces for each running job in the
 cluster.
+`,
+	}
+
+	ZipExcludeLogSeverity = FlagInfo{
+		Name: "exclude-log-severities",
+		Description: `
+List of log severities to exclude from the collected log files.
+The list can be specified as a comma-delimited list of severity
+names, or by using the flag multiple times. Valid severity names
+are: INFO, WARNING, ERROR, FATAL.
+<PRE>
+
+</PRE>
+For example, --exclude-log-severities=INFO will skip all INFO-level
+log entries, significantly reducing zip file size for large clusters.
 `,
 	}
 

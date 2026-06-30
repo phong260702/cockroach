@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -272,7 +273,7 @@ func (sc *webhookSinkClient) Flush(ctx context.Context, batch SinkPayload) error
 	req.Body = b
 	res, err := sc.client.Do(req)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "webhook sink request failed")
 	}
 	defer res.Body.Close()
 
@@ -282,7 +283,8 @@ func (sc *webhookSinkClient) Flush(ctx context.Context, batch SinkPayload) error
 		if err != nil {
 			return errors.Wrapf(err, "failed to read body for HTTP response with status: %d", res.StatusCode)
 		}
-		return fmt.Errorf("%s: %s", res.Status, string(resBody))
+		return errors.Newf("webhook sink HTTP error %s: %s",
+			redact.Safe(res.Status), resBody)
 	}
 	return nil
 }
@@ -361,7 +363,16 @@ type webhookCSVBuffer struct {
 var _ BatchBuffer = (*webhookCSVBuffer)(nil)
 
 // Append implements the BatchBuffer interface.
-func (cb *webhookCSVBuffer) Append(ctx context.Context, key []byte, value []byte, _ attributes) {
+func (cb *webhookCSVBuffer) Append(
+	ctx context.Context, key []byte, value []byte, attrs attributes,
+) {
+	if len(cb.bytes) == 0 && len(attrs.csvColumnHeader) > 0 {
+		cb.bytes = append(cb.bytes, attrs.csvColumnHeader...)
+		cb.bytes = append(cb.bytes, '\n')
+	}
+	if cb.messageCount >= 1 {
+		cb.bytes = append(cb.bytes, '\n')
+	}
 	cb.bytes = append(cb.bytes, value...)
 	cb.messageCount += 1
 }

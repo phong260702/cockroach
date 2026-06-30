@@ -209,16 +209,23 @@ var (
 		Category:    metric.Metadata_REPLICATION,
 		HowToUse:    "If this metric exceeds 1 second, it is a sign of cluster instability.",
 	}
+	metaUncachedScans = metric.Metadata{
+		Name:        "liveness.uncached_scans",
+		Help:        "Number of non-cached scans of the node liveness range",
+		Measurement: "Scans",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // Metrics holds metrics for use with node liveness activity.
 type Metrics struct {
-	LiveNodes          *metric.Gauge
+	LiveNodes          *metric.FunctionalGauge
 	HeartbeatsInFlight *metric.Gauge
 	HeartbeatSuccesses *metric.Counter
 	HeartbeatFailures  telemetry.CounterWithMetric
 	EpochIncrements    telemetry.CounterWithMetric
 	HeartbeatLatency   metric.IHistogram
+	UncachedScans      *metric.Counter
 }
 
 // IsLiveCallback is invoked when a node's IsLive state changes to true.
@@ -366,6 +373,7 @@ func NewNodeLiveness(opts NodeLivenessOptions) *NodeLiveness {
 			Duration:     opts.HistogramWindowInterval,
 			BucketConfig: metric.IOLatencyBuckets,
 		}),
+		UncachedScans: metric.NewCounter(metaUncachedScans),
 	}
 	nl.cache.setLivenessChangedFn(nl.cacheUpdated)
 	nl.heartbeatToken <- struct{}{}
@@ -904,10 +912,16 @@ func (nl *NodeLiveness) GetIsLiveMap() livenesspb.IsLiveMap {
 // ScanNodeVitalityFromCache returns a map of nodeID to boolean liveness status
 // of each node from the cache. This excludes nodes that were decommissioned.
 // Decommissioned nodes are kept in the KV store and the cache forever, but are
-// typically not referenced in normal usage. The method ScanNodeVitalityFromKV
-// does return decommissioned nodes.
+// typically not referenced in normal usage. Use ScanAllNodeVitalityFromCache to
+// include decommissioned nodes.
 func (nl *NodeLiveness) ScanNodeVitalityFromCache() livenesspb.NodeVitalityMap {
 	return nl.cache.ScanNodeVitalityFromCache()
+}
+
+// ScanAllNodeVitalityFromCache is like ScanNodeVitalityFromCache but includes
+// decommissioned nodes.
+func (nl *NodeLiveness) ScanAllNodeVitalityFromCache() livenesspb.NodeVitalityMap {
+	return nl.cache.ScanAllNodeVitalityFromCache()
 }
 
 // ScanNodeVitalityFromKV returns the status for all the nodes from KV including
@@ -918,6 +932,7 @@ func (nl *NodeLiveness) ScanNodeVitalityFromCache() livenesspb.NodeVitalityMap {
 func (nl *NodeLiveness) ScanNodeVitalityFromKV(
 	ctx context.Context,
 ) (livenesspb.NodeVitalityMap, error) {
+	nl.metrics.UncachedScans.Inc(1)
 	records, err := nl.storage.Scan(ctx)
 	if err != nil {
 		return nil, err
@@ -1100,6 +1115,7 @@ func (nl *NodeLiveness) updateLiveness(
 // verifyDiskHealth does a sync write to all disks before updating liveness, so
 // that a faulty or stalled disk will cause us to fail liveness and lose our
 // leases. All disks are written concurrently.
+//
 // We do this asynchronously in order to respect the caller's context, and
 // coalesce concurrent writes onto an in-flight one. This is particularly
 // relevant for a stalled disk during a lease acquisition heartbeat, where we
@@ -1116,7 +1132,10 @@ func (nl *NodeLiveness) verifyDiskHealth(ctx context.Context) error {
 				InheritCancelation: false,
 			},
 			func(ctx context.Context) (interface{}, error) {
-				return nil, diskStorage.WriteSyncNoop(eng.TODOEngine())
+				// NB: sync only the LogEngine. It is the engine through which all
+				// writes pass first. Also, the StateEngine does not support timely /
+				// incremental syncs, and forcing its Flush here would be too expensive.
+				return nil, diskStorage.WriteSyncNoop(eng.LogEngine())
 			})
 	}
 	for _, resultC := range resultCs {

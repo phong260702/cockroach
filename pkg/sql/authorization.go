@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -204,7 +205,7 @@ func (p *planner) HasAnyPrivilege(
 		return false, errors.AssertionFailedf("cannot use CheckAnyPrivilege without a txn")
 	}
 
-	user := p.SessionData().User()
+	user := p.User()
 	if user.IsNodeUser() {
 		// User "node" has all privileges.
 		return true, nil
@@ -286,6 +287,21 @@ func (p *planner) CheckPrivilege(
 	ctx context.Context, object privilege.Object, privilege privilege.Kind,
 ) error {
 	return p.CheckPrivilegeForUser(ctx, object, privilege, p.User())
+}
+
+// checkFKReferencesPrivilege verifies that the current user has the REFERENCES
+// privilege on the referenced (parent) table for FK creation. Before the
+// V26_3_GrantReferencesToUsersWithCreate version is active, no check is
+// performed because the REFERENCES privilege does not yet exist.
+func (p *planner) checkFKReferencesPrivilege(
+	ctx context.Context, parent catalog.TableDescriptor,
+) error {
+	if !p.ExecCfg().Settings.Version.IsActive(
+		ctx, clusterversion.V26_3_GrantReferencesToUsersWithCreate,
+	) {
+		return nil
+	}
+	return p.CheckPrivilege(ctx, parent, privilege.REFERENCES)
 }
 
 // MustCheckGrantOptionsForUser calls PrivilegeDescriptor.CheckGrantOptions, which
@@ -422,7 +438,7 @@ func isOwner(
 func (p *planner) HasOwnership(
 	ctx context.Context, privilegeObject privilege.Object,
 ) (bool, error) {
-	return p.UserHasOwnership(ctx, privilegeObject, p.SessionData().User())
+	return p.UserHasOwnership(ctx, privilegeObject, p.User())
 }
 
 // UserHasOwnership implements the AuthorizationAccessor interface.
@@ -468,7 +484,7 @@ func (p *planner) checkRolePredicate(
 // CheckAnyPrivilege implements the AuthorizationAccessor interface.
 // Requires a valid transaction to be open.
 func (p *planner) CheckAnyPrivilege(ctx context.Context, privilegeObject privilege.Object) error {
-	user := p.SessionData().User()
+	user := p.User()
 	ok, err := p.HasAnyPrivilege(ctx, privilegeObject)
 	if err != nil {
 		return err
@@ -869,17 +885,39 @@ func (p *planner) checkCanAlterToNewOwner(
 
 	// To alter the owner, you must also be a direct or indirect member of the new
 	// owning role.
-	if p.User() == newOwner {
+	return p.checkMemberOfRole(ctx, newOwner)
+}
+
+// checkMemberOfRole checks that the current user is a member of the given role,
+// either directly or indirectly. Being the role itself counts as membership.
+func (p *planner) checkMemberOfRole(ctx context.Context, role username.SQLUsername) error {
+	if p.User() == role {
 		return nil
 	}
 	memberOf, err := p.MemberOfWithAdminOption(ctx, p.User())
 	if err != nil {
 		return err
 	}
-	if _, ok := memberOf[newOwner]; ok {
+	if _, ok := memberOf[role]; ok {
 		return nil
 	}
-	return pgerror.Newf(pgcode.InsufficientPrivilege, "must be member of role %q", newOwner)
+	return pgerror.Newf(pgcode.InsufficientPrivilege, "must be member of role %q", role)
+}
+
+// checkAdminOrMemberOfRole checks that the given role exists and that the
+// current user is either an admin or a member of the given role.
+func (p *planner) checkAdminOrMemberOfRole(ctx context.Context, role username.SQLUsername) error {
+	if err := p.CheckRoleExists(ctx, role); err != nil {
+		return err
+	}
+	hasAdmin, err := p.HasAdminRole(ctx)
+	if err != nil {
+		return err
+	}
+	if hasAdmin {
+		return nil
+	}
+	return p.checkMemberOfRole(ctx, role)
 }
 
 // HasOwnershipOnSchema checks if the current user has ownership on the schema.

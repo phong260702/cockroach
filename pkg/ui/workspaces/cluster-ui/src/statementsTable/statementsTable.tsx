@@ -63,7 +63,6 @@ export interface AggregateStatistics {
   // replaced with shortStatement otherwise.
   summary: string;
   aggregatedTs: number;
-  implicitTxn: boolean;
   fullScan: boolean;
   database: string;
   applicationName: string;
@@ -76,7 +75,7 @@ export interface AggregateStatistics {
   regionNodes?: string[];
 }
 
-export class StatementsSortedTable extends SortedTable<AggregateStatistics> {}
+export const StatementsSortedTable = SortedTable<AggregateStatistics>;
 
 export function shortStatement(
   summary: StatementSummary,

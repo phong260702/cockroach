@@ -8,12 +8,14 @@ import Long from "long";
 import moment from "moment-timezone";
 
 import { fetchData } from "src/api/fetchData";
+import { TimeScale, toRoundedDateRange } from "src/timeScaleDropdown";
 import {
   FixFingerprintHexValue,
   HexStringToInt64String,
   NumericStat,
   propsToQueryString,
   stringToTimestamp,
+  useSwrWithClusterId,
 } from "src/util";
 
 import { AggregateStatistics } from "../statementsTable";
@@ -136,7 +138,6 @@ export type StatementMetadata = {
   distsql: boolean;
   failed: boolean;
   fullScan: boolean;
-  implicitTxn: boolean;
   query: string;
   querySummary: string;
   stmtType: string;
@@ -204,6 +205,115 @@ export type StatementRawFormat = {
   indexes_usage: string[];
 };
 
+export const STATEMENTS_SWR_KEY = "statements";
+export const TRANSACTIONS_SWR_KEY = "transactions";
+export const STATEMENT_DETAILS_SWR_KEY = "statementDetails";
+
+export function useCombinedStatementStats(
+  timeScale: TimeScale | null,
+  limit: number,
+  sort: SqlStatsSortType,
+) {
+  const timeRange = timeScale ? toRoundedDateRange(timeScale) : null;
+  const startUnix = timeRange?.[0]?.unix();
+  const endUnix = timeRange?.[1]?.unix();
+
+  return useSwrWithClusterId<SqlStatsResponse>(
+    timeScale
+      ? {
+          name: STATEMENTS_SWR_KEY,
+          start: startUnix,
+          end: endUnix,
+          limit,
+          sort: Number(sort),
+        }
+      : null,
+    () =>
+      getCombinedStatements(
+        createCombinedStmtsRequest({
+          start: timeRange[0],
+          end: timeRange[1],
+          limit,
+          sort,
+        }),
+      ),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    },
+  );
+}
+
+export function useStatementDetails(
+  fingerprintId: string,
+  appNames: string | undefined,
+  timeScale: TimeScale | null,
+) {
+  const timeRange = timeScale ? toRoundedDateRange(timeScale) : null;
+  const startUnix = timeRange?.[0]?.unix();
+  const endUnix = timeRange?.[1]?.unix();
+
+  return useSwrWithClusterId<StatementDetailsResponse>(
+    fingerprintId && timeScale
+      ? {
+          name: STATEMENT_DETAILS_SWR_KEY,
+          fingerprintId,
+          appNames: appNames ?? "",
+          start: startUnix,
+          end: endUnix,
+        }
+      : null,
+    () =>
+      getStatementDetails(
+        new cockroach.server.serverpb.StatementDetailsRequest({
+          fingerprint_id: fingerprintId,
+          app_names: appNames?.split(","),
+          start: Long.fromNumber(startUnix),
+          end: Long.fromNumber(endUnix),
+        }),
+      ),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    },
+  );
+}
+
+export function useCombinedTransactionStats(
+  timeScale: TimeScale | null,
+  limit: number,
+  sort: SqlStatsSortType,
+) {
+  const timeRange = timeScale ? toRoundedDateRange(timeScale) : null;
+  const startUnix = timeRange?.[0]?.unix();
+  const endUnix = timeRange?.[1]?.unix();
+
+  return useSwrWithClusterId<SqlStatsResponse>(
+    timeScale
+      ? {
+          name: TRANSACTIONS_SWR_KEY,
+          start: startUnix,
+          end: endUnix,
+          limit,
+          sort: Number(sort),
+        }
+      : null,
+    () =>
+      getFlushedTxnStatsApi(
+        createCombinedStmtsRequest({
+          start: timeRange[0],
+          end: timeRange[1],
+          limit,
+          sort,
+        }),
+      ),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    },
+  );
+}
+
 export function convertStatementRawFormatToAggregatedStatistics(
   s: StatementRawFormat,
 ): AggregateStatistics {
@@ -211,7 +321,6 @@ export function convertStatementRawFormatToAggregatedStatistics(
     applicationName: s.app_name,
     database: s.metadata.db,
     fullScan: s.metadata.fullScan,
-    implicitTxn: s.metadata.implicitTxn,
     label: s.metadata.querySummary,
     summary: s.metadata.querySummary,
     aggregatedTs: s.aggregated_ts,

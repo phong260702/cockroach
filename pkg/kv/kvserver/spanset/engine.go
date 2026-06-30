@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/metrics"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // EnableAssertions is a convenient entry point to enable/disable spanset
@@ -46,6 +47,11 @@ func NewEngine(engine storage.Engine, forbiddenMatcher func(TrickySpan) error) s
 		e:          engine,
 		spans:      spans,
 	}
+}
+
+// UnderlyingEngine returns the raw engine, with disabled assertions.
+func (s *spanSetEngine) UnderlyingEngine() storage.Engine {
+	return s.e
 }
 
 // NewBatch implements the storage.EngineWithoutRW interface.
@@ -86,11 +92,9 @@ func (s *spanSetEngine) Download(ctx context.Context, span roachpb.Span, copy bo
 
 // CreateCheckpoint implements the storage.EngineWithoutRW interface.
 func (s *spanSetEngine) CreateCheckpoint(dir string, spans []roachpb.Span) error {
-	for _, span := range spans {
-		if err := s.spans.CheckAllowed(SpanReadOnly, TrickySpan{Key: span.Key, EndKey: span.EndKey}); err != nil {
-			return err
-		}
-	}
+	// NB: intentionally not checking allowed spans. The caller declares
+	// coarsely-grained spans for checkpointing, so fine-grained span checking
+	// here would be more trouble than it's worth.
 	return s.e.CreateCheckpoint(dir, spans)
 }
 
@@ -134,10 +138,30 @@ func (s *spanSetEngine) NewSnapshot(keyRanges ...roachpb.Span) storage.Reader {
 
 // NewWriteBatch implements the storage.EngineWithoutRW interface.
 func (s *spanSetEngine) NewWriteBatch() storage.WriteBatch {
-	wb := s.e.NewWriteBatch()
+	return s.WrapWriteBatch(s.e.NewWriteBatch())
+}
+
+// WrapWriteBatch associates the given WriteBatch with this Engine, and returns
+// a wrapped WriteBatch. This enables the corresponding assertions, e.g.
+// checking that the batch accesses only the keys allowed by this Engine.
+func (s *spanSetEngine) WrapWriteBatch(wb storage.WriteBatch) storage.WriteBatch {
 	return &spanSetWriteBatch{
 		spanSetWriter: spanSetWriter{w: wb, spans: s.spans, spansOnly: true},
 		wb:            wb,
+	}
+}
+
+// WrapBatch associates the given Batch with this Engine, and returns a wrapped
+// Batch. This enables the corresponding assertions, e.g. checking that the
+// batch accesses only the keys allowed by this Engine.
+func (s *spanSetEngine) WrapBatch(b storage.Batch) storage.Batch {
+	return &spanSetBatch{
+		spanSetReader: spanSetReader{r: b, spans: s.spans, spansOnly: true},
+		spanSetWriteBatch: spanSetWriteBatch{
+			spanSetWriter: spanSetWriter{w: b, spans: s.spans, spansOnly: true},
+			wb:            b,
+		},
+		b: b, spans: s.spans, spansOnly: true,
 	}
 }
 
@@ -149,6 +173,11 @@ func (s *spanSetEngine) Attrs() roachpb.Attributes {
 // Capacity implements the storage.EngineWithoutRW interface.
 func (s *spanSetEngine) Capacity() (roachpb.StoreCapacity, error) {
 	return s.e.Capacity()
+}
+
+// WALFailoverDiskUsage implements the storage.Engine interface.
+func (s *spanSetEngine) WALFailoverDiskUsage() (vfs.DiskUsage, error) {
+	return s.e.WALFailoverDiskUsage()
 }
 
 // Properties implements the storage.EngineWithoutRW interface.

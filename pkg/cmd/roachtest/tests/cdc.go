@@ -22,7 +22,6 @@ import (
 	"io"
 	"maps"
 	"math/big"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -54,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/cdcutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -122,6 +122,8 @@ type cdcTester struct {
 
 	workloadWg *sync.WaitGroup
 	doneCh     chan struct{}
+
+	metamorphic *cdcutil.MetamorphicSettings
 }
 
 // startStatsCollection sets the start point of the stats collection window
@@ -129,11 +131,11 @@ type cdcTester struct {
 // stats.json file to the artifacts directory.
 func (ct *cdcTester) startStatsCollection() func() {
 	if ct.promCfg == nil {
-		ct.t.Error("prometheus configuration is nil")
+		ct.t.Fatalf("prometheus configuration is nil")
 	}
 	promClient, err := clusterstats.SetupCollectorPromClient(ct.ctx, ct.cluster, ct.t.L(), ct.promCfg)
 	if err != nil {
-		ct.t.Errorf("error creating prometheus client for stats collector: %s", err)
+		ct.t.Fatalf("error creating prometheus client for stats collector: %s", err)
 	}
 
 	statsCollector := clusterstats.NewStatsCollector(ct.ctx, promClient)
@@ -165,6 +167,35 @@ func (ct *cdcTester) startStatsCollection() func() {
 		if err != nil {
 			ct.t.Errorf("error exporting stats file: %s", err)
 		}
+	}
+}
+
+func (ct *cdcTester) exportLatencyToRoachperf(value time.Duration, startTime time.Time) {
+	if ct.promCfg == nil {
+		ct.t.Fatalf("prometheus configuration is nil")
+	}
+	promClient, err := clusterstats.SetupCollectorPromClient(ct.ctx, ct.cluster, ct.t.L(), ct.promCfg)
+	if err != nil {
+		ct.t.Fatalf("error creating prometheus client for stats collector: %s", err)
+	}
+
+	statsCollector := clusterstats.NewStatsCollector(ct.ctx, promClient)
+	endTime := timeutil.Now()
+	if _, err := statsCollector.Exporter().Export(ct.ctx, ct.cluster, ct.t, false, /* dryRun */
+		startTime,
+		endTime,
+		[]clusterstats.AggQuery{},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			return &roachtestutil.AggregatedMetric{
+				Name:             "Max latency (s)",
+				Value:            roachtestutil.MetricPoint(value.Seconds()),
+				Unit:             "seconds",
+				IsHigherBetter:   false,
+				AdditionalLabels: nil,
+			}
+		},
+	); err != nil {
+		ct.t.Errorf("error exporting stats file: %s", err)
 	}
 }
 
@@ -254,6 +285,18 @@ func (ct *cdcTester) setupSink(args feedArgs) string {
 		kafka.mon = ct.mon
 		kafka.validateOrder = args.kafkaArgs.validateOrder
 
+		// Manually create Kafka topics so that topic consumers can start
+		// without racing on auto-creation by the changefeed.
+		for _, target := range args.targets {
+			topic := target
+			if i := strings.LastIndex(topic, "."); i != -1 {
+				topic = topic[i+1:]
+			}
+			if err := kafka.createTopic(ct.ctx, topic); err != nil {
+				ct.t.Fatal(err)
+			}
+		}
+
 		if err := kafka.startTopicConsumers(ct.ctx, args.targets, ct.doneCh); err != nil {
 			ct.t.Fatal(err)
 		}
@@ -311,7 +354,6 @@ type tpccArgs struct {
 	tolerateErrors bool
 	conns          int
 	noWait         bool
-	cdcFeatureFlags
 }
 
 func (ct *cdcTester) lockSchema(targets []string) {
@@ -337,7 +379,7 @@ func (ct *cdcTester) runTPCCWorkload(args tpccArgs) {
 	if !ct.t.SkipInit() {
 		ct.t.Status("installing TPCC workload")
 		tpcc.install(ct.ctx, ct.cluster)
-		if args.SchemaLockTables.enabled(globalEntropy) == featureEnabled {
+		if v, ok := ct.metamorphic.Get(cdcutil.SchemaLockTables); ok && v == "true" {
 			ct.t.Status(fmt.Sprintf("Setting schema_locked for %s", allTpccTargets))
 			ct.lockSchema(allTpccTargets)
 		}
@@ -393,13 +435,18 @@ func (ct *cdcTester) DB() *gosql.DB {
 func (ct *cdcTester) Close() {
 	ct.t.Status("cdcTester closing")
 	close(ct.doneCh)
+	// Add our metamorphic settings to the test parameters so they are
+	// easily visible in the github issue for comparison across failures.
+	for name, value := range ct.metamorphic.Resolved() {
+		ct.t.AddParam(name, value)
+	}
 	ct.mon.Wait()
 
 	_, _ = ct.DB().Exec(`CANCEL ALL CHANGEFEED JOBS;`)
 
 	if !ct.t.IsDebug() {
 		if err := ct.cluster.StopGrafana(ct.ctx, ct.logger, ct.t.ArtifactsDir()); err != nil {
-			ct.t.Errorf("error shutting down prometheus/grafana: %s", err)
+			ct.t.L().Printf("WARNING: error shutting down prometheus/grafana: %s", err)
 		}
 	}
 
@@ -444,84 +491,6 @@ var allLedgerTargets []string = []string{
 	`ledger.session`,
 }
 
-type featureFlag struct {
-	v *featureState
-}
-
-type featureState int
-
-var (
-	featureUnset    featureState = 0
-	featureDisabled featureState = 1
-	featureEnabled  featureState = 2
-)
-
-type entropy struct {
-	*rand.Rand
-}
-
-func (r *entropy) Bool() bool {
-	if r.Rand == nil {
-		return rand.Int()%2 == 0
-	}
-	return r.Rand.Int()%2 == 0
-}
-
-func (r *entropy) Intn(n int) int {
-	if r.Rand == nil {
-		return rand.Intn(n)
-	}
-	return r.Rand.Intn(n)
-}
-
-var globalRand *rand.Rand
-var globalEntropy entropy
-
-func (f *featureFlag) enabled(r entropy) featureState {
-	if f.v != nil {
-		return *f.v
-	}
-
-	if r.Bool() {
-		f.v = &featureEnabled
-		return featureEnabled
-	}
-	f.v = &featureDisabled
-	return featureDisabled
-}
-
-type enumFeatureFlag struct {
-	state string
-	v     *featureState
-}
-
-// enabled returns a valid string if the returned featureState is featureEnabled.
-func (f *enumFeatureFlag) enabled(r entropy, choose func(entropy) string) (string, featureState) {
-	if f.v != nil {
-		return f.state, *f.v
-	}
-
-	if r.Bool() {
-		f.v = &featureEnabled
-		f.state = choose(r)
-		return f.state, featureEnabled
-	}
-	f.v = &featureDisabled
-	return f.state, featureDisabled
-}
-
-// cdcFeatureFlags describes various cdc feature flags.
-// zero value cdcFeatureFlags uses metamorphic settings for features.
-type cdcFeatureFlags struct {
-	RangeFeedScheduler   featureFlag
-	SchemaLockTables     featureFlag
-	DistributionStrategy enumFeatureFlag
-}
-
-func makeDefaultFeatureFlags() cdcFeatureFlags {
-	return cdcFeatureFlags{}
-}
-
 type feedArgs struct {
 	sinkType        sinkType
 	targets         []string
@@ -530,8 +499,7 @@ type feedArgs struct {
 	assumeRole      string
 	tolerateErrors  bool
 	sinkURIOverride string
-	cdcFeatureFlags
-	kafkaArgs kafkaFeedArgs
+	kafkaArgs       kafkaFeedArgs
 }
 
 // kafkaFeedArgs are args that are specific to kafkaSink changefeeds.
@@ -584,7 +552,7 @@ func (ct *cdcTester) newChangefeed(args feedArgs) changefeedJob {
 		args.sinkType, args.targets, feedOptions,
 	))
 	db := ct.DB()
-	jobID, err := newChangefeedCreator(db, db, ct.logger, globalRand, targetsStr, sinkURI, makeDefaultFeatureFlags()).
+	jobID, err := newChangefeedCreator(db, db, ct.logger, targetsStr, sinkURI, ct.metamorphic).
 		With(feedOptions).Create()
 	if err != nil {
 		ct.t.Fatalf("failed to create changefeed: %s", err.Error())
@@ -647,6 +615,12 @@ func (ct *cdcTester) verifyMetrics(
 func (ct *cdcTester) runFeedLatencyVerifier(
 	cj changefeedJob, targets latencyTargets,
 ) (waitForCompletion func()) {
+	return ct.runFeedLatencyVerifierWithCallback(cj, targets, nil)
+}
+
+func (ct *cdcTester) runFeedLatencyVerifierWithCallback(
+	cj changefeedJob, targets latencyTargets, onSteadyLatency func(value time.Duration),
+) (waitForCompletion func()) {
 	info, err := getChangefeedInfo(ct.DB(), cj.jobID)
 	if err != nil {
 		ct.t.Fatalf("failed to get changefeed info: %s", err.Error())
@@ -666,9 +640,17 @@ func (ct *cdcTester) runFeedLatencyVerifier(
 	finished := make(chan struct{})
 	ct.mon.Go(func(ctx context.Context) error {
 		defer close(finished)
+
 		err := verifier.pollLatencyUntilJobSucceeds(ctx, ct.DB(), cj.jobID, time.Second, ct.doneCh)
 		if err != nil {
+			if zipErr := ct.cluster.FetchDebugZip(context.Background(), ct.logger, fmt.Sprintf("latency_debug_%s.zip", cj.Label())); zipErr != nil {
+				ct.logger.Printf("failed to fetch debug zip on latency failure: %s", zipErr)
+			}
 			return err
+		}
+
+		if onSteadyLatency != nil {
+			onSteadyLatency(verifier.maxSeenSteadyLatency)
 		}
 
 		verifier.assertValid(ct.t)
@@ -740,6 +722,14 @@ func withNumSinkNodes(num int) opt {
 	}
 }
 
+func disableMetamorphicSettings(settings ...cdcutil.MetamorphicSetting) opt {
+	return func(ct *cdcTester) {
+		for _, s := range settings {
+			ct.metamorphic.Disable(s)
+		}
+	}
+}
+
 // Silence staticcheck.
 var _ = withNumSinkNodes
 
@@ -763,6 +753,7 @@ func newCDCTester(ctx context.Context, t test.Test, c cluster.Cluster, opts ...o
 		doneCh:       make(chan struct{}),
 		sinkCache:    make(map[sinkType]string),
 		workloadWg:   &sync.WaitGroup{},
+		metamorphic:  cdcutil.NewMetamorphicSettings(t.L()),
 	}
 
 	for _, opt := range opts {
@@ -777,7 +768,7 @@ func newCDCTester(ctx context.Context, t test.Test, c cluster.Cluster, opts ...o
 	}
 	tester.logger = changefeedLogger
 
-	startOpts, settings := makeCDCBenchOptions(c)
+	startOpts, settings := makeCDCDefaultTestOptions(c)
 
 	// With a target_duration of 10s, we won't see slow span logs from changefeeds until we are > 100s
 	// behind, which is well above the 60s targetSteadyLatency we have in some tests.
@@ -786,14 +777,14 @@ func newCDCTester(ctx context.Context, t test.Test, c cluster.Cluster, opts ...o
 
 	// Set cluster settings that we want to test metamorphically to random values
 	// since metamorphic settings don't extend to roachtests.
-	{
-		quantization := fmt.Sprintf("%ds", rand.Intn(30))
-		settings.ClusterSettings["changefeed.resolved_timestamp.granularity"] = quantization
-		t.Status(fmt.Sprintf("changefeed.resolved_timestamp.granularity: %s", quantization))
-
-		perTableTracking := fmt.Sprintf("%t", rand.Intn(2) == 0)
-		settings.ClusterSettings["changefeed.progress.per_table_tracking.enabled"] = perTableTracking
-		t.Status(fmt.Sprintf("changefeed.progress.per_table_tracking.enabled: %s", perTableTracking))
+	if v, ok := tester.metamorphic.Get(cdcutil.ResolvedTSGranularity); ok {
+		settings.ClusterSettings["changefeed.resolved_timestamp.granularity"] = v
+	}
+	if v, ok := tester.metamorphic.Get(cdcutil.PerTableTrackingEnabled); ok {
+		settings.ClusterSettings["changefeed.progress.per_table_tracking.enabled"] = v
+	}
+	if v, ok := tester.metamorphic.Get(cdcutil.PeriodicAggregatorFlushing); ok {
+		settings.ClusterSettings["changefeed.aggregator.periodic_flushing.enabled"] = v
 	}
 
 	settings.Env = append(settings.Env, envVars...)
@@ -897,7 +888,8 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster, cfg cdcBank
 		"min_checkpoint_frequency": "'2s'",
 		"diff":                     "",
 	}
-	_, err := newChangefeedCreator(db, db, t.L(), globalRand, "bank.bank", kafka.sinkURL(ctx), makeDefaultFeatureFlags()).
+	metamorphic := cdcutil.NewMetamorphicSettings(t.L())
+	_, err := newChangefeedCreator(db, db, t.L(), "bank.bank", kafka.sinkURL(ctx), metamorphic).
 		With(options).
 		Create()
 	if err != nil {
@@ -1042,21 +1034,11 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster, cfg cdcBank
 	m.Wait()
 }
 
-type cdcCheckpointType int
-
-const (
-	cdcNormalCheckpoint cdcCheckpointType = iota
-	cdcShutdownCheckpoint
-	cdcFrontierPersistence
-)
-
 // runCDCInitialScanRollingRestart runs multiple initial-scan-only changefeeds
 // on a 4-node cluster, using node 1 as the coordinator and continuously
 // restarting nodes 2-4 to hopefully force the changefeed to replan and exercise
 // the checkpoint restore logic.
-func runCDCInitialScanRollingRestart(
-	ctx context.Context, t test.Test, c cluster.Cluster, checkpointType cdcCheckpointType,
-) {
+func runCDCInitialScanRollingRestart(ctx context.Context, t test.Test, c cluster.Cluster) {
 	startOpts := option.DefaultStartOpts()
 	ips, err := c.ExternalIP(ctx, t.L(), c.Node(1))
 	sinkURL := fmt.Sprintf("https://%s:%d", ips[0], debug.WebhookServerPort)
@@ -1112,26 +1094,13 @@ func runCDCInitialScanRollingRestart(
 		// Finish splitting, so that drained ranges spread out evenly.
 		fmt.Sprintf(`ALTER TABLE large SPLIT AT SELECT id FROM large ORDER BY random() LIMIT %d`, largeSplitCount),
 		`ALTER TABLE large SCATTER`,
-	}
-	switch checkpointType {
-	case cdcNormalCheckpoint:
-		setupStmts = append(setupStmts,
-			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '5s'`,
-			`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'false'`,
-			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '10m'`,
-		)
-	case cdcShutdownCheckpoint:
-		setupStmts = append(setupStmts,
-			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '0'`,
-			`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'true'`,
-			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '10m'`,
-		)
-	case cdcFrontierPersistence:
-		setupStmts = append(setupStmts,
-			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '0'`,
-			`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'false'`,
-			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '5s'`,
-		)
+		// Configure frequent checkpointing.
+		// NB: We set changefeed.span_checkpoint.interval because in addition
+		// to controlling how often we saved the now-deprecated legacy span-level
+		// checkpoint, it also controls how often a change aggregator will flush
+		// its frontier to the coordinator during a backfill.
+		`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '1s'`,
+		`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '5s'`,
 	}
 	for _, s := range setupStmts {
 		t.L().Printf(s)
@@ -1249,6 +1218,349 @@ WITH initial_scan='only', min_checkpoint_frequency='1s'`, sinkURL),
 	}
 }
 
+type rollingRestartParams struct {
+	doRestarts bool
+	// testDuration is the total duration of the test, including the kv workload
+	// and changefeed monitoring. It may be longer than restartDuration to allow
+	// time for the changefeed to catch up after we finish restarting.
+	testDuration time.Duration
+	// restartDuration is how long the rolling restart loop runs. It must be less
+	// than or equal to testDuration.
+	restartDuration time.Duration
+}
+
+// runCDCRollingRestart tests changefeed behavior during rolling node restarts.
+// It runs a kv workload while periodically draining and restarting nodes to
+// simulate rolling upgrades. The doRestarts parameter controls whether restarts
+// actually occur (a false value runs a control baseline without restarts).
+func runCDCRollingRestart(
+	ctx context.Context, t test.Test, c cluster.Cluster, params rollingRestartParams,
+) {
+	if params.testDuration <= 0 {
+		t.Fatal("testDuration must be greater than 0")
+	}
+	if params.doRestarts && params.restartDuration <= 0 {
+		t.Fatal("restartDuration must be greater than 0 when doRestarts is true")
+	}
+	if params.restartDuration > params.testDuration {
+		t.Fatal("restartDuration must be less than or equal to testDuration")
+	}
+
+	// Node topology:
+	// - Nodes 1 through N-3: CRDB (subject to rolling restarts)
+	// - Node N-2: CRDB (stable, never restarted)
+	// - Node N-1: Kafka
+	// - Node N: Workload runner only (no CRDB, framework workload node)
+	//
+	// This is a regression test for a case where rolling restarts cause
+	// feeds to lag. That happens specifically when the backoff between
+	// retries is allowed to grow. Since restarting the coordinator
+	// would reset the backoff, we keep one node stable to avoid that.
+	// This stable node is used to simulate the changefeed coordinator
+	// in a large production cluster. In a large cluster (N nodes), we
+	// can go a long time (O(n) restarts) without restarting the coordinator.
+	crdbNodes := c.Range(1, c.Spec().NodeCount-2)
+	stableNode := c.Spec().NodeCount - 2
+	kafkaNode := c.Node(c.Spec().NodeCount - 1)
+
+	startOpts := option.DefaultStartOpts()
+	// Start the retry backoff at the max (30s) so that every restart
+	// immediately exercises worst-case backoff behavior. Without this, the
+	// default initial backoff is low enough that ~10 restarts over 20 minutes
+	// never reach problematic values, and the test would pass even if the
+	// backoff handling were broken.
+	settings := install.MakeClusterSettings(
+		install.EnvOption{`COCKROACH_CHANGEFEED_TESTING_INITIAL_RETRY_BACKOFF=30s`},
+	)
+	c.Start(ctx, t.L(), startOpts, settings, crdbNodes)
+
+	kafka, kafkaCleanup := setupKafka(ctx, t, c, kafkaNode)
+	defer kafkaCleanup()
+
+	// Set up prometheus on the workload runner node for roachperf export. The
+	// workload runner node is never restarted and doesn't run CRDB, so
+	// prometheus scraping is stable.
+	promCfg := (&prometheus.Config{}).
+		WithPrometheusNode(c.WorkloadNode().InstallNodes()[0]).
+		WithCluster(crdbNodes.InstallNodes()).
+		WithNodeExporter(c.All().InstallNodes())
+	if err := c.StartGrafana(ctx, t.L(), promCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	restart := func(n int) error {
+		t.L().Printf("draining and restarting node %d", n)
+		cmd := fmt.Sprintf("./cockroach node drain --certs-dir=%s --port={pgport:%d} --self", install.CockroachNodeCertsDir, n)
+		if err := c.RunE(ctx, option.WithNodes(c.Node(n)), cmd); err != nil {
+			return err
+		}
+		t.Monitor().ExpectProcessDead(c.Node(n))
+		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(n))
+		opts := startOpts
+		opts.RoachprodOpts.IsRestart = true
+		c.Start(ctx, t.L(), opts, settings, c.Node(n))
+		t.Monitor().ExpectProcessAlive(c.Node(n))
+		t.L().Printf("node %d restarted successfully", n)
+		return nil
+	}
+
+	// Connect to the stable CRDB node for queries since we'll be restarting
+	// the other nodes during the test.
+	db := c.Conn(ctx, t.L(), stableNode)
+	defer db.Close()
+	t.L().Printf("setting up test with doRestarts=%t", params.doRestarts)
+	if _, err := db.Exec(`SET CLUSTER SETTING kv.rangefeed.enabled = true`); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := fmt.Sprintf("./cockroach workload init kv --splits 50 {pgurl%s}", crdbNodes)
+	if err := c.RunE(ctx, option.WithNodes(c.WorkloadNode()), cmd); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run the kv workload for the full test duration on the dedicated
+	// workload runner node, spreading traffic across all CRDB nodes.
+	t.Go(func(ctx context.Context, l *logger.Logger) error {
+		cmd := fmt.Sprintf("./cockroach workload run kv --zipfian --duration=%s {pgurl%s} --tolerate-errors",
+			params.testDuration, crdbNodes)
+		return c.RunE(ctx, option.WithNodes(c.WorkloadNode()), cmd)
+	})
+
+	var jobID int
+	if err := db.QueryRow(fmt.Sprintf(
+		`CREATE CHANGEFEED FOR TABLE kv.kv INTO '%s'`+
+			` WITH updated, resolved, initial_scan='no', min_checkpoint_frequency='2s',`+
+			` kafka_sink_config='{"Flush": {"Messages": 100, "Frequency": "10ms"}}'`,
+		kafka.sinkURL(ctx),
+	)).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	t.L().Printf("changefeed %d will run for %s", jobID, params.testDuration)
+
+	// Set up Kafka consumer with duplicate counting.
+	dupV := cdctest.NewDuplicateCountingValidator(cdctest.NoOpValidator)
+	consumerStopper := make(chan struct{})
+	tc, err := kafka.newConsumerWithValidator(ctx, "kv", dupV, consumerStopper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.close()
+
+	consumerDone := make(chan struct{})
+	t.Go(func(ctx context.Context, l *logger.Logger) error {
+		defer close(consumerDone)
+		for {
+			m, err := tc.next(ctx)
+			if err != nil {
+				return err
+			}
+			if m == nil {
+				return nil
+			}
+		}
+	})
+
+	beginTime := timeutil.Now()
+
+	// Start rolling restarts in a background goroutine if enabled. We
+	// restart all CRDB nodes except the stable node.
+	if params.doRestarts {
+		const restartInterval = 2 * time.Minute
+		restartNodes := make([]int, 0, stableNode-1)
+		for i := 1; i < stableNode; i++ {
+			restartNodes = append(restartNodes, i)
+		}
+		t.Go(func(ctx context.Context, l *logger.Logger) error {
+			defer func() {
+				l.Printf("[%s] done restarting nodes", timeutil.Since(beginTime))
+			}()
+
+			l.Printf("starting rolling drain+restarts of nodes %v at %s interval for %s...", restartNodes, restartInterval, params.restartDuration)
+
+			timer := time.NewTimer(0)
+			defer timer.Stop()
+			restartDeadline := beginTime.Add(params.restartDuration)
+			for {
+				for _, n := range restartNodes {
+					if timeutil.Now().After(restartDeadline) {
+						l.Printf("restart deadline reached after %s, stopping restarts", timeutil.Since(beginTime))
+						return nil
+					}
+
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-timer.C:
+					}
+
+					if err := restart(n); err != nil {
+						return err
+					}
+					// Wait between restarts to let changefeeds make progress and
+					// allow backoff to climb higher before the next disruption.
+					timer.Reset(restartInterval)
+				}
+			}
+		})
+	}
+
+	getCurrentJobInfo := func() (time.Duration, string, string, error) {
+		var status string
+		var hwNanos gosql.NullFloat64
+		var runningStatus gosql.NullString
+		err := db.QueryRow(
+			`SELECT status, running_status, high_water_timestamp FROM [SHOW CHANGEFEED JOB $1]`, jobID,
+		).Scan(&status, &runningStatus, &hwNanos)
+		if err != nil {
+			return 0, "", "", err
+		}
+
+		var currentLag time.Duration
+		if hwNanos.Valid {
+			highwater := timeutil.Unix(0, int64(hwNanos.Float64))
+			currentLag = timeutil.Since(highwater)
+		}
+		return currentLag, status, runningStatus.String, nil
+	}
+
+	// Run the monitoring loop every 10 seconds until the end of the test
+	// to check that the changefeed lag doesn't exceed the maximum.
+	const lagPollInterval = 10 * time.Second
+	testDeadline := beginTime.Add(params.testDuration)
+	const maxAllowedLag = 5 * time.Minute
+
+	var maxHighwaterLag time.Duration
+	ticker := time.NewTicker(lagPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if timeutil.Now().After(testDeadline) {
+			break
+		}
+
+		currentLag, status, runningStatus, err := getCurrentJobInfo()
+		if err != nil {
+			t.L().Printf("[%s] error querying changefeed status: %v", timeutil.Since(beginTime), err)
+			continue
+		}
+		if currentLag > maxHighwaterLag {
+			maxHighwaterLag = currentLag
+		}
+		// Read duplicate stats from dupV's atomic counters rather than
+		// tc.validator.NumRows, which isn't safe to read cross-goroutine.
+		numTotal := dupV.NumTotal.Load()
+		numDuplicates := dupV.NumDuplicates.Load()
+		var dupPctStr string
+		if numTotal > 0 {
+			dupPctStr = fmt.Sprintf("%.2f%%", 100.0*float64(numDuplicates)/float64(numTotal))
+		} else {
+			dupPctStr = "n/a"
+		}
+		t.L().Printf("[%s] lag=%s status=%s running_status=%s total_msgs=%d dupes=%d dupe_pct=%s",
+			timeutil.Since(beginTime), currentLag, status, runningStatus,
+			numTotal, numDuplicates, dupPctStr)
+		if status == "failed" {
+			t.Fatalf("changefeed entered failed status: %s", runningStatus)
+		}
+		if currentLag > maxAllowedLag {
+			t.Fatalf("changefeed lag %s exceeded maximum allowed (%s) during rolling restarts",
+				currentLag, maxAllowedLag)
+		}
+	}
+
+	// Stop Kafka consumer and report duplicate counts.
+	close(consumerStopper)
+	<-consumerDone
+	numTotal := dupV.NumTotal.Load()
+	numDuplicates := dupV.NumDuplicates.Load()
+	if numTotal > 0 {
+		dupPct := 100.0 * float64(numDuplicates) / float64(numTotal)
+		t.L().Printf("duplicate counting: total_messages=%d unique=%d duplicates=%d duplicate_pct=%.2f%%",
+			numTotal, numTotal-numDuplicates, numDuplicates, dupPct)
+	} else {
+		t.L().Printf("duplicate counting: no messages consumed")
+	}
+
+	// After the test, verify lag has recovered below a tighter threshold.
+	finalLag, _, _, err := getCurrentJobInfo()
+	if err != nil {
+		t.Fatalf("error querying final changefeed status: %v", err)
+	}
+	t.L().Printf("[%s] changefeed %d completed %s test run, final_lag=%s max_lag=%s",
+		timeutil.Since(beginTime), jobID, params.testDuration,
+		finalLag, maxHighwaterLag)
+	const maxLagAfterRecovery = 2 * time.Minute
+	if finalLag > maxLagAfterRecovery {
+		t.Fatalf("changefeed lag %s exceeded maximum allowed (%s) after recovery period",
+			finalLag, maxLagAfterRecovery)
+	}
+
+	// Export metrics to roachperf.
+	promClient, err := clusterstats.SetupCollectorPromClient(ctx, c, t.L(), promCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxBehindNanos := clusterstats.ClusterStat{
+		LabelName: "node", Query: "changefeed_max_behind_nanos",
+	}
+	maxBehindSecondsAgg := clusterstats.AggQuery{
+		Stat:  maxBehindNanos,
+		Query: "max(changefeed_max_behind_nanos) / (1000*1000*1000)",
+		Tag:   "Max Behind (s)",
+	}
+	statsCollector := clusterstats.NewStatsCollector(ctx, promClient)
+	if _, err := statsCollector.Exporter().Export(ctx, c, t, false, /* dryRun */
+		beginTime,
+		timeutil.Now(),
+		[]clusterstats.AggQuery{maxBehindSecondsAgg},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Max highwater lag (s)",
+				Value:          roachtestutil.MetricPoint(maxHighwaterLag.Seconds()),
+				Unit:           "seconds",
+				IsHigherBetter: false,
+			}
+		},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			var maxVal float64
+			if stat, ok := stats[maxBehindNanos.Query]; ok {
+				for _, v := range stat.Value {
+					if v > maxVal {
+						maxVal = v
+					}
+				}
+			}
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Max behind lag (s)",
+				Value:          roachtestutil.MetricPoint(maxVal),
+				Unit:           "seconds",
+				IsHigherBetter: false,
+			}
+		},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Final highwater lag (s)",
+				Value:          roachtestutil.MetricPoint(finalLag.Seconds()),
+				Unit:           "seconds",
+				IsHigherBetter: false,
+			}
+		},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			var dupPct float64
+			if numTotal > 0 {
+				dupPct = 100.0 * float64(numDuplicates) / float64(numTotal)
+			}
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Duplicate percentage",
+				Value:          roachtestutil.MetricPoint(dupPct),
+				Unit:           "percent",
+				IsHigherBetter: false,
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type fineGrainedCheckpointingParams struct {
 	numRanges               int
 	transientErrorFrequency time.Duration
@@ -1336,10 +1648,16 @@ func runCDCFineGrainedCheckpointingBenchmark(
 	t.L().Printf("setting up test data...")
 	setupStmts := []string{
 		`CREATE TABLE foo (id INT PRIMARY KEY, val INT)`,
+		// Configure frequent checkpointing in the form of frontier persistence.
+		// Span level checkpointing is now deprecated, so we use frontier persistence
+		// instead.
+		//
+		// NB: We set changefeed.span_checkpoint.interval because in addition
+		// to controlling how often we saved the now-deprecated legacy span-level
+		// checkpoint, it also controls how often a change aggregator will flush
+		// its frontier to the coordinator during a backfill.
 		`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '1s'`,
-		`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'false'`,
-		`SET CLUSTER SETTING changefeed.frontier_highwater_lag_checkpoint_threshold = '100ms'`,
-		`SET CLUSTER SETTING changefeed.frontier_checkpoint_frequency = '1s'`,
+		`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '5s'`,
 		// We do not set timestamp quantization here since it is off by default
 		`SET CLUSTER SETTING kv.rangefeed.enabled = true`,
 	}
@@ -1491,7 +1809,8 @@ func runCDCSchemaRegistry(ctx context.Context, t test.Test, c cluster.Cluster) {
 		"diff":                      "",
 	}
 
-	_, err := newChangefeedCreator(db, db, t.L(), globalRand, "foo", kafka.sinkURL(ctx), makeDefaultFeatureFlags()).
+	metamorphic := cdcutil.NewMetamorphicSettings(t.L())
+	_, err := newChangefeedCreator(db, db, t.L(), "foo", kafka.sinkURL(ctx), metamorphic).
 		With(options).
 		Args(kafka.schemaRegistryURL(ctx)).
 		Create()
@@ -1631,9 +1950,10 @@ func runCDCKafkaAuth(ctx context.Context, t test.Test, c cluster.Cluster) {
 		},
 	}
 
+	metamorphic := cdcutil.NewMetamorphicSettings(t.L())
 	for _, f := range feeds {
 		t.Status(fmt.Sprintf("running:%s, query:%s", f.desc, f.queryArg))
-		_, err := newChangefeedCreator(db, db, t.L(), globalRand, "auth_test_table", f.queryArg, makeDefaultFeatureFlags()).Create()
+		_, err := newChangefeedCreator(db, db, t.L(), "auth_test_table", f.queryArg, metamorphic).Create()
 		if err != nil {
 			t.Fatalf("%s: %s", f.desc, err.Error())
 		}
@@ -1663,11 +1983,9 @@ func runCDCMultipleSchemaChanges(ctx context.Context, t test.Test, c cluster.Clu
 		fmt.Sprintf("CREATE CHANGEFEED FOR %s INTO 'null://'", strings.Join(tableNames, ", ")),
 	).Scan(&jobID)
 
-	alterStmts := []string{"SET sql_safe_updates = false"}
 	for _, tableName := range tableNames {
-		alterStmts = append(alterStmts, fmt.Sprintf(`ALTER TABLE %s DROP col`, tableName))
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN IF EXISTS col`, tableName))
 	}
-	sqlDB.ExecMultiple(t, alterStmts...)
 	timeAfterSchemaChanges := timeutil.Now()
 
 	t.L().Printf("waiting for changefeed highwater to pass %s", timeAfterSchemaChanges)
@@ -1841,7 +2159,7 @@ func runCDCMultiTablePTSBenchmark(
 	// TODO(#158779): When we add back per-table PTS, make sure that this test
 	// sets the cluster setting according to params.perTablePTS.
 
-	initCmd := fmt.Sprintf("./cockroach workload init bank --rows=%d --ranges=%d --tables=%d {pgurl%s}",
+	initCmd := fmt.Sprintf("./cockroach workload init bank --data-loader=INSERT --rows=%d --ranges=%d --tables=%d {pgurl%s}",
 		params.numRows, numRanges, params.numTables, ct.crdbNodes.RandNode())
 	if err := c.RunE(ctx, option.WithNodes(ct.workloadNode), initCmd); err != nil {
 		t.Fatalf("failed to initialize bank tables: %v", err)
@@ -2040,7 +2358,7 @@ func registerCDC(r registry.Registry) {
 		// the bulk oracle.
 		Name:             "cdc/multi-region-execution-locality-tpcc",
 		Owner:            registry.OwnerCDC,
-		Cluster:          r.MakeClusterSpec(7, spec.Geo(), spec.GatherCores(), spec.GCEZones("us-east1-b,us-west1-b")),
+		Cluster:          r.MakeClusterSpec(7, spec.Geo(), spec.GatherCores(), spec.GCEZones("us-east1-b,us-west1-c")),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -2048,9 +2366,9 @@ func registerCDC(r registry.Registry) {
 				0: "us-east1-b",
 				1: "us-east1-b",
 				2: "us-east1-b",
-				3: "us-west1-b",
-				4: "us-west1-b",
-				5: "us-west1-b",
+				3: "us-west1-c",
+				4: "us-west1-c",
+				5: "us-west1-c",
 			}
 			ct := newCDCTester(ctx, t, c)
 			defer ct.Close()
@@ -2064,8 +2382,8 @@ CONFIGURE ZONE USING
 	lease_preferences = '[[+region=us-west1]]', num_replicas = 3`)
 			require.NoError(t, err)
 
-			// Verify lease holders are in us-west1-b.
-			verifyLeaseHolderLocality(ct.DB(), t, "cloud=gce,region=us-west1,zone=us-west1-b")
+			// Verify lease holders are in us-west1-c.
+			verifyLeaseHolderLocality(ct.DB(), t, "cloud=gce,region=us-west1,zone=us-west1-c")
 
 			feed := ct.newChangefeed(feedArgs{
 				sinkType: cloudStorageSink,
@@ -2120,40 +2438,51 @@ CONFIGURE ZONE USING
 		},
 	})
 	r.Add(registry.TestSpec{
-		Name:             "cdc/initial-scan-rolling-restart/normal-checkpoint",
+		Name:             "cdc/initial-scan-rolling-restart",
 		Owner:            registry.OwnerCDC,
 		Cluster:          r.MakeClusterSpec(4),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          30 * time.Minute,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runCDCInitialScanRollingRestart(ctx, t, c, cdcNormalCheckpoint)
+			runCDCInitialScanRollingRestart(ctx, t, c)
 		},
 	})
 	r.Add(registry.TestSpec{
-		Name:             "cdc/initial-scan-rolling-restart/shutdown-checkpoint",
+		Name:             "cdc/rolling-restart",
 		Owner:            registry.OwnerCDC,
-		Cluster:          r.MakeClusterSpec(4),
+		Benchmark:        true,
+		Cluster:          r.MakeClusterSpec(6, spec.WorkloadNode()),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          30 * time.Minute,
+		Monitor:          true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runCDCInitialScanRollingRestart(ctx, t, c, cdcShutdownCheckpoint)
+			runCDCRollingRestart(ctx, t, c, rollingRestartParams{
+				doRestarts:      true,
+				testDuration:    20 * time.Minute,
+				restartDuration: 15 * time.Minute,
+			})
 		},
 	})
+	// This test serves as a control for cdc/rolling-restart, running the same
+	// workload but without rolling restarts. This helps to isolate issues to
+	// rolling restarts in particular.
 	r.Add(registry.TestSpec{
-		Name:             "cdc/initial-scan-rolling-restart/frontier-persistence",
+		Name:             "cdc/no-rolling-restart",
 		Owner:            registry.OwnerCDC,
-		Cluster:          r.MakeClusterSpec(4),
+		Benchmark:        true,
+		Cluster:          r.MakeClusterSpec(6, spec.WorkloadNode()),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          30 * time.Minute,
+		Monitor:          true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runCDCInitialScanRollingRestart(ctx, t, c, cdcFrontierPersistence)
+			runCDCRollingRestart(ctx, t, c, rollingRestartParams{
+				doRestarts:   false,
+				testDuration: 20 * time.Minute,
+			})
 		},
-		// TODO(#155015): Unskip this test.
-		Skip: "frontier persistence will not happen during an initial-scan only changefeed " +
-			"without periodic aggregator frontier flushes",
 	})
 	r.Add(registry.TestSpec{
 		Name:             "cdc/fine-grained-checkpointing",
@@ -2190,7 +2519,7 @@ CONFIGURE ZONE USING
 		Cluster:   r.MakeClusterSpec(4, spec.WorkloadNode(), spec.CPU(16)),
 		Leases:    registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
-		CompatibleClouds: registry.AllClouds.NoIBM(),
+		CompatibleClouds: registry.AllClouds.NoIBM().NoAzure(),
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			ct := newCDCTester(ctx, t, c)
@@ -2303,7 +2632,6 @@ CONFIGURE ZONE USING
 	})
 	r.Add(registry.TestSpec{
 		Name:             "cdc/initial-scan-only/parquet/metamorphic",
-		Skip:             "#119295",
 		Owner:            registry.OwnerCDC,
 		Benchmark:        true,
 		Cluster:          r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
@@ -2400,7 +2728,7 @@ CONFIGURE ZONE USING
 		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode()),
 		Leases:    registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
-		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM(),
+		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM().NoAzure(),
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			ct := newCDCTester(ctx, t, c)
@@ -2510,7 +2838,7 @@ CONFIGURE ZONE USING
 		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode()),
 		Leases:    registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
-		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM(),
+		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM().NoAzure(),
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			ct := newCDCTester(ctx, t, c)
@@ -2549,7 +2877,7 @@ CONFIGURE ZONE USING
 		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode()),
 		Leases:    registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
-		CompatibleClouds:           registry.AllClouds.NoAWS().NoIBM(),
+		CompatibleClouds:           registry.AllClouds.NoAWS().NoIBM().NoAzure(),
 		Suites:                     registry.Suites(registry.Nightly),
 		RequiresDeprecatedWorkload: true, // uses ledger
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -2620,15 +2948,17 @@ CONFIGURE ZONE USING
 			ct := newCDCTester(ctx, t, c)
 			defer ct.Close()
 
+			startTime := timeutil.Now()
 			ct.runTPCCWorkload(tpccArgs{warehouses: 100, duration: "30m"})
 
 			feed := ct.newChangefeed(feedArgs{
 				sinkType: pubsubSink,
 				targets:  allTpccTargets,
 			})
-			ct.runFeedLatencyVerifier(feed, latencyTargets{
+			ct.runFeedLatencyVerifierWithCallback(feed, latencyTargets{
 				initialScanLatency: 30 * time.Minute,
-				steadyLatency:      time.Minute,
+			}, func(value time.Duration) {
+				ct.exportLatencyToRoachperf(value, startTime)
 			})
 
 			ct.waitForWorkload()
@@ -2791,8 +3121,9 @@ CONFIGURE ZONE USING
 			tdb := sqlutils.MakeSQLRunner(db)
 			tdb.Exec(t, `CREATE TABLE auth_test_table (a INT PRIMARY KEY)`)
 
+			metamorphic := cdcutil.NewMetamorphicSettings(t.L())
 			t.L().Printf("creating changefeed with iam: %s", brokers.connectURI)
-			_, err := newChangefeedCreator(db, db, t.L(), globalRand, "auth_test_table", brokers.connectURI, makeDefaultFeatureFlags()).Create()
+			_, err := newChangefeedCreator(db, db, t.L(), "auth_test_table", brokers.connectURI, metamorphic).Create()
 			if err != nil {
 				t.Fatalf("creating changefeed: %v", err)
 			}
@@ -2863,10 +3194,10 @@ CONFIGURE ZONE USING
 			// topics that changefeeds need but not for all topics on the kafka
 			// cluster. The test verifies the work by 1. creating lots of random kafka
 			// topics on the kafka cluster 2. running some tpcc workload with a
-			// changefeed configured to watch all tpcc tables (note that cdc creates
-			// kafka topics for every target tables internally) 3. assert that
-			// changefeed only fetches metadata for tpcc tables but not for other
-			// random topics created in 1.
+			// changefeed configured to watch all tpcc tables (note that even though
+			// cdc creates kafka topics for every target table internally, we create
+			// them ourselves to avoid a race) 3. assert that changefeed only fetches
+			// metadata for tpcc tables but not for other random topics created in 1.
 
 			// Run minimal level of tpcc workload and changefeed.
 			ct.runTPCCWorkload(tpccArgs{warehouses: 1, duration: "30s"})
@@ -3053,7 +3384,7 @@ CONFIGURE ZONE USING
 		Cluster:   r.MakeClusterSpec(4, spec.WorkloadNode(), spec.CPU(16)),
 		Leases:    registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
-		CompatibleClouds: registry.AllClouds.NoIBM(),
+		CompatibleClouds: registry.AllClouds.NoIBM().NoAzure(),
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			ct := newCDCTester(ctx, t, c)
@@ -3097,7 +3428,7 @@ CONFIGURE ZONE USING
 		Leases:           registry.MetamorphicLeases,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          15 * time.Minute,
-		CompatibleClouds: registry.AllExceptIBM,
+		CompatibleClouds: registry.AllClouds.NoIBM().NoAzure(),
 		Run:              runMessageTooLarge,
 	})
 	for _, perTablePTS := range []bool{false} {
@@ -3156,7 +3487,10 @@ CONFIGURE ZONE USING
 				Suites:           registry.Suites(registry.Nightly),
 				Timeout:          2 * time.Hour,
 				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					ct := newCDCTester(ctx, t, c)
+					// This is a latency sensitive scale test, use the default granularity.
+					// The benchmark has a 2 minute latency threshold, and up to 30
+					// seconds of quantization delay eats into that budget significantly.
+					ct := newCDCTester(ctx, t, c, disableMetamorphicSettings(cdcutil.ResolvedTSGranularity))
 					defer ct.Close()
 
 					db := ct.DB()
@@ -3167,6 +3501,11 @@ CONFIGURE ZONE USING
 						// Disable span-level checkpointing since it's not necessary
 						// when frontier persistence is on.
 						"changefeed.span_checkpoint.interval": "'0'",
+						// TODO(#163764,#163766): Disable range coalescing to ensure
+						// each table is placed in its own range. There are scalability
+						// issues with multiple disjoint rangefeeds on the same range.
+						"spanconfig.range_coalescing.system.enabled":      "'false'",
+						"spanconfig.range_coalescing.application.enabled": "'false'",
 						// TODO(#158779): When we add back per-table PTS, make sure that this test
 						// turns it off, to avoid it impacting the results.
 					} {
@@ -3181,7 +3520,7 @@ CONFIGURE ZONE USING
 					// to maximize the likelihood of unmerged spans in the span frontier.
 					rows := max(cfg.ranges, 2)
 					initCmd := fmt.Sprintf(
-						"./cockroach workload init bank --tables=%d --ranges=%d --rows=%d {pgurl%s}",
+						"./cockroach workload init bank --data-loader=INSERT --tables=%d --ranges=%d --rows=%d {pgurl%s}",
 						cfg.tables, cfg.ranges, rows, ct.crdbNodes.RandNode())
 					if err := c.RunE(ctx, option.WithNodes(ct.workloadNode), initCmd); err != nil {
 						t.Fatalf("failed to initialize bank tables: %v", err)
@@ -4249,6 +4588,16 @@ func (k kafkaManager) createTopic(ctx context.Context, topic string) error {
 func (k kafkaManager) newConsumer(
 	ctx context.Context, topic string, stopper <-chan struct{},
 ) (*topicConsumer, error) {
+	var validator cdctest.Validator
+	if k.validateOrder {
+		validator = cdctest.NewOrderValidator(topic)
+	}
+	return k.newConsumerWithValidator(ctx, topic, validator, stopper)
+}
+
+func (k kafkaManager) newConsumerWithValidator(
+	ctx context.Context, topic string, validator cdctest.Validator, stopper <-chan struct{},
+) (*topicConsumer, error) {
 	kafkaAddrs := []string{k.consumerURL(ctx)}
 	config := sarama.NewConfig()
 	// I was seeing "error processing FetchRequest: kafka: error decoding
@@ -4261,10 +4610,6 @@ func (k kafkaManager) newConsumer(
 	consumer, err := sarama.NewConsumer(kafkaAddrs, config)
 	if err != nil {
 		return nil, err
-	}
-	var validator cdctest.Validator
-	if k.validateOrder {
-		validator = cdctest.NewOrderValidator(topic)
 	}
 	tc, err := newTopicConsumer(k.t, consumer, topic, validator, stopper)
 	if err != nil {
@@ -4390,27 +4735,24 @@ type changefeedCreator struct {
 	sinkURL         string
 	options         map[string]string
 	extraArgs       []interface{}
-	flags           cdcFeatureFlags
-	rng             entropy
+	metamorphic     *cdcutil.MetamorphicSettings
 	settingsApplied bool
 }
 
 func newChangefeedCreator(
 	db, systemDB *gosql.DB,
 	logger *logger.Logger,
-	r *rand.Rand,
 	targets, sinkURL string,
-	flags cdcFeatureFlags,
+	metamorphic *cdcutil.MetamorphicSettings,
 ) *changefeedCreator {
 	return &changefeedCreator{
-		db:       db,
-		systemDB: systemDB,
-		logger:   logger,
-		targets:  targets,
-		sinkURL:  sinkURL,
-		options:  make(map[string]string),
-		flags:    flags,
-		rng:      entropy{Rand: r},
+		db:          db,
+		systemDB:    systemDB,
+		logger:      logger,
+		targets:     targets,
+		sinkURL:     sinkURL,
+		options:     make(map[string]string),
+		metamorphic: metamorphic,
 	}
 }
 
@@ -4433,13 +4775,8 @@ func (cfc *changefeedCreator) Args(args ...interface{}) *changefeedCreator {
 	return cfc
 }
 
-func chooseDistributionStrategy(r entropy) string {
-	vals := changefeedccl.RangeDistributionStrategy.GetAvailableValues()
-	return vals[r.Intn(len(vals))]
-}
-
 // applySettings aplies various settings to the cluster -- once per the
-// lifetime of changefeedCreator
+// lifetime of changefeedCreator.
 func (cfc *changefeedCreator) applySettings() error {
 	if cfc.settingsApplied {
 		return nil
@@ -4449,26 +4786,24 @@ func (cfc *changefeedCreator) applySettings() error {
 		return err
 	}
 
-	schedEnabled := cfc.flags.RangeFeedScheduler.enabled(cfc.rng)
-	if schedEnabled != featureUnset {
-		cfc.logger.Printf("Setting kv.rangefeed.scheduler.enabled to %t", schedEnabled == featureEnabled)
+	if enabled, ok := cfc.metamorphic.Get(cdcutil.RangeFeedSchedulerEnabled); ok {
+		cfc.logger.Printf("Setting kv.rangefeed.scheduler.enabled to %s", enabled)
 		if _, err := cfc.systemDB.Exec(
-			"SET CLUSTER SETTING kv.rangefeed.scheduler.enabled = $1", schedEnabled == featureEnabled,
+			"SET CLUSTER SETTING kv.rangefeed.scheduler.enabled = $1", enabled,
 		); err != nil {
 			return err
 		}
 	}
 
-	rangeDistribution, rangeDistributionEnabled := cfc.flags.DistributionStrategy.enabled(cfc.rng,
-		chooseDistributionStrategy)
-	if rangeDistributionEnabled == featureEnabled {
-		cfc.logger.Printf("Setting changefeed.default_range_distribution_strategy to %s", rangeDistribution)
+	if strategy, ok := cfc.metamorphic.Get(cdcutil.DistributionStrategy); ok {
+		cfc.logger.Printf("Setting changefeed.default_range_distribution_strategy to %s", strategy)
 		if _, err := cfc.db.Exec(fmt.Sprintf(
-			"SET CLUSTER SETTING changefeed.default_range_distribution_strategy = '%s'", rangeDistribution)); err != nil {
+			"SET CLUSTER SETTING changefeed.default_range_distribution_strategy = '%s'", strategy)); err != nil {
 			return err
 		}
 	}
 
+	cfc.settingsApplied = true
 	return nil
 }
 
@@ -4712,7 +5047,7 @@ const createMSKTopicBinPath = "/tmp/create-msk-topic"
 var setupMskTopicScript = fmt.Sprintf(`
 #!/bin/bash
 set -e -o pipefail
-wget https://go.dev/dl/go1.25.5.linux-amd64.tar.gz -O /tmp/go.tar.gz
+wget https://go.dev/dl/go1.26.2.linux-amd64.tar.gz -O /tmp/go.tar.gz
 sudo rm -rf /usr/local/go
 sudo tar -C /usr/local -xzf /tmp/go.tar.gz
 echo export PATH=$PATH:/usr/local/go/bin >> ~/.profile

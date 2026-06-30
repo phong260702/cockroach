@@ -6,7 +6,6 @@
 package inspect
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -17,17 +16,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/spanutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -91,8 +87,9 @@ type indexConsistencyCheck struct {
 	// lastQueryPlaceholders stores the placeholder values used in lastQuery.
 	lastQueryPlaceholders []interface{}
 
-	// rowCount stores the number of rows processed by the check.
-	rowCount uint64
+	// rowCount stores the number of rows processed by the check. It is nil
+	// when the check cannot provide a reliable row count for the span.
+	rowCount *uint64
 }
 
 var _ inspectCheck = (*indexConsistencyCheck)(nil)
@@ -168,78 +165,15 @@ func (c *indexConsistencyCheck) Start(
 	otherColNames := colNames(otherColumns)
 	allColNames := colNames(c.columns)
 
-	// Generate query bounds from the span to limit the query to the specified range
-	var predicate string
-	var queryArgs []interface{}
-
-	// Assert that we get meaningful spans
-	if span.Key.Equal(span.EndKey) || len(span.Key) == 0 || len(span.EndKey) == 0 {
-		return errors.AssertionFailedf("received invalid span: Key=%x EndKey=%x", span.Key, span.EndKey)
-	}
-
-	// Get primary key metadata for span conversion
-	pkColTypes, err := spanutils.GetPKColumnTypes(c.tableDesc, c.priIndex.IndexDesc())
+	// If no rows exist in the primary index span, we still need to check for
+	// dangling secondary index entries. The check runs with a predicate derived
+	// from the span boundaries so that any secondary index entries found within
+	// the span are flagged as dangling since there are no corresponding primary
+	// index rows.
+	predicate, queryArgs, _, err := getPredicateAndQueryArgs(ctx, cfg, span, c.tableDesc, c.priIndex, c.asOf, pkColNames, 1, /* endPlaceholderOffset */
+		true /* needBoundsWhenEmpty */)
 	if err != nil {
-		return errors.Wrap(err, "getting primary key column types")
-	}
-
-	pkColDirs := make([]catenumpb.IndexColumn_Direction, c.priIndex.NumKeyColumns())
-	pkColIDs := catalog.TableColMap{}
-	for i := 0; i < c.priIndex.NumKeyColumns(); i++ {
-		colID := c.priIndex.GetKeyColumnID(i)
-		pkColIDs.Set(colID, i)
-		pkColDirs[i] = c.priIndex.GetKeyColumnDirection(i)
-	}
-
-	// Convert span to query bounds
-	alloc := &tree.DatumAlloc{}
-	bounds, hasRows, err := spanutils.SpanToQueryBounds(
-		ctx, cfg.DB.KV(), cfg.Codec, pkColIDs, pkColTypes, pkColDirs,
-		len(c.tableDesc.GetFamilies()), span, alloc, c.asOf,
-	)
-	if err != nil {
-		return errors.Wrap(err, "converting span to query bounds")
-	}
-
-	// If no rows exist in the primary index span, we still need to check for dangling
-	// secondary index entries. We run the check with an empty predicate, which will
-	// scan the entire secondary index within the span. Any secondary index entries found
-	// will be dangling since there are no corresponding primary index rows.
-	if !hasRows {
-		// Use empty predicate and no query arguments
-		predicate = ""
-		queryArgs = []interface{}{}
-	} else {
-		if len(bounds.Start) == 0 || len(bounds.End) == 0 {
-			return errors.AssertionFailedf("query bounds from span didn't produce start or end: %+v", bounds)
-		}
-
-		// Generate SQL predicate from the bounds
-		// Encode column names for SQL usage
-		encodedPkColNames := make([]string, len(pkColNames))
-		for i, colName := range pkColNames {
-			encodedPkColNames[i] = encodeColumnName(colName)
-		}
-		predicate, err = spanutils.RenderQueryBounds(
-			encodedPkColNames, pkColDirs, pkColTypes,
-			len(bounds.Start), len(bounds.End), true, 1,
-		)
-		if err != nil {
-			return errors.Wrap(err, "rendering query bounds")
-		}
-
-		if strings.TrimSpace(predicate) == "" {
-			return errors.AssertionFailedf("query bounds from span didn't produce predicate: %+v", bounds)
-		}
-
-		// Prepare query arguments: end bounds first, then start bounds
-		queryArgs = make([]interface{}, 0, len(bounds.End)+len(bounds.Start))
-		for _, datum := range bounds.End {
-			queryArgs = append(queryArgs, datum)
-		}
-		for _, datum := range bounds.Start {
-			queryArgs = append(queryArgs, datum)
-		}
+		return err
 	}
 
 	if indexConsistencyHashEnabled.Get(&c.execCfg.Settings.SV) && len(allColNames) > 0 {
@@ -250,7 +184,6 @@ func (c *indexConsistencyCheck) Start(
 				c.secIndex.GetName())
 		} else {
 			match, rowCount, hashErr := c.hashesMatch(ctx, allColNames, predicate, queryArgs)
-			c.rowCount = uint64(rowCount)
 			if hashErr != nil {
 				if isQueryConstructionError(hashErr) {
 					// If hashing fails and the error stems from query construction,
@@ -259,6 +192,8 @@ func (c *indexConsistencyCheck) Start(
 				}
 				// For all other hash errors, log and fall back.
 				log.Dev.Infof(ctx, "hash precheck failed; falling back to full check: %v", hashErr)
+			} else {
+				c.rowCount = &rowCount
 			}
 			if match {
 				// Hashes match, no corruption detected - skip the full check.
@@ -328,24 +263,11 @@ func (c *indexConsistencyCheck) Next(
 		_ = c.Close(ctx)
 		c.state = checkDone
 
-		// Convert internal errors to inspect issues rather than failing the entire job.
-		// This allows us to capture and log data corruption or encoding errors as
-		// structured issues for investigation.
-		details := make(map[redact.RedactableString]interface{})
-		details["error_message"] = err.Error()
-		details["error_type"] = "internal_query_error"
-		details["index_name"] = c.secIndex.GetName()
-		details["query"] = c.lastQuery // Store the query that caused the error
-		details["query_placeholders"] = formatPlaceholders(c.lastQueryPlaceholders)
-
-		return &inspectIssue{
-			ErrorType:  InternalError,
-			AOST:       c.asOf.GoTime(),
-			DatabaseID: c.tableDesc.GetParentID(),
-			SchemaID:   c.tableDesc.GetParentSchemaID(),
-			ObjectID:   c.tableDesc.GetID(),
-			Details:    details,
-		}, nil
+		issue := errorToInternalInspectIssue(err, c.asOf, c.tableDesc, c.secIndex, map[redact.RedactableString]interface{}{
+			"query":              c.lastQuery, // Store the query that caused the error
+			"query_placeholders": formatPlaceholders(c.lastQueryPlaceholders),
+		})
+		return issue, nil
 	}
 	if !ok {
 		c.state = checkDone
@@ -433,8 +355,8 @@ func (c *indexConsistencyCheck) Close(context.Context) error {
 	return nil
 }
 
-// Rows implements the inspectCheckRowCount interface.
-func (c *indexConsistencyCheck) RowCount() uint64 {
+// RowCount implements the inspectCheckRowCount interface.
+func (c *indexConsistencyCheck) RowCount() *uint64 {
 	return c.rowCount
 }
 
@@ -715,7 +637,7 @@ func (c *indexConsistencyCheck) createIndexCheckQuery(
 }
 
 type hashResult struct {
-	rowCount int64
+	rowCount uint64
 	hash     string
 }
 
@@ -725,7 +647,7 @@ type hashResult struct {
 // row count from the primary index.
 func (c *indexConsistencyCheck) hashesMatch(
 	ctx context.Context, columnNames []string, predicate string, queryArgs []interface{},
-) (match bool, rowCount int64, err error) {
+) (match bool, rowCount uint64, err error) {
 	primary, err := c.computeHashAndRowCount(ctx, c.priIndex, columnNames, predicate, queryArgs)
 	if err != nil {
 		return false, 0, errors.Wrapf(err, "computing hash for primary index %s", c.priIndex.GetName())
@@ -767,7 +689,7 @@ func (c *indexConsistencyCheck) computeHashAndRowCount(
 		return hashResult{}, errors.AssertionFailedf("hash query returned unexpected column count: %d", len(row))
 	}
 	return hashResult{
-		rowCount: int64(tree.MustBeDInt(row[0])),
+		rowCount: uint64(tree.MustBeDInt(row[0])),
 		hash:     string(tree.MustBeDBytes(row[1])),
 	}, nil
 }
@@ -800,13 +722,6 @@ func hashInputExpression(columnNames []string) string {
 	}
 	encoded := fmt.Sprintf("crdb_internal.datums_to_bytes(%s)", strings.Join(args, ", "))
 	return fmt.Sprintf("COALESCE(%s, ''::BYTES)", encoded)
-}
-
-// encodeColumnName properly encodes a column name for use in SQL.
-func encodeColumnName(columnName string) string {
-	var buf bytes.Buffer
-	lexbase.EncodeRestrictedSQLIdent(&buf, columnName, lexbase.EncNoFlags)
-	return buf.String()
 }
 
 // colRef returns the string for referencing a column, with a specific alias,

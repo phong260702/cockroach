@@ -153,6 +153,40 @@ DatabaseZoneConfig :  DatabaseID
 DatabaseZoneConfig :  ZoneConfig
 DatabaseZoneConfig :  SeqNum
 
+object DomainCheckConstraint
+
+DomainCheckConstraint :  TypeID
+DomainCheckConstraint :  ConstraintID
+DomainCheckConstraint :  Expression
+
+object DomainCheckConstraintUnvalidated
+
+DomainCheckConstraintUnvalidated :  TypeID
+DomainCheckConstraintUnvalidated :  ConstraintID
+DomainCheckConstraintUnvalidated :  Expression
+
+object DomainConstraintName
+
+DomainConstraintName :  TypeID
+DomainConstraintName :  ConstraintID
+DomainConstraintName :  Name
+
+object DomainDefault
+
+DomainDefault :  TypeID
+DomainDefault :  Expression
+
+object DomainNotNull
+
+DomainNotNull :  TypeID
+DomainNotNull :  ConstraintID
+
+object DomainType
+
+DomainType :  TypeID
+DomainType :  ArrayTypeID
+DomainType :  BaseTypeT
+
 object EnumType
 
 EnumType :  TypeID
@@ -207,6 +241,11 @@ FunctionBody : []UsesSequenceIDs
 FunctionBody : []UsesTypeIDs
 FunctionBody : []UsesFunctionIDs
 
+object FunctionComment
+
+FunctionComment :  FunctionID
+FunctionComment :  Comment
+
 object FunctionLeakProof
 
 FunctionLeakProof :  FunctionID
@@ -221,6 +260,12 @@ object FunctionNullInputBehavior
 
 FunctionNullInputBehavior :  FunctionID
 FunctionNullInputBehavior :  NullInputBehavior
+
+object FunctionParams
+
+FunctionParams :  FunctionID
+FunctionParams : []Params
+FunctionParams :  ReturnType
 
 object FunctionSecurity
 
@@ -511,7 +556,6 @@ object TriggerEnabled
 
 TriggerEnabled :  TableID
 TriggerEnabled :  TriggerID
-TriggerEnabled :  Enabled
 
 object TriggerEvents
 
@@ -611,6 +655,7 @@ SecondaryIndex <|-- ConstraintComment
 UniqueWithoutIndexConstraint <|-- ConstraintComment
 CheckConstraint <|-- ConstraintComment
 ForeignKeyConstraint <|-- ConstraintComment
+DomainCheckConstraint <|-- ConstraintComment
 UniqueWithoutIndexConstraint <|-- ConstraintWithoutIndexName
 CheckConstraint <|-- ConstraintWithoutIndexName
 ForeignKeyConstraint <|-- ConstraintWithoutIndexName
@@ -619,13 +664,22 @@ Database <|-- DatabaseData
 Database <|-- DatabaseRegionConfig
 Database <|-- DatabaseRoleSetting
 Database <|-- DatabaseZoneConfig
+DomainType <|-- DomainCheckConstraint
+DomainType <|-- DomainCheckConstraintUnvalidated
+DomainCheckConstraint <|-- DomainConstraintName
+DomainCheckConstraintUnvalidated <|-- DomainConstraintName
+DomainNotNull <|-- DomainConstraintName
+DomainType <|-- DomainDefault
+DomainType <|-- DomainNotNull
 EnumType <|-- EnumTypeValue
 Table <|-- ForeignKeyConstraint
 Table <|-- ForeignKeyConstraintUnvalidated
 Function <|-- FunctionBody
+Function <|-- FunctionComment
 Function <|-- FunctionLeakProof
 Function <|-- FunctionName
 Function <|-- FunctionNullInputBehavior
+Function <|-- FunctionParams
 Function <|-- FunctionSecurity
 Function <|-- FunctionVolatility
 PrimaryIndex <|-- IndexColumn
@@ -650,6 +704,7 @@ Database <|-- Namespace
 Schema <|-- Namespace
 AliasType <|-- Namespace
 EnumType <|-- Namespace
+DomainType <|-- Namespace
 Table <|-- Owner
 View <|-- Owner
 Sequence <|-- Owner
@@ -657,6 +712,7 @@ Database <|-- Owner
 Schema <|-- Owner
 AliasType <|-- Owner
 EnumType <|-- Owner
+DomainType <|-- Owner
 TablePartitioning <|-- PartitionZoneConfig
 Table <|-- Policy
 Policy <|-- PolicyDeps
@@ -671,6 +727,7 @@ Table <|-- RowLevelSecurityForced
 Table <|-- RowLevelTTL
 AliasType <|-- SchemaChild
 EnumType <|-- SchemaChild
+DomainType <|-- SchemaChild
 Table <|-- SchemaChild
 View <|-- SchemaChild
 Sequence <|-- SchemaChild
@@ -709,7 +766,7 @@ Trigger <|-- TriggerName
 Trigger <|-- TriggerTiming
 Trigger <|-- TriggerTransition
 Trigger <|-- TriggerWhen
-CompositeType,EnumType <|-- TypeComment
+CompositeType,EnumType,DomainType <|-- TypeComment
 Table <|-- UniqueWithoutIndexConstraint
 Table <|-- UniqueWithoutIndexConstraintUnvalidated
 Table <|-- UserPrivileges
@@ -719,4 +776,5 @@ Database <|-- UserPrivileges
 Schema <|-- UserPrivileges
 AliasType <|-- UserPrivileges
 EnumType <|-- UserPrivileges
+DomainType <|-- UserPrivileges
 @enduml

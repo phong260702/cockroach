@@ -7,7 +7,6 @@ package optbuilder
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -21,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -139,6 +137,10 @@ type Builder struct {
 	// are disabled and only statements whitelisted are allowed.
 	insideFuncDef bool
 
+	// If set, we are processing a procedure definition (not a function or DO
+	// block). Used to selectively allow DDL that is permitted in procedures.
+	insideProcDef bool
+
 	// If set, we are processing a trigger definition; in this case catalog caches
 	// are disabled.
 	insideTriggerDef bool
@@ -186,11 +188,29 @@ type Builder struct {
 	// expansion.
 	subqueryNameIdx int
 
-	// checkPrivilegeUser helps identify the username.SQLUsername for privilege
-	// checks performed. For routines that are specified with SECURITY
-	// DEFINER, the owner of the routine is checked. Otherwise, the check is
-	// against the user of the current session.
-	checkPrivilegeUser username.SQLUsername
+	// currentUser is the session user at the time the Builder was created. It
+	// is the default user for all privilege checks unless overridden by
+	// dataSourcePrivilegeUserOverride or executePrivilegeUserOverride.
+	currentUser username.SQLUsername
+
+	// dataSourcePrivilegeUserOverride, when set, overrides currentUser for
+	// data source (e.g., table, view) privilege checks. It is set in two
+	// cases:
+	//   1. Views: set to the view owner so that SELECT privilege on the
+	//      view's underlying tables is checked as the definer.
+	//   2. SECURITY DEFINER routines: set to the routine owner so that all
+	//      data source access within the routine body uses the definer's
+	//      privileges.
+	dataSourcePrivilegeUserOverride username.SQLUsername
+
+	// executePrivilegeUserOverride, when set, overrides currentUser for
+	// EXECUTE privilege checks on functions and procedures. This is separate
+	// from dataSourcePrivilegeUserOverride because views set
+	// dataSourcePrivilegeUserOverride to the view owner for table access,
+	// but EXECUTE privilege on functions called by the view should still be
+	// checked against the invoker, matching PostgreSQL behavior. SECURITY
+	// DEFINER routines set both override fields to the routine owner.
+	executePrivilegeUserOverride username.SQLUsername
 
 	// builtTriggerFuncs caches already-built trigger functions for a table. It is
 	// necessary to cache these functions since triggers can recursively reference
@@ -223,14 +243,14 @@ func New(
 	// be repeated.
 	semaCtx.Properties.IgnoreUnpreferredOverloads = evalCtx.SessionData().LegacyVarcharTyping
 	return &Builder{
-		factory:            factory,
-		stmt:               stmt,
-		ctx:                ctx,
-		verboseTracing:     log.ExpensiveLogEnabled(ctx, 2),
-		semaCtx:            semaCtx,
-		evalCtx:            evalCtx,
-		catalog:            catalog,
-		checkPrivilegeUser: catalog.GetCurrentUser(),
+		factory:        factory,
+		stmt:           stmt,
+		ctx:            ctx,
+		verboseTracing: log.ExpensiveLogEnabled(ctx, 2),
+		semaCtx:        semaCtx,
+		evalCtx:        evalCtx,
+		catalog:        catalog,
+		currentUser:    catalog.GetCurrentUser(),
 	}
 }
 
@@ -364,10 +384,26 @@ func (b *Builder) buildStmt(
 		case *tree.Insert, *tree.Update, *tree.Delete:
 		case *tree.Call:
 		case *tree.DoBlock:
-			if !b.evalCtx.Settings.Version.ActiveVersion(b.ctx).IsActive(clusterversion.V25_1) {
-				panic(doBlockVersionErr)
-			}
 		default:
+			if isAllowlistedProcedureDDL(stmt) {
+				if !b.insideProcDef {
+					panic(unimplemented.NewWithIssuef(110080,
+						"%s usage inside a function definition is not supported",
+						stmt.StatementTag(),
+					))
+				}
+				// DDL and DCL are allowed inside stored procedures when the
+				// cluster has been upgraded to v26.3.
+				if !b.evalCtx.Settings.Version.IsActive(
+					b.ctx, clusterversion.V26_3,
+				) {
+					panic(pgerror.Newf(pgcode.FeatureNotSupported,
+						"%s usage inside a stored procedure is not supported until upgrade to version 26.3 is finalized",
+						stmt.StatementTag(),
+					))
+				}
+				break
+			}
 			if tree.CanModifySchema(stmt) {
 				panic(unimplemented.NewWithIssuef(110080,
 					"%s usage inside a function definition is not supported", stmt.StatementTag(),
@@ -536,37 +572,44 @@ func (b *Builder) trackReferencedColumnForViews(col *scopeColumn) {
 }
 
 func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
-	if b.trackSchemaDeps {
-		if texpr != nil && texpr.ResolvedType().Identical(types.RegClass) {
-			// We do not add a dependency if the RegClass Expr contains variables,
-			// we cannot resolve the variables in this context. This matches Postgres
-			// behavior.
-			if !tree.ContainsVars(texpr) {
-				regclass, err := eval.Expr(b.ctx, b.evalCtx, texpr)
-				if err != nil {
-					panic(err)
-				}
-
-				var ds cat.DataSource
-				// Regclass can contain an ID or a string.
-				// Ex. nextval('s'::regclass) and nextval(59::regclass) are both valid.
-				id, err := strconv.Atoi(regclass.String())
-				if err == nil {
-					ds, _, err = b.catalog.ResolveDataSourceByID(b.ctx, cat.Flags{}, cat.StableID(id))
-					if err != nil {
-						panic(err)
-					}
-				} else {
-					tn := tree.MakeUnqualifiedTableName(tree.Name(regclass.String()))
-					ds, _, _ = b.resolveDataSource(&tn, privilege.SELECT)
-				}
-
-				b.schemaDeps = append(b.schemaDeps, opt.SchemaDep{
-					DataSource: ds,
-				})
-			}
-		}
+	if !b.trackSchemaDeps {
+		return
 	}
+	if texpr == nil || !texpr.ResolvedType().Identical(types.RegClass) {
+		return
+	}
+	// We do not add a dependency if the RegClass Expr contains variables,
+	// we cannot resolve the variables in this context. This matches Postgres
+	// behavior.
+	if tree.ContainsVars(texpr) {
+		return
+	}
+	regclass, err := eval.Expr(b.ctx, b.evalCtx, texpr)
+	if err != nil {
+		panic(err)
+	}
+	// A NULL REGCLASS references no object, so there is no dependency to track.
+	// This happens, for example, with a NULL::REGCLASS literal or an
+	// uninitialized OUT parameter of type REGCLASS in a routine body.
+	if regclass == tree.DNull {
+		return
+	}
+	// eval.Expr on a non-NULL REGCLASS expression returns a *tree.DOid.
+	// Use the OID directly for resolution rather than DOid.String(), which
+	// returns only the object name and drops the schema prefix (e.g. returns
+	// "myseq" instead of "sc.myseq"), causing unqualified lookups to fail
+	// when the schema is not in the search path.
+	dOid, ok := regclass.(*tree.DOid)
+	if !ok {
+		panic(errors.AssertionFailedf(
+			"expected *tree.DOid from eval.Expr on REGCLASS expression, got %T", regclass,
+		))
+	}
+	ds, _, err := b.catalog.ResolveDataSourceByID(b.ctx, cat.Flags{}, cat.StableID(dOid.Oid))
+	if err != nil {
+		panic(err)
+	}
+	b.schemaDeps = append(b.schemaDeps, opt.SchemaDep{DataSource: ds})
 }
 
 func (b *Builder) maybeTrackUserDefinedTypeDepsForViews(texpr tree.TypedExpr) {
@@ -620,6 +663,26 @@ func (b *Builder) DisableSchemaDepTracking() func() {
 	return func() {
 		b.trackSchemaDeps = originalTrackSchemaDeps
 	}
+}
+
+// checkPrivilegeUser returns the user whose privileges should be checked for
+// data source access. Returns dataSourcePrivilegeUserOverride if set, or
+// currentUser otherwise.
+func (b *Builder) checkPrivilegeUser() username.SQLUsername {
+	if b.dataSourcePrivilegeUserOverride.Undefined() {
+		return b.currentUser
+	}
+	return b.dataSourcePrivilegeUserOverride
+}
+
+// checkExecutePrivilegeUser returns the user whose EXECUTE privilege should be
+// checked for functions and procedures. Returns executePrivilegeUserOverride if
+// set, or currentUser otherwise.
+func (b *Builder) checkExecutePrivilegeUser() username.SQLUsername {
+	if b.executePrivilegeUserOverride.Undefined() {
+		return b.currentUser
+	}
+	return b.executePrivilegeUserOverride
 }
 
 // optTrackingTypeResolver is a wrapper around a TypeReferenceResolver that

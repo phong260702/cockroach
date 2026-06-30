@@ -66,6 +66,7 @@ const (
 	TableStatisticsTableName                SystemTableName = "table_statistics"
 	LocationsTableName                      SystemTableName = "locations"
 	RoleMembersTableName                    SystemTableName = "role_members"
+	ClusterMetricsTableName                 SystemTableName = "cluster_metrics"
 	CommentsTableName                       SystemTableName = "comments"
 	ReportsMetaTableName                    SystemTableName = "reports_meta"
 	ReplicationConstraintStatsTableName     SystemTableName = "replication_constraint_stats"
@@ -111,7 +112,12 @@ const (
 	PreparedTransactionsTableName           SystemTableName = "prepared_transactions"
 	InspectErrorsTableName                  SystemTableName = "inspect_errors"
 	StatementHintsTableName                 SystemTableName = "statement_hints"
+	StatementsTableName                     SystemTableName = "statements"
 	TableStatisticsLocksTableName           SystemTableName = "table_statistics_locks"
+	AdvisoryLocksTableName                  SystemTableName = "advisory_locks"
+	ResourceGroupsTableName                 SystemTableName = "resource_groups"
+	ResourceGroupIDSequenceName             SystemTableName = "resource_group_id_seq"
+	VcpuUsageTableName                      SystemTableName = "vcpu_usage"
 )
 
 // Oid for virtual database and table.
@@ -231,6 +237,8 @@ const (
 	CrdbInternalStoreLivenessSupportFrom
 	CrdbInternalStoreLivenessSupportFor
 	CrdbInternalClusterInspectErrorsViewID
+	CrdbInternalNodeActiveSessionHistoryTableID
+	CrdbInternalClusterActiveSessionHistoryTableID
 	// CrdbInternalTestID is reserved for tests that need to inject virtual tables
 	// into crdb_internal.
 	CrdbInternalTestID
@@ -324,6 +332,7 @@ const (
 	InformationSchemaCrdbIndexUsageStatsiticsTableID
 	PgCatalogID
 	PgCatalogAggregateTableID
+	PgCatalogAiosTableID
 	PgCatalogAmTableID
 	PgCatalogAmopTableID
 	PgCatalogAmprocTableID
@@ -333,6 +342,7 @@ const (
 	PgCatalogAuthMembersTableID
 	PgCatalogAvailableExtensionVersionsTableID
 	PgCatalogAvailableExtensionsTableID
+	PgCatalogBackendMemoryContextsTableID
 	PgCatalogCastTableID
 	PgCatalogClassTableID
 	PgCatalogCollationTableID
@@ -354,6 +364,7 @@ const (
 	PgCatalogForeignTableTableID
 	PgCatalogGroupTableID
 	PgCatalogHbaFileRulesTableID
+	PgCatalogIdentFileMappingsTableID
 	PgCatalogIndexTableID
 	PgCatalogIndexesTableID
 	PgCatalogInheritsTableID
@@ -367,12 +378,14 @@ const (
 	PgCatalogOpclassTableID
 	PgCatalogOperatorTableID
 	PgCatalogOpfamilyTableID
+	PgCatalogParameterACLTableID
 	PgCatalogPartitionedTableTableID
 	PgCatalogPoliciesTableID
 	PgCatalogPolicyTableID
 	PgCatalogPreparedStatementsTableID
 	PgCatalogPreparedXactsTableID
 	PgCatalogProcTableID
+	PgCatalogPublicationNamespaceTableID
 	PgCatalogPublicationRelTableID
 	PgCatalogPublicationTableID
 	PgCatalogPublicationTablesTableID
@@ -392,23 +405,30 @@ const (
 	PgCatalogSharedDescriptionTableID
 	PgCatalogSharedSecurityLabelTableID
 	PgCatalogShdependTableID
+	PgCatalogShmemAllocationsNumaTableID
 	PgCatalogShmemAllocationsTableID
 	PgCatalogStatActivityTableID
 	PgCatalogStatAllIndexesTableID
 	PgCatalogStatAllTablesTableID
 	PgCatalogStatArchiverTableID
 	PgCatalogStatBgwriterTableID
+	PgCatalogStatCheckpointerTableID
 	PgCatalogStatDatabaseConflictsTableID
 	PgCatalogStatDatabaseTableID
 	PgCatalogStatGssapiTableID
+	PgCatalogStatIOTableID
 	PgCatalogStatProgressAnalyzeTableID
 	PgCatalogStatProgressBasebackupTableID
 	PgCatalogStatProgressClusterTableID
+	PgCatalogStatProgressCopyTableID
 	PgCatalogStatProgressCreateIndexTableID
 	PgCatalogStatProgressVacuumTableID
+	PgCatalogStatRecoveryPrefetchTableID
+	PgCatalogStatReplicationSlotsTableID
 	PgCatalogStatReplicationTableID
 	PgCatalogStatSlruTableID
 	PgCatalogStatSslTableID
+	PgCatalogStatSubscriptionStatsTableID
 	PgCatalogStatSubscriptionTableID
 	PgCatalogStatSysIndexesTableID
 	PgCatalogStatSysTablesTableID
@@ -416,6 +436,7 @@ const (
 	PgCatalogStatUserIndexesTableID
 	PgCatalogStatUserTablesTableID
 	PgCatalogStatWalReceiverTableID
+	PgCatalogStatWalTableID
 	PgCatalogStatXactAllTablesTableID
 	PgCatalogStatXactSysTablesTableID
 	PgCatalogStatXactUserFunctionsTableID
@@ -432,6 +453,7 @@ const (
 	PgCatalogStatisticExtDataTableID
 	PgCatalogStatisticExtTableID
 	PgCatalogStatisticTableID
+	PgCatalogStatsExtExprsTableID
 	PgCatalogStatsExtTableID
 	PgCatalogStatsTableID
 	PgCatalogSubscriptionRelTableID
@@ -452,11 +474,15 @@ const (
 	PgCatalogUserMappingsTableID
 	PgCatalogUserTableID
 	PgCatalogViewsTableID
+	PgCatalogWaitEventsTableID
 	PgExtensionSchemaID
 	PgExtensionGeographyColumnsTableID
 	PgExtensionGeometryColumnsTableID
 	PgExtensionSpatialRefSysTableID
-	MinVirtualID = PgExtensionSpatialRefSysTableID
+	InformationSchemaCrdbNodeActiveSessionHistoryTableID
+	InformationSchemaCrdbClusterActiveSessionHistoryTableID
+	CrdbInternalClusterHeldAdvisoryLocksTableID
+	MinVirtualID = CrdbInternalClusterHeldAdvisoryLocksTableID
 )
 
 // ConstraintType is used to identify the type of a constraint.

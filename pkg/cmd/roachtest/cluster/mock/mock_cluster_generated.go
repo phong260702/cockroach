@@ -554,6 +554,20 @@ func (mr *MockClusterMockRecorder) ListSnapshots(arg0, arg1 interface{}) *gomock
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListSnapshots", reflect.TypeOf((*MockCluster)(nil).ListSnapshots), arg0, arg1)
 }
 
+// LocalCertsDir mocks base method.
+func (m *MockCluster) LocalCertsDir() string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LocalCertsDir")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// LocalCertsDir indicates an expected call of LocalCertsDir.
+func (mr *MockClusterMockRecorder) LocalCertsDir() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LocalCertsDir", reflect.TypeOf((*MockCluster)(nil).LocalCertsDir))
+}
+
 // MakeNodes mocks base method.
 func (m *MockCluster) MakeNodes(arg0 ...option.Option) string {
 	m.ctrl.T.Helper()
@@ -688,17 +702,17 @@ func (mr *MockClusterMockRecorder) PutE(arg0, arg1, arg2, arg3 interface{}, arg4
 }
 
 // PutLibraries mocks base method.
-func (m *MockCluster) PutLibraries(arg0 context.Context, arg1 string, arg2 []string) error {
+func (m *MockCluster) PutLibraries(arg0 context.Context, arg1 *logger.Logger, arg2 string, arg3 []string) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "PutLibraries", arg0, arg1, arg2)
+	ret := m.ctrl.Call(m, "PutLibraries", arg0, arg1, arg2, arg3)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // PutLibraries indicates an expected call of PutLibraries.
-func (mr *MockClusterMockRecorder) PutLibraries(arg0, arg1, arg2 interface{}) *gomock.Call {
+func (mr *MockClusterMockRecorder) PutLibraries(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PutLibraries", reflect.TypeOf((*MockCluster)(nil).PutLibraries), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PutLibraries", reflect.TypeOf((*MockCluster)(nil).PutLibraries), arg0, arg1, arg2, arg3)
 }
 
 // PutString mocks base method.

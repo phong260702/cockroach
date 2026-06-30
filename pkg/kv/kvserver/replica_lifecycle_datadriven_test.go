@@ -11,6 +11,7 @@ package kvserver
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -24,18 +25,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/print"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/dd"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
@@ -69,7 +75,7 @@ import (
 //	Updates the specified fields of the existing replica's HardState. Other
 //	fields of the HardState are retained.
 //
-// eval-split range-id=<int> split-key=<key> [verbose]
+// eval-split range-id=<int> split-key=<key> [legacy] [verbose]
 // ----
 //
 //	Evaluates a split for the specified range at the given split key. This
@@ -79,7 +85,8 @@ import (
 //	applied. However, the range state is updated to reflect the split -- the LHS
 //	narrows, and a new range descriptor is created for the RHS with the same
 //	replica set as the LHS. Optionally, we print the evaluated batch if
-//	running with the verbose flag.
+//	running with the verbose flag. The "legacy" flag generates a batch that can
+//	be inherited from older CRDB versions.
 //
 // set-lease range-id=<int> replica=<int> [lease-type=leader-lease|epoch|expiration]
 // ----
@@ -99,6 +106,25 @@ import (
 //	post-split RHS replica is automatically determined based on the test
 //	context's state; if the replica doesn't exist, or a newer (higher ReplicaID)
 //	replica exists, it is considered destroyed.
+//
+// eval-merge lhs-range-id=<int> rhs-range-id=<int> [verbose]
+// ----
+//
+//	Evaluates a merge of the RHS range into the LHS range. The LHS and RHS
+//	ranges must be adjacent (LHS.EndKey == RHS.StartKey). This constructs a
+//	MergeTrigger, runs the merge trigger evaluation, and stashes the resulting
+//	batch representing the pending raft log command. The batch is NOT committed
+//	until the merge is applied. However, the in-memory range state is updated
+//	to reflect the merge -- the LHS widens to cover the RHS keyspace.
+//	Optionally, we print the evaluated batch if running with the verbose flag.
+//
+// apply-merge range-id=<int>
+// ----
+//
+//	Applies the pending merge for the specified (LHS) range using the stashed
+//	batch that was generated during merge evaluation. This also subsumes the
+//	RHS replica, removing its RangeID-local state from storage and installing
+//	a merge tombstone. The RHS range is removed from the test context.
 //
 // destroy-replica range-id=<int>
 // ----
@@ -122,6 +148,13 @@ import (
 //	boundaries and is used as the base key for generating range data; otherwise
 //	the range's start key is used.
 //
+// add-abortspan-entry range-id=<int> [num-entries=<int>]
+// ----
+//
+//	Adds one or more synthetic abortspan entries to the specified range.
+//	Each entry uses a unique deterministic txn ID. The number of entries
+//	defaults to 1.
+//
 // print-range-state [sort-keys=<bool>]
 // ----
 //
@@ -129,11 +162,19 @@ import (
 //	sorted by range ID. If sort-keys is set to true, ranges are sorted by their
 //	descriptor's start key instead.
 //
+// disable-state-flush
+// ----
+//
+//	Disables state engine flushes. After this command, mutate() commits only
+//	the log engine batch, simulating a crash before the state engine batch is
+//	applied. WAG nodes are still written to the log engine.
+//
 // restart
 // ----
 //
-//	Simulates the node restart. It causes all uninitialized replicas to be
-//	forgotten because we don't load them on server startup.
+//	Simulates a node restart. Runs WAG replay to recover any state that was
+//	lost due to a crash (see disable-state-flush), then reloads all replica
+//	state from storage.
 func TestReplicaLifecycleDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -141,6 +182,10 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 	// Disable some metamorphic values for deterministic output.
 	storage.DisableMetamorphicSimpleValueEncoding(t)
 	batcheval.DisableMetamorphicSplitScansRightForStatsFirst(t)
+
+	// Enable verbose logging across all files. logCapture in restart
+	// filters down to entries from the files listed in capturedFiles.
+	testutils.SetVModule(t, "*=2")
 
 	datadriven.Walk(t, "testdata/replica_lifecycle", func(t *testing.T, path string) {
 		tc := newTestCtx()
@@ -171,20 +216,22 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				}
 
 				var err error
-				output := tc.mutate(t, func(stateBatch, raftBatch storage.Batch) {
+				output := tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
 					if initialized {
 						require.NoError(t, kvstorage.WriteInitialRangeState(
-							ctx, stateBatch, raftBatch,
+							ctx, b.State(), b.Raft(),
 							rs.desc, repl.ReplicaID, rs.version,
 						))
 					} else {
 						err = kvstorage.CreateUninitializedReplica(
-							ctx, kvstorage.WrapState(stateBatch), raftBatch, 1, /* StoreID */
+							ctx, kvstorage.WrapState(b.State()), kvstorage.RaftRO(tc.eng.LogEngine()),
+							b.WagWriter(),
+							1, /* StoreID */
 							roachpb.FullReplicaID{RangeID: rs.desc.RangeID, ReplicaID: repl.ReplicaID},
 						)
 					}
-					tc.updateReplicaStateFromStorage(t, ctx, rs, stateBatch, raftBatch, true /* justCreated */)
 				})
+				tc.updateReplicaStateFromStorage(ctx, t, rs, true /* justCreated */)
 				// CreateUninitializedReplica can return an error if the replica is
 				// already destroyed.
 				if errors.HasType(err, &kvpb.RaftGroupDeletedError{}) {
@@ -207,7 +254,7 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				}
 
 				require.NoError(t, kvstorage.MakeStateLoader(rangeID).SetHardState(
-					ctx, tc.raftStorage, rs.replica.hs,
+					ctx, tc.eng.LogEngine(), rs.replica.hs,
 				))
 				return fmt.Sprintf("HardState %+v", rs.replica.hs)
 
@@ -247,7 +294,8 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 			case "eval-split":
 				rangeID := dd.ScanArg[roachpb.RangeID](t, d, "range-id")
 				splitKey := roachpb.RKey(dd.ScanArg[string](t, d, "split-key"))
-				verbose := d.HasArg("verbose")
+				legacy, verbose := d.HasArg("legacy"), d.HasArg("verbose")
+
 				rs := tc.mustGetRangeState(t, rangeID)
 				desc := rs.desc
 				require.True(
@@ -270,15 +318,8 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				// generated for replication. Stash it away. This represents the
 				// raft log entry that will be applied as part of split
 				// application.
-				batch := tc.stateStorage.NewBatch()
-				rec := (&batcheval.MockEvalCtx{
-					ClusterSettings:        tc.st,
-					Desc:                   &desc,
-					Clock:                  tc.clock,
-					AbortSpan:              rs.abortspan,
-					LastReplicaGCTimestamp: rs.lastGCTimestamp,
-					RangeLeaseDuration:     tc.rangeLeaseDuration,
-				}).EvalContext()
+				batch := tc.eng.StateEngine().NewBatch()
+				rec := tc.makeEvalCtx(rs, &desc)
 
 				in := batcheval.SplitTriggerHelperInput{
 					LeftLease:      rs.lease,
@@ -287,14 +328,23 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 					ReplicaVersion: rs.version,
 				}
 				_, _, err := batcheval.TestingSplitTrigger(
-					ctx, rec, batch, enginepb.MVCCStats{}, &split, in, hlc.Timestamp{},
-				)
+					ctx, rec, batch, enginepb.MVCCStats{}, &split, in, hlc.Timestamp{})
 				require.NoError(t, err)
+				if legacy {
+					batch := spanset.DisableForbiddenSpanAssertions(batch)
+					writeLegacySplitTriggerKeys(ctx, t, batch, rightDesc.RangeID)
+				}
 
 				batchRepr := batch.Repr()
+				lhsRepl := rs.replica
+				require.NotNil(t, lhsRepl, "LHS replica must exist on n1/s1")
+				// Bump the raft index to account for where the split command
+				// would go in the raft log.
+				lhsRepl.lastIdx++
 				tc.splits[rangeID] = pendingSplit{
 					trigger:   split,
 					batchRepr: batchRepr,
+					raftIndex: lhsRepl.lastIdx,
 				}
 				tc.updatePostSplitRangeState(ctx, t, batch, split)
 				batch.Close()
@@ -315,6 +365,9 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				delete(tc.splits, rangeID)
 				split := ps.trigger
 
+				lhsRangeState := tc.mustGetRangeState(t, rangeID)
+				require.NotNil(t, lhsRangeState.replica, "LHS replica must exist on n1/s1")
+
 				// Determine if the RHS is "destroyed" by checking replica
 				// state. This mirrors the logic in validateAndPrepareSplit:
 				// - if there's no replica for the rhs, it's considered
@@ -324,26 +377,129 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				// destroyed).
 				rhsRangeState := tc.mustGetRangeState(t, split.RightDesc.RangeID)
 				rhsReplDesc := rhsRangeState.mustGetReplicaDescriptor(t, roachpb.NodeID(1))
-				destroyed := rhsRangeState.replica == nil ||
+				rhsDestroyed := rhsRangeState.replica == nil ||
 					rhsRangeState.replica.ReplicaID > rhsReplDesc.ReplicaID
 
 				in := splitPreApplyInput{
-					destroyed:           destroyed,
-					rhsDesc:             split.RightDesc,
+					lhsID:               lhsRangeState.replica.FullReplicaID,
+					lhsStartKey:         split.LeftDesc.StartKey,
+					raftIndex:           ps.raftIndex,
+					rhsID:               roachpb.FullReplicaID{RangeID: split.RightDesc.RangeID, ReplicaID: rhsReplDesc.ReplicaID},
+					rhsSpan:             split.RightDesc.RSpan(),
+					rhsDestroyed:        rhsDestroyed,
 					initClosedTimestamp: hlc.Timestamp{WallTime: 100}, // dummy timestamp
+					lhsLastReplicaGC:    hlc.Timestamp{},              // dummy timestamp
 				}
-				return tc.mutate(t, func(stateBatch, raftBatch storage.Batch) {
-					// First, apply the stashed batch from split trigger
-					// evaluation.
-					require.NoError(t, stateBatch.ApplyBatchRepr(ps.batchRepr, false /* sync */))
-					// Then run splitPreApply which does the apply-time tweaks.
-					splitPreApply(ctx, kvstorage.StateRW(stateBatch), kvstorage.WrapRaft(raftBatch), in)
-					// If the RHS replica wasn't destroyed, it is now initialized.
-					// Update the in-memory state to reflect this.
-					if !destroyed {
-						tc.updateReplicaStateFromStorage(t, ctx, rhsRangeState, stateBatch, raftBatch, false /* justCreated */)
-					}
+				output := tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
+					// First, apply the stashed batch from split trigger evaluation.
+					require.NoError(t, b.State().ApplyBatchRepr(ps.batchRepr, false /* sync */))
+					// Then run splitPreApply which does the apply-time tweaks and stages
+					// a WAG event in the batch.
+					splitPreApply(ctx, kvstorage.StateRW(b.State()), kvstorage.Raft{
+						RO: tc.eng.LogEngine(),
+						WO: b.Raft(),
+					}, b.WagWriter(), in)
 				})
+				// If the RHS replica wasn't destroyed, it is now initialized. Update
+				// the in-memory state to reflect this.
+				if !rhsDestroyed {
+					tc.updateReplicaStateFromStorage(ctx, t, rhsRangeState, false /* justCreated */)
+				}
+				return output
+
+			case "eval-merge":
+				lhsRangeID := dd.ScanArg[roachpb.RangeID](t, d, "lhs-range-id")
+				rhsRangeID := dd.ScanArg[roachpb.RangeID](t, d, "rhs-range-id")
+				verbose := d.HasArg("verbose")
+				lhsRS := tc.mustGetRangeState(t, lhsRangeID)
+				rhsRS := tc.mustGetRangeState(t, rhsRangeID)
+				require.True(t,
+					lhsRS.desc.EndKey.Equal(rhsRS.desc.StartKey),
+					"ranges are not adjacent: lhs end key %s != rhs start key %s",
+					lhsRS.desc.EndKey, rhsRS.desc.StartKey,
+				)
+
+				lhsDesc := lhsRS.desc
+				mergedDesc := lhsDesc
+				mergedDesc.EndKey = rhsRS.desc.EndKey
+				// NB: LeftDesc in the MergeTrigger is the *post-merge*
+				// descriptor (with the widened EndKey), matching production
+				// behavior in AdminMerge. The EvalContext's Desc, on the other
+				// hand, is the original pre-merge LHS descriptor; mergeTrigger
+				// validates that the two are consistent (same StartKey,
+				// LeftDesc.EndKey > Desc.EndKey).
+				merge := roachpb.MergeTrigger{
+					LeftDesc:  mergedDesc,
+					RightDesc: rhsRS.desc,
+				}
+
+				batch := tc.eng.StateEngine().NewBatch()
+				rec := tc.makeEvalCtx(lhsRS, &lhsDesc)
+
+				var ms enginepb.MVCCStats
+				_, err := batcheval.TestingMergeTrigger(
+					ctx, rec, batch, &ms, &merge, hlc.Timestamp{},
+				)
+				require.NoError(t, err)
+
+				batchRepr := batch.Repr()
+				lhsRepl := lhsRS.replica
+				require.NotNil(t, lhsRepl, "LHS replica must exist on n1/s1")
+				// Bump the raft index to account for where the merge command
+				// would go in the raft log.
+				lhsRepl.lastIdx++
+				tc.merges[lhsRangeID] = pendingMerge{
+					trigger:   merge,
+					batchRepr: batchRepr,
+					raftIndex: lhsRepl.lastIdx,
+				}
+				batch.Close()
+
+				if verbose {
+					output, err := print.DecodeWriteBatch(batchRepr)
+					require.NoError(t, err)
+					return strings.ReplaceAll(output, "\n\n", "\n")
+				}
+				return fmt.Sprintf("merged: r%d [%s, %s) + r%d [%s, %s) -> r%d [%s, %s)",
+					lhsDesc.RangeID, lhsDesc.StartKey, lhsDesc.EndKey,
+					rhsRS.desc.RangeID, rhsRS.desc.StartKey, rhsRS.desc.EndKey,
+					mergedDesc.RangeID, mergedDesc.StartKey, mergedDesc.EndKey)
+
+			case "apply-merge":
+				rangeID := dd.ScanArg[roachpb.RangeID](t, d, "range-id")
+				pm, ok := tc.merges[rangeID]
+				require.True(t, ok, "pending merge not found for range-id %d", rangeID)
+				// NB: Delete from the pending merge map before looking up the RHS via
+				// mustGetRangeState, which guards against operating on a subsumed range
+				// by scanning this map.
+				delete(tc.merges, rangeID)
+				merge := pm.trigger
+
+				lhsRS := tc.mustGetRangeState(t, rangeID)
+				rhsRS := tc.mustGetRangeState(t, merge.RightDesc.RangeID)
+				require.NotNil(t, rhsRS.replica, "rhs replica must exist for merge application")
+
+				lhsRS.desc = merge.LeftDesc // update to post-merge descriptor
+				output := tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
+					require.NoError(t, b.State().ApplyBatchRepr(pm.batchRepr, false /* sync */))
+					require.NoError(t, mergePreApply(ctx, kvstorage.ReadWriter{
+						State: kvstorage.WrapState(b.State()),
+						Raft:  kvstorage.Raft{RO: tc.eng.LogEngine(), WO: b.Raft()},
+					}, b.WagWriter(), mergePreApplyInput{
+						lhsID:       lhsRS.replica.FullReplicaID,
+						lhsStartKey: merge.LeftDesc.StartKey,
+						raftIndex:   pm.raftIndex,
+						rhsDestroyInfo: kvstorage.DestroyReplicaInfo{
+							FullReplicaID: rhsRS.replica.FullReplicaID,
+							// TODO(pav-kv): support the applied index properly.
+							RaftAppliedIndex: kvpb.RaftIndex(rhsRS.replica.hs.Commit),
+							Keys:             rhsRS.desc.RSpan(),
+							Separated:        tc.eng.Separated(),
+						},
+					}))
+				})
+				delete(tc.ranges, merge.RightDesc.RangeID)
+				return output
 
 			case "destroy-replica":
 				rangeID := dd.ScanArg[roachpb.RangeID](t, d, "range-id")
@@ -351,26 +507,25 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				rs.mustGetReplicaDescriptor(t, roachpb.NodeID(1)) // ensure replica exists
 
 				destroyInfo := kvstorage.DestroyReplicaInfo{
-					FullReplicaID: rs.replica.FullReplicaID,
+					FullReplicaID:    rs.replica.FullReplicaID,
+					RaftAppliedIndex: kvpb.RaftIndex(rs.replica.hs.Commit),
+					Separated:        tc.eng.Separated(),
 				}
-				// NB: destriyInfo.Keys is only set for initialized replicas.
+				// NB: destroyInfo.Keys is only set for initialized replicas.
 				if rs.replica.initialized() {
 					destroyInfo.Keys = rs.desc.RSpan()
 				}
 
-				output := tc.mutate(t, func(stateBatch, raftBatch storage.Batch) {
-					rw := kvstorage.ReadWriter{
-						State: kvstorage.WrapState(stateBatch),
-						Raft:  kvstorage.WrapRaft(raftBatch),
-					}
-					require.NoError(t, kvstorage.DestroyReplica(
-						ctx,
-						rw,
-						destroyInfo,
-						rs.desc.NextReplicaID,
-					))
+				output := tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
+					require.NoError(t, kvstorage.DestroyReplica(ctx, kvstorage.ReadWriter{
+						State: kvstorage.WrapState(b.State()),
+						Raft:  kvstorage.Raft{RO: tc.eng.LogEngine(), WO: b.Raft()},
+					}, b.WagWriter(), destroyInfo, rs.desc.NextReplicaID))
 				})
-				rs.replica = nil // clear the replica from the range state
+				// Reload from storage so the in-memory view reflects what's
+				// persisted (in crash mode, the destroy's state batch was
+				// dropped, so the replica is still alive in the state engine).
+				tc.updateReplicaStateFromStorage(ctx, t, rs, false /* justCreated */)
 				return output
 
 			case "append-raft-entries":
@@ -384,11 +539,11 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				rs.replica.lastIdx += kvpb.RaftIndex(numEntries)
 				term := rs.replica.hs.Term
 
-				return tc.mutate(t, func(_, raftBatch storage.Batch) {
+				return tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
 					for i := 0; i < numEntries; i++ {
 						entryIndex := lastIndex + 1 + kvpb.RaftIndex(i)
 						require.NoError(t, storage.MVCCBlindPutProto(
-							ctx, raftBatch,
+							ctx, b.Raft(),
 							sl.RaftLogKey(entryIndex), hlc.Timestamp{},
 							&raftpb.Entry{Index: uint64(entryIndex), Term: term},
 							storage.MVCCWriteOptions{},
@@ -416,17 +571,17 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 					return append(baseKey, strconv.Itoa(i)...)
 				}
 
-				return tc.mutate(t, func(stateBatch, _ storage.Batch) {
+				return tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
 					// 1. User keys.
 					for i := 0; i < numUserKeys; i++ {
-						require.NoError(t, stateBatch.PutMVCC(
+						require.NoError(t, b.State().PutMVCC(
 							storage.MVCCKey{Key: getUserKey(i), Timestamp: ts}, storage.MVCCValue{},
 						))
 					}
 					// 2. System keys.
 					for i := 0; i < numSystemKeys; i++ {
 						key := keys.TransactionKey(getUserKey(i), uuid.NamespaceDNS)
-						require.NoError(t, stateBatch.PutMVCC(
+						require.NoError(t, b.State().PutMVCC(
 							storage.MVCCKey{Key: key, Timestamp: ts}, storage.MVCCValue{},
 						))
 					}
@@ -435,7 +590,24 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 						ek, _ := storage.LockTableKey{
 							Key: getUserKey(i), Strength: lock.Intent, TxnUUID: uuid.UUID{},
 						}.ToEngineKey(nil)
-						require.NoError(t, stateBatch.PutEngineKey(ek, nil))
+						require.NoError(t, b.State().PutEngineKey(ek, nil))
+					}
+				})
+
+			case "add-abortspan-entry":
+				rangeID := dd.ScanArg[roachpb.RangeID](t, d, "range-id")
+				numEntries := dd.ScanArgOr(t, d, "num-entries", 1)
+				rs := tc.mustGetRangeState(t, rangeID)
+				return tc.mutate(t, func(b *kvstorage.Batch[storage.Batch]) {
+					for i := 0; i < numEntries; i++ {
+						txnID := uuid.FromUint128(uint128.FromInts(0, uint64(i+1)))
+						require.NoError(t, rs.abortspan.Put(ctx, b.State(), nil, /* ms */
+							txnID, &roachpb.AbortSpanEntry{
+								Key:       rs.desc.StartKey.AsRawKey(),
+								Timestamp: hlc.Timestamp{WallTime: 10},
+								Priority:  100,
+							},
+						))
 					}
 				})
 
@@ -462,9 +634,12 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				}
 				return sb.String()
 
-			case "restart":
-				tc.restart()
+			case "disable-state-flush":
+				tc.crashMode = true
 				return "ok"
+
+			case "restart":
+				return tc.restart(ctx, t)
 
 			default:
 				return fmt.Sprintf("unknown command: %s", d.Cmd)
@@ -482,16 +657,18 @@ type rangeState struct {
 	gcHint          roachpb.GCHint
 	abortspan       *abortspan.AbortSpan
 	lastGCTimestamp hlc.Timestamp
-	replica         *replicaInfo // replica on n1/s1.
+	replica         *replicaInfo      // replica on n1/s1.
+	tombstone       roachpb.ReplicaID // NextReplicaID from RangeTombstone
 }
 
 // replicaInfo contains the basic info about a replica, used for managing its
 // engine (both raft log and state machine) state.
 type replicaInfo struct {
 	roachpb.FullReplicaID
-	hs      raftpb.HardState
-	ts      kvserverpb.RaftTruncatedState
-	lastIdx kvpb.RaftIndex
+	hs           raftpb.HardState
+	ts           kvserverpb.RaftTruncatedState
+	lastIdx      kvpb.RaftIndex
+	appliedIndex kvpb.RaftIndex
 }
 
 // initialized returns true iff the replica is initialized.
@@ -503,6 +680,14 @@ func (r *replicaInfo) initialized() bool {
 type pendingSplit struct {
 	trigger   roachpb.SplitTrigger
 	batchRepr []byte
+	raftIndex kvpb.RaftIndex
+}
+
+// pendingMerge represents a merge that has been evaluated but not yet applied.
+type pendingMerge struct {
+	trigger   roachpb.MergeTrigger
+	batchRepr []byte
+	raftIndex kvpb.RaftIndex
 }
 
 // testCtx is a single test's context. It tracks the state of all ranges and any
@@ -515,11 +700,22 @@ type testCtx struct {
 	nextRangeID roachpb.RangeID // monotonically-increasing rangeID
 	ranges      map[roachpb.RangeID]*rangeState
 	splits      map[roachpb.RangeID]pendingSplit
+	merges      map[roachpb.RangeID]pendingMerge
+
 	// The storage engines correspond to a single store, (n1, s1). The engines
 	// are logically separated into two -- one for the state machine, and one
 	// for Raft.
-	stateStorage storage.Engine
-	raftStorage  storage.Engine
+	eng    kvstorage.Engines
+	wagSeq wag.Seq
+	bf     kvstorage.BatchFactory
+
+	// crashMode, when true, causes mutate() to commit only the log engine
+	// batch, simulating a crash before the state engine batch is applied.
+	// Enabled by disable-state-flush and cleared by restart.
+	//
+	// TODO(mira): replace the "drop the state batch" crash approximation with vfs.CrashClone
+	// of the state engine's FS, so the write path in mutate() is unchanged.
+	crashMode bool
 }
 
 // newTestCtx constructs and returns a new testCtx.
@@ -527,44 +723,77 @@ func newTestCtx() *testCtx {
 	st := cluster.MakeTestingClusterSettings()
 	manual := timeutil.NewManualTime(timeutil.Unix(0, 10))
 	clock := hlc.NewClockForTesting(manual)
-	return &testCtx{
+	tc := &testCtx{
 		st:                 st,
 		clock:              clock,
 		rangeLeaseDuration: 99 * time.Nanosecond,
 
-		nextRangeID:  1,
-		ranges:       make(map[roachpb.RangeID]*rangeState),
-		splits:       make(map[roachpb.RangeID]pendingSplit),
-		stateStorage: storage.NewDefaultInMemForTesting(),
-		raftStorage:  storage.NewDefaultInMemForTesting(),
+		nextRangeID: 1,
+		ranges:      make(map[roachpb.RangeID]*rangeState),
+		splits:      make(map[roachpb.RangeID]pendingSplit),
+		merges:      make(map[roachpb.RangeID]pendingMerge),
+		eng: kvstorage.MakeSeparatedEnginesForTesting(
+			storage.NewDefaultInMemForTesting(),
+			storage.NewDefaultInMemForTesting(),
+		),
 	}
+	tc.bf = kvstorage.MakeBatchFactory(&tc.eng, &tc.wagSeq)
+	return tc
+}
+
+// makeEvalCtx constructs a batcheval.EvalContext for the given range.
+func (tc *testCtx) makeEvalCtx(
+	rs *rangeState, desc *roachpb.RangeDescriptor,
+) batcheval.EvalContext {
+	return (&batcheval.MockEvalCtx{
+		ClusterSettings:        tc.st,
+		Desc:                   desc,
+		Clock:                  tc.clock,
+		AbortSpan:              rs.abortspan,
+		LastReplicaGCTimestamp: rs.lastGCTimestamp,
+		RangeLeaseDuration:     tc.rangeLeaseDuration,
+	}).EvalContext()
 }
 
 // close closes the test context's storage engines.
 func (tc *testCtx) close() {
-	tc.stateStorage.Close()
-	tc.raftStorage.Close()
+	tc.eng.Close()
 }
 
 // mutate executes a write operation on both state and raft storage batches
 // and commits them. All KVs written as part of both batches are returned as a
 // string for the benefit of the datadriven test output, with explicit labels
 // for each engine.
-func (tc *testCtx) mutate(t *testing.T, write func(stateBatch, raftBatch storage.Batch)) string {
-	stateBatch := tc.stateStorage.NewBatch()
-	defer stateBatch.Close()
-	raftBatch := tc.raftStorage.NewBatch()
-	defer raftBatch.Close()
+func (tc *testCtx) mutate(t *testing.T, write func(b *kvstorage.Batch[storage.Batch])) string {
+	b := tc.bf.NewBatch()
+	defer b.Close()
+	write(&b)
 
-	write(stateBatch, raftBatch)
+	stateRepr := b.State().Repr()
+	require.NoError(t, b.TestingFlushWAG())
+	raftRepr := b.Raft().Repr()
 
-	stateOutput, err := print.DecodeWriteBatch(stateBatch.Repr())
+	// If the raft batch contains a WAG node with an embedded state engine
+	// batch, verify it matches and omit the state engine output — the WAG
+	// node in the raft output already contains it.
+	var stateOutput string
+	if wag.AssertMutationBatch(t, raftRepr, stateRepr) {
+		stateOutput = "(matches WAG node)\n"
+	} else {
+		var err error
+		stateOutput, err = print.DecodeWriteBatch(stateRepr)
+		require.NoError(t, err)
+	}
+	raftOutput, err := print.DecodeWriteBatch(raftRepr)
 	require.NoError(t, err)
-	raftOutput, err := print.DecodeWriteBatch(raftBatch.Repr())
-	require.NoError(t, err)
 
-	require.NoError(t, raftBatch.Commit(false))
-	require.NoError(t, stateBatch.Commit(false))
+	if tc.crashMode {
+		// In crash mode, commit only the log engine batch. The state engine
+		// batch is dropped, simulating a crash after writing the WAG node.
+		require.NoError(t, b.Raft().Commit(true /* sync */))
+	} else {
+		require.NoError(t, b.Commit(false /* sync */))
+	}
 
 	// TODO(arul): There may be double new lines in the output (see tryTxn in
 	// debug_print.go) that we need to strip out for the benefit of the
@@ -640,39 +869,56 @@ func newRangeState(desc roachpb.RangeDescriptor) *rangeState {
 	}
 }
 
-// mustGetRangeState returns the range state for the given range ID.
+// mustGetRangeState returns the range state for the given range ID. It fails
+// the test if the range is not found or is the RHS of a pending merge.
 func (tc *testCtx) mustGetRangeState(t *testing.T, rangeID roachpb.RangeID) *rangeState {
 	rs, ok := tc.ranges[rangeID]
 	require.True(t, ok, "range-id %d not found", rangeID)
+	require.False(t, tc.preMergeRHSIsSubsumed(rangeID), "range r%d is subsumed", rangeID)
 	return rs
 }
 
+// preMergeRHSIsSubsumed returns true if the given range is the RHS of a pending
+// merge that has been evaluated but not yet applied.
+func (tc *testCtx) preMergeRHSIsSubsumed(rangeID roachpb.RangeID) bool {
+	for _, pm := range tc.merges {
+		if pm.trigger.RightDesc.RangeID == rangeID {
+			return true
+		}
+	}
+	return false
+}
+
 func (tc *testCtx) updateReplicaStateFromStorage(
-	t *testing.T,
-	ctx context.Context,
-	rs *rangeState,
-	stateReader, raftReader storage.Reader,
-	justCreated bool,
+	ctx context.Context, t *testing.T, rs *rangeState, justCreated bool,
 ) {
 	if justCreated {
 		// Sanity check that we're not overwriting an existing replica.
 		require.Nil(t, rs.replica)
 	}
 	sl := kvstorage.MakeStateLoader(rs.desc.RangeID)
-	hs, err := sl.LoadHardState(ctx, raftReader)
+	hs, err := sl.LoadHardState(ctx, tc.eng.LogEngine())
 	require.NoError(t, err)
-	ts, err := sl.LoadRaftTruncatedState(ctx, raftReader)
+	ts, err := sl.LoadRaftTruncatedState(ctx, tc.eng.LogEngine())
 	require.NoError(t, err)
-	replID, err := sl.LoadRaftReplicaID(ctx, stateReader)
+	mark, err := sl.LoadReplicaMark(ctx, tc.eng.StateEngine())
+	require.NoError(t, err)
+	rs.tombstone = mark.NextReplicaID
+	if !mark.Exists() {
+		rs.replica = nil
+		return
+	}
+	as, err := sl.LoadRangeAppliedState(ctx, tc.eng.StateEngine())
 	require.NoError(t, err)
 	rs.replica = &replicaInfo{
 		FullReplicaID: roachpb.FullReplicaID{
 			RangeID:   rs.desc.RangeID,
-			ReplicaID: replID.ReplicaID,
+			ReplicaID: mark.ReplicaID,
 		},
-		hs:      hs,
-		ts:      ts,
-		lastIdx: ts.Index,
+		hs:           hs,
+		ts:           ts,
+		lastIdx:      ts.Index,
+		appliedIndex: as.RaftAppliedIndex,
 	}
 }
 
@@ -712,18 +958,61 @@ func (rs *rangeState) String() string {
 	if rs.replica != nil {
 		sb.WriteString(fmt.Sprintf("\n		replica (n1/s1): %s", rs.replica))
 	}
+	if rs.tombstone != 0 {
+		sb.WriteString(fmt.Sprintf("\n		tombstone: next_replica_id=%d", rs.tombstone))
+	}
 	if (rs.lease != roachpb.Lease{}) {
 		sb.WriteString(fmt.Sprintf("\n		lease: %s", rs.lease))
 	}
 	return sb.String()
 }
 
-// restart imitates the node restart. It causes all uninitialized replicas to be
-// forgotten because we don't load them on server startup.
-func (tc *testCtx) restart() {
+// restart imitates a node restart. WAG replay recovers any state engine
+// writes that were dropped under crash mode (see disable-state-flush). All
+// replica state is then reloaded from storage, and uninitialized replicas
+// are forgotten (they aren't loaded on real startup).
+func (tc *testCtx) restart(ctx context.Context, t *testing.T) string {
+	t.Helper()
+	// Re-init the WAG sequencer and replay any unapplied WAG nodes.
+	require.NoError(t, tc.wagSeq.Init(ctx, tc.eng.LogEngine()))
+	var capture logCapture
+	defer log.InterceptWith(ctx, &capture)()
+	require.NoError(t, kvstorage.ReplayWAG(
+		ctx,
+		kvstorage.RaftRO(tc.eng.LogEngine()),
+		kvstorage.StateRW(tc.eng.StateEngine()),
+		tc.newReplayBatch,
+	))
+	// Reload replica state from storage for all ranges, then forget
+	// uninitialized replicas (matching real startup behavior).
 	for _, rs := range tc.ranges {
+		tc.updateReplicaStateFromStorage(ctx, t, rs, false /* justCreated */)
 		if rs.replica != nil && !rs.replica.initialized() {
 			rs.replica = nil
+		}
+	}
+	tc.crashMode = false
+	return strings.Join(capture, "\n")
+}
+
+// capturedFiles lists files whose log entries are captured into the test
+// output by logCapture.
+var capturedFiles = []string{"wag_replay"}
+
+// logCapture is a log.Interceptor that collects log entries emitted by the
+// allowlisted files in capturedFiles.
+type logCapture []string
+
+// Intercept implements log.Interceptor.
+func (c *logCapture) Intercept(jsonBytes []byte) {
+	var e logpb.Entry
+	if err := json.Unmarshal(jsonBytes, &e); err != nil {
+		return
+	}
+	for _, f := range capturedFiles {
+		if strings.Contains(e.File, "/"+f+".go") {
+			*c = append(*c, e.Message)
+			return
 		}
 	}
 }
@@ -740,7 +1029,73 @@ func (r *replicaInfo) String() string {
 	}
 
 	sb.WriteString(hs)
+	sb.WriteString(fmt.Sprintf(" AppliedIndex=%d", r.appliedIndex))
 	sb.WriteString(fmt.Sprintf(" TruncatedState={Index:%d,Term:%d}", r.ts.Index, r.ts.Term))
 	sb.WriteString(fmt.Sprintf(" LastIdx=%d", r.lastIdx))
 	return sb.String()
+}
+
+// newReplayBatch returns a ReplayBatch that advances the applied index for
+// each raft entry without decoding the entry payload. On Commit, it persists
+// the updated applied state to the state engine.
+func (tc *testCtx) newReplayBatch(
+	ctx context.Context, rangeID roachpb.RangeID, _ roachpb.RKey,
+) (kvstorage.ReplayBatch, error) {
+	sl := kvstorage.MakeStateLoader(rangeID)
+	as, err := sl.LoadRangeAppliedState(ctx, tc.eng.StateEngine())
+	if err != nil {
+		return nil, err
+	}
+	return &testReplayBatch{
+		sl:       sl,
+		stateEng: tc.eng.StateEngine(),
+		as:       as,
+	}, nil
+}
+
+type testReplayBatch struct {
+	sl       kvstorage.StateLoader
+	stateEng storage.Engine
+	as       *kvserverpb.RangeAppliedState
+}
+
+func (b *testReplayBatch) AppliedIndex() kvpb.RaftIndex {
+	return b.as.RaftAppliedIndex
+}
+
+func (b *testReplayBatch) ApplyEntry(_ context.Context, ent raftpb.Entry) (bool, error) {
+	b.as.RaftAppliedIndex = kvpb.RaftIndex(ent.Index)
+	return true, nil
+}
+
+func (b *testReplayBatch) Commit(ctx context.Context) error {
+	return b.sl.SetRangeAppliedState(ctx, b.stateEng, b.as)
+}
+
+func (b *testReplayBatch) Close() {}
+
+// writeLegacySplitTriggerKeys simulates the legacy split trigger behavior where
+// some unreplicated keys of the RHS were written to the evaluated batch (now
+// written at apply time instead). This includes writing RaftTruncatedState and
+// LastReplicaGCTimestamp.
+//
+// TODO(#152847): remove when there are no historical proposals with these keys,
+// e.g. after a below-raft migration.
+func writeLegacySplitTriggerKeys(
+	ctx context.Context, t *testing.T, w storage.Writer, rhsRangeID roachpb.RangeID,
+) {
+	t.Helper()
+	require.NoError(t, storage.MVCCBlindPutProto(
+		ctx, w,
+		keys.RangeLastReplicaGCTimestampKey(rhsRangeID), hlc.Timestamp{},
+		&hlc.Timestamp{WallTime: 1234}, storage.MVCCWriteOptions{},
+	))
+	require.NoError(t, storage.MVCCBlindPutProto(
+		ctx, w,
+		keys.RaftTruncatedStateKey(rhsRangeID), hlc.Timestamp{},
+		&kvserverpb.RaftTruncatedState{
+			Index: kvstorage.RaftInitialLogIndex,
+			Term:  kvstorage.RaftInitialLogTerm,
+		}, storage.MVCCWriteOptions{},
+	))
 }

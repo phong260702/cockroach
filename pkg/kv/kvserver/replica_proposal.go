@@ -786,7 +786,7 @@ func linkExternalSStablePreApply(
 	}
 
 	externalFile := pebble.ExternalFile{
-		Locator:           remote.Locator(sst.RemoteFileLoc),
+		Locator:           remote.MakeLocator(sst.RemoteFileLoc),
 		ObjName:           sst.RemoteFilePath,
 		Size:              sst.ApproximatePhysicalSize,
 		StartKey:          start.Encode(),
@@ -977,8 +977,9 @@ func makeProposalResultErr(err error) proposalResult {
 func (r *Replica) evaluateProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
+	ss *kvpb.ScanStats,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 ) (*kvpb.BatchRequest, *result.Result, bool, *kvpb.Error) {
@@ -996,7 +997,7 @@ func (r *Replica) evaluateProposal(
 	//
 	// TODO(tschottdorf): absorb all returned values in `res` below this point
 	// in the call stack as well.
-	ba, batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, g, st, ui)
+	ba, batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ss, ba, g, st, ui)
 
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
@@ -1006,10 +1007,6 @@ func (r *Replica) evaluateProposal(
 	}
 
 	if pErr != nil {
-		if _, ok := pErr.GetDetail().(*kvpb.ReplicaCorruptionError); ok {
-			return ba, &res, false /* needConsensus */, pErr
-		}
-
 		txn := pErr.GetTxn()
 		if txn != nil && ba.Txn == nil {
 			log.KvExec.Fatalf(ctx, "error had a txn but batch is non-transactional. Err txn: %s", txn)
@@ -1087,12 +1084,13 @@ func (r *Replica) evaluateProposal(
 func (r *Replica) requestToProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
+	ss *kvpb.ScanStats,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 ) (*ProposalData, *kvpb.Error) {
-	ba, res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, g, st, ui)
+	ba, res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ss, ba, g, st, ui)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.
 	proposal := &ProposalData{

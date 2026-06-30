@@ -9,14 +9,19 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/hints"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/prep"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -29,7 +34,7 @@ import (
 
 func (ex *connExecutor) execPrepare(
 	ctx context.Context, parseCmd PrepareStmt,
-) (fsm.Event, fsm.EventPayload) {
+) (retEv fsm.Event, retPayload fsm.EventPayload) {
 	retErr := func(err error) (fsm.Event, fsm.EventPayload) {
 		return ex.makeErrEvent(err, parseCmd.AST)
 	}
@@ -81,8 +86,23 @@ func (ex *connExecutor) execPrepare(
 		ctx, parseCmd.Statement, ex.server.cfg.GenerateID(),
 		tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(ex.server.cfg.SV())),
 		statementHintsCache,
+		ex.sessionData().Database,
 	)
-	_, err := ex.addPreparedStmt(
+	// Create a sequencing point so KV reads issued during prepare (e.g.
+	// descriptor resolution) observe a valid read snapshot, including
+	// after a prior ROLLBACK TO SAVEPOINT. For an internal executor
+	// running under an outer txn, the deferred cleanup undoes the step
+	// so the parent's read snapshot is left untouched.
+	cleanup, err := ex.stepReadSequenceWithRestore(ctx)
+	if err != nil {
+		return retErr(err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			retEv, retPayload = retErr(err)
+		}
+	}()
+	_, err = ex.addPreparedStmt(
 		ctx,
 		parseCmd.Name,
 		stmt,
@@ -195,6 +215,7 @@ func (ex *connExecutor) prepare(
 	}
 
 	var flags planFlags
+	var udts []*types.T
 	prepare := func(ctx context.Context, txn *kv.Txn) (err error) {
 		p := &ex.planner
 		if origin == prep.StatementOriginWire {
@@ -205,6 +226,8 @@ func (ex *connExecutor) prepare(
 			// the planner here would break the assumptions of the instrumentation.
 			ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime())
+			ex.execMon.StartNoReserved(ctx, ex.state.txnMon)
+			defer ex.execMon.Stop(ctx)
 		}
 
 		if err := ex.maybeAdjustTxnForDDL(ctx, stmt); err != nil {
@@ -262,7 +285,14 @@ func (ex *connExecutor) prepare(
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 		p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
-		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p, origin)
+		flags, udts, err = ex.populatePrepared(ctx, txn, placeholderHints, p, origin)
+		// Copy the udts slice to ensure prepared statements and memos
+		// maintain independent references. The reason for the separation is
+		// that, when UDT versions change, we update only the prepared
+		// statement's udts while keeping the memo's udts unchanged, so that
+		// the memo is properly invalidated during plan generation.
+		prepared.UDTs = make([]*types.T, len(udts))
+		copy(prepared.UDTs, udts)
 		return err
 	}
 
@@ -294,10 +324,10 @@ func (ex *connExecutor) populatePrepared(
 	placeholderHints tree.PlaceholderTypes,
 	p *planner,
 	origin prep.StatementOrigin,
-) (planFlags, error) {
+) (planFlags, []*types.T, error) {
 	if before := ex.server.cfg.TestingKnobs.BeforePrepare; before != nil {
 		if err := before(ctx, ex.planner.stmt.String(), txn); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	stmt := &p.stmt
@@ -311,8 +341,22 @@ func (ex *connExecutor) populatePrepared(
 	// for pgwire- or SQL-level prepared statements.
 	if origin != prep.StatementOriginSessionMigration {
 		if err := ex.handleAOST(ctx, p.stmt.AST); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
+	}
+
+	// Force StatsRolloutStable during PREPARE so the cached memo is built
+	// with stable (baseline) stats. This applies when:
+	//   - canary_fraction > 0 (auto mode may roll canary during EXECUTE), or
+	//   - canary_stats_mode is force_canary or force_stable (session
+	//     overrides the rollout, and EXECUTE will use a non-Default rollout).
+	// During EXECUTE, the dice is rolled per query: stable executions reuse
+	// this memo; canary executions skip it and rebuild from scratch with
+	// canary stats (see the canary guard in chooseValidPreparedMemo).
+	if !p.SessionData().Internal &&
+		(stats.CanaryFraction.Get(&p.EvalContext().Settings.SV) > 0 ||
+			p.SessionData().CanaryStatsMode != sessiondatapb.CanaryStatsModeAuto) {
+		p.EvalContext().StatsRollout = eval.StatsRolloutStable
 	}
 
 	// PREPARE has a limited subset of statements it can be run with. Postgres
@@ -322,19 +366,19 @@ func (ex *connExecutor) populatePrepared(
 	// However, we must be able to handle every type of statement below because
 	// the Postgres extended protocol requires running statements via the prepare
 	// and execute paths.
-	flags, err := p.prepareUsingOptimizer(ctx, origin)
+	flags, udts, err := p.prepareUsingOptimizer(ctx, origin)
 	if err != nil {
 		log.VEventf(ctx, 1, "optimizer prepare failed: %v", err)
-		return 0, err
+		return 0, nil, err
 	}
 	log.VEvent(ctx, 2, "optimizer prepare succeeded")
 	// stmt.Prepared fields have been populated.
-	return flags, nil
+	return flags, udts, nil
 }
 
 func (ex *connExecutor) execBind(
 	ctx context.Context, bindCmd BindStmt,
-) (fsm.Event, fsm.EventPayload) {
+) (retEv fsm.Event, retPayload fsm.EventPayload) {
 	var ps *prep.Statement
 	retErr := func(err error) (fsm.Event, fsm.EventPayload) {
 		if bindCmd.PreparedStatementName != "" {
@@ -397,6 +441,22 @@ func (ex *connExecutor) execBind(
 
 	numQArgs := uint16(len(ps.InferredTypes))
 
+	// Create a sequencing point so KV reads issued during bind (e.g.
+	// ResolveTypeByOID for enum parameters, descriptor staleness checks)
+	// observe a valid read snapshot, including after a prior ROLLBACK TO
+	// SAVEPOINT. For an internal executor running under an outer txn,
+	// the deferred cleanup undoes the step so the parent's read snapshot
+	// is left untouched.
+	cleanup, err := ex.stepReadSequenceWithRestore(ctx)
+	if err != nil {
+		return retErr(err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			retEv, retPayload = retErr(err)
+		}
+	}()
+
 	// Decode the arguments, except for internal queries for which we just verify
 	// that the arguments match what's expected.
 	qargs := make(tree.QueryArguments, numQArgs)
@@ -450,6 +510,8 @@ func (ex *connExecutor) execBind(
 			ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 			p := &ex.planner
 			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+			ex.execMon.StartNoReserved(ctx, ex.state.txnMon)
+			defer ex.execMon.Stop(ctx)
 			if err := ex.handleAOST(ctx, ps.AST); err != nil {
 				return err
 			}
@@ -514,6 +576,59 @@ func (ex *connExecutor) execBind(
 		return retErr(err)
 	}
 
+	// Validate that the prepared statement's result type hasn't changed due to
+	// schema changes. This check needs to happen during Bind (not Execute) to
+	// match PostgreSQL's behavior of returning errors before sending BindComplete.
+	// See issue #152791.
+	if len(ps.Columns) > 0 {
+		// Use chooseGenericPlan to determine which memo will actually be used
+		// during Execute, then check that memo for staleness. This mirrors
+		// the logic in chooseValidPreparedMemo.
+		p := &ex.planner
+		ex.resetPlanner(ctx, p, ex.state.mu.txn, ex.server.cfg.Clock.PhysicalTime())
+		p.stmt.Prepared = ps
+		opc := &p.optPlanningCtx
+		opc.reset(ctx)
+		cachedMemo := ps.BaseMemo
+		if opc.chooseGenericPlan(ctx) {
+			cachedMemo = ps.GenericMemo
+		}
+		if cachedMemo != nil {
+			// Phase 1: Check if the memo's dependencies are stale. This is a
+			// cheap descriptor version comparison that avoids rebuilding the
+			// optbuilder expression on every Bind call.
+			isStale, err := cachedMemo.IsStale(ctx, p.EvalContext(), opc.catalog)
+			if err != nil {
+				return retErr(err)
+			}
+			if isStale {
+				// Phase 2: The schema has changed. Rebuild the expression to get
+				// the current result columns, then compare against the prepared
+				// statement's columns.
+				p.semaCtx.Placeholders.Init(len(ps.TypeHints), ps.TypeHints)
+				f := opc.optimizer.Factory()
+				bld := optbuilder.New(ctx, &p.semaCtx, p.EvalContext(), opc.catalog, f, ps.AST)
+				bld.KeepPlaceholders = true
+				if err := bld.Build(); err != nil {
+					return retErr(err)
+				}
+
+				newMemo := f.Memo()
+				md := newMemo.Metadata()
+				physical := newMemo.RootProps()
+				currentCols := make(colinfo.ResultColumns, len(physical.Presentation))
+				for i, col := range physical.Presentation {
+					colMeta := md.ColumnMeta(col.ID)
+					currentCols[i].Name = col.Alias
+					currentCols[i].Typ = colMeta.Type
+				}
+				if !ps.Columns.TypesEqual(currentCols) {
+					return retErr(pgerror.New(pgcode.FeatureNotSupported, "cached plan must not change result type"))
+				}
+			}
+		}
+	}
+
 	columnFormatCodes := bindCmd.OutFormats
 	if len(bindCmd.OutFormats) == 1 && numCols > 1 {
 		// Apply the format code to every column.
@@ -530,7 +645,7 @@ func (ex *connExecutor) execBind(
 
 	if log.V(2) {
 		log.Dev.Infof(ctx, "portal: %q for %q, args %q, formats %q",
-			portalName, ps.Statement, qargs, columnFormatCodes)
+			portalName, ps.Statement.SQL, qargs, columnFormatCodes)
 	}
 
 	return nil, nil

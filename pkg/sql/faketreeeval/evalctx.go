@@ -238,7 +238,14 @@ func (ep *DummyEvalPlanner) ResetLeaseTimestamp(ctx context.Context) {
 	panic(errors.WithStack(errEvalPlanner))
 }
 
-// UserHasAdminRole is part of the Planner interface.
+// MaybeResolveSystemRoleOID is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) MaybeResolveSystemRoleOID(
+	ctx context.Context, roleOID oid.Oid,
+) (string, bool) {
+	return "", false
+}
+
+// UserHasAdminRole is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) UserHasAdminRole(
 	ctx context.Context, user username.SQLUsername,
 ) (bool, error) {
@@ -327,13 +334,25 @@ func (*DummyEvalPlanner) RepairTTLScheduledJobForTable(ctx context.Context, tabl
 	return errors.WithStack(errEvalPlanner)
 }
 
-// Mon is part of the eval.Planner interface.
-func (ep *DummyEvalPlanner) Mon() *mon.BytesMonitor {
+// TxnMon is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) TxnMon() *mon.BytesMonitor {
+	// DummyEvalPlanner is only used for remote flows during the execution, so
+	// it doesn't really have a txn-bound monitor.
+	return nil
+}
+
+// ExecMon is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) ExecMon() *mon.BytesMonitor {
 	return ep.Monitor
 }
 
 // ExecutorConfig is part of the Planner interface.
 func (*DummyEvalPlanner) ExecutorConfig() interface{} {
+	return nil
+}
+
+// TimeSeriesQuerier is part of the eval.Planner interface.
+func (*DummyEvalPlanner) TimeSeriesQuerier() eval.TimeSeriesQuerier {
 	return nil
 }
 
@@ -603,9 +622,33 @@ func (ep *DummyEvalPlanner) ProcessVectorIndexFixups(
 
 // InsertStatementHint is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) InsertStatementHint(
-	ctx context.Context, statementFingerprint string, hint hintpb.StatementHintUnion,
+	ctx context.Context,
+	statementFingerprint string,
+	hint hintpb.StatementHintUnion,
+	optDatabase string,
+) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+// DeleteStatementHint is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) DeleteStatementHint(
+	ctx context.Context, rowID int64, statementFingerprint string, optDatabase string,
+) ([]int64, []string, [][]byte, error) {
+	return nil, nil, nil, nil
+}
+
+// SetStatementHintEnabled is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) SetStatementHintEnabled(
+	ctx context.Context, rowID int64, statementFingerprint string, enabled bool, optDatabase string,
 ) (int64, error) {
 	return 0, nil
+}
+
+// ValidateSessionVariableHint is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) ValidateSessionVariableHint(
+	ctx context.Context, varName, varValue string, safeUpdates bool,
+) error {
+	return nil
 }
 
 // UsingHintInjection is part of the eval.Planner interface.
@@ -621,6 +664,30 @@ func (ep *DummyEvalPlanner) GetHintIDs() []int64 {
 // LogEvent is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) LogEvent(ctx context.Context, event interface{}) error {
 	return nil
+}
+
+// AdvisoryXactLock is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) AdvisoryXactLock(ctx context.Context, _ int64, _ bool) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// AdvisoryXactLockInt4 is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) AdvisoryXactLockInt4(ctx context.Context, _, _ int32, _ bool) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// AdvisoryTryXactLock is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) AdvisoryTryXactLock(
+	ctx context.Context, _ int64, _ bool,
+) (bool, error) {
+	return false, errors.WithStack(errEvalPlanner)
+}
+
+// AdvisoryTryXactLockInt4 is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) AdvisoryTryXactLockInt4(
+	ctx context.Context, _, _ int32, _ bool,
+) (bool, error) {
+	return false, errors.WithStack(errEvalPlanner)
 }
 
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.
@@ -648,6 +715,20 @@ func (ep *DummyPrivilegedAccessor) LookupZoneConfigByNamespaceID(
 // IsSystemTable is part of the tree.PrivilegedAccessor interface.
 func (ep *DummyPrivilegedAccessor) IsSystemTable(ctx context.Context, id int64) (bool, error) {
 	return false, errors.WithStack(errEvalPrivileged)
+}
+
+// ResolvedZoneConfigForKey is part of the eval.PrivilegedAccessor interface.
+func (ep *DummyPrivilegedAccessor) ResolvedZoneConfigForKey(
+	ctx context.Context, key roachpb.Key,
+) (tree.Datum, error) {
+	return nil, errors.WithStack(errEvalPrivileged)
+}
+
+// ZoneConfigSpanEnd is part of the eval.PrivilegedAccessor interface.
+func (ep *DummyPrivilegedAccessor) ZoneConfigSpanEnd(
+	ctx context.Context, key roachpb.Key,
+) (roachpb.Key, error) {
+	return nil, errors.WithStack(errEvalPrivileged)
 }
 
 // DummySessionAccessor implements the eval.SessionAccessor interface by returning errors.

@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
@@ -115,8 +117,9 @@ import (
 var looselyCoupledTruncationEnabled = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.raft_log.loosely_coupled_truncation.enabled",
-	"set to true to loosely couple the raft log truncation",
-	false,
+	"set to true to loosely couple the raft log truncation. Loosely coupled truncations are "+
+		"automatically enabled if engines are separated",
+	metamorphic.ConstantWithTestBool("kv.raft_log.loosely_coupled_truncation.enabled", false),
 	settings.WithVisibility(settings.Reserved),
 )
 
@@ -697,6 +700,8 @@ func (rlq *raftLogQueue) process(
 		log.VEventf(ctx, 1, "%v", redact.Safe(decision.String()))
 	}
 	b := &kv.Batch{}
+	b.Header.WorkloadID = uint64(workloadid.WORKLOAD_ID_RAFT_LOG_TRUNCATION)
+	b.Header.WorkloadType = workloadid.WorkloadTypeSystem.ToUint32()
 	truncRequest := &kvpb.TruncateLogRequest{
 		RequestHeader:      kvpb.RequestHeader{Key: r.Desc().StartKey.AsRawKey()},
 		Index:              decision.NewCompIndex + 1,

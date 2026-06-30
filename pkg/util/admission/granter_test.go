@@ -93,9 +93,10 @@ func TestCPUGranterBasic(t *testing.T) {
 				return req
 			}
 			delayForGrantChainTermination = 0
-			coords := NewGrantCoordinators(ambientCtx, settings, opts, registry, &noopOnLogEntryAdmitted{}, nil)
+			knobs := &TestingKnobs{DisableCPUTimeTokenSQLBypass: true}
+			coords := NewGrantCoordinators(ambientCtx, settings, opts, registry, &noopOnLogEntryAdmitted{}, knobs)
 			defer coords.Close()
-			coord = coords.RegularCPU
+			coord = coords.RegularCPU.slotsCoord
 			return flushAndReset()
 
 		case "set-has-waiting-requests":
@@ -403,10 +404,10 @@ func TestStoreGranterBasic(t *testing.T) {
 			var readBytes, writeBytes int
 			d.ScanArgs(t, "actual-write-bytes", &writeBytes)
 			d.ScanArgs(t, "actual-read-bytes", &readBytes)
-			m := StoreMetrics{DiskStats: DiskStats{
+			m := DiskStats{
 				BytesRead:    uint64(readBytes),
 				BytesWritten: uint64(writeBytes),
-			}}
+			}
 			coord.adjustDiskTokenError(m)
 			return flushAndReset()
 
@@ -460,7 +461,8 @@ func TestStoreCoordinators(t *testing.T) {
 			return str
 		},
 	}
-	coords := NewGrantCoordinators(ambientCtx, settings, opts, registry, &noopOnLogEntryAdmitted{}, nil)
+	knobs := &TestingKnobs{DisableCPUTimeTokenSQLBypass: true}
+	coords := NewGrantCoordinators(ambientCtx, settings, opts, registry, &noopOnLogEntryAdmitted{}, knobs)
 	// There is only 1 KVWork requester at this point in initialization, for the
 	// Regular GrantCoordinator.
 	require.Equal(t, 1, len(requesters))
@@ -618,8 +620,21 @@ type testMetricsProvider struct {
 	metrics []StoreMetrics
 }
 
+var _ PebbleMetricsProvider = &testMetricsProvider{}
+
 func (m *testMetricsProvider) GetPebbleMetrics() []StoreMetrics {
 	return m.metrics
+}
+
+func (m *testMetricsProvider) GetDiskStats(buf *DiskMetricsBuf) error {
+	buf.Stats = (buf.Stats)[:0]
+	for _, sm := range m.metrics {
+		buf.Stats = append(buf.Stats, StoreIDAndStats{
+			StoreID: sm.StoreID,
+			Stats:   sm.DiskStats,
+		})
+	}
+	return nil
 }
 
 func (m *testMetricsProvider) Close() {}

@@ -124,7 +124,7 @@ type StoreRebalancer struct {
 	processTimeoutFn        func(replica CandidateReplica) time.Duration
 	objectiveProvider       RebalanceObjectiveProvider
 	subscribedToSpanConfigs func() bool
-	disabled                func() bool
+	disabled                func(ctx context.Context) bool
 }
 
 // NewStoreRebalancer creates a StoreRebalancer to work in tandem with the
@@ -167,9 +167,9 @@ func NewStoreRebalancer(
 			}
 			return !rq.store.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty()
 		},
-		disabled: func() bool {
-			mode := kvserverbase.LoadBasedRebalancingMode.Get(&st.SV)
-			return mode == kvserverbase.LBRebalancingOff || kvserverbase.LoadBasedRebalancingModeIsMMA(&st.SV) ||
+		disabled: func(ctx context.Context) bool {
+			mode := kvserverbase.GetLoadBasedRebalancingMode(ctx, st)
+			return mode == kvserverbase.LBRebalancingOff || kvserverbase.LoadBasedRebalancingModeIsMMA(ctx, st) ||
 				rq.store.cfg.TestingKnobs.DisableStoreRebalancer
 		},
 	}
@@ -214,9 +214,9 @@ type RebalanceContext struct {
 }
 
 // RebalanceMode returns the mode of the store rebalancer. See
-// kvserverbase.LoadBasedRebalancingMode.
-func (sr *StoreRebalancer) RebalanceMode() kvserverbase.LBRebalancingMode {
-	return kvserverbase.LoadBasedRebalancingMode.Get(&sr.st.SV)
+// kvserverbase.GetLoadBasedRebalancingMode.
+func (sr *StoreRebalancer) RebalanceMode(ctx context.Context) kvserverbase.LBRebalancingMode {
+	return kvserverbase.GetLoadBasedRebalancingMode(ctx, sr.st)
 }
 
 // RebalanceDimension returns the dimension the store rebalancer is balancing.
@@ -288,7 +288,7 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 			case <-timer.C:
 				timer.Reset(jitteredInterval(allocator.LoadBasedRebalanceInterval.Get(&sr.st.SV)))
 			}
-			if sr.disabled() {
+			if sr.disabled(ctx) {
 				continue
 			}
 			// Once the rebalance mode and rebalance objective are defined for
@@ -300,12 +300,12 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 			}
 			objective := sr.RebalanceObjective()
 			sr.AddLogTag("obj", objective)
-			ctx = sr.AnnotateCtx(ctx)
+			sCtx := sr.AnnotateCtx(ctx)
 
 			hottestRanges := sr.replicaRankings.TopLoad(objective.ToDimension())
-			options := sr.scorerOptions(ctx, objective.ToDimension())
-			rctx := sr.NewRebalanceContext(ctx, options, hottestRanges, sr.RebalanceMode())
-			sr.rebalanceStore(ctx, rctx)
+			options := sr.scorerOptions(sCtx, objective.ToDimension())
+			rctx := sr.NewRebalanceContext(sCtx, options, hottestRanges, sr.RebalanceMode(sCtx))
+			sr.rebalanceStore(sCtx, rctx)
 		}
 	})
 }
@@ -758,6 +758,12 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 ) (CandidateReplica, roachpb.ReplicaDescriptor, []CandidateReplica) {
 	var considerForRebalance []CandidateReplica
 	now := sr.storePool.Clock().NowAsClockTimestamp()
+	// candidatesConsidered and loadConsidered track the number and cumulative
+	// load of lease-holding candidates we've looked at (and held the lease
+	// for). These include the candidate we ultimately pick (if any), so the log
+	// message subtracts it back out to report what was skipped.
+	var candidatesConsidered int
+	var loadConsidered load.Load = load.Vector{}
 	for {
 		if len(rctx.hottestRanges) == 0 {
 			return nil, roachpb.ReplicaDescriptor{}, considerForRebalance
@@ -775,11 +781,14 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 			continue
 		}
 
+		candidateImpact := candidateReplica.RangeUsageInfo().TransferImpact()
+		candidatesConsidered++
+		loadConsidered = load.Add(loadConsidered, candidateImpact)
+
 		// Don't bother moving leases whose load is below some small fraction of the
 		// store's load. It's just unnecessary churn with no benefit to move leases
 		// responsible for, for example, 1 load unit on a store with 5000 load units.
-		if candidateReplica.RangeUsageInfo().TransferImpact().Dim(rctx.loadDimension) <
-			rctx.LocalDesc.Capacity.Load().Dim(rctx.loadDimension)*minLeaseLoadFraction {
+		if candidateImpact.Dim(rctx.loadDimension) < rctx.LocalDesc.Capacity.Load().Dim(rctx.loadDimension)*minLeaseLoadFraction {
 			log.KvDistribution.VEventf(ctx, 3, "r%d's %s load is too little to matter relative to s%d's %s total load",
 				candidateReplica.GetRangeID(), candidateReplica.RangeUsageInfo().TransferImpact(),
 				rctx.LocalDesc.StoreID, rctx.LocalDesc.Capacity.Load())
@@ -852,13 +861,16 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 		if targetStore, ok := rctx.allStoresList.FindStoreByID(candidate.StoreID); ok {
 			log.KvDistribution.Infof(
 				ctx,
-				"transferring lease for r%d load=%s to store s%d load=%s from local store s%d load=%s",
+				"transferring lease for r%d load=%s to store s%d load=%s from local store s%d load=%s"+
+					" (skipped %d candidates with load=%s)",
 				desc.RangeID,
-				candidateReplica.RangeUsageInfo().TransferImpact(),
+				candidateImpact,
 				targetStore.StoreID,
 				targetStore.Capacity.Load(),
 				rctx.LocalDesc.StoreID,
 				rctx.LocalDesc.Capacity.Load(),
+				candidatesConsidered-1,
+				load.Sub(loadConsidered, candidateImpact),
 			)
 		}
 		return candidateReplica, candidate, considerForRebalance

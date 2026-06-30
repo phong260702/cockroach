@@ -11,10 +11,15 @@ import {
   StatementStatus,
   StmtInsightEvent,
 } from "src/insights/types";
+import {
+  TimeScale,
+  timeScaleRangeToObj,
+  toRoundedDateRange,
+} from "src/timeScaleDropdown";
 import { INTERNAL_APP_NAME_PREFIX } from "src/util/constants";
 
 import { getInsightsFromProblemsAndCauses } from "../insights/utils";
-import { FixFingerprintHexValue } from "../util";
+import { FixFingerprintHexValue, useSwrWithClusterId } from "../util";
 
 import { getContentionDetailsApi } from "./contentionApi";
 import {
@@ -39,7 +44,6 @@ export type StmtInsightsResponseRow = {
   session_id: string;
   txn_id: string;
   txn_fingerprint_id: string; // hex string
-  implicit_txn: boolean;
   stmt_id: string;
   stmt_fingerprint_id: string; // hex string
   query: string;
@@ -73,7 +77,6 @@ const stmtColumns = `
 session_id,
 txn_id,
 txn_fingerprint_id,
-implicit_txn,
 stmt_id,
 stmt_fingerprint_id,
 query,
@@ -139,6 +142,47 @@ export const stmtInsightsByTxnExecutionQuery = (id: string): string => `
  WHERE txn_id = '${id}'
 `;
 
+export function useStmtInsightDetails(
+  stmtExecutionID: string,
+  timeScale: TimeScale,
+) {
+  return useSwrWithClusterId<SqlApiResponse<StmtInsightEvent[]>>(
+    stmtExecutionID ? { name: "stmtInsightDetails", stmtExecutionID } : null,
+    () => {
+      const { start, end } = timeScaleRangeToObj(timeScale);
+      return getStmtInsightsApi({ stmtExecutionID, start, end });
+    },
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    },
+  );
+}
+
+export function useStmtInsights(timeScale: TimeScale) {
+  const shouldPoll = timeScale?.key !== "Custom";
+  return useSwrWithClusterId<SqlApiResponse<StmtInsightEvent[]>>(
+    timeScale
+      ? {
+          name: "stmtInsights",
+          tsKey: timeScale.key,
+          tsEnd: timeScale.fixedWindowEnd
+            ? timeScale.fixedWindowEnd.toISOString()
+            : undefined,
+        }
+      : null,
+    () => {
+      const { start, end } = timeScaleRangeToObj(timeScale);
+      return getStmtInsightsApi({ start, end });
+    },
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      refreshInterval: shouldPoll ? 10_000 : 0,
+    },
+  );
+}
+
 export async function getStmtInsightsApi(
   req?: StmtInsightsReq,
 ): Promise<SqlApiResponse<StmtInsightEvent[]>> {
@@ -198,6 +242,45 @@ async function addStmtContentionInfoApi(
   }
 }
 
+export const STMT_FINGERPRINT_INSIGHTS_SWR_KEY = "stmtFingerprintInsights";
+
+export function useStmtFingerprintInsights(
+  stmtFingerprintId: string,
+  timeScale: TimeScale,
+) {
+  let hexId: string | null = null;
+  try {
+    hexId = stmtFingerprintId ? BigInt(stmtFingerprintId).toString(16) : null;
+  } catch {
+    hexId = null;
+  }
+  const timeRange = timeScale ? toRoundedDateRange(timeScale) : null;
+  const startUnix = timeRange?.[0]?.unix();
+  const endUnix = timeRange?.[1]?.unix();
+
+  return useSwrWithClusterId<SqlApiResponse<StmtInsightEvent[]>>(
+    hexId && timeScale
+      ? {
+          name: STMT_FINGERPRINT_INSIGHTS_SWR_KEY,
+          stmtFingerprintId: hexId,
+          start: startUnix,
+          end: endUnix,
+        }
+      : null,
+    () => {
+      return getStmtInsightsApi({
+        start: timeRange[0],
+        end: timeRange[1],
+        stmtFingerprintId: hexId,
+      });
+    },
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    },
+  );
+}
+
 export function formatStmtInsights(
   response: SqlTxnResult<StmtInsightsResponseRow>,
 ): StmtInsightEvent[] {
@@ -213,7 +296,6 @@ export function formatStmtInsights(
     return {
       transactionExecutionID: r.txn_id,
       transactionFingerprintID: FixFingerprintHexValue(r.txn_fingerprint_id),
-      implicitTxn: row.implicit_txn,
       databaseName: row.database_name,
       application: row.app_name,
       username: row.user_name,

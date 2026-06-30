@@ -18,21 +18,25 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -51,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -58,12 +63,7 @@ import (
 var defaultNumSteps = envutil.EnvOrDefaultInt("COCKROACH_KVNEMESIS_STEPS", 100)
 
 func (cfg kvnemesisTestCfg) testClusterArgs(
-	ctx context.Context,
-	t testing.TB,
-	rng *rand.Rand,
-	tr *SeqTracker,
-	partitioner *rpc.Partitioner,
-	mode TestMode,
+	ctx context.Context, t testing.TB, rng *rand.Rand, tr *SeqTracker, mode TestMode,
 ) (base.TestClusterArgs, stop.Closer) {
 	storeKnobs := &kvserver.StoreTestingKnobs{
 		DisableRaftLogQueue:                   true,
@@ -275,16 +275,34 @@ func (cfg kvnemesisTestCfg) testClusterArgs(
 		}
 	}
 
+	// We need to install the GC TTL in the span config. However, there might be
+	// a preexisting OverrideFallbackConf in the span config testing knob, so we
+	// have to be careful to not overwrite it.
+	if cfg.gcTTLSeconds > 0 {
+		if commonServerArgs.Knobs.SpanConfig == nil {
+			commonServerArgs.Knobs.SpanConfig = &spanconfig.TestingKnobs{}
+		}
+		config := commonServerArgs.Knobs.SpanConfig.(*spanconfig.TestingKnobs)
+		currentFn := config.OverrideFallbackConf
+		config.OverrideFallbackConf = func(config roachpb.SpanConfig) roachpb.SpanConfig {
+			if currentFn != nil {
+				config = currentFn(config)
+			}
+			config.GCPolicy.TTLSeconds = cfg.gcTTLSeconds
+			return config
+		}
+	}
+
 	reg := fs.NewStickyRegistry(fs.UseStrictMemFS)
 	lisReg := listenerutil.NewListenerRegistry()
 	args := base.TestClusterArgs{
 		ReusableListenerReg: lisReg,
+		EnablePartitioner:   true,
 		ServerArgs:          commonServerArgs,
 		ServerArgsPerNode: func() map[int]base.TestServerArgs {
 			perNode := make(map[int]base.TestServerArgs)
 			for i := 0; i < cfg.numNodes; i++ {
 				nodeId := i + 1
-				ctk := rpc.ContextTestingKnobs{}
 				// Test clock injection
 				//
 				// We need to stay away within 80% of the max offset, so we set our
@@ -297,12 +315,10 @@ func (cfg kvnemesisTestCfg) testClusterArgs(
 				period := 1 * time.Second
 				clock := NewTestClock(maxOffset, period, rng)
 				t.Logf("n%d using %s", nodeId, clock)
-				partitioner.RegisterTestingKnobs(roachpb.NodeID(nodeId), &ctk)
 				perNodeServerArgs := commonServerArgs
 				perNodeServerArgs.Knobs.Server = &server.TestingKnobs{
-					StickyVFSRegistry:   reg,
-					WallClock:           clock,
-					ContextTestingKnobs: ctk,
+					StickyVFSRegistry: reg,
+					WallClock:         clock,
 				}
 				perNodeServerArgs.Locality = roachpb.Locality{
 					Tiers: []roachpb.Tier{{Key: "node", Value: fmt.Sprintf("n%d", nodeId)}},
@@ -432,6 +448,10 @@ type kvnemesisTestCfg struct {
 	testGeneratorConfig func(*GeneratorConfig)
 
 	mode TestMode
+
+	// If > 0, change the MVCC GC TTL seconds from the default to the given
+	// value in the span config.
+	gcTTLSeconds int32
 }
 
 func defaultTestConfiguration(numNodes int) kvnemesisTestCfg {
@@ -684,6 +704,26 @@ func FuzzKVNemesisSingleNode(f *testing.F) {
 	})
 }
 
+func TestKVNemesisMVCCGC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cfg := defaultTestConfiguration(5)
+	cfg.seedOverride = 0
+	cfg.gcTTLSeconds = 5
+	cfg.testGeneratorConfig = func(cfg *GeneratorConfig) {
+		cfg.Ops.MvccGC.MvccGC = 5
+	}
+
+	// Lower the ClearRangeMinKeys so that a ClearRange is issued on every
+	// GC call.
+	cfg.testSettings = func(ctx context.Context, settings *cluster.Settings) {
+		gc.ClearRangeMinKeys.Override(ctx, &settings.SV, 1)
+	}
+
+	testKVNemesisImpl(t, cfg)
+}
+
 func testKVNemesisImpl(t testing.TB, cfg kvnemesisTestCfg) {
 	skip.UnderRace(t)
 
@@ -701,17 +741,10 @@ func testKVNemesisImpl(t testing.TB, cfg kvnemesisTestCfg) {
 	// 4 nodes so we have somewhere to move 3x replicated ranges to.
 	ctx := context.Background()
 	tr := &SeqTracker{}
-	var partitioner rpc.Partitioner
-	args, closer := cfg.testClusterArgs(ctx, t, rng, tr, &partitioner, cfg.mode)
+	args, closer := cfg.testClusterArgs(ctx, t, rng, tr, cfg.mode)
 	tc := testcluster.StartTestCluster(t, cfg.numNodes, args)
 	tc.Stopper().AddCloser(closer)
 	defer tc.Stopper().Stop(ctx)
-	for i := 0; i < cfg.numNodes; i++ {
-		g := tc.Servers[i].StorageLayer().GossipI().(*gossip.Gossip)
-		addr := g.GetNodeAddr().String()
-		nodeID := g.NodeID.Get()
-		partitioner.RegisterNodeAddr(addr, nodeID)
-	}
 	dbs, sqlDBs := make([]*kv.DB, cfg.numNodes), make([]*gosql.DB, cfg.numNodes)
 	for i := 0; i < cfg.numNodes; i++ {
 		dbs[i] = tc.Server(i).DB()
@@ -748,7 +781,15 @@ func testKVNemesisImpl(t testing.TB, cfg kvnemesisTestCfg) {
 
 	logger := newTBridge(t)
 	defer dumpRaftLogsOnFailure(t, logger.ll.dir, tc.Servers)
-	env := &Env{SQLDBs: sqlDBs, Tracker: tr, L: logger, Partitioner: &partitioner, ServerController: tc}
+	env := &Env{
+		SQLDBs:           sqlDBs,
+		Tracker:          tr,
+		L:                logger,
+		Partitioner:      tc.Partitioner(),
+		ServerController: tc,
+		MvccGCController: testClusterGCController{tc},
+		PtsController:    makePtsController(t, tc),
+	}
 	failures, err := RunNemesis(ctx, rng, env, config, cfg.concurrency, cfg.numSteps, cfg.mode, dbs...)
 
 	logMetricsReport(t, tc)
@@ -766,6 +807,7 @@ func logMetricsReport(t testing.TB, tc *testcluster.TestCluster) {
 		"raft.commands.reproposed.unchanged",
 		// Transaction metrics
 		"txn.aborts",
+		"txn.commits",
 		"txn.durations",
 		"txn.restarts.writetooold",
 		"txn.restarts.serializable",
@@ -933,7 +975,7 @@ func setAndVerifyZoneConfigs(
 					desc := replica.Desc()
 					confReader, err := store.GetConfReader(ctx)
 					require.NoError(t, err)
-					spanConfig, _, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
+					spanConfig, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
 					require.NoError(t, err)
 					if len(spanConfig.Constraints) == 0 {
 						return errors.Errorf("range %d has no constraints in span config yet", desc.RangeID)
@@ -955,4 +997,112 @@ func setAndVerifyZoneConfigs(
 
 	// Wait for allocator work to complete
 	require.NoError(t, tc.WaitForFullReplication())
+}
+
+type testClusterGCController struct {
+	tc *testcluster.TestCluster
+}
+
+// MvccGCRangeForKey implements the MvccGCController interface.
+func (c testClusterGCController) MvccGCRangeForKey(key []byte) error {
+	rng, err := c.tc.LookupRange(key)
+	if err != nil {
+		return err
+	}
+
+	// Find the leaseholder for the range and enqueue the corresponding replica
+	// to the MVCC GC queue directly.
+	lease, err := c.tc.FindRangeLeaseHolder(rng, nil /* hint */)
+	if err != nil {
+		return err
+	}
+	srv, err := c.tc.FindMemberServer(lease.StoreID)
+	if err != nil {
+		return err
+	}
+	store, err := srv.StorageLayer().GetStores().(*kvserver.Stores).GetStore(lease.StoreID)
+	if err != nil {
+		return err
+	}
+	repl, err := store.GetReplica(rng.RangeID)
+	if err != nil {
+		return err
+	}
+
+	// Enqueue the replica to the store's queue, and return any queueing errors
+	// first, and then return the processing error.
+	//
+	// NB: we use a fresh context here and not the context that might be
+	// supplied by the applier because the store.Enqueue call requires a context
+	// associated with the store on which it is called. Otherwise, it panics
+	// with an assertion failure in (*Tracer).startSpanGeneric in
+	// `pkg/util/tracing/tracer.go`.
+	ctx := store.AnnotateCtx(context.Background())
+	pErr, qErr := store.Enqueue(ctx, "mvccGC", repl, true /* skipShouldQueue */, false /* async */)
+	if qErr != nil {
+		return qErr
+	}
+	return pErr
+}
+
+type testClusterPtsController struct {
+	t       testutils.TestFataler
+	tc      *testcluster.TestCluster
+	storage protectedts.Storage
+	id      uuid.UUID
+}
+
+func makePtsController(t testutils.TestFataler, tc *testcluster.TestCluster) PtsController {
+	cfg := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig)
+	storage := ptstorage.WithDatabase(cfg.ProtectedTimestampProvider, cfg.InternalDB)
+	return &testClusterPtsController{
+		t:       t,
+		tc:      tc,
+		storage: storage,
+		id:      uuid.MakeV4(),
+	}
+}
+
+// Start implements the PtsController interface.
+func (t *testClusterPtsController) Start(ctx context.Context, timestamp hlc.Timestamp) error {
+	rec := &ptpb.Record{
+		ID:        t.id.GetBytesMut(),
+		Timestamp: timestamp,
+		Mode:      ptpb.PROTECT_AFTER,
+		MetaType:  "kvnemesis",
+		Target:    ptpb.MakeClusterTarget(),
+	}
+	if err := t.storage.Protect(ctx, rec); err != nil {
+		return err
+	}
+
+	// Wait for the protected timestamp to become visible on all the stores.
+	for i := 0; i < t.tc.NumServers(); i++ {
+		srv := t.tc.Server(i)
+		store, err := srv.GetStores().(*kvserver.Stores).GetStore(srv.GetFirstStoreID())
+		if err != nil {
+			return err
+		}
+		reader := store.GetStoreConfig().ProtectedTimestampReader
+		ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+			ctx,
+			t.t,
+			srv,
+			reader,
+			timestamp,
+			roachpb.Spans{GeneratorDataSpan()},
+		)
+	}
+
+	return nil
+}
+
+// Advance implements the PtsController interface.
+func (t *testClusterPtsController) Advance(ctx context.Context, timestamp hlc.Timestamp) error {
+	return t.storage.UpdateTimestamp(ctx, t.id, timestamp)
+}
+
+// Finish implements the PtsController interface.
+func (t *testClusterPtsController) Finish(ctx context.Context) error {
+	return t.storage.Release(ctx, t.id)
 }

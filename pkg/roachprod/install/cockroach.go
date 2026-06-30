@@ -10,6 +10,7 @@ import (
 	_ "embed" // required for go:embed
 	"encoding/csv"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,12 +23,12 @@ import (
 	"time"
 
 	"github.com/alessio/shellescape"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/roachprodutil"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
+	"github.com/cockroachdb/cockroach/pkg/server/license/licensepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -39,6 +40,12 @@ import (
 
 //go:embed scripts/start.sh
 var startScript string
+
+//go:embed scripts/start_sql_proxy.sh
+var startSQLProxyScript string
+
+//go:embed scripts/start_directory_server.sh
+var startDirectoryServerScript string
 
 //go:embed files/cockroachdb-logging.yaml
 var loggingConfig string
@@ -140,6 +147,11 @@ type StartOpts struct {
 	// Populated in Start() by checking the version of the cockroach binary on the first node.
 	// N.B. may be nil if the version cannot be fetched.
 	Version *version.Version
+
+	// UseDRPC, if true, adds --use-new-rpc to the start arguments to
+	// enable the DRPC framework instead of gRPC. Only applied if the
+	// binary version supports it (v26.2+).
+	UseDRPC bool
 
 	// -- Options that apply only to the StartServiceForVirtualCluster target --
 	VirtualClusterName     string
@@ -619,6 +631,14 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 			startOpts.Version = parsedVersion
 		} else {
 			l.Printf("WARN: unable to fetch cockroach version: %s", err)
+		}
+
+		if startOpts.UseDRPC {
+			if ok, reason := shouldEnableDRPC(startOpts.Version); ok {
+				l.Printf("DRPC: enabling --use-new-rpc (version %s)", startOpts.Version)
+			} else {
+				l.Printf("WARN: DRPC requested but skipped: %s", reason)
+			}
 		}
 
 		l.Printf("%s (%s): starting cockroach processes", c.Name, startOpts.VirtualClusterName)
@@ -1108,6 +1128,40 @@ func execStartTemplate(data startTemplateData) (string, error) {
 	return buf.String(), nil
 }
 
+func execSQLProxyStartTemplate(data startTemplateData) (string, error) {
+	tpl, err := template.New("start-sqlproxy").
+		Funcs(template.FuncMap{"shesc": func(i interface{}) string {
+			return shellescape.Quote(fmt.Sprint(i))
+		}}).
+		Delims("#{", "#}").
+		Parse(startSQLProxyScript)
+	if err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	if err := tpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func execDirectoryServerStartTemplate(data startTemplateData) (string, error) {
+	tpl, err := template.New("start-directory-server").
+		Funcs(template.FuncMap{"shesc": func(i interface{}) string {
+			return shellescape.Quote(fmt.Sprint(i))
+		}}).
+		Delims("#{", "#}").
+		Parse(startDirectoryServerScript)
+	if err != nil {
+		return "", err
+	}
+	var buf strings.Builder
+	if err := tpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
 func execLoggingTemplate(data loggingTemplateData) (string, error) {
 	tpl, err := template.New("loggingConfig").
 		Delims("#{", "#}").
@@ -1120,6 +1174,21 @@ func execLoggingTemplate(data loggingTemplateData) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// shouldEnableDRPC reports whether --use-new-rpc should be added to the
+// start arguments for the given binary version. DRPC requires v26.2+.
+// Returns (true, "") when DRPC should be enabled, or (false, reason)
+// explaining why it was skipped.
+func shouldEnableDRPC(v *version.Version) (ok bool, reason string) {
+	if v == nil {
+		return false, "binary version unknown, skipping --use-new-rpc"
+	}
+	if v.Major().Year < 26 ||
+		(v.Major().Year == 26 && v.Major().Ordinal < 2) {
+		return false, fmt.Sprintf("--use-new-rpc not supported in %s, skipping", v)
+	}
+	return true, ""
 }
 
 // generateStartArgs generates cockroach binary arguments for starting a node.
@@ -1240,7 +1309,15 @@ func (c *SyncedCluster) generateStartArgs(
 			if err != nil {
 				return nil, err
 			}
-			addresses[i] = fmt.Sprintf("%s:%d", c.Host(joinNode), desc.Port)
+			var joinHost string
+			if c.IsLocal() {
+				joinHost = listenHost
+			} else if c.shouldAdvertisePublicIP() {
+				joinHost = c.Host(joinNode)
+			} else {
+				joinHost = c.VMs[joinNode-1].PrivateIP
+			}
+			addresses[i] = fmt.Sprintf("%s:%d", joinHost, desc.Port)
 		}
 		args = append(args, fmt.Sprintf("--join=%s", strings.Join(addresses, ",")))
 	}
@@ -1260,6 +1337,14 @@ func (c *SyncedCluster) generateStartArgs(
 
 	if startOpts.Target == StartDefault || startOpts.Target == StartServiceForVirtualCluster {
 		args = append(args, c.generateStartFlagsSQL(node, startOpts)...)
+	}
+
+	// DRPC (--use-new-rpc) is only supported in v26.2+. The decision is
+	// logged once per Start() call; here we just append the flag silently.
+	if startOpts.UseDRPC {
+		if ok, _ := shouldEnableDRPC(startOpts.Version); ok {
+			args = append(args, "--use-new-rpc")
+		}
 	}
 
 	args = append(args, startOpts.ExtraArgs...)
@@ -1502,7 +1587,7 @@ func (c *SyncedCluster) maybeGenerateLicense(l *logger.Logger) string {
 	var res string
 
 	if config.CockroachDevLicense != "" {
-		license, err := licenseccl.Decode(config.CockroachDevLicense)
+		license, err := licensepb.Decode(config.CockroachDevLicense)
 		if err != nil {
 			l.Printf("WARN: (cluster=%q) failed to decode COCKROACH_DEV_LICENSE: %s", c.Name, err)
 		} else if license.ValidUntilUnixSec < timeutil.Now().AddDate(0, 0, 1).Unix() {
@@ -1514,11 +1599,11 @@ func (c *SyncedCluster) maybeGenerateLicense(l *logger.Logger) string {
 		}
 	}
 	if res == "" {
-		res, _ = (&licenseccl.License{
-			Type: licenseccl.License_Enterprise,
+		res, _ = (&licensepb.License{
+			Type: licensepb.License_Enterprise,
 			// OrganizationName needs to be set to preserve backwards compatibility.
 			OrganizationName:  "Cockroach Labs - Production Testing",
-			Environment:       licenseccl.Development,
+			Environment:       licensepb.Development,
 			ValidUntilUnixSec: timeutil.Now().AddDate(0, 1, 0).Unix(),
 		}).Encode()
 		l.Printf("(cluster=%q) generated a fresh license: %v ", c.Name, res)
@@ -1621,14 +1706,21 @@ func (c *SyncedCluster) generateKeyCmd(
 		storeDirs = append(storeDirs, startOpts.ExtraArgs[storeArgIdx+1])
 	}
 
-	// Command to create the store key.
+	// Metamorphically choose between v1 and v2 encryption keys. V1 uses
+	// a raw key-id + key format; v2 uses JWK (JSON Web Key) format. Each
+	// node independently picks its key version; mixed v1/v2 within a
+	// cluster is safe because store keys are per-node.
+	keyVersion := rand.Intn(2) + 1
+	binary := cockroachNodeBinary(c, node)
+	l.Printf("generating encryption key for node %d (version=%d)", node, keyVersion)
+
 	var keyCmd strings.Builder
 	for _, storeDir := range storeDirs {
 		fmt.Fprintf(&keyCmd, `
 			mkdir -p %[1]s;
 			if [ ! -e %[1]s/aes-128.key ]; then
-				openssl rand -out %[1]s/aes-128.key 48;
-			fi;`, storeDir)
+				%[2]s %[3]s gen encryption-key -s 128 --version=%[4]d %[1]s/aes-128.key;
+			fi;`, storeDir, SuppressMetamorphicConstantsEnvVar(), binary, keyVersion)
 	}
 
 	e := expander{node: node}
@@ -1825,6 +1917,369 @@ func (c *SyncedCluster) createFixedBackupSchedule(
 	if out := strings.TrimSpace(res.CombinedOut); out != "" {
 		l.Printf(out)
 	}
+	return nil
+}
+
+// SQLProxyOpts contains options for starting or stopping a SQL proxy.
+type SQLProxyOpts struct {
+	// DirectoryAddr is the address of the directory server.
+	DirectoryAddr string
+	// Insecure disables TLS to backend.
+	Insecure bool
+	// SkipVerify skips identity verification of the backend.
+	SkipVerify bool
+	// ListenPort is the port the proxy listens on.
+	ListenPort int
+}
+
+// DirectoryServerOpts contains options for starting or stopping a directory server.
+type DirectoryServerOpts struct {
+	// GRPCPort is the port for the GRPC directory interface.
+	GRPCPort int
+	// HTTPPort is the port for the HTTP control API.
+	HTTPPort int
+}
+
+// SQLProxyLabel is the value used to "label" SQL proxy processes
+// running locally or in a VM. This is used by roachprod to identify
+// and monitor such processes.
+func SQLProxyLabel() string {
+	return "sql-proxy"
+}
+
+func SQLProxyPort(proxyOpts SQLProxyOpts) int {
+	if proxyOpts.ListenPort != 0 {
+		return proxyOpts.ListenPort
+	}
+
+	// N.B. For now, we hardcode the sql proxy port as the default of 46257.
+	// TODO(darryl): support service registration for sql proxy and dynamically assign ports.
+	return 46257
+}
+
+// DirectoryServerLabel returns the label for a directory server instance.
+func DirectoryServerLabel() string {
+	return "directory-server"
+}
+
+func DirectoryServerGRPCPort(proxyOpts DirectoryServerOpts) int {
+	if proxyOpts.GRPCPort != 0 {
+		return proxyOpts.GRPCPort
+	}
+
+	// N.B. For now, we hardcode the directory server grpc port as the default of 46258.
+	// TODO(darryl): support service registration for directory and dynamically assign ports.
+	return 46258
+}
+
+func DirectoryServerHTTPPort(proxyOpts DirectoryServerOpts) int {
+	if proxyOpts.HTTPPort != 0 {
+		return proxyOpts.HTTPPort
+	}
+
+	// N.B. For now, we hardcode the directory server http port as the default of 46259.
+	// TODO(darryl): support service registration for directory and dynamically assign ports.
+	return 46259
+}
+
+// StartSQLProxy starts a SQL proxy process on the specified node.
+func (c *SyncedCluster) StartSQLProxy(
+	ctx context.Context, l *logger.Logger, node Node, proxyOpts SQLProxyOpts,
+) error {
+	label := SQLProxyLabel()
+	logDir := c.LogDir(node, label, 0)
+
+	// Determine listen address
+	var listenHost string
+	if c.IsLocal() {
+		listenHost = "127.0.0.1"
+	} else {
+		listenHost = "0.0.0.0"
+	}
+	listenAddr := fmt.Sprintf("%s:%d", listenHost, SQLProxyPort(proxyOpts))
+
+	// Build the proxy command arguments
+	var args []string
+	args = append(args, "mt", "start-proxy")
+
+	args = append(args, fmt.Sprintf("--listen-addr=%s", listenAddr))
+	args = append(args, fmt.Sprintf("--directory=%s", proxyOpts.DirectoryAddr))
+
+	if proxyOpts.Insecure {
+		args = append(args, "--insecure")
+	} else {
+		certsDir := c.CertsDir(node)
+		args = append(args, fmt.Sprintf("--listen-cert=%s/node.crt", certsDir))
+		args = append(args, fmt.Sprintf("--listen-key=%s/node.key", certsDir))
+	}
+
+	if proxyOpts.SkipVerify {
+		args = append(args, "--skip-verify")
+	}
+
+	// Generate the start script content using the SQL proxy template
+	scriptContent, err := execSQLProxyStartTemplate(startTemplateData{
+		LogDir:              logDir,
+		Binary:              cockroachNodeBinary(c, node),
+		Args:                args,
+		VirtualClusterLabel: label,
+		Local:               c.IsLocal(),
+		MemoryMax:           config.MemoryMax,
+		NumFilesLimit:       config.DefaultNumFilesLimit,
+		EnvVars: append(append([]string{
+			fmt.Sprintf("ROACHPROD=%s", c.roachprodEnvValue(node)),
+		}, c.Env...), getEnvVars()...),
+	})
+	if err != nil {
+		return err
+	}
+
+	scriptPath := "sqlproxy.sh"
+
+	var uploadCmd string
+	if c.IsLocal() {
+		uploadCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
+	}
+	uploadCmd += fmt.Sprintf(`cat > %[1]s && chmod +x %[1]s`, scriptPath)
+
+	uploadOpts := defaultCmdOpts("upload-sql-proxy-script")
+	uploadOpts.stdin = strings.NewReader(scriptContent)
+	result, err := c.runCmdOnSingleNode(ctx, l, node, uploadCmd, uploadOpts)
+	if err != nil {
+		return err
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+
+	// Execute the start script
+	var runScriptCmd string
+	if c.IsLocal() {
+		runScriptCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
+	}
+	runScriptCmd += "./" + scriptPath
+	result, err = c.runCmdOnSingleNode(ctx, l, node, runScriptCmd, defaultCmdOpts("run-sql-proxy-script"))
+	if err != nil {
+		return err
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+
+	l.Printf("SQL proxy started on node %d", node)
+	return nil
+}
+
+// StopSQLProxy stops a SQL proxy process on the specified node.
+func (c *SyncedCluster) StopSQLProxy(
+	ctx context.Context, l *logger.Logger, node Node, proxyOpts SQLProxyOpts,
+) error {
+	label := SQLProxyLabel()
+
+	l.Printf("Stopping SQL proxy on node %d", node)
+
+	// Find and kill the proxy process using the label
+	// We use SIGTERM (15) for graceful shutdown, wait for it to exit, with a 30s grace period
+	virtualClusterFilter := fmt.Sprintf(
+		"grep -E '%s' |",
+		envVarRegex("ROACHPROD_VIRTUAL_CLUSTER", label),
+	)
+
+	cmd := fmt.Sprintf(`
+pids=$(ps axeww -o pid -o command | \
+  %s \
+  sed 's/export ROACHPROD=//g' | \
+  awk '/%s/ { print $1 }')
+if [ -n "${pids}" ]; then
+  echo "Stopping proxy processes: ${pids}"
+  kill -15 ${pids}
+  # Wait for process to exit (up to 30 seconds)
+  for pid in ${pids}; do
+    waitcnt=0
+    while kill -0 ${pid} 2>/dev/null; do
+      if [ $waitcnt -gt 30 ]; then
+        echo "Process ${pid} did not stop after 30s, sending SIGKILL"
+        kill -9 ${pid}
+        break
+      fi
+      sleep 1
+      waitcnt=$(expr $waitcnt + 1)
+    done
+    echo "Process ${pid} stopped"
+  done
+else
+  echo "No proxy process found with label: %s"
+fi`,
+		virtualClusterFilter,
+		c.roachprodEnvRegex(node),
+		label,
+	)
+
+	result, err := c.runCmdOnSingleNode(ctx, l, node, cmd, defaultCmdOpts("stop-proxy"))
+	if err != nil {
+		return err
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+
+	l.Printf("SQL proxy stopped on node %d", node)
+	return nil
+}
+
+func (c *SyncedCluster) SQLProxyURL(
+	node Node, virtualClusterName string, tenantID int, certsDir string, opts SQLProxyOpts,
+) string {
+	var u url.URL
+	u.Scheme = "postgres"
+	u.Host = fmt.Sprintf("%s:%d", c.Host(node), SQLProxyPort(opts))
+	u.Path = "/"
+
+	v := url.Values{}
+	if opts.Insecure {
+		u.User = url.User("root")
+		v.Add("sslmode", "disable")
+	} else {
+		user := DefaultUser
+		password := DefaultPassword
+		u.User = url.UserPassword(user, password)
+
+		v.Add("sslcert", fmt.Sprintf("%s/client.%s.crt", certsDir, user))
+		v.Add("sslkey", fmt.Sprintf("%s/client.%s.key", certsDir, user))
+		v.Add("sslrootcert", fmt.Sprintf("%s/ca.crt", certsDir))
+		v.Add("sslmode", "verify-full")
+	}
+
+	// To connect to the SQL proxy, we must specify the tenant we wish to connect
+	// with a cluster identifier: <virtualclustername>-<tenantid>
+	clusterIdentifier := fmt.Sprintf("%s-%d", virtualClusterName, tenantID)
+	v.Add("options", fmt.Sprintf("-ccluster=%s", clusterIdentifier))
+
+	u.RawQuery = v.Encode()
+	return u.String()
+}
+
+// StartDirectoryServer starts a directory server process on the specified node.
+// The directory server provides a static pod registry for SQL proxies to discover tenant pods.
+func (c *SyncedCluster) StartDirectoryServer(
+	ctx context.Context, l *logger.Logger, node Node, dirOpts DirectoryServerOpts,
+) error {
+	label := DirectoryServerLabel()
+	logDir := c.LogDir(node, label, 0)
+
+	// Build the directory server command arguments
+	var args []string
+	args = append(args, "mt", "http-test-directory")
+	args = append(args, "--logtostderr=INFO")
+
+	args = append(args, fmt.Sprintf("--grpc-port=%d", DirectoryServerGRPCPort(dirOpts)))
+	args = append(args, fmt.Sprintf("--http-port=%d", DirectoryServerHTTPPort(dirOpts)))
+
+	// Generate the start script content using the directory server template
+	scriptContent, err := execDirectoryServerStartTemplate(startTemplateData{
+		LogDir:              logDir,
+		Binary:              cockroachNodeBinary(c, node),
+		Args:                args,
+		VirtualClusterLabel: label,
+		Local:               c.IsLocal(),
+		MemoryMax:           config.MemoryMax,
+		NumFilesLimit:       config.DefaultNumFilesLimit,
+		EnvVars: append(append([]string{
+			fmt.Sprintf("ROACHPROD=%s", c.roachprodEnvValue(node)),
+		}, c.Env...), getEnvVars()...),
+	})
+	if err != nil {
+		return err
+	}
+
+	scriptPath := "directory-server.sh"
+
+	var uploadCmd string
+	if c.IsLocal() {
+		uploadCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
+	}
+	uploadCmd += fmt.Sprintf(`cat > %[1]s && chmod +x %[1]s`, scriptPath)
+
+	uploadOpts := defaultCmdOpts("upload-directory-server-script")
+	uploadOpts.stdin = strings.NewReader(scriptContent)
+	result, err := c.runCmdOnSingleNode(ctx, l, node, uploadCmd, uploadOpts)
+	if err != nil {
+		return err
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+
+	// Execute the start script
+	var runScriptCmd string
+	if c.IsLocal() {
+		runScriptCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
+	}
+	runScriptCmd += "./" + scriptPath
+	result, err = c.runCmdOnSingleNode(ctx, l, node, runScriptCmd, defaultCmdOpts("run-directory-server-script"))
+	if err != nil {
+		return err
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+
+	l.Printf("Directory server started on node %d", node)
+	return nil
+}
+
+// StopDirectoryServer stops a directory server process on the specified node.
+func (c *SyncedCluster) StopDirectoryServer(
+	ctx context.Context, l *logger.Logger, node Node, dirOpts DirectoryServerOpts,
+) error {
+	label := DirectoryServerLabel()
+
+	l.Printf("Stopping directory server on node %d", node)
+
+	virtualClusterFilter := fmt.Sprintf(
+		"grep -E '%s' |",
+		envVarRegex("ROACHPROD_VIRTUAL_CLUSTER", label),
+	)
+
+	cmd := fmt.Sprintf(`
+pids=$(ps axeww -o pid -o command | \
+  %s \
+  sed 's/export ROACHPROD=//g' | \
+  awk '/%s/ { print $1 }')
+if [ -n "${pids}" ]; then
+  echo "Stopping directory server processes: ${pids}"
+  kill -15 ${pids}
+  # Wait for process to exit (up to 30 seconds)
+  for pid in ${pids}; do
+    waitcnt=0
+    while kill -0 ${pid} 2>/dev/null; do
+      if [ $waitcnt -gt 30 ]; then
+        echo "Process ${pid} did not stop after 30s, sending SIGKILL"
+        kill -9 ${pid}
+        break
+      fi
+      sleep 1
+      waitcnt=$(expr $waitcnt + 1)
+    done
+    echo "Process ${pid} stopped"
+  done
+else
+  echo "No directory server process found with label: %s"
+fi`,
+		virtualClusterFilter,
+		c.roachprodEnvRegex(node),
+		label,
+	)
+
+	result, err := c.runCmdOnSingleNode(ctx, l, node, cmd, defaultCmdOpts("stop-directory-server"))
+	if err != nil {
+		return err
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+
+	l.Printf("Directory server stopped on node %d", node)
 	return nil
 }
 

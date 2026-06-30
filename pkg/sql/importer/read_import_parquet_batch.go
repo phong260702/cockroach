@@ -28,6 +28,10 @@ type parquetCopyValueFunc func(rowIdx int, valIdx int)
 // Values are stored in type-specific slices (e.g., boolValues, int32Values) based
 // on the column's physical type. The isNull array tracks which rows are NULL.
 //
+// For LIST columns, the batch stores pre-assembled per-row element slices in
+// listRowValues instead of using the typed value slices. Each entry is a []any
+// of raw element values for that row, or nil for a null list.
+//
 // Design: We use separate slices for each type rather than []interface{} to:
 // 1. Avoid heap allocations from boxing primitive values
 // 2. Enable better cache locality during batch processing
@@ -57,6 +61,11 @@ type parquetColumnBatch struct {
 
 	// Null tracking - one entry per row
 	isNull []bool // [rowIdx] -> is this row null?
+
+	// LIST column fields. When isList is true, the typed value slices above
+	// are unused. Instead, per-row arrays are stored in listRowValues.
+	isList        bool
+	listRowValues [][]any // [rowIdx] -> element values (nil = null list, empty = empty list)
 }
 
 // parquetBatchBuffers holds reusable buffers for reading Parquet values.
@@ -232,4 +241,44 @@ func (b *parquetColumnBatch) Read() error {
 		}
 	}
 	return nil
+}
+
+// GetValueAt extracts the raw Parquet value at the given row index.
+// Returns (value, isNull, error).
+//
+// For flat columns, the value is typed according to the physical type (int32,
+// string, etc.). For LIST columns, the value is a []any of raw element values.
+func (b *parquetColumnBatch) GetValueAt(rowIdx int) (any, bool, error) {
+	if rowIdx < 0 || rowIdx >= int(b.rowCount) {
+		return nil, false, errors.Newf("row index %d out of bounds [0, %d)", rowIdx, b.rowCount)
+	}
+
+	if b.isNull[rowIdx] {
+		return nil, true, nil
+	}
+
+	if b.isList {
+		return b.listRowValues[rowIdx], false, nil
+	}
+
+	switch b.physicalType {
+	case parquet.Types.Boolean:
+		return b.boolValues[rowIdx], false, nil
+	case parquet.Types.Int32:
+		return b.int32Values[rowIdx], false, nil
+	case parquet.Types.Int64:
+		return b.int64Values[rowIdx], false, nil
+	case parquet.Types.Int96:
+		return b.int96Values[rowIdx], false, nil
+	case parquet.Types.Float:
+		return b.float32Values[rowIdx], false, nil
+	case parquet.Types.Double:
+		return b.float64Values[rowIdx], false, nil
+	case parquet.Types.ByteArray:
+		return b.byteArrayValues[rowIdx], false, nil
+	case parquet.Types.FixedLenByteArray:
+		return b.fixedLenByteArrayValues[rowIdx], false, nil
+	default:
+		return nil, false, errors.Newf("unsupported Parquet type: %v", b.physicalType)
+	}
 }

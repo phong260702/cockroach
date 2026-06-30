@@ -9,6 +9,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1147,11 +1148,16 @@ func TestStatementTimeoutForSchemaChangeCommit(t *testing.T) {
 				if implicitTxn {
 					_, err := conn.DB.ExecContext(ctx, "ALTER TABLE t1 ADD COLUMN j INT DEFAULT 32")
 					require.ErrorContains(t, err, sqlerrors.QueryTimeoutError.Error())
-					require.Equal(t, 2, len(actualNotices))
+					// There will be one notice for the job and one from the WaitForOneVersion
+					// operation. In addition to the notice from the job that was created.
+					require.Equal(t, 3, len(actualNotices))
 					require.Regexp(t, "waiting for job\\(s\\) to complete: \\d+", actualNotices[0])
 					require.Regexp(t,
 						"The statement has timed out, but the following background jobs have been created and will continue running: \\d+",
 						actualNotices[1])
+					require.Regexp(t,
+						"The statement has timed out while waiting for the schema change to be visible on all nodes.",
+						actualNotices[2])
 				} else {
 					txn := conn.Begin(t)
 					_, err := txn.Exec("SET LOCAL autocommit_before_ddl=off")
@@ -1162,5 +1168,216 @@ func TestStatementTimeoutForSchemaChangeCommit(t *testing.T) {
 					require.NoError(t, err)
 				}
 			})
+	}
+}
+
+// TestStatementTimeoutForSchemaChangeWaitForOneVersion confirms that waiting new versions
+// also respects the statement timeout.
+func TestStatementTimeoutForSchemaChangeWaitForOneVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	skip.UnderDuress(t, "sets a long timeout")
+
+	numNodes := 1
+	tc := serverutils.StartCluster(t, numNodes,
+		base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	url, cleanup := tc.ApplicationLayer(0).PGUrl(t)
+	defer cleanup()
+	baseConn, err := pq.NewConnector(url.String())
+	require.NoError(t, err)
+	actualNotices := make([]string, 0)
+	connector := pq.ConnectorWithNoticeHandler(baseConn, func(n *pq.Error) {
+		actualNotices = append(actualNotices, n.Message)
+	})
+	dbWithHandler := gosql.OpenDB(connector)
+	defer dbWithHandler.Close()
+
+	conn := sqlutils.MakeSQLRunner(dbWithHandler)
+	for _, test := range []struct {
+		description              string
+		setup                    string
+		blockingTxn              string
+		schemaChange             string
+		forceLegacySchemaChanger bool
+		expectJobMessage         bool
+	}{
+		{
+			description:  "WaitForOneVersion",
+			setup:        "CREATE TABLE t1 (n int);",
+			blockingTxn:  "SELECT * FROM t1;",
+			schemaChange: "ALTER TABLE t1 ADD COLUMN j INT DEFAULT 32",
+		},
+		{
+			description:  "WaitForNoVersion",
+			setup:        "CREATE TABLE t2 (n int);",
+			blockingTxn:  "SELECT * FROM t2",
+			schemaChange: "DROP TABLE t2",
+		},
+		{
+			description:  "WaitForInitialVersion",
+			setup:        "SELECT 1",
+			blockingTxn:  "DELETE FROM system.lease;",
+			schemaChange: "CREATE TABLE t3 (n int)",
+		},
+		{
+			description:  "waitForTxnJobs",
+			setup:        "CREATE TABLE t4(n int) WITH (schema_locked=false)",
+			blockingTxn:  "SELECT * FROM t4",
+			schemaChange: "ALTER TABLE t4 ADD COLUMN j int;",
+			// The legacy schema changer will execute the WaitForOneVersion in
+			// the job. So, this allows us to confirm the job wait code can be
+			// canceled as well.
+			forceLegacySchemaChanger: true,
+			// We expect the message to occur while waiting for the job.
+			expectJobMessage: true,
+		},
+	} {
+		t.Run(test.description, func(t *testing.T) {
+			conn.Exec(t, "RESET statement_timeout")
+			conn.Exec(t, "RESET use_declarative_schema_changer")
+			conn.Exec(t, test.setup)
+			txn := conn.Begin(t)
+			_, err := txn.Exec(test.blockingTxn)
+			require.NoError(t, err)
+			if test.forceLegacySchemaChanger {
+				conn.Exec(t, "SET use_declarative_schema_changer='off'")
+			}
+			conn.Exec(t, "SET statement_timeout = '1s'")
+			conn.ExpectErr(t, "pq: query execution canceled due to statement timeout", test.schemaChange)
+			err = txn.Rollback()
+			require.NoError(t, err)
+			foundSchemaChangeNotice := false
+			for _, notice := range actualNotices {
+				expectedNotice := "The statement has timed out while waiting for the schema change to be visible on all nodes."
+				if test.expectJobMessage {
+					expectedNotice = `The statement has timed out, but the following background jobs have been created and will continue running: \d+.`
+				}
+				noticeRegex := regexp.MustCompile(expectedNotice)
+				if noticeRegex.MatchString(notice) {
+					foundSchemaChangeNotice = true
+					break
+				}
+			}
+			require.True(t, foundSchemaChangeNotice, "schema change notice not found: %v", actualNotices)
+			actualNotices = actualNotices[:0]
+		})
+	}
+}
+
+// TestStatementTimeoutForCheckTwoVersionInvariant confirms that the pre-commit
+// two-version invariant check (descs.CheckTwoVersionInvariant) honours
+// statement_timeout. The check runs inside commitSQLTransactionInternal and
+// waits for stale (V-2) descriptor leases to drain before the schema-change
+// txn can commit. To enter the wait loop deterministically we disable the
+// post-commit schema-changer job (via *SchemaChangeJobNoOp), which prevents
+// the usual WaitForOneVersion from dropping old leases between successive
+// schema changes; this leaves a V-2 lease lingering when the second schema
+// change tries to commit. ALTER TYPE ADD VALUE is the original symptom from
+// #168767; ALTER TABLE ADD COLUMN exercises the same pre-commit code path.
+func TestStatementTimeoutForCheckTwoVersionInvariant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	skip.UnderDuress(t, "sets a long timeout")
+
+	for _, tc := range []struct {
+		name string
+		// knobs disables the post-commit schema-changer job that would
+		// normally drop the lingering V-2 lease via WaitForOneVersion.
+		knobs base.TestingKnobs
+		// setup creates the descriptor under test.
+		setup string
+		// pinDescriptor runs in an open txn on a separate session to hold a
+		// lease on the descriptor at its initial version.
+		pinDescriptor string
+		// bumpVersion bumps the descriptor (v=1 -> v=2). The held lease
+		// lingers at v=1.
+		bumpVersion string
+		// bumpVersionAgain triggers the second pre-commit two-version check
+		// (v=2 -> v=3) under the tight statement_timeout.
+		bumpVersionAgain string
+	}{
+		{
+			name: "alter table add column",
+			knobs: base.TestingKnobs{
+				SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+					SchemaChangeJobNoOp: func() bool { return true },
+				},
+			},
+			setup:            "CREATE TABLE t (n INT) WITH (schema_locked=false)",
+			pinDescriptor:    "INSERT INTO t VALUES (1)",
+			bumpVersion:      "ALTER TABLE t ADD COLUMN c1 INT",
+			bumpVersionAgain: "ALTER TABLE t ADD COLUMN c2 INT",
+		},
+		{
+			name: "alter type add value",
+			knobs: base.TestingKnobs{
+				SQLTypeSchemaChanger: &sql.TypeSchemaChangerTestingKnobs{
+					TypeSchemaChangeJobNoOp: func() bool { return true },
+				},
+			},
+			setup:            "CREATE TYPE et AS ENUM ('a')",
+			pinDescriptor:    "SELECT 'a'::et",
+			bumpVersion:      "ALTER TYPE et ADD VALUE 'b'",
+			bumpVersionAgain: "ALTER TYPE et ADD VALUE 'c'",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := serverutils.StartServerOnly(t, base.TestServerArgs{Knobs: tc.knobs})
+			defer srv.Stopper().Stop(ctx)
+
+			url, cleanup := srv.ApplicationLayer().PGUrl(t)
+			defer cleanup()
+			baseConn, err := pq.NewConnector(url.String())
+			require.NoError(t, err)
+			var actualNotices []string
+			connector := pq.ConnectorWithNoticeHandler(baseConn, func(n *pq.Error) {
+				actualNotices = append(actualNotices, n.Message)
+			})
+			dbWithHandler := gosql.OpenDB(connector)
+			defer dbWithHandler.Close()
+			conn := sqlutils.MakeSQLRunner(dbWithHandler)
+
+			// CheckTwoVersionInvariant only runs in the user's commit when the
+			// txn has uncommitted descriptors, which the legacy schema changer
+			// arranges for here.
+			conn.Exec(t, "SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off'")
+			conn.Exec(t, "SET use_declarative_schema_changer = 'off'")
+			conn.Exec(t, tc.setup)
+
+			// Open a separate session and pin a lease on the descriptor at its
+			// initial version. With the post-commit job no-op, the usual
+			// WaitForOneVersion does not drop this lease after the first bump,
+			// so it persists as the V-2 lease for the second bump's pre-commit
+			// check.
+			leaseHolder, err := dbWithHandler.Conn(ctx)
+			require.NoError(t, err)
+			defer func() { _ = leaseHolder.Close() }()
+			leaseTxn, err := leaseHolder.BeginTx(ctx, nil)
+			require.NoError(t, err)
+			_, err = leaseTxn.ExecContext(ctx, tc.pinDescriptor)
+			require.NoError(t, err)
+			defer func() { _ = leaseTxn.Rollback() }()
+
+			// First bump moves the descriptor to v=2; the held lease stays at
+			// v=1.
+			conn.Exec(t, tc.bumpVersion)
+
+			// Second bump (v=2 -> v=3) under a tight statement_timeout. Its
+			// pre-commit CheckTwoVersionInvariant finds the lingering v=1
+			// lease and enters the wait loop. Without the fix the loop would
+			// block indefinitely; with the fix it exits when the timeout
+			// cancels the context.
+			conn.Exec(t, "SET statement_timeout = '1s'")
+			conn.ExpectErr(t, "pq: query execution canceled due to statement timeout",
+				tc.bumpVersionAgain)
+
+			const expected = "The statement has timed out while waiting for older descriptor " +
+				"leases to be released. The schema change was not applied."
+			require.Contains(t, actualNotices, expected)
+		})
 	}
 }

@@ -133,6 +133,10 @@ func (c *cachedCatalogReader) IsDescIDKnownToNotExist(id, maybeParentID descpb.I
 		return false
 	}
 	if c.hasScanAll {
+		// Temp schemas have namespace entries but no descriptors.
+		if c.cache.LookupNamespaceEntryByID(id) != nil {
+			return false
+		}
 		return true
 	}
 	if c.byIDState[maybeParentID].hasScanNamespaceForDatabaseEntries {
@@ -486,6 +490,11 @@ func (c *cachedCatalogReader) ensure(ctx context.Context, read nstree.Catalog) e
 	}
 	return c.memAcc.Grow(ctx, c.cache.ByteSize()-oldSize)
 
+}
+
+// InvalidateSystemCacheEntry is part of the CatalogReader interface.
+func (c *cachedCatalogReader) InvalidateSystemCacheEntry(key descpb.NameInfo) {
+	c.systemDatabaseCache.removeNameEntry(c.version, key)
 }
 
 func (c *cachedCatalogReader) setByIDState(id descpb.ID, s byIDStateValue) {

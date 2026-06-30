@@ -2,13 +2,25 @@ name: Claude Code PR Review
 
 on:
   pull_request_target:
-    types: [synchronize, ready_for_review, reopened]
+    types: [synchronize, ready_for_review, reopened, labeled]
 
 jobs:
   claude-code-pr-review:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: "!startsWith(github.base_ref, 'release-') && !contains(github.event.pull_request.labels.*.name, 'O-No-AI-Review') && !github.event.pull_request.merged && !github.event.pull_request.draft"
+    # Skip release branches, opted-out PRs, merged/draft PRs, and unrelated label events.
+    # Author verification (org membership) is handled by the "Verify author" step below
+    # using usermapper, because GitHub webhook payloads can misreport author_association
+    # (e.g. CONTRIBUTOR instead of MEMBER) for some org members working from forks.
+    if: |
+      !startsWith(github.base_ref, 'release-') &&
+      !contains(github.event.pull_request.labels.*.name, 'O-No-AI-Review') &&
+      !github.event.pull_request.merged &&
+      !github.event.pull_request.draft &&
+      (
+        github.event.action != 'labeled' ||
+        github.event.label.name == 'O-AI-Review'
+      )
     permissions:
       contents: read
       pull-requests: write
@@ -21,23 +33,61 @@ jobs:
           fetch-depth: 1
 
       - name: Authenticate to Google Cloud
-        uses: 'google-github-actions/auth@v3'
+        uses: 'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093' # v3
         with:
           project_id: 'vertex-model-runners'
           service_account: 'ai-review@dev-inf-prod.iam.gserviceaccount.com'
           workload_identity_provider: 'projects/72497726731/locations/global/workloadIdentityPools/ai-review/providers/ai-review'
 
+      - name: Get usermapper token
+        id: usermapper_auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: 'dev-inf-prod'
+          service_account: 'ai-review@dev-inf-prod.iam.gserviceaccount.com'
+          workload_identity_provider: 'projects/72497726731/locations/global/workloadIdentityPools/ai-review/providers/ai-review'
+          token_format: 'id_token'
+          id_token_audience: 'https://us-east4-dev-inf-prod.cloudfunctions.net/usermapper-api'
+
+      - name: Verify author
+        id: verify_author
+        run: |
+          # Check if the PR has the O-AI-Review label (allows external contributors).
+          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | jq -e 'index("O-AI-Review")' > /dev/null 2>&1; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            echo "Author authorized via O-AI-Review label"
+            exit 0
+          fi
+
+          # Verify org membership via usermapper. GitHub webhook payloads can
+          # misreport author_association for org members working from forks.
+          AUTHOR="${{ github.event.pull_request.user.login }}"
+          RESP=$(curl -sf -H "Authorization: bearer ${{ steps.usermapper_auth.outputs.id_token }}" \
+            "https://us-east4-dev-inf-prod.cloudfunctions.net/usermapper-api?v2_github=${AUTHOR}" || true)
+          if [ -n "$RESP" ] && echo "$RESP" | jq -e '.activeOrgs | index("cockroachdb")' > /dev/null 2>&1; then
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+            echo "Author '${AUTHOR}' verified as cockroachdb org member via usermapper"
+          else
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            echo "Author '${AUTHOR}' is not a cockroachdb org member"
+          fi
+
       - name: Stage 1 - Initial Bug Screening
         id: stage1
+        if: steps.verify_author.outputs.authorized == 'true'
         uses: cockroachdb/claude-code-action@v1
         env:
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
           CLOUD_ML_REGION: global
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # External contributor PRs are gated by the O-AI-Review label at the job level,
+          # so it's safe to allow non-write users through the action's permission check.
+          allowed_non_write_users: "*"
           use_vertex: "true"
           claude_args: |
-            --model claude-sonnet-4-5@20250929
+            --model claude-opus-4-6
             --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*)"
           prompt: |
             REPO: ${{ github.repository }}
@@ -84,9 +134,10 @@ jobs:
           CLOUD_ML_REGION: global
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: "*"
           use_vertex: "true"
           claude_args: |
-            --model claude-sonnet-4-5@20250929
+            --model claude-opus-4-6
             --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*)"
           prompt: |
             REPO: ${{ github.repository }}
@@ -134,9 +185,10 @@ jobs:
           CLOUD_ML_REGION: global
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: "*"
           use_vertex: "true"
           claude_args: |
-            --model claude-sonnet-4-5@20250929
+            --model claude-opus-4-6
             --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*)"
           prompt: |
             REPO: ${{ github.repository }}
@@ -170,7 +222,7 @@ jobs:
             2. 'NO_BUG_DETECTED' if issues are not critical enough
 
             For each issue found, provide:
-            1. The specific line(s) where the issue occurs
+            1. The specific file and line(s) where the issue occurs
             2. A clear description of what is wrong
             3. A suggested fix
 
@@ -191,20 +243,24 @@ jobs:
           echo "Stage 3 result extracted (${#RESULT} characters)"
 
       - name: Final Analysis Report
-        if: always()
+        if: always() && steps.verify_author.outputs.authorized == 'true'
         uses: cockroachdb/claude-code-action@v1
         env:
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
           CLOUD_ML_REGION: global
+          PR_NUM: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: "*"
           use_vertex: "true"
           claude_args: |
-            --model claude-sonnet-4-5@20250929
-            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --model claude-opus-4-6
+            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr edit:*)"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
+            RUN URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             ## Three-Stage Analysis Summary
 
@@ -224,24 +280,29 @@ jobs:
             2. The final determination (critical bug found or no critical bugs)
             3. If bugs were found, what actions are recommended
 
-            **If all three stages detected bugs**, this indicates a potential issue that warrants investigation.
+            ## Actions
 
-      - name: Comment on PR if bugs confirmed
-        if: contains(steps.stage3_result.outputs.result, 'STAGE3_RESULT - POTENTIAL_BUG_CONFIRMED')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body "## Potential Bug(s) Detected
+            ### If Stage 3 confirmed bugs (STAGE3_RESULT - POTENTIAL_BUG_CONFIRMED):
 
-          The three-stage Claude Code analysis has identified potential bug(s) in this PR that may warrant investigation.
+            1. For each specific bug identified in the Stage 3 results, use
+               mcp__github_inline_comment__create_inline_comment to post a concise inline
+               comment on the exact file and line where the issue occurs. Each comment should
+               state the issue and suggest a fix in 2-3 sentences.
 
-          **Next Steps:**
-          Please review the detailed findings in the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+            2. Post a summary PR comment using:
+               gh pr comment $PR_NUM --body "<body>"
 
-          **Note:** When viewing the workflow output, scroll to the bottom to find the Final Analysis Summary.
+               The summary body should contain:
+               - A heading: "## AI Review: Potential Issue(s) Detected"
+               - A note that inline comments have been added to the relevant lines
+               - A link: [View full analysis]($RUN_URL)
+               - Feedback instructions:
+                 "If helpful: add `O-AI-Review-Real-Issue-Found` label.
+                  If not helpful: add `O-AI-Review-Not-Helpful` label."
 
-          After you review the findings, please tag the issue as follows:
-          - If the detected issue is real or was helpful in any way, please tag the issue with \`O-AI-Review-Real-Issue-Found\`
-          - If the detected issue was not helpful in any way, please tag the issue with \`O-AI-Review-Not-Helpful\`"
+            3. Add a label to the PR:
+               gh pr edit $PR_NUM --add-label "o-AI-Review-Potential-Issue-Detected"
 
-          gh pr edit ${{ github.event.pull_request.number }} --add-label "o-AI-Review-Potential-Issue-Detected"
+            ### If no bugs were confirmed:
+
+            Provide a brief textual summary only. Do NOT post any PR comments or labels.

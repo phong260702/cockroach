@@ -199,6 +199,10 @@ type saramaConfig struct {
 		Messages    int          `json:",omitempty"`
 		Frequency   jsonDuration `json:",omitempty"`
 		MaxMessages int          `json:",omitempty"`
+		// MaxBytes overrides the cluster setting
+		// changefeed.kafka.max_request_size for this changefeed.
+		// int32 to match kgo.ProducerBatchMaxBytes.
+		MaxBytes int32 `json:",omitempty"`
 	}
 
 	Compression      compressionCodec `json:",omitempty"`
@@ -369,6 +373,7 @@ func (s *kafkaSink) EmitRow(
 	ctx context.Context,
 	topicDescr TopicDescriptor,
 	key, value []byte,
+	csvColumnHeader []byte,
 	updated, mvcc hlc.Timestamp,
 	alloc kvevent.Alloc,
 	headers rowHeaders,
@@ -671,6 +676,8 @@ func (s *kafkaSink) handleBufferedRetries(msgs []*sarama.ProducerMessage, retryE
 
 	for {
 		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
 		case <-s.stopWorkerCh:
 			log.Changefeed.Infof(s.ctx, "kafka sink ending retries due to worker close")
 			return lastSendErr

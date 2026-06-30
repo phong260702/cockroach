@@ -7,7 +7,9 @@ package scbuildstmt
 
 import (
 	"fmt"
+	"slices"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -17,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -135,10 +136,11 @@ func dropSecondaryIndex(
 		// served by a unique constraint 'uc' that is provided by a unique index 'ui'.
 		// In this case, if we were to drop 'ui' and no other unique constraint can be
 		// found to replace 'uc' (to continue to serve 'fk'), we will require CASCADE
-		//and drop 'fk' as well.
+		// and drop 'fk' as well.
+		canUseSubset := b.ClusterSettings().Version.IsActive(b, clusterversion.V26_3)
 		maybeDropDependentFKConstraints(b, sie.TableID, sie.ConstraintID, string(indexName.Index), dropBehavior,
 			func(fkReferencedColIDs []catid.ColumnID) bool {
-				return isIndexUniqueAndCanServeFK(b, &sie.Index, fkReferencedColIDs)
+				return isIndexUniqueAndCanServeFK(b, &sie.Index, fkReferencedColIDs, canUseSubset)
 			})
 
 		// If shard index, also drop the shard column and all check constraints that
@@ -364,9 +366,9 @@ func maybeDropAdditionallyForShardedIndex(
 	dropColumn(b, &tn, tbl, stmt, stmt, shardCol, shardColElms, dropBehavior)
 }
 
-// maybeDropTriggers attempts to drop all triggers that depend on the index
-// being dropped, but only if the drop behavior is CASCADE. It panics if any
-// dependent trigger exists and the drop behavior is not CASCADE.
+// maybeDropTriggers drops all triggers that depend on the index being dropped
+// if the drop behavior is CASCADE. It panics if any dependent trigger exists
+// and the drop behavior is not CASCADE.
 func maybeDropTriggers(
 	b BuildCtx,
 	tableID catid.DescID,
@@ -379,19 +381,22 @@ func maybeDropTriggers(
 		case *scpb.TriggerDeps:
 			for _, ref := range elt.UsesRelations {
 				if ref.ID == tableID && ref.IndexID == indexID {
-					if behavior == tree.DropCascade {
-						panic(unimplemented.NewWithIssuef(
-							146667, "DROP INDEX cascade is not supported with triggers"))
-					}
 					tableElts := b.QueryByID(elt.TableID)
 					tableName := tableElts.FilterNamespace().MustGetOneElement()
 					triggerName := tableElts.FilterTriggerName().Filter(
 						func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.TriggerName) bool {
 							return e.TriggerID == elt.TriggerID
 						}).MustGetOneElement()
-					panic(sqlerrors.NewDependentObjectErrorf(
-						"cannot drop index %q because trigger %q on table %q depends on it",
-						indexName, triggerName.Name, tableName.Name))
+					if behavior != tree.DropCascade {
+						panic(sqlerrors.NewDependentObjectErrorf(
+							"cannot drop index %q because trigger %q on table %q depends on it",
+							indexName, triggerName.Name, tableName.Name))
+					}
+					b.EvalCtx().ClientNoticeSender.BufferClientNotice(b, pgnotice.Newf(
+						"drop cascades to trigger %s on table %s",
+						triggerName.Name, tableName.Name,
+					))
+					dropTrigger(b, elt.TableID, elt.TriggerID)
 				}
 			}
 		}
@@ -509,10 +514,15 @@ func explicitKeyColumnIDsWithoutShardColumn(b BuildCtx, ie *scpb.Index) descpb.C
 	return colIDs
 }
 
-// isIndexUniqueAndCanServeFK return true if the index `ie` is unique,
-// non-partial, and can thus serve a FK that referenced `fkReferencedColIDs`.
+// isIndexUniqueAndCanServeFK returns true if the index `ie` is unique,
+// non-partial, and can thus serve a FK that references `fkReferencedColIDs`.
+//
+// When asSubset is false, the index must cover the FK's referenced columns
+// exactly (a permutation match). When true, the index validates as a subset
+// match: its key columns may be a non-empty subset of the FK's referenced
+// columns.
 func isIndexUniqueAndCanServeFK(
-	b BuildCtx, ie *scpb.Index, fkReferencedColIDs []tree.ColumnID,
+	b BuildCtx, ie *scpb.Index, fkReferencedColIDs []tree.ColumnID, asSubset bool,
 ) bool {
 	if !ie.IsUnique {
 		return false
@@ -533,7 +543,11 @@ func isIndexUniqueAndCanServeFK(
 	keyColIDs, _, _ := getSortedColumnIDsInIndexByKind(b, ie.TableID, ie.IndexID)
 	implicitKeyColIDs := keyColIDs[:explicitColumnStartIdx(b, ie)]
 	explicitKeyColIDsWithoutShardCol := explicitKeyColumnIDsWithoutShardColumn(b, ie)
-	allKeyColIDsWithoutShardCol := descpb.ColumnIDs(append(implicitKeyColIDs, explicitKeyColIDsWithoutShardCol...))
+	allKeyColIDsWithoutShardCol := slices.Concat(implicitKeyColIDs, explicitKeyColIDsWithoutShardCol)
+	if asSubset {
+		return explicitKeyColIDsWithoutShardCol.IsNonEmptySubsetOf(fkReferencedColIDs) ||
+			allKeyColIDsWithoutShardCol.IsNonEmptySubsetOf(fkReferencedColIDs)
+	}
 	return explicitKeyColIDsWithoutShardCol.PermutationOf(fkReferencedColIDs) ||
 		allKeyColIDsWithoutShardCol.PermutationOf(fkReferencedColIDs)
 }
@@ -548,6 +562,7 @@ func isIndexUniqueAndCanServeFK(
 func hasColsUniquenessConstraintOtherThan(
 	b BuildCtx, tableID descpb.ID, columnIDs []descpb.ColumnID, otherThan descpb.ConstraintID,
 ) (ret bool) {
+	canUseSubset := b.ClusterSettings().Version.IsActive(b, clusterversion.V26_3)
 	b.QueryByID(tableID).Filter(publicTargetFilter).Filter(publicStatusFilter).
 		ForEach(func(
 			current scpb.Status, target scpb.TargetStatus, e scpb.Element,
@@ -557,15 +572,19 @@ func hasColsUniquenessConstraintOtherThan(
 			}
 			switch t := e.(type) {
 			case *scpb.PrimaryIndex:
-				if t.ConstraintID != otherThan && isIndexUniqueAndCanServeFK(b, &t.Index, columnIDs) {
+				if t.ConstraintID != otherThan && isIndexUniqueAndCanServeFK(b, &t.Index, columnIDs, canUseSubset) {
 					ret = true
 				}
 			case *scpb.SecondaryIndex:
-				if t.ConstraintID != otherThan && isIndexUniqueAndCanServeFK(b, &t.Index, columnIDs) {
+				if t.ConstraintID != otherThan && isIndexUniqueAndCanServeFK(b, &t.Index, columnIDs, canUseSubset) {
 					ret = true
 				}
 			case *scpb.UniqueWithoutIndexConstraint:
-				if t.ConstraintID != otherThan && descpb.ColumnIDs(t.ColumnIDs).PermutationOf(columnIDs) {
+				if t.ConstraintID == otherThan {
+					return
+				}
+				cols := descpb.ColumnIDs(t.ColumnIDs)
+				if cols.PermutationOf(columnIDs) || (canUseSubset && cols.IsNonEmptySubsetOf(columnIDs)) {
 					ret = true
 				}
 			}

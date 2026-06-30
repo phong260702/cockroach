@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/backup/backupsink"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -40,6 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/besteffort"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -47,10 +48,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 )
 
 const defaultLinkWorkersPerNode = 2
+
+// experimentalCopyLinkFraction is the fraction of overall job progress
+// allocated to the link phase of an ExperimentalCopy restore.
+const experimentalCopyLinkFraction = 0.05
 
 var onlineRestoreLinkWorkers = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
@@ -69,8 +75,37 @@ var onlineRestoreLayerLimit = settings.RegisterIntSetting(
 	settings.WithVisibility(settings.Reserved),
 )
 
+// onlineRestoreUseDistFlow controls whether online restore uses the distributed
+// restore flow (distRestore with RestoreDataProcessor) instead of the simpler
+// sendAddRemoteSSTs loop. When enabled, the RestoreDataProcessor will link
+// files via LinkExternalSSTable instead of downloading and ingesting them.
+var onlineRestoreUseDistFlow = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"backup.restore.online_use_dist_flow.enabled",
+	"if enabled, online restore uses the distributed restore flow with file linking",
+	true,
+	settings.WithVisibility(settings.Reserved),
+)
+
+var orDownloadRetryMaxDuration = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
+	"backup.restore.online_download_retry_max_duration",
+	"maximum duration the online restore download phase will retry before pausing the job",
+	72*time.Hour,
+	settings.WithVisibility(settings.Reserved),
+	settings.PositiveDuration,
+)
+
+var orDownloadRetryLogRate = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
+	"backup.restore.online_download_retry_log_rate",
+	"maximum rate at which retryable online restore download errors are logged to the job messages table",
+	5*time.Minute,
+	settings.WithVisibility(settings.Reserved),
+	settings.PositiveDuration,
+)
+
 const linkCompleteKey = "link_complete"
-const maxDownloadAttempts = 5
 
 // splitAndScatter runs through all entries produced by genSpans splitting and
 // scattering the key-space designated by the passed rewriter such that if all
@@ -185,12 +220,6 @@ func sendAddRemoteSSTs(
 	tracingAggCh chan *execinfrapb.TracingAggregatorEvents,
 	genSpan func(ctx context.Context, spanCh chan execinfrapb.RestoreSpanEntry) error,
 ) (approxRows int64, approxDataSize int64, err error) {
-	defer close(tracingAggCh)
-
-	if encryption != nil {
-		return 0, 0, errors.AssertionFailedf("encryption not supported with online restore")
-	}
-
 	const targetRangeSize = 440 << 20
 
 	kr, err := MakeKeyRewriterFromRekeys(execCtx.ExecCfg().Codec, dataToRestore.getRekeys(), dataToRestore.getTenantRekeys(),
@@ -202,10 +231,6 @@ func sendAddRemoteSSTs(
 	fromSystemTenant := isFromSystemTenant(dataToRestore.getTenantRekeys())
 
 	if err := execCtx.ExecCfg().JobRegistry.CheckPausepoint("restore.before_split"); err != nil {
-		return 0, 0, err
-	}
-
-	if err := job.NoTxn().UpdateStatusMessage(ctx, "Splitting and distributing spans"); err != nil {
 		return 0, 0, err
 	}
 
@@ -223,10 +248,6 @@ func sendAddRemoteSSTs(
 		}
 	}
 	if err := execCtx.ExecCfg().JobRegistry.CheckPausepoint("restore.before_link"); err != nil {
-		return 0, 0, err
-	}
-
-	if err := job.NoTxn().UpdateStatusMessage(ctx, ""); err != nil {
 		return 0, 0, err
 	}
 
@@ -310,8 +331,6 @@ func sendAddRemoteSSTWorker(
 	return func(ctx context.Context) error {
 		testingKnobs := execCtx.ExecCfg().BackupRestoreTestingKnobs
 
-		extConnCache := make(map[string]externalconn.ExternalConnection)
-
 		for entry := range restoreSpanEntriesCh {
 			log.Dev.VInfof(ctx, 1, "starting restore of backed up span %s containing %d files", entry.Span, len(entry.Files))
 
@@ -325,6 +344,7 @@ func sendAddRemoteSSTWorker(
 					return errors.AssertionFailedf("files not sorted by layer")
 				}
 				currentLayer = file.Layer
+
 				if file.HasRangeKeys {
 					return errors.Wrapf(permanentRestoreError, "online restore of range keys not supported")
 				}
@@ -348,40 +368,6 @@ func sendAddRemoteSSTWorker(
 
 				log.Dev.VInfof(ctx, 1, "restoring span %s of file %s (file span: %s)", restoringSubspan, file.Path, file.BackupFileEntrySpan)
 				file.BackupFileEntrySpan = restoringSubspan
-
-				// swap out any external connections for their underlying uris and revalidate
-				uri, err := url.Parse(file.Dir.URI)
-				if err != nil {
-					return errors.Wrap(err, "invalid URI")
-				}
-				if uri.Scheme == externalconn.Scheme {
-					var ec externalconn.ExternalConnection
-					var ok bool
-					if ec, ok = extConnCache[uri.Host]; !ok {
-						if err := execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, t isql.Txn) error {
-							ec, err = externalconn.LoadExternalConnection(ctx, uri.Host, t)
-							if err != nil {
-								return err
-							}
-							extConnCache[uri.Host] = ec
-							return nil
-						}); err != nil {
-							return errors.Wrap(err, "failed to load external connection")
-						}
-					}
-
-					materialized, err := externalconn.Materialize(ec, uri)
-					if err != nil {
-						return errors.Wrap(err, "failed to materialize external connection URI")
-					}
-					// revalidate in case the user changed the underlying uri in the external connection
-					// to a non early boot uri since the job was created
-					if err := cloud.SchemeSupportsEarlyBoot(materialized.Scheme); err != nil {
-						return errors.Wrap(err, "backup URI not supported for online restore")
-					}
-
-					file.Dir.URI = materialized.String()
-				}
 
 				if err := sendRemoteAddSSTable(ctx, execCtx, file, entry.ElidedPrefix, fromSystemTenant); err != nil {
 					return err
@@ -498,7 +484,7 @@ func sendRemoteAddSSTable(
 	}
 
 	loc := kvpb.LinkExternalSSTableRequest_ExternalFile{
-		Locator:                 file.Dir.URI,
+		Locator:                 cloud.MakeRedactableLocatorURI(file.Dir.URI),
 		Path:                    file.Path,
 		ApproximatePhysicalSize: fileSize,
 		BackingFileSize:         file.BackingFileSize,
@@ -521,10 +507,6 @@ func checkManifestsForOnlineCompat(
 		return errors.AssertionFailedf("expected at least 1 backup manifest")
 	}
 
-	if len(manifests) > 1 && !clusterversion.V24_1.Version().Less(manifests[0].ClusterVersion) {
-		return errors.Newf("the backup must be on a cluster version greater than %s to run online restore with an incremental backup", clusterversion.V24_1.String())
-	}
-
 	// TODO(online-restore): Remove once we support layer ordering and have tested some reasonable number of layers.
 	layerLimit := int(onlineRestoreLayerLimit.Get(&settings.SV))
 	if len(manifests) > layerLimit {
@@ -533,9 +515,17 @@ func checkManifestsForOnlineCompat(
 
 	for _, manifest := range manifests {
 		if !manifest.RevisionStartTime.IsEmpty() || manifest.MVCCFilter == backuppb.MVCCFilter_All {
-			return pgerror.Newf(pgcode.FeatureNotSupported, "experimental online restore: restoring from a revision history backup not supported")
+			// Revision history backups are supported when using the distributed
+			// flow, which can handle mixed link/ingest entries. The coordinator
+			// loop (sendAddRemoteSSTs) cannot handle them.
+			if !onlineRestoreUseDistFlow.Get(&settings.SV) {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"experimental online restore: restoring from a revision history backup not supported")
+			}
+			break
 		}
 	}
+
 	return nil
 }
 
@@ -588,8 +578,14 @@ func (r *restoreResumer) maybeCalculateTotalDownloadSpans(
 	// amount we expect to download and persist it so that we can indicate our
 	// progress as that number goes down later.
 	log.Dev.Infof(ctx, "calculating total download size (across all stores) to complete restore")
-	if err := r.job.NoTxn().UpdateStatusMessage(ctx, "Calculating total download size..."); err != nil {
-		return 0, errors.Wrapf(err, "failed to update running status of job %d", r.job.ID())
+
+	// Set the Phase 2 status message before calculating the total download size.
+	// This ensures users always see the download phase status, even if there's
+	// nothing to download.
+	if err := execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		return r.job.StatusStorage().Set(ctx, txn, "Phase 2 of 2: Downloading restored data")
+	}); err != nil {
+		return 0, errors.Wrap(err, "updating status message for download phase")
 	}
 
 	total, err := getExternalBytesOverSpans(ctx, execCtx.ExecCfg(), details.DownloadSpans)
@@ -603,9 +599,9 @@ func (r *restoreResumer) maybeCalculateTotalDownloadSpans(
 		return total, nil
 	}
 
-	if err := r.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+	//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+	if err := r.job.DeprecatedNoTxn().Update(ctx, func(txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
 		md.Progress.GetRestore().TotalDownloadRequired = total
-		md.Progress.StatusMessage = fmt.Sprintf("Downloading %s of restored data...", sz(total))
 		ju.UpdateProgress(md.Progress)
 		return nil
 	}); err != nil {
@@ -615,45 +611,73 @@ func (r *restoreResumer) maybeCalculateTotalDownloadSpans(
 	return total, nil
 }
 
+// sendDownloadWorker retries sendDownloadSpan with the given backoff
+// until either done is closed (the observer signalled remaining bytes
+// hit zero), the retry budget is exhausted, or ctx is cancelled. The
+// retry counter resets on each successful dispatch, so newly appearing
+// work (e.g. from rebalancing) does not count against the no-progress
+// budget.
 func (r *restoreResumer) sendDownloadWorker(
-	execCtx sql.JobExecContext, spans roachpb.Spans, completionPoller chan struct{},
-) func(context.Context) error {
-	return func(ctx context.Context) error {
-		ctx, tsp := tracing.ChildSpan(ctx, "backup.sendDownloadWorker")
-		defer tsp.Finish()
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	spans roachpb.Spans,
+	done <-chan struct{},
+	retryOpts retry.Options,
+) error {
+	ctx, tsp := tracing.ChildSpan(ctx, "backup.sendDownloadWorker")
+	defer tsp.Finish()
 
-		testingKnobs := execCtx.ExecCfg().BackupRestoreTestingKnobs
-		for {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
+	testingKnobs := execCtx.ExecCfg().BackupRestoreTestingKnobs
+	logThrottler := util.EveryMono(orDownloadRetryLogRate.Get(&execCtx.ExecCfg().Settings.SV))
 
-			if testingKnobs != nil && testingKnobs.RunBeforeSendingDownloadSpan != nil {
-				if err := testingKnobs.RunBeforeSendingDownloadSpan(); err != nil {
-					return err
-				}
-			}
-
-			if err := sendDownloadSpan(ctx, execCtx, spans); err != nil {
-				return err
-			}
-
-			// Wait for the completion poller to signal that it has checked our work.
-			select {
-			case _, ok := <-completionPoller:
-				if !ok {
-					return nil
-				}
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-
-			// Sleep a bit before sending download requests again to avoid a hot loop.
-			// This will only be hit if after a successful download request, there are
-			// still spans to download (e.g. because of a rabalancing).
-			time.Sleep(10 * time.Second)
+	var lastErr error
+	for rt := retry.StartWithCtx(ctx, retryOpts); rt.Next(); {
+		select {
+		case <-done:
+			return nil
+		default:
 		}
+		if testingKnobs != nil && testingKnobs.RunBeforeSendingDownloadSpan != nil {
+			if err := testingKnobs.RunBeforeSendingDownloadSpan(); err != nil {
+				lastErr = err
+				r.recordDownloadFailure(ctx, execCtx, &logThrottler, err)
+				continue
+			}
+		}
+		if err := sendDownloadSpan(ctx, execCtx, spans); err != nil {
+			lastErr = err
+			r.recordDownloadFailure(ctx, execCtx, &logThrottler, err)
+			continue
+		}
+		lastErr = nil
+		rt.Reset()
 	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return ctx.Err()
+}
+
+// recordDownloadFailure logs a download failure to the job's message
+// log, throttled by the configured rate.
+func (r *restoreResumer) recordDownloadFailure(
+	ctx context.Context, execCtx sql.JobExecContext, throttler *util.EveryN[crtime.Mono], err error,
+) {
+	log.Dev.Warningf(ctx, "failed attempt to download files: %v", err)
+	if !throttler.ShouldProcess(crtime.NowMono()) {
+		return
+	}
+	besteffort.Warning(
+		ctx, "or-download-failed-log",
+		func(ctx context.Context) error {
+			return execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				return r.job.Messages().Record(
+					ctx, txn, "error",
+					fmt.Sprintf("online restore download encountered error: %v", err),
+				)
+			})
+		},
+	)
 }
 
 var useCopy = envutil.EnvOrDefaultBool("COCKROACH_DOWNLOAD_COPY", true)
@@ -675,6 +699,12 @@ func sendDownloadSpan(ctx context.Context, execCtx sql.JobExecContext, spans roa
 		err := errors.DecodeError(ctx, encoded)
 		return errors.Wrapf(err,
 			"failed to download spans on %d nodes; n%d err", len(resp.Errors), n)
+	}
+	if testingKnobs := execCtx.ExecCfg().BackupRestoreTestingKnobs; testingKnobs != nil &&
+		testingKnobs.RunAfterSendingDownloadSpan != nil {
+		if err := testingKnobs.RunAfterSendingDownloadSpan(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -751,14 +781,18 @@ func (r *restoreResumer) maybeWriteDownloadJob(
 	})
 }
 
-// waitForDownloadToComplete waits until there are no more ExternalFileBytes
-// remaining to be downloaded for the restore. It sends a signal on the passed
-// channel each time it polls the span, and closes it when it stops.
+// waitForDownloadToComplete polls until there are no more ExternalFileBytes
+// remaining to be downloaded for the restore, then closes done to tell the
+// dispatch worker it can stop. If the retry budget elapses without any
+// observed decrease in remaining bytes, returns an error and leaves done
+// open — the surrounding ctxgroup will tear down the worker via ctx cancel.
 func (r *restoreResumer) waitForDownloadToComplete(
-	ctx context.Context, execCtx sql.JobExecContext, details jobspb.RestoreDetails, ch chan struct{},
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	details jobspb.RestoreDetails,
+	done chan<- struct{},
+	retryOpts retry.Options,
 ) error {
-	defer close(ch)
-
 	ctx, tsp := tracing.ChildSpan(ctx, "backup.waitForDownloadToComplete")
 	defer tsp.Finish()
 
@@ -766,23 +800,37 @@ func (r *restoreResumer) waitForDownloadToComplete(
 	if err != nil {
 		return errors.Wrap(err, "failed to calculate total number of spans to download")
 	}
+	if knobs := execCtx.ExecCfg().BackupRestoreTestingKnobs; knobs != nil &&
+		knobs.OverrideRemainingBytesFn != nil {
+		total = knobs.OverrideRemainingBytesFn()
+	}
 
 	// Download is already complete or there is nothing to be downloaded, in
 	// either case we can mark the job as done.
 	if total == 0 {
 		r.downloadJobProg = 1.0
-		return r.job.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+		close(done)
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		return r.job.DeprecatedNoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 			return 1.0
 		})
 	}
 
+	lastRemaining := total
 	var lastProgressUpdate time.Time
-	for rt := retry.StartWithCtx(
-		ctx, retry.Options{InitialBackoff: time.Second, MaxBackoff: time.Second * 10},
-	); rt.Next(); {
+	for rt := retry.StartWithCtx(ctx, retryOpts); rt.Next(); {
 		remaining, err := getExternalBytesOverSpans(ctx, execCtx.ExecCfg(), details.DownloadSpans)
 		if err != nil {
 			return errors.Wrap(err, "failed to get remaining external file bytes")
+		}
+		if knobs := execCtx.ExecCfg().BackupRestoreTestingKnobs; knobs != nil &&
+			knobs.OverrideRemainingBytesFn != nil {
+			remaining = knobs.OverrideRemainingBytesFn()
+		}
+
+		if remaining < lastRemaining {
+			lastRemaining = remaining
+			rt.Reset()
 		}
 
 		// Sometimes a new virtual/external file sneaks in after we count total; the
@@ -793,7 +841,12 @@ func (r *restoreResumer) waitForDownloadToComplete(
 			total = remaining
 		}
 
-		fractionComplete := float32(total-remaining) / float32(total)
+		rawFraction := float32(total-remaining) / float32(total)
+		fractionComplete := rawFraction
+		if details.ExperimentalCopy {
+			fractionComplete = experimentalCopyLinkFraction +
+				rawFraction*(1.0-experimentalCopyLinkFraction)
+		}
 		log.Dev.VInfof(ctx, 1, "restore download phase, %s downloaded, %s remaining of %s total (%.2f complete)",
 			sz(total-remaining), sz(remaining), sz(total), fractionComplete,
 		)
@@ -801,25 +854,24 @@ func (r *restoreResumer) waitForDownloadToComplete(
 
 		if remaining == 0 {
 			r.notifyStatsRefresherOfNewTables(ctx)
+			close(done)
 			return nil
 		}
 
 		if timeutil.Since(lastProgressUpdate) > time.Minute {
-			if err := r.job.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			if err := r.job.DeprecatedNoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 				return fractionComplete
 			}); err != nil {
 				return err
 			}
 			lastProgressUpdate = timeutil.Now()
 		}
-		// Signal the download job if it is waiting that we've polled and found work
-		// left for it to do.
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
 	}
-	return ctx.Err()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return errors.New("download made no observable progress within retry budget")
 }
 
 func unstickRestoreSpans(
@@ -872,28 +924,22 @@ func getRemainingExternalFileBytes(
 	return remaining, nil
 }
 
-func (r *restoreResumer) doDownloadFilesWithRetry(
-	ctx context.Context, execCtx sql.JobExecContext,
-) error {
-	var err error
-	var lastProgress float32
-	for rt := retry.StartWithCtx(ctx, retry.Options{
-		InitialBackoff: time.Millisecond * 100,
-		MaxBackoff:     time.Second,
-		MaxRetries:     maxDownloadAttempts - 1,
-	}); rt.Next(); {
-		err = r.doDownloadFiles(ctx, execCtx)
-		if err == nil {
-			return nil
-		}
-		log.Dev.Warningf(ctx, "failed attempt to download files: %v", err)
-		if lastProgress != r.downloadJobProg {
-			lastProgress = r.downloadJobProg
-			rt.Reset()
-			log.Dev.Infof(ctx, "download progress has advanced since last retry, resetting retry counter")
-		}
+// downloadRetryOpts returns the retry options used by both the dispatch
+// worker and the observer in the download phase. The MaxDuration bounds
+// how long either loop will sit without observable forward motion (a
+// successful dispatch for the worker, a decrease in remaining bytes for
+// the observer); both loops reset their counter on each forward step.
+func downloadRetryOpts(execCtx sql.JobExecContext) retry.Options {
+	opts := retry.Options{
+		InitialBackoff: time.Second,
+		MaxBackoff:     10 * time.Second,
+		MaxDuration:    orDownloadRetryMaxDuration.Get(&execCtx.ExecCfg().Settings.SV),
 	}
-	return errors.Wrapf(err, "retries exhausted for downloading files")
+	if knobs := execCtx.ExecCfg().BackupRestoreTestingKnobs; knobs != nil &&
+		knobs.DownloadPhaseRetryPolicy != nil {
+		opts = *knobs.DownloadPhaseRetryPolicy
+	}
+	return opts
 }
 
 func (r *restoreResumer) doDownloadFiles(ctx context.Context, execCtx sql.JobExecContext) error {
@@ -903,27 +949,30 @@ func (r *restoreResumer) doDownloadFiles(ctx context.Context, execCtx sql.JobExe
 		return err
 	}
 
-	grp := ctxgroup.WithContext(ctx)
-	completionPoller := make(chan struct{})
+	retryOpts := downloadRetryOpts(execCtx)
+	done := make(chan struct{})
 
-	grp.GoCtx(r.sendDownloadWorker(execCtx, details.DownloadSpans, completionPoller))
+	grp := ctxgroup.WithContext(ctx)
 	grp.GoCtx(func(ctx context.Context) error {
-		return r.waitForDownloadToComplete(ctx, execCtx, details, completionPoller)
+		return r.sendDownloadWorker(ctx, execCtx, details.DownloadSpans, done, retryOpts)
+	})
+	grp.GoCtx(func(ctx context.Context) error {
+		return r.waitForDownloadToComplete(ctx, execCtx, details, done, retryOpts)
 	})
 
 	if err := grp.Wait(); err != nil {
 		if errors.HasType(err, &kvpb.InsufficientSpaceError{}) {
 			return jobs.MarkPauseRequestError(errors.UnwrapAll(err))
 		}
-		return errors.Wrap(err, "failed to generate and send download spans")
+		if jobs.IsPauseSelfError(err) || jobs.IsPermanentJobError(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return errors.CombineErrors(ctx.Err(), err)
+		}
+		return jobs.MarkPauseRequestError(errors.Wrap(err, "download phase"))
 	}
 
-	testingKnobs := execCtx.ExecCfg().BackupRestoreTestingKnobs
-	if testingKnobs != nil && testingKnobs.RunBeforeDownloadCleanup != nil {
-		if err := testingKnobs.RunBeforeDownloadCleanup(); err != nil {
-			return errors.Wrap(err, "testing knob RunBeforeDownloadCleanup failed")
-		}
-	}
 	return r.cleanupAfterDownload(ctx, details)
 }
 
@@ -1002,52 +1051,39 @@ func setDescriptorsOffline(
 		return nil
 	}
 
-	mutableTables, err := getUndroppedTablesFromRestore(ctx, txn.KV(), details, descCol)
-	if err != nil {
-		return errors.Wrapf(err, "set descriptors offline: getting undropped tables from restore")
+	var descIDs []descpb.ID
+	for _, desc := range details.TableDescs {
+		descIDs = append(descIDs, desc.ID)
 	}
-	for _, mutableTable := range mutableTables {
-		if err := writeDesc(mutableTable); err != nil {
-			return err
-		}
-	}
-
 	for i := range details.FunctionDescs {
-		mutableFunc, err := descCol.MutableByID(txn.KV()).Function(ctx, details.FunctionDescs[i].ID)
-		if err != nil {
-			return err
-		}
-		if err := writeDesc(mutableFunc); err != nil {
-			return err
-		}
+		descIDs = append(descIDs, details.FunctionDescs[i].ID)
 	}
-
 	for i := range details.DatabaseDescs {
-		mutableDB, err := descCol.MutableByID(txn.KV()).Database(ctx, details.DatabaseDescs[i].ID)
-		if err != nil {
-			return err
-		}
-		if err := writeDesc(mutableDB); err != nil {
-			return err
-		}
+		descIDs = append(descIDs, details.DatabaseDescs[i].ID)
 	}
-
 	for i := range details.TypeDescs {
-		mutableType, err := descCol.MutableByID(txn.KV()).Type(ctx, details.TypeDescs[i].ID)
-		if err != nil {
-			return err
-		}
-		if err := writeDesc(mutableType); err != nil {
-			return err
-		}
+		descIDs = append(descIDs, details.TypeDescs[i].ID)
+	}
+	for i := range details.SchemaDescs {
+		descIDs = append(descIDs, details.SchemaDescs[i].ID)
 	}
 
-	for i := range details.SchemaDescs {
-		mutableSchema, err := descCol.MutableByID(txn.KV()).Schema(ctx, details.SchemaDescs[i].ID)
+	for _, id := range descIDs {
+		// We use Desc over the type-specific lookups because the latter replaces
+		// the shared catalog.ErrDescriptorNotFound with a more specific pgcode.
+		// Uinsg the former allows us to match on one error type for all
+		// descriptors.
+		desc, err := descCol.MutableByID(txn.KV()).Desc(ctx, id)
 		if err != nil {
+			if errors.Is(err, catalog.ErrDescriptorNotFound) {
+				continue
+			}
 			return err
 		}
-		if err := writeDesc(mutableSchema); err != nil {
+		if desc.Dropped() {
+			continue
+		}
+		if err := writeDesc(desc); err != nil {
 			return err
 		}
 	}
@@ -1148,4 +1184,120 @@ func uriCompatibleWithOnlineRestore(ctx context.Context, txn isql.Txn, path stri
 		return errors.Wrap(err, "backup URI not supported for online restore")
 	}
 	return nil
+}
+
+// resolveExternalStorageURIs resolves any external:// URIs in the provided
+// URI slice, locality info, and backup manifests to their underlying URIs.
+// This is needed for online restore because the external:// scheme is not
+// available at early boot time when SSTs are ingested.
+func resolveExternalStorageURIs(
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	urisIn []string,
+	localityInfoIn []jobspb.RestoreDetails_BackupLocalityInfo,
+	backupManifests []backuppb.BackupManifest,
+) ([]string, []jobspb.RestoreDetails_BackupLocalityInfo, error) {
+	extConnCache := make(map[string]externalconn.ExternalConnection)
+
+	// resolveURI resolves a single URI if it uses the external:// scheme.
+	resolveURI := func(uriStr string) (string, bool, error) {
+		uri, err := url.Parse(uriStr)
+		if err != nil {
+			return "", false, errors.Wrap(err, "invalid URI")
+		}
+		if uri.Scheme != externalconn.Scheme {
+			return uriStr, false, nil
+		}
+
+		var ec externalconn.ExternalConnection
+		var ok bool
+		if ec, ok = extConnCache[uri.Host]; !ok {
+			if err := execCtx.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, t isql.Txn) error {
+				ec, err = externalconn.LoadExternalConnection(ctx, uri.Host, t)
+				if err != nil {
+					return err
+				}
+				extConnCache[uri.Host] = ec
+				return nil
+			}); err != nil {
+				return "", false, errors.Wrap(err, "failed to load external connection")
+			}
+		}
+
+		materialized, err := externalconn.Materialize(ec, uri)
+		if err != nil {
+			return "", false, errors.Wrap(err, "failed to materialize external connection URI")
+		}
+		// Revalidate in case the user changed the underlying uri in the external
+		// connection to a non early boot uri since the job was created.
+		if err := cloud.SchemeSupportsEarlyBoot(materialized.Scheme); err != nil {
+			return "", false, errors.Wrap(err, "backup URI not supported for online restore")
+		}
+
+		return materialized.String(), true, nil
+	}
+
+	// Resolve main URIs.
+	var urisOut []string
+	for i, uriStr := range urisIn {
+		resolved, changed, err := resolveURI(uriStr)
+		if err != nil {
+			return nil, nil, err
+		}
+		if changed {
+			if urisOut == nil {
+				urisOut = append(urisOut, urisIn...)
+			}
+			urisOut[i] = resolved
+		}
+	}
+	if urisOut == nil {
+		urisOut = urisIn
+	}
+
+	// Resolve locality info URIs.
+	var localityInfoOut []jobspb.RestoreDetails_BackupLocalityInfo
+	for i, localityInfo := range localityInfoIn {
+		if localityInfo.URIsByOriginalLocalityKV == nil {
+			continue
+		}
+		for kv, uriStr := range localityInfo.URIsByOriginalLocalityKV {
+			resolved, changed, err := resolveURI(uriStr)
+			if err != nil {
+				return nil, nil, err
+			}
+			if changed {
+				// Lazily initialize the output slice.
+				if localityInfoOut == nil {
+					localityInfoOut = make([]jobspb.RestoreDetails_BackupLocalityInfo, len(localityInfoIn))
+					for j := range localityInfoIn {
+						if localityInfoIn[j].URIsByOriginalLocalityKV != nil {
+							localityInfoOut[j].URIsByOriginalLocalityKV = make(map[string]string)
+							for k, v := range localityInfoIn[j].URIsByOriginalLocalityKV {
+								localityInfoOut[j].URIsByOriginalLocalityKV[k] = v
+							}
+						}
+					}
+				}
+				localityInfoOut[i].URIsByOriginalLocalityKV[kv] = resolved
+			}
+		}
+	}
+	if localityInfoOut == nil {
+		localityInfoOut = localityInfoIn
+	}
+
+	// Resolve backup manifest Dir URIs. The Dir field in each manifest is used
+	// to construct file paths for LinkExternalSSTable requests.
+	for i := range backupManifests {
+		resolved, changed, err := resolveURI(backupManifests[i].Dir.URI)
+		if err != nil {
+			return nil, nil, err
+		}
+		if changed {
+			backupManifests[i].Dir.URI = resolved
+		}
+	}
+
+	return urisOut, localityInfoOut, nil
 }

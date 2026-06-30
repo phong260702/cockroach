@@ -1251,7 +1251,7 @@ func TestNonTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 		ba := &kvpb.BatchRequest{}
 		ba.RangeID = desc.RangeID
 		ba.Add(getArgs(key))
-		br, pErr := tc.GetFirstStoreFromServer(t, 1).Send(ctx, ba)
+		br, pErr := kvserver.ToSenderForTesting(tc.GetFirstStoreFromServer(t, 1)).Send(ctx, ba)
 		nonTxnRespC <- resp{br, pErr}
 	})
 
@@ -1290,7 +1290,7 @@ func TestNonTxnReadWithinUncertaintyIntervalAfterLeaseTransfer(t *testing.T) {
 	ba := &kvpb.BatchRequest{}
 	ba.RangeID = desc.RangeID
 	ba.Add(putArgs(key, []byte("val")))
-	br, pErr := tc.GetFirstStoreFromServer(t, 0).Send(ctx, ba)
+	br, pErr := kvserver.ToSenderForTesting(tc.GetFirstStoreFromServer(t, 0)).Send(ctx, ba)
 	require.Nil(t, pErr)
 	writeTs := br.Timestamp
 	require.True(t, nonTxnOrigTs.Less(writeTs), "nonTxnOrigTs: %v, writeTs: %v", nonTxnOrigTs, writeTs)
@@ -2000,6 +2000,24 @@ func TestLeaseExpirationBelowFutureTimeRequest(t *testing.T) {
 			return lease.Replica.StoreID == l.replica1.StoreID()
 		}, 5*time.Second, 100*time.Millisecond, "timed out waiting for replica 0 to pick up new lease")
 
+		// Wait for raft leadership to transfer to the leaseholder. The lease
+		// extension below goes through verifyLeaseRequestSafetyRLocked which
+		// treats a stasis-period lease as expired (PrevLeaseExpired=true) and
+		// falls through to verifyAcquisition, which rejects if we're not the
+		// raft leader. Without this wait, the raft group can be leaderless
+		// after AdminTransferLease initiates a leadership transfer.
+		testutils.SucceedsSoon(t, func() error {
+			raftStatus := l.replica1.RaftStatus()
+			if raftStatus == nil {
+				return errors.New("raft status not available")
+			}
+			if raftStatus.RaftState == raftpb.StateLeader {
+				return nil
+			}
+			return errors.Newf("replica1 raft state: %s, lead: %d, term: %d",
+				raftStatus.RaftState, raftStatus.Lead, raftStatus.Term)
+		})
+
 		// Pause the cluster's clocks.
 		l.manualClock.Pause()
 		atPause := l.manualClock.UnixNano()
@@ -2033,8 +2051,8 @@ func TestLeaseExpirationBelowFutureTimeRequest(t *testing.T) {
 			// may end up being extended by some other request. That fact that
 			// our request was rejected is good enough.
 		} else {
-			// The request should have been rejected.
-			require.Nil(t, pErr)
+			// The request should succeed and trigger a lease extension.
+			require.Nil(t, pErr, "expected request to succeed: %s", pErr)
 
 			// The lease should have been extended.
 			l.checkHasLease(t, 1)
@@ -2589,7 +2607,7 @@ func TestConsistencyQueueDelaysProcessingNewRanges(t *testing.T) {
 		rngID := store.LookupReplica(roachpb.RKey(key)).RangeID
 		h := kvpb.Header{RangeID: rngID}
 		args := adminSplitArgs(key)
-		if _, pErr := kv.SendWrappedWith(ctx, store, h, args); pErr != nil {
+		if _, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), h, args); pErr != nil {
 			return pErr.GoError()
 		}
 		return nil
@@ -2600,7 +2618,7 @@ func TestConsistencyQueueDelaysProcessingNewRanges(t *testing.T) {
 		rngID := store.LookupReplica(roachpb.RKey(key)).RangeID
 		h := kvpb.Header{RangeID: rngID}
 		args := adminMergeArgs(key)
-		if _, pErr := kv.SendWrappedWith(ctx, store, h, args); pErr != nil {
+		if _, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), h, args); pErr != nil {
 			return pErr.GoError()
 		}
 		return nil
@@ -2744,7 +2762,7 @@ func TestLeaseInfoRequest(t *testing.T) {
 		},
 	}
 	reply, pErr := kv.SendWrappedWith(
-		context.Background(), s, kvpb.Header{
+		context.Background(), kvserver.ToSenderForTesting(s), kvpb.Header{
 			RangeID:         rangeDesc.RangeID,
 			ReadConsistency: kvpb.INCONSISTENT,
 		}, leaseInfoReq)
@@ -2870,7 +2888,7 @@ func TestRangeInfoAfterSplit(t *testing.T) {
 				},
 			}
 			ba.Add(gArgs)
-			br, pErr := store.Send(ctx, ba)
+			br, pErr := kvserver.ToSenderForTesting(store).Send(ctx, ba)
 			require.NoError(t, pErr.GoError())
 			descs := make([]roachpb.RangeDescriptor, len(br.RangeInfos))
 			for i, ri := range br.RangeInfos {
@@ -3044,21 +3062,19 @@ func TestLossQuorumCauseLeaderlessWatcherToSignalUnavailable(t *testing.T) {
 		return nil
 	})
 
-	sendPutRequestWithTimeout := func(repl *kvserver.Replica, timeout time.Duration) (*kvpb.Error, error) {
-		ctx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
+	sendPutRequest := func(repl *kvserver.Replica) *kvpb.Error {
 		ba := &kvpb.BatchRequest{}
 		ba.RangeID = desc.RangeID
 		ba.Timestamp = repl.Clock().Now()
 		ba.Add(putArgs(key, []byte("foo")))
-		_, pErr := repl.Send(ctx, ba)
-		return pErr, ctx.Err()
+		_, pErr := kvserver.ToSenderForTesting(repl).Send(ctx, ba)
+		return pErr
 	}
 
 	// Requests should immediately return an error indicating that the range is
-	// unavailable.
-	pErr, ctxErr := sendPutRequestWithTimeout(repl, 2*time.Second)
-	require.NoError(t, ctxErr)
+	// unavailable. No timeout is used here because the leaderless watcher should
+	// cause the request to fail fast. See #161316.
+	pErr = sendPutRequest(repl)
 	require.Regexp(t, "replica has been leaderless for 10s", pErr)
 	require.True(t, errors.HasType(pErr.GoError(), (*kvpb.ReplicaUnavailableError)(nil)),
 		"expected ReplicaUnavailableError, got %v", err)
@@ -3082,15 +3098,9 @@ func TestLossQuorumCauseLeaderlessWatcherToSignalUnavailable(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		for i := range numServers {
 			repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(roachpb.RKey(key))
-			pErr, ctxErr = sendPutRequestWithTimeout(repl, 2*time.Second)
-			if ctxErr == nil && pErr == nil {
+			if pErr = sendPutRequest(repl); pErr == nil {
 				return nil
 			}
-		}
-		// If we reach this point, we know that the request failed, return the
-		// error.
-		if ctxErr != nil {
-			return ctxErr
 		}
 		return pErr.GoError()
 	})
@@ -3514,6 +3524,11 @@ func TestLeaseTransferRejectedIfTargetNeedsSnapshot(t *testing.T) {
 		truncArgs.Key = keyA
 		_, pErr = kv.SendWrapped(ctx, store0.TestSender(), truncArgs)
 		require.Nil(t, pErr)
+
+		// Wait for the truncation to be enacted. Under loosely coupled
+		// truncations, the truncation is applied asynchronously after the state
+		// machine engine flushes, so we poll until GetCompactedIndex catches up.
+		waitForTruncationForTesting(t, repl0, index)
 
 		// Complete or initiate the lease transfer attempt to node 2, which must not
 		// succeed because node 2 now needs a snapshot.
@@ -4161,7 +4176,7 @@ func TestReplicaTombstone(t *testing.T) {
 					return nil
 				})
 				require.NoError(t, tc.Server(0).DB().AdminMerge(ctx, key))
-				var tombstone kvserverpb.RangeTombstone
+				var mark kvstorage.ReplicaMark
 				testutils.SucceedsSoon(t, func() (err error) {
 					// One of the two other stores better be the raft leader eventually.
 					// We keep trying to send snapshots until one takes.
@@ -4175,17 +4190,17 @@ func TestReplicaTombstone(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					ts, err := kvstorage.MakeStateLoader(rhsDesc.RangeID).LoadRangeTombstone(
+					rm, err := kvstorage.MakeStateLoader(rhsDesc.RangeID).LoadReplicaMark(
 						context.Background(), store.StateEngine(),
 					)
 					require.NoError(t, err)
-					if ts.NextReplicaID == 0 {
-						return errors.New("no tombstone found")
+					if rm.Exists() {
+						return errors.New("replica still exists")
 					}
-					tombstone = ts
+					mark = rm
 					return nil
 				})
-				require.Equal(t, roachpb.ReplicaID(math.MaxInt32), tombstone.NextReplicaID)
+				require.Equal(t, roachpb.ReplicaID(math.MaxInt32), mark.NextReplicaID)
 			})
 		})
 }
@@ -5868,6 +5883,7 @@ func TestOptimisticEvalWithConcurrentWriters(t *testing.T) {
 func TestLeaseTransferReplicatesLocks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "can cause uncooperative lease change under leader leases")
 
 	testutils.SetVModule(t, "cmd_lease=2")
 
@@ -5889,6 +5905,26 @@ func TestLeaseTransferReplicatesLocks(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Settings: st,
+			RaftConfig: base.RaftConfig{
+				// Suppress timeout-based elections to prevent unexpected
+				// leadership changes (and thus uncooperative lease changes
+				// under leader leases) that would clear the lock table without
+				// exporting unreplicated locks.
+				RaftElectionTimeoutTicks: 1000000,
+			},
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					RaftTestingKnobs: &raft.TestingKnobs{
+						// Due to high RaftElectionTimeoutTicks, we only have
+						// one opportunity to campaign which should not be
+						// missed. Under leader leases, in a cold cluster, a
+						// campaign can fail due to missing store liveness
+						// support from the node's peers. Disallow this check to
+						// ensure that the campaign succeeds.
+						DisablePreCampaignStoreLivenessCheck: true,
+					},
+				},
+			},
 		},
 	})
 	defer tc.Stopper().Stop(ctx)

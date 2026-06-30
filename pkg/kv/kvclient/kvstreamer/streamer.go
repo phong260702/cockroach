@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -355,7 +356,8 @@ const (
 var streamerConcurrencyLimit = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
 	"kv.streamer.concurrency_limit",
-	"maximum number of asynchronous requests by a single streamer",
+	"maximum number of asynchronous requests by a single streamer. "+
+		"The default value is computed as the number of vCPUs in a node times 96.",
 	defaultStreamerStreamsPerVCPU*max(kvcoord.MinViableProcs, int64(runtime.GOMAXPROCS(0))),
 	settings.PositiveInt,
 )
@@ -402,6 +404,8 @@ func NewStreamer(
 	lockStrength lock.Strength,
 	lockDurability lock.Durability,
 	reverse bool,
+	workloadID uint64,
+	workloadType workloadid.WorkloadType,
 ) *Streamer {
 	if txn.Type() != kv.LeafTxn {
 		panic(errors.AssertionFailedf("RootTxn is given to the Streamer"))
@@ -446,6 +450,8 @@ func NewStreamer(
 		lockWaitPolicy:         lockWaitPolicy,
 		requestAdmissionHeader: txn.AdmissionHeader(),
 		responseAdmissionQ:     txn.DB().SQLKVResponseAdmissionQ,
+		workloadID:             workloadID,
+		workloadType:           workloadType,
 	}
 	s.coordinator.asyncSem = quotapool.NewIntPool(
 		"single Streamer async concurrency",
@@ -866,6 +872,9 @@ func (s *Streamer) Close(ctx context.Context) {
 		// exited.
 		s.results.close(ctx)
 	}
+	if s.truncationHelper != nil {
+		s.truncationHelper.Release()
+	}
 	s.metrics.OperatorsCount.Dec(1)
 	*s = Streamer{}
 }
@@ -914,6 +923,11 @@ type workerCoordinator struct {
 	// For request and response admission control.
 	requestAdmissionHeader kvpb.AdmissionHeader
 	responseAdmissionQ     *admission.WorkQueue
+	// workloadID is the identifier for the workload that triggered this
+	// request (e.g. statement fingerprint ID) for ASH sampling.
+	workloadID uint64
+	// workloadType distinguishes the kind of workload for ASH sampling.
+	workloadType workloadid.WorkloadType
 }
 
 // mainLoop runs throughout the lifetime of the Streamer (from the first Enqueue
@@ -1550,9 +1564,11 @@ func (w *workerCoordinator) performRequestAsync(
 		// Do admission control after we've finalized the memory accounting.
 		if br != nil && w.responseAdmissionQ != nil {
 			responseAdmission := admission.WorkInfo{
-				TenantID:   roachpb.SystemTenantID,
-				Priority:   admissionpb.WorkPriority(w.requestAdmissionHeader.Priority),
-				CreateTime: w.requestAdmissionHeader.CreateTime,
+				TenantID:     roachpb.SystemTenantID,
+				Priority:     admissionpb.WorkPriority(w.requestAdmissionHeader.Priority),
+				CreateTime:   w.requestAdmissionHeader.CreateTime,
+				WorkloadID:   w.workloadID,
+				WorkloadType: w.workloadType,
 			}
 			if _, err = w.responseAdmissionQ.Admit(ctx, responseAdmission); err != nil {
 				log.VEventf(ctx, 2, "dropping response: admission control: %v", err)

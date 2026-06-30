@@ -166,9 +166,13 @@ type ExprFmtCtx struct {
 	// with the session variable `save_tables_prefix` set to the same value.
 	nameGen *ExprNameGenerator
 
-	// seenUDFs is used to ensure that formatting of recursive UDFs does not
-	// infinitely recurse.
+	// seenUDFs is used to ensure that formatting of repetitive UDF calls does
+	// not grow the output exponentially.
 	seenUDFs map[*UDFDefinition]struct{}
+
+	// withinUDFs is used to track within invocations of which UDFs we are when
+	// formatting.
+	withinUDFs map[*UDFDefinition]struct{}
 
 	// tailCalls allows for quick lookup of all the routines in tail-call position
 	// when the last body statement of a routine is formatted.
@@ -214,6 +218,7 @@ func MakeExprFmtCtxBuffer(
 		Catalog:          catalog,
 		nameGen:          nameGen,
 		seenUDFs:         make(map[*UDFDefinition]struct{}),
+		withinUDFs:       make(map[*UDFDefinition]struct{}),
 	}
 }
 
@@ -928,6 +933,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			if cost.Penalties&HugeCostPenalty != 0 {
 				b.WriteString(" huge-cost-penalty")
 			}
+			if cost.Penalties&PlanGramMismatchPenalty != 0 {
+				b.WriteString(" plangram-mismatch")
+			}
 			if cost.Penalties&UnboundedCardinalityPenalty != 0 {
 				b.WriteString(" unbounded-cardinality")
 			}
@@ -1067,40 +1075,53 @@ func (f *ExprFmtCtx) formatScalarWithLabel(
 ) {
 	formatUDFDefinition := func(def *UDFDefinition, tp treeprinter.Node) {
 		if _, seen := f.seenUDFs[def]; !seen {
-			// Ensure that the definition of the UDF is not printed out again if it
-			// is recursively called.
+			// Ensure that the definition of the UDF is not printed out again if
+			// it has already been seen.
 			f.seenUDFs[def] = struct{}{}
+			f.withinUDFs[def] = struct{}{}
 			if len(def.Params) > 0 {
 				f.formatColList(tp, "params:", def.Params, opt.ColSet{} /* notNullCols */)
 			}
-			n := tp.Child("body")
-			for i := range def.Body {
-				stmtNode := n
-				if i == 0 {
-					if def.FirstStmtOutput.CursorDeclaration != nil {
-						// The first statement is opening a cursor.
-						stmtNode = n.Child("open-cursor")
-					} else if def.FirstStmtOutput.TargetBufferID != 0 {
-						// The first statement is writing to a target buffer.
-						stmtNode = n.Child("add-to-srf-result")
+			if def.Body != nil {
+				n := tp.Child("body")
+				for i := range def.Body {
+					stmtNode := n
+					if i == 0 {
+						if def.FirstStmtOutput.CursorDeclaration != nil {
+							// The first statement is opening a cursor.
+							stmtNode = n.Child("open-cursor")
+						} else if def.FirstStmtOutput.TargetBufferID != 0 {
+							// The first statement is writing to a target buffer.
+							stmtNode = n.Child("add-to-srf-result")
+						}
+					}
+					prevTailCalls := f.tailCalls
+
+					// Routine calls in the last body statement may be tail calls if
+					// ResultBufferID is unset. If it is set, the result of the last
+					// body statement is not directly used as the result of the UDF
+					// call, so it cannot contain tail calls.
+					if i == len(def.Body)-1 && def.ResultBufferID == 0 {
+						f.tailCalls = make(map[opt.ScalarExpr]struct{})
+						ExtractTailCalls(def.Body[i], f.tailCalls)
+					}
+					f.formatExpr(def.Body[i], stmtNode)
+					f.tailCalls = prevTailCalls
+				}
+			} else {
+				// Deferred-build routine: body is not yet built. Show ASTs.
+				n := tp.Child("body (deferred)")
+				for i, ast := range def.BodyASTs {
+					if ast != nil {
+						n.Childf("stmt%d: %s", i+1, tree.AsString(ast))
 					}
 				}
-				prevTailCalls := f.tailCalls
-
-				// Routine calls in the last body statement may be tail calls if
-				// ResultBufferID is unset. If it is set, the result of the last body
-				// statement is not directly used as the result of the UDF call, so it
-				// cannot contain tail calls.
-				if i == len(def.Body)-1 && def.ResultBufferID == 0 {
-					f.tailCalls = make(map[opt.ScalarExpr]struct{})
-					ExtractTailCalls(def.Body[i], f.tailCalls)
-				}
-				f.formatExpr(def.Body[i], stmtNode)
-				f.tailCalls = prevTailCalls
 			}
-			delete(f.seenUDFs, def)
-		} else {
+			delete(f.withinUDFs, def)
+		} else if _, recursive := f.withinUDFs[def]; recursive {
 			tp.Child("recursive-call")
+		} else {
+			tp.Child("repetitive-call")
 		}
 		if def.ExceptionBlock != nil {
 			n := tp.Child("exception-handler")

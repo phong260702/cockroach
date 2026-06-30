@@ -85,7 +85,7 @@ func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 		Ctx:           ctx,
 		connCtx:       tc.ctx,
 		sqlTimestamp:  timeutil.Now(),
-		mon:           txnStateMon,
+		txnMon:        txnStateMon,
 		txnAbortCount: metric.NewCounter(MetaTxnAbort),
 	}
 	ts.mu.txn = kv.NewTxn(ctx, tc.mockDB, roachpb.NodeID(1) /* gatewayNodeID */)
@@ -121,7 +121,7 @@ func (tc *testContext) createNoTxnState() (fsm.State, *txnState) {
 		Name:     mon.MakeName("test mon"),
 		Settings: cluster.MakeTestingClusterSettings(),
 	})
-	ts := txnState{mon: txnStateMon, connCtx: tc.ctx}
+	ts := txnState{txnMon: txnStateMon, connCtx: tc.ctx}
 	return stateNoTxn{}, &ts
 }
 
@@ -283,7 +283,8 @@ func TestTransitions(t *testing.T) {
 			},
 			ev: eventTxnStart{ImplicitTxn: fsm.True},
 			evPayload: makeEventTxnStartPayload(pri, tree.ReadWrite, timeutil.Now(),
-				nil /* historicalTimestamp */, tranCtx, sessiondatapb.Normal, isolation.Serializable,
+				nil /* historicalTimestamp */, tranCtx, sessiondatapb.Normal,
+				0 /* resourceGroupID */, isolation.Serializable,
 				false /* omitInRangefeeds */, false /* bufferedWritesEnabled */, rng,
 			),
 			expState: stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False},
@@ -310,7 +311,8 @@ func TestTransitions(t *testing.T) {
 			},
 			ev: eventTxnStart{ImplicitTxn: fsm.False},
 			evPayload: makeEventTxnStartPayload(pri, tree.ReadWrite, timeutil.Now(),
-				nil /* historicalTimestamp */, tranCtx, sessiondatapb.Normal, isolation.Serializable,
+				nil /* historicalTimestamp */, tranCtx, sessiondatapb.Normal,
+				0 /* resourceGroupID */, isolation.Serializable,
 				false /* omitInRangefeeds */, false /* bufferedWritesEnabled */, rng,
 			),
 			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},

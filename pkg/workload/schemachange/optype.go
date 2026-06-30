@@ -113,23 +113,29 @@ const (
 	alterTableSetStorageParams        // ALTER TABLE <table> SET (<storage_param>=<val>)
 	alterTableResetStorageParams      // ALTER TABLE <table> RESET <storage_param>
 
+	// ALTER VIEW ...
+
+	alterViewSetViewOption   // ALTER VIEW <view> SET (security_invoker = <bool>)
+	alterViewResetViewOption // ALTER VIEW <view> RESET (security_invoker)
+
 	// ALTER TYPE ...
 
 	alterTypeDropValue // ALTER TYPE <type> DROP VALUE <value>
 
 	// CREATE ...
 
-	createTypeEnum      // CREATE TYPE <type> ENUM AS <def>
-	createTypeComposite // CREATE TYPE <type> AS <def>
-	createIndex         // CREATE INDEX <index> ON <table> <def>
-	createPolicy        // CREATE POLICY <policy> ON <table> <def>
-	createSchema        // CREATE SCHEMA <schema>
-	createSequence      // CREATE SEQUENCE <sequence> <def>
-	createTable         // CREATE TABLE <table> <def>
-	createTableAs       // CREATE TABLE <table> AS <def>
-	createView          // CREATE VIEW <view> AS <def>
-	createFunction      // CREATE FUNCTION <function> ...
-	createTrigger       // CREATE TRIGGER <trigger> {...} ON <table> EXECUTE FUNCTION <function>()
+	createTypeEnum        // CREATE TYPE <type> ENUM AS <def>
+	createTypeComposite   // CREATE TYPE <type> AS <def>
+	createIndex           // CREATE INDEX <index> ON <table> <def>
+	createPolicy          // CREATE POLICY <policy> ON <table> <def>
+	createSchema          // CREATE SCHEMA <schema>
+	createSequence        // CREATE SEQUENCE <sequence> <def>
+	createTable           // CREATE TABLE <table> <def>
+	createTableAs         // CREATE TABLE <table> AS <def>
+	createView            // CREATE VIEW <view> AS <def>
+	createFunction        // CREATE FUNCTION <function> ...
+	createTrigger         // CREATE TRIGGER <trigger> {...} ON <table> EXECUTE FUNCTION <function>()
+	createTriggerFunction // CREATE FUNCTION <function>() RETURNS TRIGGER ...
 
 	// COMMENT ON ...
 
@@ -246,6 +252,8 @@ var opFuncs = []func(*operationGenerator, context.Context, pgx.Tx) (*opStmt, err
 	alterTableSetColumnNotNull:        (*operationGenerator).setColumnNotNull,
 	alterTableSetStorageParams:        (*operationGenerator).setTableStorageParam,
 	alterTableResetStorageParams:      (*operationGenerator).resetTableStorageParam,
+	alterViewSetViewOption:            (*operationGenerator).alterViewSetViewOption,
+	alterViewResetViewOption:          (*operationGenerator).alterViewResetViewOption,
 	alterTypeDropValue:                (*operationGenerator).alterTypeDropValue,
 	commentOn:                         (*operationGenerator).commentOn,
 	createFunction:                    (*operationGenerator).createFunction,
@@ -256,6 +264,7 @@ var opFuncs = []func(*operationGenerator, context.Context, pgx.Tx) (*opStmt, err
 	createTable:                       (*operationGenerator).createTable,
 	createTableAs:                     (*operationGenerator).createTableAs,
 	createTrigger:                     (*operationGenerator).createTrigger,
+	createTriggerFunction:             (*operationGenerator).createTriggerFunction,
 	createTypeEnum:                    (*operationGenerator).createEnum,
 	createTypeComposite:               (*operationGenerator).createCompositeType,
 	createView:                        (*operationGenerator).createView,
@@ -285,8 +294,8 @@ var opWeights = []int{
 	alterDatabaseAddRegion:            1,
 	alterDatabaseAddSuperRegion:       0, // Disabled and tracked with #111299
 	alterDatabaseDropSuperRegion:      0, // Disabled and tracked with #111299
-	alterDatabasePrimaryRegion:        0, // Disabled and tracked with #83831
-	alterDatabaseSurvivalGoal:         0, // Disabled and tracked with #83831
+	alterDatabasePrimaryRegion:        1,
+	alterDatabaseSurvivalGoal:         1,
 	alterFunctionRename:               1,
 	alterFunctionSetSchema:            1,
 	alterPolicy:                       1,
@@ -307,6 +316,8 @@ var opWeights = []int{
 	alterTableSetColumnNotNull:        1,
 	alterTableSetStorageParams:        1,
 	alterTableResetStorageParams:      1,
+	alterViewSetViewOption:            1,
+	alterViewResetViewOption:          1,
 	alterTypeDropValue:                1,
 	commentOn:                         1,
 	createFunction:                    1,
@@ -317,6 +328,7 @@ var opWeights = []int{
 	createTable:                       10,
 	createTableAs:                     1,
 	createTrigger:                     1,
+	createTriggerFunction:             2,
 	createTypeEnum:                    1,
 	createTypeComposite:               1,
 	createView:                        1,
@@ -335,6 +347,23 @@ var opWeights = []int{
 	truncateTable:                     1,
 }
 
+// DisableMultiRegionOps sets the weight of alterDatabasePrimaryRegion and
+// alterDatabaseSurvivalGoal to 0, disabling them. It returns a cleanup
+// function that restores the original weights.
+func DisableMultiRegionOps() func() {
+	ops := []opType{alterDatabasePrimaryRegion, alterDatabaseSurvivalGoal}
+	saved := make(map[opType]int, len(ops))
+	for _, op := range ops {
+		saved[op] = opWeights[op]
+		opWeights[op] = 0
+	}
+	return func() {
+		for op, w := range saved {
+			opWeights[op] = w
+		}
+	}
+}
+
 // This workload will maintain its own list of minimal supported versions for
 // the declarative schema changer, since the cluster we are running against can
 // be downlevel. The declarative schema changer builder does have a supported
@@ -345,7 +374,7 @@ var opDeclarativeVersion = map[opType]clusterversion.Key{
 	validate:   clusterversion.MinSupported,
 	inspect:    clusterversion.V25_4,
 
-	alterPolicy:                       clusterversion.V25_2,
+	alterPolicy:                       clusterversion.MinSupported,
 	alterTableAddColumn:               clusterversion.MinSupported,
 	alterTableAddConstraintForeignKey: clusterversion.MinSupported,
 	alterTableAddConstraintUnique:     clusterversion.MinSupported,
@@ -355,23 +384,25 @@ var opDeclarativeVersion = map[opType]clusterversion.Key{
 	alterTableSetColumnNotNull:        clusterversion.MinSupported,
 	alterTableSetStorageParams:        clusterversion.V26_1,
 	alterTableResetStorageParams:      clusterversion.V26_1,
-	alterTableDropNotNull:             clusterversion.V25_3,
-	alterTableRLS:                     clusterversion.V25_2,
+	alterTableLocality:                clusterversion.V26_2,
+	alterTableDropNotNull:             clusterversion.MinSupported,
+	alterTableRLS:                     clusterversion.MinSupported,
 	alterTypeDropValue:                clusterversion.MinSupported,
 	commentOn:                         clusterversion.MinSupported,
 	createFunction:                    clusterversion.MinSupported,
 	createIndex:                       clusterversion.MinSupported,
-	createPolicy:                      clusterversion.V25_2,
+	createPolicy:                      clusterversion.MinSupported,
 	createSchema:                      clusterversion.MinSupported,
 	createSequence:                    clusterversion.MinSupported,
-	createTrigger:                     clusterversion.MinSupported,
+	createTrigger:                     clusterversion.V26_2_Start,
+	createTriggerFunction:             clusterversion.V26_2_Start,
 	dropFunction:                      clusterversion.MinSupported,
 	dropIndex:                         clusterversion.MinSupported,
-	dropPolicy:                        clusterversion.V25_2,
+	dropPolicy:                        clusterversion.MinSupported,
 	dropSchema:                        clusterversion.MinSupported,
 	dropSequence:                      clusterversion.MinSupported,
 	dropTable:                         clusterversion.MinSupported,
-	dropTrigger:                       clusterversion.MinSupported,
+	dropTrigger:                       clusterversion.V26_2_Start,
 	dropView:                          clusterversion.MinSupported,
 	truncateTable:                     clusterversion.V25_4,
 }

@@ -178,7 +178,7 @@ type TransactionalJobRegistry interface {
 
 // JobUpdateCallback is for updating a job.
 type JobUpdateCallback = func(
-	md jobs.JobMetadata,
+	md jobs.DeprecatedJobMetadata,
 	updateProgress func(*jobspb.Progress),
 	updatePayload func(*jobspb.Payload),
 ) error
@@ -220,7 +220,8 @@ type Merger interface {
 	MergeIndexes(context.Context, *jobs.Job, MergeProgress, BackfillerProgressWriter, catalog.TableDescriptor) error
 }
 
-// Validator provides interfaces that allow indexes and check constraints to be validated.
+// Validator provides interfaces that allow indexes, check constraints,
+// and enum type values to be validated.
 type Validator interface {
 	ValidateForwardIndexes(
 		ctx context.Context,
@@ -245,6 +246,15 @@ type Validator interface {
 		indexIDForValidation descpb.IndexID,
 		override sessiondata.InternalExecutorOverride,
 	) error
+
+	ValidateEnumTypeValueRemoval(
+		ctx context.Context,
+		job *jobs.Job,
+		typeDesc catalog.TypeDescriptor,
+		physicalRep []byte,
+		logicalRep string,
+		override sessiondata.InternalExecutorOverride,
+	) error
 }
 
 // IndexSpanSplitter can try to split an index span in the current transaction
@@ -259,6 +269,11 @@ type IndexSpanSplitter interface {
 	// MaybeSplitIndexSpansForPartitioning will split backfilled index spans
 	// across hash-sharded index boundaries if applicable.
 	MaybeSplitIndexSpansForPartitioning(ctx context.Context, table catalog.TableDescriptor, indexToBackfill catalog.Index) error
+
+	// ShouldSkipSplitForSmallTable returns true if the table's estimated size
+	// fits within a single range, meaning index boundary splits should be
+	// skipped to avoid range count bloat on small tables.
+	ShouldSkipSplitForSmallTable(ctx context.Context, table catalog.TableDescriptor) bool
 }
 
 // BackfillProgress tracks the progress for a Backfill.
@@ -279,7 +294,7 @@ type BackfillProgress struct {
 
 	// SSTManifests captures SST metadata emitted by the distributed merge
 	// backfill pipeline.
-	SSTManifests []jobspb.IndexBackfillSSTManifest
+	SSTManifests []jobspb.BulkSSTManifest
 
 	// SSTStoragePrefixes identifies the external storage prefixes used to write
 	// distributed-merge SSTs for this backfill. These prefixes are used to clean
@@ -291,6 +306,12 @@ type BackfillProgress struct {
 	// N (N >= 1) = merge iteration N completed.
 	// See jobspb.BackfillProgress.DistributedMergePhase for full semantics.
 	DistributedMergePhase int32
+
+	// MergeIterationTasksTotal is the total number of tasks in current iteration.
+	MergeIterationTasksTotal int64
+
+	// MergeIterationCompletedTasks contains IDs of completed tasks for resumability.
+	MergeIterationCompletedTasks []int64
 }
 
 // Backfill corresponds to a definition of a backfill from a source

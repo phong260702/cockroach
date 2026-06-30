@@ -11,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -22,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -75,6 +77,14 @@ type tableWriterBase struct {
 	// kvCPUTime tracks the cumulative CPU time (in nanoseconds) that KV
 	// reported in BatchResponse headers during the execution of this table writer.
 	kvCPUTime int64
+	// localKVCPUTime tracks the cumulative SQL goroutine CPU time (in
+	// nanoseconds) spent inside KV calls during the execution of this table
+	// writer, as measured by the grunning library. This is the portion of SQL
+	// goroutine CPU that overlapped with KV work, not the CPU consumed on KV
+	// servers (see kvCPUTime for that).
+	localKVCPUTime int64
+	// cpuStopWatch is used to measure grunning time around KV calls.
+	cpuStopWatch timeutil.CPUStopWatch
 	// rowsWrittenLimit if positive indicates that
 	// `transaction_rows_written_err` is enabled. The limit will be checked in
 	// finalize() before deciding whether it is safe to auto commit (if auto
@@ -92,6 +102,10 @@ type tableWriterBase struct {
 	// originally written with before being replicated via Logical Data
 	// Replication.
 	originTimestamp hlc.Timestamp
+	// workloadID is the statement fingerprint ID or job ID for ASH sampling.
+	workloadID uint64
+	// workloadType distinguishes the kind of workload for ASH sampling.
+	workloadType workloadid.WorkloadType
 }
 
 var maxBatchBytes = settings.RegisterByteSizeSetting(
@@ -119,6 +133,8 @@ func (tb *tableWriterBase) init(
 		tb.deadlockTimeout = evalCtx.SessionData().DeadlockTimeout
 		tb.originID = evalCtx.SessionData().OriginIDForLogicalDataReplication
 		tb.originTimestamp = evalCtx.SessionData().OriginTimestampForLogicalDataReplication
+		tb.workloadID = evalCtx.WorkloadID
+		tb.workloadType = evalCtx.WorkloadType
 	}
 	tb.forceProductionBatchSizes = evalCtx != nil && evalCtx.TestingKnobs.ForceProductionValues
 	tb.maxBatchSize = mutations.MaxBatchSize(tb.forceProductionBatchSizes)
@@ -146,7 +162,12 @@ func (tb *tableWriterBase) setRowsWrittenLimit(sd *sessiondata.SessionData) {
 // tableWriters.
 func (tb *tableWriterBase) flushAndStartNewBatch(ctx context.Context) error {
 	log.VEventf(ctx, 2, "writing batch with %d requests", len(tb.b.Requests()))
-	if err := tb.txn.Run(ctx, tb.b); err != nil {
+	tb.cpuStopWatch.Start()
+	err := tb.txn.Run(ctx, tb.b)
+	if delta := tb.cpuStopWatch.Stop(); delta > 0 {
+		tb.localKVCPUTime += int64(delta)
+	}
+	if err != nil {
 		return row.ConvertBatchError(ctx, tb.desc, tb.b, false /* alwaysConvertCondFailed */)
 	}
 	if err := tb.tryDoResponseAdmission(ctx); err != nil {
@@ -187,10 +208,18 @@ func (tb *tableWriterBase) finalize(ctx context.Context) (err error) {
 		// An auto-txn can commit the transaction with the batch. This is an
 		// optimization to avoid an extra round-trip to the transaction
 		// coordinator.
+		tb.cpuStopWatch.Start()
 		err = tb.txn.CommitInBatch(ctx, tb.b)
+		if delta := tb.cpuStopWatch.Stop(); delta > 0 {
+			tb.localKVCPUTime += int64(delta)
+		}
 	} else {
 		log.VEventf(ctx, 2, "writing batch with %d requests", len(tb.b.Requests()))
+		tb.cpuStopWatch.Start()
 		err = tb.txn.Run(ctx, tb.b)
+		if delta := tb.cpuStopWatch.Stop(); delta > 0 {
+			tb.localKVCPUTime += int64(delta)
+		}
 	}
 	if err != nil {
 		return row.ConvertBatchError(ctx, tb.desc, tb.b, false /* alwaysConvertCondFailed */)
@@ -208,9 +237,11 @@ func (tb *tableWriterBase) tryDoResponseAdmission(ctx context.Context) error {
 	if responseAdmissionQ != nil {
 		requestAdmissionHeader := tb.txn.AdmissionHeader()
 		responseAdmission := admission.WorkInfo{
-			TenantID:   roachpb.SystemTenantID,
-			Priority:   admissionpb.WorkPriority(requestAdmissionHeader.Priority),
-			CreateTime: requestAdmissionHeader.CreateTime,
+			TenantID:     roachpb.SystemTenantID,
+			Priority:     admissionpb.WorkPriority(requestAdmissionHeader.Priority),
+			CreateTime:   requestAdmissionHeader.CreateTime,
+			WorkloadID:   tb.workloadID,
+			WorkloadType: tb.workloadType,
 		}
 		if _, err := responseAdmissionQ.Admit(ctx, responseAdmission); err != nil {
 			return err

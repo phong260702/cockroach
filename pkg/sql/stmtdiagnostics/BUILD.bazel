@@ -34,13 +34,14 @@ go_test(
     srcs = [
         "main_test.go",
         "statement_diagnostics_helpers_test.go",
+        "statement_diagnostics_max_latency_test.go",
         "statement_diagnostics_test.go",
         "txn_diagnostics_helpers_test.go",
         "txn_diagnostics_test.go",
     ],
     embed = [":stmtdiagnostics"],
     exec_properties = {"test.Pool": "large"},
-    tags = ["no-remote-exec"],
+    shard_count = 4,
     deps = [
         "//pkg/base",
         "//pkg/kv",

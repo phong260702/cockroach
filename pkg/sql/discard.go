@@ -39,7 +39,7 @@ func (n *discardNode) startExec(params runParams) error {
 		}
 
 		// SET SESSION AUTHORIZATION DEFAULT
-		if err := params.p.setRole(params.ctx, false /* local */, params.p.SessionData().SessionUser()); err != nil {
+		if err := params.p.setRole(params.ctx, setScopeSession, params.p.SessionData().SessionUser()); err != nil {
 			return err
 		}
 
@@ -85,7 +85,6 @@ func deleteTempTables(ctx context.Context, p *planner) error {
 	if len(p.SessionData().DatabaseIDToTempSchemaID) == 0 {
 		return nil
 	}
-	codec := p.execCfg.Codec
 	descCol := p.Descriptors()
 	// Note: grabbing all the databases here is somewhat suspect. It appears
 	// that the logic related to maintaining the set of database temp schemas
@@ -108,7 +107,7 @@ func deleteTempTables(ctx context.Context, p *planner) error {
 			continue
 		}
 		err = cleanupTempSchemaObjects(
-			ctx, p.InternalSQLTxn(), descCol, codec, db, sc,
+			ctx, p.InternalSQLTxn(), descCol, db, sc,
 		)
 		if err != nil {
 			return err

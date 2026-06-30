@@ -644,11 +644,7 @@ message LocalOnlySessionData {
   // OptimizerUseDeleteRangeFastPath, when true, indicates that the optimizer
   // should try to use the delete range fast-path when possible.
   bool optimizer_use_delete_range_fast_path = 164;
-  // AllowCreateTriggerFunctionWithArgvReferences, when true, allows triggers to
-  // be created with trigger functions that use the TG_ARGV parameter even
-  // though it currently doesn't have Postgres-compatible 0-based indexing
-  // behavior.
-  bool allow_create_trigger_function_with_argv_references = 165;
+  reserved 165;
   // CreateTableWithSchemaLocked, when true will create tables as schema_locked
   // by default.
   bool create_table_with_schema_locked = 166;
@@ -686,8 +682,7 @@ message LocalOnlySessionData {
   // procedure is executed via a portal in the extended wire protocol.
   bool use_proc_txn_control_extended_protocol_fix = 175;
   reserved 176;
-  // AllowViewWithSecurityInvokerClause indicates whether security invoker for views is enabled
-  bool allow_view_with_security_invoker_clause = 177;
+  reserved 177;
   // VectorSearchRerankMultiplier controls how many of the initial search results
   // can be reranked using exact distance calculations with the original
   // full-size vectors. It acts as a multiplier on a base limit derived from the
@@ -755,8 +750,9 @@ message LocalOnlySessionData {
   // some jobs were created in the txn.
   bool disable_wait_for_jobs_notice = 192;
   // CanaryStatsMode controls whether queries in the session use
-  // canary statistics (mode == on), stable statistics (mode == off), or
-  // let the system decide based on random selection (mode == auto).
+  // canary statistics (mode == force_canary), stable statistics
+  // (mode == force_stable), or let the system decide based on
+  // the canary fraction cluster setting (mode == auto).
   int64 canary_stats_mode = 193 [(gogoproto.casttype) = "CanaryStatsMode"];
   // UseSwapMutations, when true, enables use of the update swap and delete swap
   // operators.
@@ -774,6 +770,81 @@ message LocalOnlySessionData {
   // physical planner from partitioning scans with soft limits into multiple
   // TableReaders. When true, this matches the behavior for hard limits.
   bool distsql_prevent_partitioning_soft_limited_scans = 197 [(gogoproto.customname) = "DistSQLPreventPartitioningSoftLimitedScans"];
+  // OptimizerInlineAnyUnnestSubquery, when true, enables the InlineAnyProjectSet
+  // normalization rule that inlines unnest subqueries in ANY comparisons.
+  bool optimizer_inline_any_unnest_subquery = 198;
+  // TcpKeepalivesIdle is the time (in seconds) with no network activity before
+  // sending a TCP keepalive probe. 0 means use the cluster setting default.
+  // Corresponds to PostgreSQL's tcp_keepalives_idle.
+  int32 tcp_keepalives_idle = 199;
+  // TcpKeepalivesInterval is the time (in seconds) between TCP keepalive
+  // retransmissions. 0 means use the cluster setting default.
+  // Corresponds to PostgreSQL's tcp_keepalives_interval.
+  int32 tcp_keepalives_interval = 200;
+  // TcpKeepalivesCount is the maximum number of TCP keepalive probes before
+  // the connection is dropped. 0 means use the cluster setting default.
+  // Corresponds to PostgreSQL's tcp_keepalives_count.
+  int32 tcp_keepalives_count = 201;
+  // TcpUserTimeout is the maximum time (in milliseconds) that transmitted data
+  // may remain unacknowledged before the connection is dropped. 0 means use the
+  // cluster setting default. Corresponds to PostgreSQL's tcp_user_timeout.
+  int32 tcp_user_timeout = 202;
+  // OptimizerUseMinRowCountAntiJoinFix, when true, causes the
+  // optimizer_min_row_count setting to be applied correctly to anti-joins.
+  bool optimizer_use_min_row_count_anti_join_fix = 203;
+  // StatsAsOf is an optional timestamp that, when set, causes
+  // statistics selection to be based on the age gap between the stats
+  // creation timestamp and the StatsAsOf timestamp, rather than the
+  // current time. This is primarily intended for debugging, testing,
+  // and historical analysis. Should not be used in production
+  // environments.
+  // Note the time-traveling only takes effect if the timestamp is later
+  // than or equal to the latest full stats in the stable stats cache --
+  // we don't support traveling way too back in the history at this
+  // moment. If the asOf timestamp is earlier than the latest full stats
+  // in the stable stats cache, a trace message would be logged, and
+  // still the whole stable stats cache will be used for planning.
+  util.hlc.Timestamp stats_as_of = 204 [(gogoproto.nullable) = false];
+  // BufferedWritesImplicitTxnsEnabled, if set, will make it so that the
+  // buffered writes feature is used for implicit txns.
+  bool buffered_writes_implicit_txns_enabled = 205;
+  // PgDumpCompatibility controls how CockroachDB presents its metadata to
+  // external tools. Valid values are "off" (default), "postgres" (suppress
+  // CRDB-specific syntax for pg_dump compatibility), and "cockroachdb"
+  // (show CRDB syntax explicitly).
+  string pg_dump_compatibility = 206;
+  // OptimizerSpanLimit sets the maximum number of constraint spans allowed in
+  // a scan during query optimization. 0 means no limit. Default: 131072.
+  int32 optimizer_span_limit = 207;
+  // DistSQLPlanLocalityFilter restricts the set of SQL instances that the
+  // DistSQL physical planner will consider when assigning flow components for
+  // queries from this session. The value is a CockroachDB locality string
+  // (e.g. "region=us-east1,zone=us-east1-a"); only instances whose locality
+  // matches every key/value pair in the filter are eligible. The empty string
+  // disables the filter and is the default. The filter is consumed only on the
+  // gateway during physical planning, so it does not need to be propagated to
+  // remote nodes.
+  string distsql_plan_locality_filter = 208 [(gogoproto.customname) = "DistSQLPlanLocalityFilter"];
+  // DistSQLPlanLocalityFilterStrict, when true, causes physical planning to
+  // return an error if no SQL instance matches DistSQLPlanLocalityFilter
+  // instead of falling back to the gateway / random instance selection.
+  bool distsql_plan_locality_filter_strict = 209 [(gogoproto.customname) = "DistSQLPlanLocalityFilterStrict"];
+  // OptimizerInlinePlaceholderEqualities, when true, allows the
+  // InlineConstVar normalization rule to inline placeholder expressions
+  // (e.g. $1) in addition to constants. This enables better index usage
+  // in correlated subqueries with placeholder equalities.
+  bool optimizer_inline_placeholder_equalities = 210;
+  // ResourceGroupName is the user-visible name of the resource group bound
+  // to the current session (e.g. set via SET resource_group = '...'). It is
+  // empty when no group is set. The value is consumed on the gateway: it is
+  // resolved to ResourceGroupID at SET time and that id is stamped onto the
+  // admission header of the session's KV requests, so the name itself does
+  // not need to be propagated to remote nodes.
+  string resource_group_name = 211;
+  // ResourceGroupID is the numeric id that ResourceGroupName resolved to, as
+  // returned by the resource group name cache. It is zero when no group is
+  // set. See ResourceGroupName for how it is used.
+  uint64 resource_group_id = 212 [(gogoproto.customname) = "ResourceGroupID"];
 
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //

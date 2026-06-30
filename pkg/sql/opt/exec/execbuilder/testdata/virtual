@@ -9,6 +9,21 @@ distribution: local
   table: pg_class@pg_class_oid_idx
   spans: [/50 - /50]
 
+# The @primary hint forces a full scan, preventing the optimizer from using
+# the virtual index. This is useful when the virtual index is incomplete and
+# lookups with certain OIDs (e.g. hashed index OIDs) fall back to a full
+# scan anyway, making the optimizer's O(1) cost estimate incorrect.
+query T
+EXPLAIN SELECT * FROM pg_catalog.pg_class@primary WHERE oid = 50
+----
+distribution: local
+·
+• filter
+│ filter: oid = 50
+│
+└── • virtual table
+      table: pg_class@primary
+
 query T
 EXPLAIN SELECT * FROM pg_catalog.pg_class WHERE relname = 'blah'
 ----
@@ -135,12 +150,12 @@ distribution: local
         └── • virtual table lookup join
             │ table: pg_attribute@pg_attribute_attrelid_idx
             │ equality: (oid) = (attrelid)
-            │ pred: column158 = attnum
+            │ pred: column170 = attnum
             │
             └── • render
                 │
                 └── • hash join
-                    │ equality: (attrelid, attnum) = (oid, column130)
+                    │ equality: (attrelid, attnum) = (oid, column140)
                     │
                     ├── • filter
                     │   │ filter: attrelid = 'b'::REGCLASS
@@ -505,17 +520,17 @@ distribution: local
 ├── • virtual table
 │     table: pg_class@primary
 │
-└── • hash join
+└── • merge join
     │ equality: (indrelid) = (oid)
     │
     ├── • virtual table
-    │     table: pg_index@primary
+    │     table: pg_index@pg_index_indrelid_idx
     │
     └── • filter
         │ filter: relkind = 'r'
         │
         └── • virtual table
-              table: pg_class@primary
+              table: pg_class@pg_class_oid_idx
 
 statement ok
 RESET disallow_full_table_scans;

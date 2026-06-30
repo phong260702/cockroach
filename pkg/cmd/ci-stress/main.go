@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
@@ -116,27 +117,86 @@ func getPkgToTests(diff string) map[string][]string {
 	return ret
 }
 
-func runTests(ctx context.Context, pkgToTests map[string][]string, extraBazelArgs []string) error {
-	var testPackages []string
+// selectAppropriateTests discovers test targets in the packages from
+// pkgToTests via `bazel query`, excluding any targets tagged with
+// "integration". Returns the surviving test targets and a sorted,
+// deduplicated list of test names to stress.
+func selectAppropriateTests(
+	ctx context.Context, pkgToTests map[string][]string,
+) (testTargets []string, tests []string, err error) {
+	var pkgTargets []string
 	for pkg := range pkgToTests {
-		testPackages = append(testPackages, fmt.Sprintf("//%s:%s_test", pkg, filepath.Base(pkg)))
+		pkgTargets = append(pkgTargets, fmt.Sprintf("//%s:all", pkg))
+	}
+	if len(pkgTargets) == 0 {
+		return nil, nil, nil
+	}
+	pkgUnion := strings.Join(pkgTargets, " + ")
+	testKind := fmt.Sprintf("kind(\"_test rule\", %s)", pkgUnion)
+	query := fmt.Sprintf(
+		"%s except attr(\"tags\", \"[\\[ ]integration[,\\]]\", %s)",
+		testKind, testKind,
+	)
+	cmd := exec.CommandContext(ctx, "bazel", "query", query)
+	outputBytes, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return nil, nil, fmt.Errorf("unable to filter integration tests: bazel query: %w\nstderr: %s", err, exitErr.Stderr)
+		}
+		return nil, nil, fmt.Errorf("unable to filter integration tests: bazel query: %w", err)
+	}
+	output := strings.TrimSpace(string(outputBytes))
+	if output == "" {
+		return nil, nil, nil
+	}
+	testTargets = strings.Split(output, "\n")
+
+	// Collect tests only from packages that survived filtering.
+	survivingPkgs := make(map[string]bool, len(testTargets))
+	for _, target := range testTargets {
+		pkg := strings.TrimPrefix(target[:strings.IndexByte(target, ':')], "//")
+		survivingPkgs[pkg] = true
 	}
 	allTests := make(map[string]struct{})
-	for _, tests := range pkgToTests {
-		for _, test := range tests {
+	for pkg, pkgTests := range pkgToTests {
+		if !survivingPkgs[pkg] {
+			continue
+		}
+		for _, test := range pkgTests {
 			allTests[test] = struct{}{}
 		}
 	}
-	allTestsSlice := make([]string, 0, len(allTests))
+	tests = make([]string, 0, len(allTests))
 	for test := range allTests {
-		allTestsSlice = append(allTestsSlice, test)
+		tests = append(tests, test)
 	}
-	slices.Sort(allTestsSlice)
-	testFilter := strings.Join(allTestsSlice, "|")
-	testFilter = "^(" + testFilter + ")$"
-	// Run each test multiple times.
-	bazelArgs := []string{"test", "--test_filter", testFilter, "--runs_per_test", "10"}
-	bazelArgs = append(bazelArgs, testPackages...)
+	slices.Sort(tests)
+	return testTargets, tests, nil
+}
+
+func runTests(ctx context.Context, pkgToTests map[string][]string, extraBazelArgs []string) error {
+	testTargets, tests, err := selectAppropriateTests(ctx, pkgToTests)
+	if err != nil {
+		return err
+	}
+	if len(testTargets) == 0 {
+		fmt.Println("no non-integration test targets to stress, exiting")
+		return nil
+	}
+
+	testFilter := "^(" + strings.Join(tests, "|") + ")$"
+	runsPerTest := 25
+	// Run each test multiple times. Calculate the number of times based on
+	// whether this is --race or not.
+	for i := range extraBazelArgs {
+		if extraBazelArgs[i] == "--config=race" ||
+			(i < len(extraBazelArgs)-1 && extraBazelArgs[i] == "--config" && extraBazelArgs[i+1] == "race") {
+			runsPerTest = 10
+		}
+	}
+	bazelArgs := []string{"test", "--test_filter", testFilter, "--runs_per_test", strconv.Itoa(runsPerTest)}
+	bazelArgs = append(bazelArgs, testTargets...)
 	bazelArgs = append(bazelArgs, extraBazelArgs...)
 	fmt.Printf("running `bazel` with args %+v\n", bazelArgs)
 	cmd := exec.CommandContext(ctx, "bazel", bazelArgs...)

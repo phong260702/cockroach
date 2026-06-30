@@ -7,15 +7,18 @@ package norm
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -400,9 +403,18 @@ func (c *CustomFuncs) foldOIDFamilyCast(
 				return nil, true, err
 			}
 
-			c.mem.Metadata().AddDependency(opt.DepByName(&resName), ds, privilege.SELECT)
+			// Pass an empty user so that re-validation uses the current
+			// session user (this is not a definer context).
+			c.mem.Metadata().AddDependency(opt.DepByName(&resName), ds, privilege.SELECT, username.SQLUsername{})
+			resolvedOid := catconstants.RemapPgCatalogOid(
+				string(resName.SchemaName),
+				uint32(ds.PostgresDescriptorID()),
+				sessiondatapb.IsPgDumpCompatibilityEnabled(
+					c.f.evalCtx.SessionData().PgDumpCompatibility,
+				),
+			)
 			dOid = tree.NewDOidWithTypeAndName(
-				oid.Oid(ds.PostgresDescriptorID()), types.RegClass, string(tn.ObjectName),
+				resolvedOid, types.RegClass, string(tn.ObjectName),
 			)
 
 		default:
@@ -591,7 +603,7 @@ func (c *CustomFuncs) FoldIndirection(input, index opt.ScalarExpr) (_ opt.Scalar
 		return nil, false
 	}
 
-	// Case 2: The input is a constant DArray or DJSON.
+	// Case 2: The input is a constant DArray, DJSON, or Name.
 	if memo.CanExtractConstDatum(input) {
 		var resolvedType *types.T
 		switch input.DataType().Family() {
@@ -599,8 +611,14 @@ func (c *CustomFuncs) FoldIndirection(input, index opt.ScalarExpr) (_ opt.Scalar
 			resolvedType = input.DataType()
 		case types.ArrayFamily:
 			resolvedType = input.DataType().ArrayContents()
+		case types.StringFamily:
+			if input.DataType().Oid() == oid.T_name {
+				resolvedType = types.String
+			} else {
+				panic(errors.AssertionFailedf("expected array, json, or name; found %s", input.DataType().SQLString()))
+			}
 		default:
-			panic(errors.AssertionFailedf("expected array or json; found %s", input.DataType().SQLString()))
+			panic(errors.AssertionFailedf("expected array, json, or name; found %s", input.DataType().SQLString()))
 		}
 		inputD := memo.ExtractConstDatum(input)
 		texpr := tree.NewTypedIndirectionExpr(inputD, indexD, resolvedType)

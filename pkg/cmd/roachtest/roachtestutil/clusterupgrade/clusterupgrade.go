@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
@@ -26,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/testutils/release"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/version"
@@ -103,6 +105,31 @@ func CurrentVersion() *Version {
 	}
 
 	return &Version{version.MustParse(build.BinaryVersion())}
+}
+
+// RandomReplicationPeerVersion returns the latest patch release for a
+// randomly selected supported previous major version that is at least
+// minVersion. If minVersion is 0, any supported predecessor is
+// eligible. Returns (nil, nil) if no supported release meets the
+// minimum.
+func RandomReplicationPeerVersion(rng *rand.Rand, minVersion clusterversion.Key) (*Version, error) {
+	supportedReleases := clusterversion.SupportedPreviousReleases()
+	var eligible []clusterversion.Key
+	for _, k := range supportedReleases {
+		if k >= minVersion {
+			eligible = append(eligible, k)
+		}
+	}
+	if len(eligible) == 0 {
+		return nil, nil
+	}
+	selected := eligible[rng.Intn(len(eligible))]
+	seriesStr := selected.ReleaseSeries().String()
+	patchStr, err := release.LatestPatch(seriesStr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "getting latest patch for series %s", seriesStr)
+	}
+	return ParseVersion(patchStr)
 }
 
 // MustParseVersion parses the version string given (with or without
@@ -209,6 +236,46 @@ func ClusterVersion(ctx context.Context, l *logger.Logger, db *gosql.DB) (roachp
 	}
 
 	return roachpb.ParseVersion(sv)
+}
+
+// ClusterVersionFromKV returns the cluster version stored in the KV layer
+// (system.settings table) without waiting for local version synchronization.
+// This is useful during mid-upgrade states when SHOW CLUSTER SETTING version
+// would block waiting for the upgrade to complete on all nodes.
+// See GitHub issue #160516
+func ClusterVersionFromKV(
+	ctx context.Context, l *logger.Logger, db *gosql.DB,
+) (roachpb.Version, error) {
+	zero := roachpb.Version{}
+	var encodedVal string
+	// Query the raw encoded value from system.settings
+	rows, err := roachtestutil.QueryWithRetry(
+		ctx, l, db, roachtestutil.ClusterSettingRetryOpts,
+		`SELECT value FROM system.settings WHERE name = 'version'`,
+	)
+	if err != nil {
+		return zero, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return zero, err
+		}
+		return zero, fmt.Errorf("no version found in system.settings")
+	}
+
+	if err := rows.Scan(&encodedVal); err != nil {
+		return zero, err
+	}
+
+	// Decode the protobuf-encoded ClusterVersion
+	var cv clusterversion.ClusterVersion
+	if err := protoutil.Unmarshal([]byte(encodedVal), &cv); err != nil {
+		return zero, fmt.Errorf("failed to decode cluster version: %w", err)
+	}
+
+	return cv.Version, nil
 }
 
 // UploadCockroach stages the cockroach binary in the nodes.

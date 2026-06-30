@@ -82,7 +82,6 @@ var buildTargetMapping = map[string]string{
 	"crlfmt":                "@com_github_cockroachdb_crlfmt//:crlfmt",
 	"dev":                   devTarget,
 	"docgen":                "//pkg/cmd/docgen:docgen",
-	"docs-issue-gen":        "//pkg/cmd/docs-issue-generation:docs-issue-generation",
 	"drt-run":               "//pkg/cmd/drt-run:drt-run",
 	"execgen":               "//pkg/sql/colexec/execgen/cmd/execgen:execgen",
 	"gofmt":                 "@com_github_cockroachdb_gostdlib//cmd/gofmt:gofmt",
@@ -106,6 +105,7 @@ var buildTargetMapping = map[string]string{
 	"smithtest":             "//pkg/cmd/smithtest:smithtest",
 	"sql-bootstrap-data":    "//pkg/cmd/sql-bootstrap-data:sql-bootstrap-data",
 	"staticcheck":           "@co_honnef_go_tools//cmd/staticcheck:staticcheck",
+	"tef":                   "//pkg/cmd/tef:tef",
 	"tests":                 "//pkg:all_tests",
 	"vecbench":              "//pkg/cmd/vecbench:vecbench",
 	"whoownsit":             "//pkg/cmd/whoownsit:whoownsit",
@@ -192,6 +192,21 @@ func (d *dev) crossBuild(
 ) error {
 	bazelArgs = append(bazelArgs, fmt.Sprintf("--config=%s", crossConfig), "--config=nolintonbuild", "-c", "opt", "--config=pgo")
 	configArgs := getConfigArgs(bazelArgs)
+
+	// When using a local pebble checkout, mount it into the container
+	// and rewrite the override_repository arg that was added to bazelArgs
+	// by addCommonBazelArguments to use the container path instead.
+	if localPebble != "" {
+		const containerPebblePath = "/pebble"
+		dockerArgs = append(dockerArgs, "-v", localPebble+":"+containerPebblePath)
+		overridePrefix := "--override_repository=" + pebbleOverrideRepo + "="
+		for i, arg := range bazelArgs {
+			if strings.HasPrefix(arg, overridePrefix) {
+				bazelArgs[i] = overridePrefix + containerPebblePath
+			}
+		}
+	}
+
 	dockerArgs, err := d.getDockerRunArgs(ctx, volume, false, dockerArgs)
 	if err != nil {
 		return err

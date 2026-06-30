@@ -11,6 +11,7 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
@@ -162,6 +163,8 @@ var GetCFetcherWrapper func(
 	nextKVer NextKVer,
 	startKey roachpb.Key,
 	mustSerialize bool,
+	workloadID uint64,
+	workloadType workloadid.WorkloadType,
 ) (CFetcherWrapper, error)
 
 // onNextKVFn represents the transition that the mvccScanFetchAdapter needs to
@@ -460,6 +463,8 @@ func mvccScanToCols(
 		&adapter,
 		key,
 		mustSerialize,
+		opts.WorkloadID,
+		opts.WorkloadType,
 	)
 	if err != nil {
 		return MVCCScanResult{}, err

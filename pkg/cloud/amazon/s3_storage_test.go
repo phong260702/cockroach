@@ -17,10 +17,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
+	s3svc "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/smithy-go"
+	smithymiddleware "github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
@@ -408,71 +411,80 @@ func TestPutS3Endpoint(t *testing.T) {
 	})
 
 	t.Run("use-path-style", func(t *testing.T) {
-		// EngFlow machines have no internet access, and queries even to localhost will time out.
-		// So this test is skipped above.
 		ctx := context.Background()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 		defer srv.Close()
 
-		q := make(url.Values)
-		// Convert IP address to `localhost` to exercise the DNS-defining path in the S3 client.
-		localhostURL := strings.Replace(srv.URL, "127.0.0.1", "localhost", -1)
-		q.Add(AWSEndpointParam, localhostURL)
-		q.Add(AWSAccessKeyParam, "key")
-		q.Add(AWSSecretParam, "secret")
-		q.Add(S3RegionParam, "region")
-
-		// To validate the test, firstassert that the call fails without the Path Style param.
-		u := url.URL{
-			Scheme:   "s3",
-			Host:     "bucket",
-			Path:     "subdir1/subdir2",
-			RawQuery: q.Encode(),
-		}
-
 		user := username.RootUserName()
 		ioConf := base.ExternalIODirConfig{}
-
-		conf, err := cloud.ExternalStorageConfFromURI(u.String(), user)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Setup a sink for the given args.
 		testSettings := cluster.MakeTestingClusterSettings()
 		clientFactory := blobs.TestBlobServiceClient("")
+		maxRetries.Override(ctx, &testSettings.SV, 1)
 
-		storage, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory,
-			nil, nil, cloud.NilMetrics)
-		if err != nil {
-			t.Fatal(err)
+		{
+			q := make(url.Values)
+			localhostURL := strings.Replace(srv.URL, "127.0.0.1", "localhost", -1)
+			q.Add(AWSEndpointParam, localhostURL)
+			q.Add(AWSAccessKeyParam, "key")
+			q.Add(AWSSecretParam, "secret")
+			q.Add(S3RegionParam, "region")
+
+			u := url.URL{
+				Scheme:   "s3",
+				Host:     "bucket",
+				Path:     "subdir1/subdir2",
+				RawQuery: q.Encode(),
+			}
+
+			conf, err := cloud.ExternalStorageConfFromURI(u.String(), user)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			storage, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory,
+				nil, nil, cloud.NilMetrics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storage.Close()
+
+			_, _, err = storage.ReadFile(ctx, "test file", cloud.ReadOptions{NoFileSize: true})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "lookup bucket.localhost")
+			require.Contains(t, err.Error(), "no such host")
 		}
-		defer storage.Close()
 
-		_, _, err = storage.ReadFile(ctx, "test file", cloud.ReadOptions{NoFileSize: true})
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "lookup bucket.localhost")
-		require.Contains(t, err.Error(), "no such host")
+		{
+			q := make(url.Values)
+			q.Add(AWSEndpointParam, srv.URL)
+			q.Add(AWSAccessKeyParam, "key")
+			q.Add(AWSSecretParam, "secret")
+			q.Add(S3RegionParam, "region")
+			q.Add(AWSUsePathStyle, "true")
 
-		// Now add the Path Style param and try again.
-		q.Add(AWSUsePathStyle, "true")
-		u.RawQuery = q.Encode()
-		pathStyleConf, err := cloud.ExternalStorageConfFromURI(u.String(), user)
-		if err != nil {
-			t.Fatal(err)
-		}
+			u := url.URL{
+				Scheme:   "s3",
+				Host:     "bucket",
+				Path:     "subdir1/subdir2",
+				RawQuery: q.Encode(),
+			}
 
-		pathStyleStorage, err := cloud.MakeExternalStorage(ctx, pathStyleConf, ioConf, testSettings, clientFactory,
-			nil, nil, cloud.NilMetrics)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer pathStyleStorage.Close()
+			pathStyleConf, err := cloud.ExternalStorageConfFromURI(u.String(), user)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		// Should successfuly return a (empty) response.
-		_, _, err = pathStyleStorage.ReadFile(ctx, "test file", cloud.ReadOptions{NoFileSize: true})
-		if err != nil {
-			t.Fatal(err)
+			pathStyleStorage, err := cloud.MakeExternalStorage(ctx, pathStyleConf, ioConf, testSettings, clientFactory,
+				nil, nil, cloud.NilMetrics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pathStyleStorage.Close()
+
+			_, _, err = pathStyleStorage.ReadFile(ctx, "test file", cloud.ReadOptions{NoFileSize: true})
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 
@@ -480,64 +492,74 @@ func TestPutS3Endpoint(t *testing.T) {
 		ctx := context.Background()
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 		defer srv.Close()
-		q := make(url.Values)
-		// Convert IP address to `localhost` to exercise the DNS-defining path in the S3 client.
-		localhostURL := strings.Replace(srv.URL, "127.0.0.1", "localhost", -1)
-		q.Add(AWSEndpointParam, localhostURL)
-		q.Add(AWSAccessKeyParam, "key")
-		q.Add(AWSSecretParam, "secret")
-		q.Add(S3RegionParam, "region")
-		q.Add(AWSUsePathStyle, "true")
-
-		// Verify that it fails without the flag.
-		u := url.URL{
-			Scheme:   "s3",
-			Host:     "bucket",
-			Path:     "subdir1/subdir2",
-			RawQuery: q.Encode(),
-		}
 
 		user := username.RootUserName()
 		ioConf := base.ExternalIODirConfig{}
-
-		conf, err := cloud.ExternalStorageConfFromURI(u.String(), user)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Setup a sink for the given args.
 		testSettings := cluster.MakeTestingClusterSettings()
 		clientFactory := blobs.TestBlobServiceClient("")
-		// Force to fail quickly.
-
 		maxRetries.Override(ctx, &testSettings.SV, 1)
-		storage, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory,
-			nil, nil, cloud.NilMetrics)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer storage.Close()
-		_, _, err = storage.ReadFile(ctx, "test file", cloud.ReadOptions{NoFileSize: true})
-		require.Error(t, err)
 
-		// Set AWSSkipTLSVerify to use with HTTPS Server with self signed certificates.
-		q.Add(AWSSkipTLSVerify, "true")
-		u.RawQuery = q.Encode()
+		{
+			q := make(url.Values)
+			q.Add(AWSEndpointParam, srv.URL)
+			q.Add(AWSAccessKeyParam, "key")
+			q.Add(AWSSecretParam, "secret")
+			q.Add(S3RegionParam, "region")
+			q.Add(AWSUsePathStyle, "true")
 
-		confWithSkipVerify, err := cloud.ExternalStorageConfFromURI(u.String(), user)
-		if err != nil {
-			t.Fatal(err)
+			u := url.URL{
+				Scheme:   "s3",
+				Host:     "bucket",
+				Path:     "subdir1/subdir2",
+				RawQuery: q.Encode(),
+			}
+
+			conf, err := cloud.ExternalStorageConfFromURI(u.String(), user)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			storage, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory,
+				nil, nil, cloud.NilMetrics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storage.Close()
+			_, _, err = storage.ReadFile(ctx, "test file", cloud.ReadOptions{NoFileSize: true})
+			require.Error(t, err)
 		}
-		storageWithSkipVerify, err := cloud.MakeExternalStorage(ctx, confWithSkipVerify, ioConf, testSettings, clientFactory,
-			nil, nil, cloud.NilMetrics)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer storageWithSkipVerify.Close()
-		require.True(t, storageWithSkipVerify.Conf().S3Config.SkipTLSVerify)
-		_, _, err = storageWithSkipVerify.ReadFile(ctx, "another test file", cloud.ReadOptions{NoFileSize: true})
-		if err != nil {
-			t.Fatal(err)
+
+		{
+			q := make(url.Values)
+			q.Add(AWSEndpointParam, srv.URL)
+			q.Add(AWSAccessKeyParam, "key")
+			q.Add(AWSSecretParam, "secret")
+			q.Add(S3RegionParam, "region")
+			q.Add(AWSUsePathStyle, "true")
+			q.Add(AWSSkipTLSVerify, "true")
+
+			u := url.URL{
+				Scheme:   "s3",
+				Host:     "bucket",
+				Path:     "subdir1/subdir2",
+				RawQuery: q.Encode(),
+			}
+
+			confWithSkipVerify, err := cloud.ExternalStorageConfFromURI(u.String(), user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storageWithSkipVerify, err := cloud.MakeExternalStorage(ctx, confWithSkipVerify, ioConf, testSettings, clientFactory,
+				nil, nil, cloud.NilMetrics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storageWithSkipVerify.Close()
+			require.True(t, storageWithSkipVerify.Conf().S3Config.SkipTLSVerify)
+			_, _, err = storageWithSkipVerify.ReadFile(ctx, "another test file", cloud.ReadOptions{NoFileSize: true})
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 }
@@ -616,6 +638,7 @@ func (a awserror) ErrorFault() smithy.ErrorFault {
 }
 
 func TestInterpretAWSCode(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	{
 		// with code
 		err := types.BucketAlreadyOwnedByYou{}
@@ -848,6 +871,7 @@ func TestReadFileAtReturnsSize(t *testing.T) {
 }
 
 func TestCanceledError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	cancelFunc()
 	err := ctx.Err()
@@ -855,8 +879,7 @@ func TestCanceledError(t *testing.T) {
 	var aerr error
 	aerr = awserr.New(request.CanceledErrorCode,
 		"request context canceled", err)
-	// Unfortunately, errors.Is returns false, so
-	// kvpb.MaybeWrapReplicaCorruptionError will think this is corruption.
+	// Unfortunately, errors.Is returns false without errors.Mark.
 	require.False(t, errors.Is(aerr, ctx.Err()))
 	aerr = errors.Mark(aerr, ctx.Err())
 	require.True(t, errors.Is(aerr, ctx.Err()))
@@ -881,12 +904,22 @@ func TestAWSS3ImplicitAuthRequiresNoSharedConfigFiles(t *testing.T) {
 	// so in order to circumvent this and test the case where the shared config
 	// files are not present, we need to set the AWS_CONFIG_FILE and
 	// AWS_SHARED_CREDENTIALS_FILE.
+	origConfigFile, hasConfigFile := os.LookupEnv("AWS_CONFIG_FILE")
+	origCredsFile, hasCredsFile := os.LookupEnv("AWS_SHARED_CREDENTIALS_FILE")
 	require.NoError(t, os.Setenv("AWS_CONFIG_FILE", "/tmp/config"))
 	require.NoError(t, os.Setenv("AWS_SHARED_CREDENTIALS_FILE",
 		"/tmp/credentials"))
 	defer func() {
-		require.NoError(t, os.Unsetenv("AWS_CONFIG_FILE"))
-		require.NoError(t, os.Unsetenv("AWS_SHARED_CREDENTIALS_FILE"))
+		if hasConfigFile {
+			require.NoError(t, os.Setenv("AWS_CONFIG_FILE", origConfigFile))
+		} else {
+			require.NoError(t, os.Unsetenv("AWS_CONFIG_FILE"))
+		}
+		if hasCredsFile {
+			require.NoError(t, os.Setenv("AWS_SHARED_CREDENTIALS_FILE", origCredsFile))
+		} else {
+			require.NoError(t, os.Unsetenv("AWS_SHARED_CREDENTIALS_FILE"))
+		}
 	}()
 
 	s3 := s3Storage{
@@ -900,4 +933,55 @@ func TestAWSS3ImplicitAuthRequiresNoSharedConfigFiles(t *testing.T) {
 	}
 	_, _, err := s3.newClient(context.Background())
 	require.NoError(t, err)
+}
+
+func TestAddClearChecksumMiddleware(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for _, tc := range []struct {
+		name  string
+		input interface{}
+	}{
+		{"PutObjectInput", &s3svc.PutObjectInput{ChecksumAlgorithm: types.ChecksumAlgorithmCrc32}},
+		{"UploadPartInput", &s3svc.UploadPartInput{ChecksumAlgorithm: types.ChecksumAlgorithmCrc32}},
+		{"CreateMultipartUploadInput", &s3svc.CreateMultipartUploadInput{ChecksumAlgorithm: types.ChecksumAlgorithmCrc32}},
+		{"CompleteMultipartUploadInput", &s3svc.CompleteMultipartUploadInput{ChecksumType: types.ChecksumTypeFullObject}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stack := smithymiddleware.NewStack(tc.name, smithyhttp.NewStackRequest)
+			require.NoError(t, stack.Initialize.Add(smithymiddleware.InitializeMiddlewareFunc(
+				"testHandler",
+				func(
+					ctx context.Context,
+					in smithymiddleware.InitializeInput,
+					next smithymiddleware.InitializeHandler,
+				) (smithymiddleware.InitializeOutput, smithymiddleware.Metadata, error) {
+					switch v := in.Parameters.(type) {
+					case *s3svc.PutObjectInput:
+						require.Equal(t, types.ChecksumAlgorithm(""), v.ChecksumAlgorithm)
+					case *s3svc.UploadPartInput:
+						require.Equal(t, types.ChecksumAlgorithm(""), v.ChecksumAlgorithm)
+					case *s3svc.CreateMultipartUploadInput:
+						require.Equal(t, types.ChecksumAlgorithm(""), v.ChecksumAlgorithm)
+					case *s3svc.CompleteMultipartUploadInput:
+						require.Equal(t, types.ChecksumType(""), v.ChecksumType)
+					default:
+						t.Fatalf("unexpected input type: %T", v)
+					}
+					return smithymiddleware.InitializeOutput{}, smithymiddleware.Metadata{}, nil
+				},
+			), smithymiddleware.After))
+			require.NoError(t, addClearChecksumMiddleware(stack))
+
+			handler := smithymiddleware.DecorateHandler(
+				smithymiddleware.HandlerFunc(
+					func(ctx context.Context, input interface{}) (interface{}, smithymiddleware.Metadata, error) {
+						return nil, smithymiddleware.Metadata{}, nil
+					}),
+				stack,
+			)
+			_, _, err := handler.Handle(context.Background(), tc.input)
+			require.NoError(t, err)
+		})
+	}
 }

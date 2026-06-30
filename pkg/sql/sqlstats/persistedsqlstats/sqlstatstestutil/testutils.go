@@ -29,6 +29,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// FingerprintIDHex returns the hex-encoded statement fingerprint ID assigned
+// to a redacted statement (the "stmtNoConstants" form) executed against the
+// given database.
+func FingerprintIDHex(stmtNoConstants string, database string) string {
+	return sqlstatsutil.EncodeStmtFingerprintIDToString(
+		appstatspb.ConstructStatementFingerprintID(stmtNoConstants, database))
+}
+
 // GetRandomizedCollectedStatementStatisticsForTest returns a
 // appstatspb.CollectedStatementStatistics with its fields randomly filled.
 func GetRandomizedCollectedStatementStatisticsForTest(
@@ -37,6 +45,8 @@ func GetRandomizedCollectedStatementStatisticsForTest(
 	data := sqlstatsutil.GenRandomData()
 	sqlstatsutil.FillObject(t, reflect.ValueOf(&result), &data)
 	result.Stats.Count = 1
+	result.Stats.CanaryStats.Count = 1
+	result.Stats.StableStats.Count = 1
 
 	return result
 }
@@ -214,7 +224,6 @@ func InsertMockedIntoSystemStmtActivity(
 			StmtType:       "",
 			AppNames:       []string{stmtStats.Key.App},
 			Databases:      []string{stmtStats.Key.Database},
-			ImplicitTxn:    false,
 			DistSQLCount:   0,
 			FullScanCount:  0,
 			VecCount:       0,
@@ -406,7 +415,7 @@ func waitForStatementStatsRows(
 		}
 
 		return nil
-	}, 5*time.Second)
+	}, testutils.SucceedsSoonDuration())
 }
 
 // WaitForStatementEntriesAtLeast waits for the count of statement stats entries to be >= expectedCount.
@@ -515,7 +524,7 @@ func waitForTransactionStatsRows(
 			return errors.Errorf("expected exec count of at least %d, got %d", filters[0].ExecCount, execCount)
 		}
 		return nil
-	}, 5*time.Second)
+	}, testutils.SucceedsSoonDuration())
 }
 
 // WaitForTransactionEntriesAtLeast waits for transaction fingerprint to be >= expectedCount.

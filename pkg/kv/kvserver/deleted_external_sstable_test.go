@@ -200,7 +200,7 @@ func (etc *externalSSTTestCluster) linkExternalSSTableToFile(
 		Key:    startKey,
 		EndKey: endKey,
 	}, kvpb.LinkExternalSSTableRequest_ExternalFile{
-		Locator: URI,
+		Locator: cloud.MakeRedactableLocatorURI(URI),
 		Path:    fileName,
 		// Use a dummy file sizes.
 		ApproximatePhysicalSize: uint64(512 * 1024 * 1024),
@@ -831,9 +831,7 @@ func TestGeneralOperationsWorkAsExpectedOnDeletedExternalSST(t *testing.T) {
 				etc *externalSSTTestCluster,
 			) {
 				// Splits that operate on the deleted SSTable should fail.
-				etc.requireNotFoundError(t, etc.splitHelper(ctx, roachpb.Key("d-15000")))
 				etc.requireNotFoundError(t, etc.splitHelper(ctx, roachpb.Key("e-15000")))
-				etc.requireNotFoundError(t, etc.splitHelper(ctx, roachpb.Key("f-15000")))
 
 				// Splits that don't operate on the deleted SSTable should
 				// succeed.

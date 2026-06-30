@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/syncbench"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
@@ -1364,6 +1365,8 @@ var debugCmds = []*cobra.Command{
 	debugResetQuorumCmd,
 	debugSendKVBatchCmd,
 	debugRecoverCmd,
+	debugResolveTxnIDCmd,
+	debugUploadCmd,
 }
 
 // DebugCmd is the root of all debug commands.
@@ -1491,11 +1494,15 @@ func init() {
 		"maximum number of concurrent compactions")
 
 	f = debugRecoverCollectInfoCmd.Flags()
+	cliflagcfg.BoolFlag(f, &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = f.MarkHidden(cliflags.UseNewRPC.Name)
 	f.VarP(&debugRecoverCollectInfoOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
 	f.IntVarP(&debugRecoverCollectInfoOpts.maxConcurrency, "max-concurrency", "c", debugRecoverDefaultMaxConcurrency,
 		"maximum concurrency when fanning out RPCs to nodes in the cluster")
 
 	f = debugRecoverPlanCmd.Flags()
+	cliflagcfg.BoolFlag(f, &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = f.MarkHidden(cliflags.UseNewRPC.Name)
 	f.StringVarP(&debugRecoverPlanOpts.outputFileName, "plan", "o", "",
 		"filename to write plan to")
 	f.IntSliceVar(&debugRecoverPlanOpts.deadStoreIDs, "dead-store-ids", nil,
@@ -1513,6 +1520,8 @@ func init() {
 		formatHelper.maxPrintedKeyLength, cliflags.PrintKeyLength.Usage())
 
 	f = debugRecoverExecuteCmd.Flags()
+	cliflagcfg.BoolFlag(f, &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = f.MarkHidden(cliflags.UseNewRPC.Name)
 	f.VarP(&debugRecoverExecuteOpts.Stores, cliflags.RecoverStore.Name, cliflags.RecoverStore.Shorthand, cliflags.RecoverStore.Usage())
 	f.VarP(&debugRecoverExecuteOpts.confirmAction, cliflags.ConfirmActions.Name, cliflags.ConfirmActions.Shorthand,
 		cliflags.ConfirmActions.Usage())
@@ -1524,6 +1533,8 @@ func init() {
 		"maximum concurrency when fanning out RPCs to nodes in the cluster")
 
 	f = debugRecoverVerifyCmd.Flags()
+	cliflagcfg.BoolFlag(f, &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = f.MarkHidden(cliflags.UseNewRPC.Name)
 	f.IntVarP(&debugRecoverVerifyOpts.maxConcurrency, "max-concurrency", "c", debugRecoverDefaultMaxConcurrency,
 		"maximum concurrency when fanning out RPCs to nodes in the cluster")
 
@@ -1581,6 +1592,24 @@ func init() {
 	f.BoolVar(&debugZipUploadOpts.dryRun, "dry-run", false, "run in dry-run mode without making any actual uploads")
 	f.Lookup("dry-run").Hidden = true
 
+	f = debugUploadCmd.Flags()
+	f.StringVar(&debugUploadOpts.crlSupportAPIKey, "crl-support-api-key",
+		getEnvOrDefault(crlSupportAPIKeyEnvVar, ""),
+		"API key for uploads to Cockroach Labs support "+
+			"(defaults to $"+crlSupportAPIKeyEnvVar+")")
+	// TODO: bake in the prod upload server URL as the default once
+	// finalised; until then the flag is hidden and internal users
+	// must pass it explicitly.
+	f.StringVar(&debugUploadOpts.crlSupportURL, "crl-support-url", "",
+		"base URL of the Cockroach Labs support server")
+	f.Lookup("crl-support-url").Hidden = true
+	f.StringVar(&debugUploadOpts.crlSupportTicketID, "crl-support-ticket-id", "",
+		"optional support ticket ID to associate with this upload")
+	f.StringVar(&debugUploadOpts.resumeSession, "resume-session", "",
+		"resume an interrupted upload by session ID")
+	f.StringVar(&debugUploadOpts.proxy, "proxy", "",
+		"forward proxy URL (defaults to $"+httpsProxyEnvVar+")")
+
 	f = debugDecodeKeyCmd.Flags()
 	f.Var(&decodeKeyOptions.encoding, "encoding", "key argument encoding")
 	f.BoolVar(&decodeKeyOptions.userKey, "user-key", false, "key type")
@@ -1601,13 +1630,15 @@ func init() {
 	f.Var(&debugLogChanSel, "only-channels", "selection of channels to include in the output diagram.")
 
 	f = debugTimeSeriesDumpCmd.Flags()
+	cliflagcfg.BoolFlag(f, &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = f.MarkHidden(cliflags.UseNewRPC.Name)
 	f.Var(&debugTimeSeriesDumpOpts.format, "format", "output format (text, csv, tsv, raw, openmetrics)")
+	f.StringVar(&debugTimeSeriesDumpOpts.encoding, "encoding", "", "encoding for raw format (supported: zstd)")
 	f.StringVarP(&debugTimeSeriesDumpOpts.output, "output", "o", "", "output file path; writes output to file instead of stdout")
 	f.Var(&debugTimeSeriesDumpOpts.from, "from", "oldest timestamp to include (inclusive)")
 	f.Var(&debugTimeSeriesDumpOpts.to, "to", "newest timestamp to include (inclusive)")
 	f.StringVar(&debugTimeSeriesDumpOpts.clusterLabel, "cluster-label",
 		"", "prometheus label for cluster name")
-	f.StringVar(&debugTimeSeriesDumpOpts.yaml, "yaml", debugTimeSeriesDumpOpts.yaml, "full path to create the tsdump.yaml with storeID: nodeID mappings (raw format only). This file is required when loading the raw tsdump for troubleshooting.")
 	f.StringVar(&debugTimeSeriesDumpOpts.targetURL, "target-url", "", "target URL to send openmetrics data over HTTP")
 	f.StringVar(&debugTimeSeriesDumpOpts.ddSite, "dd-site", getEnvOrDefault(datadogSiteEnvVar, defaultDDSite),
 		"Datadog site to use to send tsdump artifacts to datadog")
@@ -1629,6 +1660,8 @@ func init() {
 	f.StringVar(&debugTimeSeriesDumpOpts.metricsListFile, "metrics-list-file", "", "text file containing metric names or regex patterns to dump (one per line). Prefixes cr.node., cr.store., and cockroachdb. are automatically stripped if present. When specified, only matching metrics are dumped instead of all metrics.")
 
 	f = debugSendKVBatchCmd.Flags()
+	cliflagcfg.BoolFlag(f, &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = f.MarkHidden(cliflags.UseNewRPC.Name)
 	f.StringVar(&debugSendKVBatchContext.traceFormat, "trace", debugSendKVBatchContext.traceFormat,
 		"which format to use for the trace output (off, text, jaeger)")
 	f.BoolVar(&debugSendKVBatchContext.keepCollectedSpans, "keep-collected-spans", debugSendKVBatchContext.keepCollectedSpans,
@@ -1663,9 +1696,9 @@ func initPebbleCmds(cmd *cobra.Command, pebbleTool *tool.T) {
 				}
 				wrapper := storage.MakeExternalStorageWrapper(context.Background(), es)
 				factory := remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
-					"": wrapper,
+					remote.MakeLocator(""): wrapper,
 				})
-				pebbleTool.ConfigureSharedStorage(factory, remote.CreateOnSharedLower, "" /* createOnSharedLocator */)
+				pebbleTool.ConfigureSharedStorage(factory, remote.CreateOnSharedLower, remote.MakeLocator("") /* createOnSharedLocator */)
 			}
 			pebbleCryptoInitializer(cmd.Context())
 			return nil

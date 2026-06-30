@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -43,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -438,6 +440,13 @@ func (oc *optCatalog) CheckPrivilege(
 	if o.ID() == cat.DefaultStableID {
 		return oc.planner.CheckPrivilegeForUser(ctx, syntheticprivilege.GlobalPrivilegeObject, priv, user)
 	}
+	// TEMPORARY is a database-level privilege, so for schema objects we need
+	// to check against the database descriptor rather than the schema.
+	if priv == privilege.TEMPORARY {
+		if s, ok := o.(*optSchema); ok {
+			return oc.planner.CheckPrivilegeForUser(ctx, s.database, priv, user)
+		}
+	}
 	desc, err := getDescFromCatalogObjectForPermissions(o)
 	if err != nil {
 		return err
@@ -685,6 +694,8 @@ func (oc *optCatalog) dataSourceForTable(
 	// Even if we have a cached data source, we still have to cross-check that
 	// statistics and the zone config haven't changed.
 	var tableStats []*stats.TableStatistic
+	var statsDiffer bool
+	var canaryExpiration hlc.Timestamp
 	if !flags.NoTableStats {
 		var typeResolver *descs.DistSQLTypeResolver
 		if p := oc.planner; p != nil {
@@ -692,7 +703,16 @@ func (oc *optCatalog) dataSourceForTable(
 			typeResolver = &r
 		}
 		var err error
-		tableStats, err = oc.planner.execCfg.TableStatsCache.GetTableStats(ctx, desc, typeResolver)
+		var stable bool
+		var statsCanaryWindow time.Duration
+		var statsAsOf hlc.Timestamp
+		if desc.TableDesc() != nil && oc.planner != nil && oc.planner.EvalContext() != nil {
+			stable = desc.TableDesc().StatsCanaryWindow > 0 &&
+				oc.planner.EvalContext().StatsRollout == eval.StatsRolloutStable
+			statsCanaryWindow = desc.TableDesc().StatsCanaryWindow
+			statsAsOf = oc.planner.EvalContext().SessionData().StatsAsOf
+		}
+		tableStats, statsDiffer, canaryExpiration, err = oc.planner.execCfg.TableStatsCache.GetTableStatsMaybeStable(ctx, desc, typeResolver, stable, statsCanaryWindow, statsAsOf)
 		if err != nil {
 			// Ignore any error. We still want to be able to run queries even if we lose
 			// access to the statistics table.
@@ -712,7 +732,7 @@ func (oc *optCatalog) dataSourceForTable(
 		return ds, nil
 	}
 
-	ds, err := newOptTable(ctx, desc, oc.codec(), tableStats, zoneConfig)
+	ds, err := newOptTable(ctx, desc, oc.codec(), tableStats, zoneConfig, statsDiffer, canaryExpiration)
 	if err != nil {
 		return nil, err
 	}
@@ -807,7 +827,7 @@ func (ov *optView) IsSystemView() bool {
 
 // Query is part of the cat.View interface.
 func (ov *optView) Query() string {
-	return ov.desc.GetViewQuery()
+	return string(ov.desc.GetViewQuery())
 }
 
 // ColumnNameCount is part of the cat.View interface.
@@ -834,6 +854,16 @@ func (ov *optView) TriggerCount() int {
 // Trigger is part of the cat.View interface.
 func (ov *optView) Trigger(i int) cat.Trigger {
 	return &ov.triggers[i]
+}
+
+// IsSecurityInvoker is part of the cat.View interface.
+func (ov *optView) IsSecurityInvoker() bool {
+	return ov.desc.IsSecurityInvoker()
+}
+
+// Owner is part of the cat.View interface.
+func (ov *optView) Owner() username.SQLUsername {
+	return ov.desc.GetPrivileges().Owner()
 }
 
 // optSequence is a wrapper around catalog.TableDescriptor that
@@ -903,6 +933,11 @@ type optTable struct {
 	// indexes.
 	indexes []optIndex
 
+	// readableIndexCount is the number of indexes usable for reads. Non-readable
+	// public indexes (e.g. those being recreated during ALTER PRIMARY KEY) are
+	// reordered past this boundary.
+	readableIndexCount int
+
 	// codec is capable of encoding sql table keys.
 	codec keys.SQLCodec
 
@@ -938,6 +973,22 @@ type optTable struct {
 
 	triggers []optTrigger
 
+	// canaryAndStableStatsDiffer is true when the canary (newest) and stable
+	// (second-newest) statistics for this table genuinely differ within the
+	// canary window.
+	canaryAndStableStatsDiffer bool
+
+	// statsCanaryWindow is the configured canary window duration for this
+	// table.
+	statsCanaryWindow time.Duration
+
+	// canaryExpiration is the timestamp at which this table's canary
+	// window expires. Used by CheckDependencies to invalidate cached
+	// stable-execution memos when canary stats ripen. Empty when there is
+	// no active canary window or when canary and stable stats are already
+	// identical, since there is no pending transition to detect.
+	canaryExpiration hlc.Timestamp
+
 	// Row-level security (RLS) fields
 	rlsEnabled bool
 	rlsForced  bool
@@ -956,12 +1007,17 @@ func newOptTable(
 	codec keys.SQLCodec,
 	stats []*stats.TableStatistic,
 	tblZone cat.Zone,
+	canaryAndStableStatsDiffer bool,
+	canaryExpiration hlc.Timestamp,
 ) (*optTable, error) {
 	ot := &optTable{
-		desc:     desc,
-		codec:    codec,
-		rawStats: stats,
-		zone:     tblZone,
+		desc:                       desc,
+		codec:                      codec,
+		rawStats:                   stats,
+		zone:                       tblZone,
+		canaryAndStableStatsDiffer: canaryAndStableStatsDiffer,
+		statsCanaryWindow:          desc.TableDesc().StatsCanaryWindow,
+		canaryExpiration:           canaryExpiration,
 	}
 
 	// Determine the primary key columns.
@@ -1010,9 +1066,9 @@ func newOptTable(
 				col.GetType(),
 				col.IsNullable(),
 				visibility,
-				cd.DefaultExpr,
-				cd.ComputeExpr,
-				cd.OnUpdateExpr,
+				(*string)(cd.DefaultExpr),
+				(*string)(cd.ComputeExpr),
+				(*string)(cd.OnUpdateExpr),
 				mapGeneratedAsIdentityType(col.GetGeneratedAsIdentityType()),
 				cd.GeneratedAsIdentitySequenceOption,
 			)
@@ -1030,7 +1086,7 @@ func newOptTable(
 				col.GetType(),
 				col.IsNullable(),
 				visibility,
-				col.GetComputeExpr(),
+				string(col.GetComputeExpr()),
 			)
 		}
 	}
@@ -1058,9 +1114,9 @@ func newOptTable(
 				sysCol.GetType(),
 				sysCol.IsNullable(),
 				cat.MaybeHidden(sysCol.IsHidden()),
-				cd.DefaultExpr,
-				cd.ComputeExpr,
-				cd.OnUpdateExpr,
+				(*string)(cd.DefaultExpr),
+				(*string)(cd.ComputeExpr),
+				(*string)(cd.OnUpdateExpr),
 				mapGeneratedAsIdentityType(sysCol.GetGeneratedAsIdentityType()),
 				cd.GeneratedAsIdentitySequenceOption,
 			)
@@ -1080,13 +1136,43 @@ func newOptTable(
 			name:         u.GetName(),
 			table:        ot.ID(),
 			columns:      u.CollectKeyColumnIDs().Ordered(),
-			predicate:    u.GetPredicate(),
+			predicate:    string(u.GetPredicate()),
 			withoutIndex: true,
 			validity:     u.GetConstraintValidity(),
 		}
 	}
 
-	// Build the indexes.
+	// Build the indexes. Reorder public secondary indexes so that readable
+	// indexes (those not being added or recreated) come before non-readable
+	// ones. This allows IndexCount to only include indexes that can be used
+	// for reads.
+	// Non-readable indexes are the secondary indexes that are recreated
+	// during a primary key swap that may lack key columns from the old
+	// primary key and cannot be used for look ups.
+	numPublicSecondary := len(desc.ActiveIndexes()) - 1
+	readableCount := 0
+	for i := 0; i < numPublicSecondary; i++ {
+		if !secondaryIndexes[i].Adding() {
+			readableCount++
+		}
+	}
+	if readableCount < numPublicSecondary {
+		reordered := make([]catalog.Index, len(secondaryIndexes))
+		ri, ni := 0, readableCount
+		for i := 0; i < numPublicSecondary; i++ {
+			if !secondaryIndexes[i].Adding() {
+				reordered[ri] = secondaryIndexes[i]
+				ri++
+			} else {
+				reordered[ni] = secondaryIndexes[i]
+				ni++
+			}
+		}
+		copy(reordered[numPublicSecondary:], secondaryIndexes[numPublicSecondary:])
+		secondaryIndexes = reordered
+	}
+	ot.readableIndexCount = 1 + readableCount
+
 	ot.indexes = make([]optIndex, 1+len(secondaryIndexes))
 	// partZones is allocated lazily and is reused for all indexes.
 	var partZones map[string]cat.Zone
@@ -1158,6 +1244,11 @@ func newOptTable(
 				partitionColumn := catalog.FindColumnByID(desc, idx.GetKeyColumnID(0 /* columnOrdinal */))
 				canUseTombstones := idx.ImplicitPartitioningColumnCount() == 1 &&
 					partitionColumn.GetType().Family() == types.EnumFamily
+
+				// If the skip_unique_checks storage parameter is set on this index, we
+				// can elide uniqueness checks for this constraint.
+				canElideCheck := idx.SkipUniqueChecks()
+
 				ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
 					name:             idx.GetName(),
 					table:            ot.ID(),
@@ -1166,21 +1257,22 @@ func newOptTable(
 					canUseTombstones: canUseTombstones,
 					// One would assume that this would be idx.Ordinal(), but they can differ during schema change
 					tombstoneIndexOrdinal: i,
-					predicate:             idx.GetPredicate(),
+					predicate:             string(idx.GetPredicate()),
 					// TODO(rytaft): will we ever support an unvalidated unique constraint
 					// here?
-					validity: descpb.ConstraintValidity_Validated,
+					validity:            descpb.ConstraintValidity_Validated,
+					canElideUniqueCheck: canElideCheck,
 				})
 			} else if idx.IsSharded() {
 				// Add unique constraint for hash sharded indexes.
 				ot.uniqueConstraints = append(ot.uniqueConstraints, optUniqueConstraint{
-					name:                               idx.GetName(),
-					table:                              ot.ID(),
-					columns:                            idx.IndexDesc().KeyColumnIDs[idx.IndexDesc().ExplicitColumnStartIdx():],
-					withoutIndex:                       true,
-					predicate:                          idx.GetPredicate(),
-					validity:                           descpb.ConstraintValidity_Validated,
-					uniquenessGuaranteedByAnotherIndex: true,
+					name:                idx.GetName(),
+					table:               ot.ID(),
+					columns:             idx.IndexDesc().KeyColumnIDs[idx.IndexDesc().ExplicitColumnStartIdx():],
+					withoutIndex:        true,
+					predicate:           string(idx.GetPredicate()),
+					validity:            descpb.ConstraintValidity_Validated,
+					canElideUniqueCheck: true,
 				})
 			}
 		}
@@ -1268,7 +1360,7 @@ func newOptTable(
 	for i := range activeChecks {
 		check := activeChecks[i]
 		ot.checkConstraints = append(ot.checkConstraints, optCheckConstraint{
-			constraint:  check.GetExpr(),
+			constraint:  string(check.GetExpr()),
 			validated:   check.GetConstraintValidity() == descpb.ConstraintValidity_Validated,
 			columnCount: len(check.CheckDesc().ColumnIDs),
 			lookupColumnOrdinal: func(j int) (int, error) {
@@ -1427,8 +1519,7 @@ func (ot *optTable) getCol(i int) catalog.Column {
 
 // IndexCount is part of the cat.Table interface.
 func (ot *optTable) IndexCount() int {
-	// Primary index is always present, so count is always >= 1.
-	return len(ot.desc.ActiveIndexes())
+	return ot.readableIndexCount
 }
 
 // WritableIndexCount is part of the cat.Table interface.
@@ -1638,6 +1729,21 @@ func (ot *optTable) Policies() *cat.Policies {
 		return nil
 	}
 	return &ot.policies
+}
+
+// CanaryAndStableStatsDiffer is part of the cat.Table interface.
+func (ot *optTable) CanaryAndStableStatsDiffer() bool {
+	return ot.canaryAndStableStatsDiffer
+}
+
+// StatsCanaryWindow is part of the cat.Table interface.
+func (ot *optTable) StatsCanaryWindow() time.Duration {
+	return ot.statsCanaryWindow
+}
+
+// CanaryExpiration is part of the cat.Table interface.
+func (ot *optTable) CanaryExpiration() hlc.Timestamp {
+	return ot.canaryExpiration
 }
 
 // LookupColumnOrdinal returns the ordinal of the column with the given ID. A
@@ -1917,7 +2023,7 @@ func (oi *optIndex) VectorColumn() cat.IndexColumn {
 // expression and true if the index is a partial index. If the index is not
 // partial, the empty string and false is returned.
 func (oi *optIndex) Predicate() (string, bool) {
-	return oi.idx.GetPredicate(), oi.idx.GetPredicate() != ""
+	return string(oi.idx.GetPredicate()), oi.idx.GetPredicate() != ""
 }
 
 // Zone is part of the cat.Index interface.
@@ -2060,6 +2166,10 @@ type optTableStat struct {
 
 var _ cat.TableStatistic = &optTableStat{}
 
+// statFailedTypeCheckLogLimiter is used to minimize spamming the log with
+// "skipping stat ... due to failed type check" errors.
+var statFailedTypeCheckLogLimiter = log.Every(time.Second)
+
 func (os *optTableStat) init(
 	ctx context.Context, tab *optTable, stat *stats.TableStatistic,
 ) (ok bool, _ error) {
@@ -2084,15 +2194,18 @@ func (os *optTableStat) init(
 			col.GetType(), string(tab.Name()), col.GetName(), stats.TSFromTime(stat.CreatedAt),
 		); err != nil {
 			// Column type in the histogram differs from column type in the
-			// table. This is only possible if we somehow re-used the same column ID
-			// during an ALTER TABLE statement, which we shouldn't.
+			// table. This can happen after a metadata-only ALTER COLUMN TYPE that
+			// changes the type family (e.g., TIMESTAMPTZ to TIMESTAMP) without
+			// rewriting data or invalidating histograms.
 			if buildutil.CrdbTestBuild {
 				return false, errors.NewAssertionErrorWithWrappedErrf(
 					err, "type check failed while initializing stat %d", stat.StatisticID,
 				)
 			}
 			// For release builds, skip over the stat and log a warning.
-			log.Dev.Warningf(ctx, "skipping stat %d due to failed type check: %v", stat.StatisticID, err)
+			if statFailedTypeCheckLogLimiter.ShouldLog() {
+				log.Dev.Warningf(ctx, "skipping stat %d due to failed type check: %v", stat.StatisticID, err)
+			}
 			return false, nil
 		}
 	}
@@ -2235,7 +2348,7 @@ type optUniqueConstraint struct {
 	tombstoneIndexOrdinal cat.IndexOrdinal
 	validity              descpb.ConstraintValidity
 
-	uniquenessGuaranteedByAnotherIndex bool
+	canElideUniqueCheck bool
 }
 
 var _ cat.UniqueConstraint = &optUniqueConstraint{}
@@ -2293,12 +2406,9 @@ func (u *optUniqueConstraint) Validated() bool {
 	return u.validity == descpb.ConstraintValidity_Validated
 }
 
-// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
-// interface. It is a hack to make unique hash sharded index work before issue
-// #75070 is resolved. Be sure to remove `ignoreUniquenessCheck` field from
-// `optUniqueConstraint` struct when dropping this hack.
-func (u *optUniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
-	return u.uniquenessGuaranteedByAnotherIndex
+// CanElideUniqueCheck is part of the cat.UniqueConstraint interface.
+func (u *optUniqueConstraint) CanElideUniqueCheck() bool {
+	return u.canElideUniqueCheck
 }
 
 // optForeignKeyConstraint implements cat.ForeignKeyConstraint and represents a
@@ -2464,7 +2574,8 @@ func newOptVirtualTable(
 		name: *name,
 	}
 
-	ot.columns = make([]cat.Column, len(desc.PublicColumns())+1)
+	// Allocate space for public columns + 1 dummy PK + tableoid system column.
+	ot.columns = make([]cat.Column, len(desc.PublicColumns())+1+1)
 	// Init dummy PK column.
 	ot.columns[0].Init(
 		0,
@@ -2490,13 +2601,32 @@ func newOptVirtualTable(
 			d.GetType(),
 			d.IsNullable(),
 			cat.MaybeHidden(d.IsHidden()),
-			cd.DefaultExpr,
-			cd.ComputeExpr,
-			cd.OnUpdateExpr,
+			(*string)(cd.DefaultExpr),
+			(*string)(cd.ComputeExpr),
+			(*string)(cd.OnUpdateExpr),
 			mapGeneratedAsIdentityType(d.GetGeneratedAsIdentityType()),
 			cd.GeneratedAsIdentitySequenceOption,
 		)
 	}
+
+	// Add the tableoid system column. Other system columns
+	// (crdb_internal_mvcc_timestamp, etc.) are not meaningful for virtual
+	// tables since they don't have MVCC data.
+	tableoidOrd := len(desc.PublicColumns()) + 1
+	ot.columns[tableoidOrd].Init(
+		tableoidOrd,
+		cat.StableID(colinfo.TableOIDColumnID),
+		colinfo.TableOIDColumnName,
+		cat.System,
+		types.Oid,
+		true,       /* nullable */
+		cat.Hidden, /* hidden */
+		nil,        /* defaultExpr */
+		nil,        /* computedExpr */
+		nil,        /* onUpdateExpr */
+		cat.NotGeneratedAsIdentity,
+		nil, /* generatedAsIdentitySequenceOption */
+	)
 
 	// Create the table's column mapping from descpb.ColumnID to column ordinal.
 	for i := range ot.columns {
@@ -2511,7 +2641,9 @@ func newOptVirtualTable(
 	// Build the indexes (add 1 to account for lack of primary index in
 	// indexes slice).
 	ot.indexes = make([]optVirtualIndex, len(ot.desc.ActiveIndexes()))
-	// Set up the primary index.
+	// Set up the primary index. Include the tableoid system column in
+	// numCols so the optimizer considers all indexes as covering for
+	// tableoid queries.
 	ot.indexes[0] = optVirtualIndex{
 		tab:          ot,
 		indexOrdinal: 0,
@@ -2523,7 +2655,6 @@ func newOptVirtualTable(
 			panic(errors.AssertionFailedf("virtual indexes with more than 1 col not supported"))
 		}
 
-		// Add 1, since the 0th index will the primary that we added above.
 		ot.indexes[idx.Ordinal()] = optVirtualIndex{
 			tab:          ot,
 			idx:          idx,
@@ -2648,7 +2779,7 @@ func (ot *optVirtualTable) CheckCount() int {
 func (ot *optVirtualTable) Check(i int) cat.CheckConstraint {
 	check := ot.desc.EnforcedCheckConstraints()[i]
 	return &optCheckConstraint{
-		constraint:  check.GetExpr(),
+		constraint:  string(check.GetExpr()),
 		validated:   check.GetConstraintValidity() == descpb.ConstraintValidity_Validated,
 		columnCount: len(check.CheckDesc().ColumnIDs),
 		lookupColumnOrdinal: func(j int) (int, error) {
@@ -2782,6 +2913,15 @@ func (ot *optVirtualTable) IsRowLevelSecurityForced() bool { return false }
 // Policies is part of the cat.Table interface.
 func (ot *optVirtualTable) Policies() *cat.Policies { return nil }
 
+// CanaryAndStableStatsDiffer is part of the cat.Table interface.
+func (ot *optVirtualTable) CanaryAndStableStatsDiffer() bool { return false }
+
+// StatsCanaryWindow is part of the cat.Table interface.
+func (ot *optVirtualTable) StatsCanaryWindow() time.Duration { return 0 }
+
+// CanaryExpiration is part of the cat.Table interface.
+func (ot *optVirtualTable) CanaryExpiration() hlc.Timestamp { return hlc.Timestamp{} }
+
 // optVirtualIndex is a dummy implementation of cat.Index for the indexes
 // reported by a virtual table. The index assumes that table column 0 is a dummy
 // PK column.
@@ -2896,9 +3036,16 @@ func (oi *optVirtualIndex) Column(i int) cat.IndexColumn {
 		return cat.IndexColumn{Column: oi.tab.Column(0)}
 	}
 
-	i -= length + 1
-	ord, _ := oi.tab.LookupColumnOrdinal(oi.idx.GetStoredColumnID(i))
-	return cat.IndexColumn{Column: oi.tab.Column(ord)}
+	storedIdx := i - length - 1
+	if storedIdx < oi.idx.NumSecondaryStoredColumns() {
+		ord, _ := oi.tab.LookupColumnOrdinal(oi.idx.GetStoredColumnID(storedIdx))
+		return cat.IndexColumn{Column: oi.tab.Column(ord)}
+	}
+
+	// The tableoid system column is the last column in the index, after all
+	// key columns, the bogus PK column, and all stored columns.
+	tableoidOrd := oi.tab.ColumnCount() - 1
+	return cat.IndexColumn{Column: oi.tab.Column(tableoidOrd)}
 }
 
 // InvertedColumn is part of the cat.Index interface.
@@ -2917,7 +3064,7 @@ func (oi *optVirtualIndex) Predicate() (string, bool) {
 		return "", false
 	}
 	pred := oi.idx.GetPredicate()
-	return pred, pred != ""
+	return string(pred), pred != ""
 }
 
 // Zone is part of the cat.Index interface.
@@ -3128,10 +3275,10 @@ func getOptTriggers(descTriggers []descpb.TriggerDescriptor) []optTrigger {
 			newTransitionAlias: tree.Name(descTrigger.NewTransitionAlias),
 			oldTransitionAlias: tree.Name(descTrigger.OldTransitionAlias),
 			forEachRow:         descTrigger.ForEachRow,
-			whenExpr:           descTrigger.WhenExpr,
+			whenExpr:           string(descTrigger.WhenExpr),
 			funcID:             cat.StableID(descTrigger.FuncID),
 			funcArgs:           funcArgs,
-			funcBody:           descTrigger.FuncBody,
+			funcBody:           string(descTrigger.FuncBody),
 			enabled:            descTrigger.Enabled,
 		}
 	}
@@ -3149,9 +3296,9 @@ func getOptPolicies(descPolicies []descpb.PolicyDescriptor) cat.Policies {
 		policy := cat.Policy{
 			Name:               tree.Name(descPolicy.Name),
 			ID:                 descPolicy.ID,
-			UsingExpr:          descPolicy.UsingExpr,
+			UsingExpr:          string(descPolicy.UsingExpr),
 			UsingColumnIDs:     descPolicy.UsingColumnIDs,
-			WithCheckExpr:      descPolicy.WithCheckExpr,
+			WithCheckExpr:      string(descPolicy.WithCheckExpr),
 			WithCheckColumnIDs: descPolicy.WithCheckColumnIDs,
 			Command:            descPolicy.Command,
 		}
@@ -3183,12 +3330,12 @@ func collectTypes(col catalog.Column) (descpb.IDs, error) {
 
 	// Collect UDTs in default expression, computed column and the column type itself.
 	if col.HasDefault() {
-		if err := addOIDsInExpr(col.GetDefaultExpr()); err != nil {
+		if err := addOIDsInExpr(string(col.GetDefaultExpr())); err != nil {
 			return nil, err
 		}
 	}
 	if col.IsComputed() {
-		if err := addOIDsInExpr(col.GetComputeExpr()); err != nil {
+		if err := addOIDsInExpr(string(col.GetComputeExpr())); err != nil {
 			return nil, err
 		}
 	}

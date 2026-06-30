@@ -289,7 +289,8 @@ func (imt *IndexMergeTracker) FlushCheckpoint(ctx context.Context) error {
 		details.ResumeSpanList[progress.MutationIdx[idx]].ResumeSpans = progress.TodoSpans[idx]
 	}
 
-	return imt.jobMu.job.NoTxn().SetDetails(ctx, details)
+	//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+	return imt.jobMu.job.DeprecatedNoTxn().SetDetails(ctx, details)
 }
 
 // FlushFractionCompleted writes out the fraction completed based on the number of total
@@ -356,9 +357,7 @@ func newPeriodicProgressFlusher(settings *cluster.Settings) scexec.PeriodicProgr
 			return backfill.IndexBackfillCheckpointInterval.Get(&settings.SV)
 		},
 		func() time.Duration {
-			// fractionInterval is copied from the logic in existing backfill code.
-			const fractionInterval = 10 * time.Second
-			return fractionInterval
+			return backfill.IndexBackfillProgressInterval.Get(&settings.SV)
 		},
 	)
 }

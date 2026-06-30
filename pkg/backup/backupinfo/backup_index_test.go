@@ -27,9 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -122,10 +124,14 @@ func TestWriteBackupIndexMetadata(t *testing.T) {
 		return externalStorage, nil
 	}
 
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
 	start := hlc.Timestamp{WallTime: 0}
 	end := hlc.Timestamp{WallTime: time.Date(2025, 7, 30, 0, 0, 0, 0, time.UTC).UnixNano()}
 	subdir := "/2025/07/18-143826.00"
+	writeFullMetadata(t, ctx, externalStorage, subdir, clusterversion.Latest.Version())
 
 	details := jobspb.BackupDetails{
 		Destination: jobspb.BackupDetails_Destination{
@@ -139,7 +145,7 @@ func TestWriteBackupIndexMetadata(t *testing.T) {
 	}
 
 	require.NoError(t, WriteBackupIndexMetadata(
-		ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{},
+		ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{}, nil, /* kmsEnv */
 	))
 
 	filepath, err := getBackupIndexFilePath(subdir, start, end)
@@ -220,7 +226,10 @@ func TestListIndexesHandlesInvalidFiles(t *testing.T) {
 		clusterversion.Latest.Version(),
 		true,
 	)
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
 	const collectionURI = "nodelocal://1/backup"
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -244,6 +253,7 @@ func TestListIndexesHandlesInvalidFiles(t *testing.T) {
 	}
 
 	subdir := "/2025/07/18-120000.00"
+	writeFullMetadata(t, ctx, externalStorage, subdir, clusterversion.Latest.Version())
 	// Write 3 valid index files.
 	zeroTime := time.Unix(0, 0).UTC()
 	fullBackupEndTime := time.Date(2025, 7, 18, 12, 0, 0, 0, time.UTC)
@@ -267,7 +277,7 @@ func TestListIndexesHandlesInvalidFiles(t *testing.T) {
 			URI:           collectionURI + subdir,
 		}
 		require.NoError(t, WriteBackupIndexMetadata(
-			ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{},
+			ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{}, nil, /* kmsEnv */
 		))
 	}
 
@@ -333,45 +343,6 @@ func TestDontWriteBackupIndexMetadata(t *testing.T) {
 		CollectionURI: "nodelocal://1/backup",
 	}
 
-	t.Run("pre v25.4 version", func(t *testing.T) {
-		st := cluster.MakeTestingClusterSettingsWithVersions(
-			clusterversion.V25_3.Version(),
-			clusterversion.V25_3.Version(),
-			true,
-		)
-		const collectionURI = "nodelocal://1/backup"
-		dir, dirCleanupFn := testutils.TempDir(t)
-		defer dirCleanupFn()
-		externalStorage, err = cloud.ExternalStorageFromURI(
-			ctx,
-			collectionURI,
-			base.ExternalIODirConfig{},
-			st,
-			blobs.TestBlobServiceClient(dir),
-			username.RootUserName(),
-			nil, /* db */
-			nil, /* limiters */
-			cloud.NilMetrics,
-		)
-		require.NoError(t, err)
-		execCfg := &sql.ExecutorConfig{Settings: st}
-
-		start := hlc.Timestamp{}
-		end := hlc.Timestamp{WallTime: 20}
-		details.StartTime = start
-		details.EndTime = end
-
-		require.NoError(t, WriteBackupIndexMetadata(
-			ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{},
-		))
-
-		filepath, err := getBackupIndexFilePath(subdir, start, end)
-		require.NoError(t, err)
-
-		_, _, err = externalStorage.ReadFile(ctx, filepath, cloud.ReadOptions{})
-		require.ErrorContains(t, err, "does not exist")
-	})
-
 	t.Run("missing full backup index", func(t *testing.T) {
 		st := cluster.MakeTestingClusterSettingsWithVersions(
 			clusterversion.Latest.Version(),
@@ -393,7 +364,11 @@ func TestDontWriteBackupIndexMetadata(t *testing.T) {
 			cloud.NilMetrics,
 		)
 		require.NoError(t, err)
-		execCfg := &sql.ExecutorConfig{Settings: st}
+		writeFullMetadata(t, ctx, externalStorage, subdir, clusterversion.Latest.Version())
+		execCfg := &sql.ExecutorConfig{
+			Settings:          st,
+			RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+		}
 
 		start := hlc.Timestamp{WallTime: 10}
 		end := hlc.Timestamp{WallTime: 20}
@@ -401,7 +376,7 @@ func TestDontWriteBackupIndexMetadata(t *testing.T) {
 		details.EndTime = end
 
 		require.NoError(t, WriteBackupIndexMetadata(
-			ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{},
+			ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{}, nil, /* kmsEnv */
 		))
 
 		filepath, err := getBackupIndexFilePath(subdir, start, end)
@@ -436,17 +411,26 @@ func TestIndexExists(t *testing.T) {
 	const collectionURI = "nodelocal://1/backup"
 	const subdir1 = "/2025/07/18-222500.00"
 	const subdir2 = "/2025/07/19-123456.00"
+	const pre26_1Subdir = "/2025/07/20-120000.00"
+
 	st := cluster.MakeTestingClusterSettingsWithVersions(
 		clusterversion.Latest.Version(),
 		clusterversion.Latest.Version(),
 		true,
 	)
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
+	mem := execCfg.RootMemoryMonitor.MakeBoundAccount()
 
 	zeroTime := time.Unix(0, 0).UTC()
 	fullBackupEndTime := time.Date(2025, 7, 18, 12, 0, 0, 0, time.UTC)
 	incBackup1EndTime := time.Date(2025, 7, 18, 13, 0, 0, 0, time.UTC)
 	incBackup2EndTime := time.Date(2025, 7, 18, 14, 0, 0, 0, time.UTC)
+
+	pre26_1FullBackupEndTime := time.Date(2025, 7, 20, 12, 0, 0, 0, time.UTC)
+	pre26_1IncBackupEndTime := time.Date(2025, 7, 20, 13, 0, 0, 0, time.UTC)
 
 	testcases := []testcase{
 		{
@@ -532,6 +516,20 @@ func TestIndexExists(t *testing.T) {
 			targetSubdir:   subdir2,
 			expectedExists: false,
 		},
+		{
+			name: "indexed full backup on 25.4 version should be ignored",
+			subdirs: []subdir{
+				{
+					name: pre26_1Subdir,
+					backups: []indexTime{
+						{start: zeroTime, end: pre26_1FullBackupEndTime},
+						{start: pre26_1FullBackupEndTime, end: pre26_1IncBackupEndTime},
+					},
+				},
+			},
+			targetSubdir:   pre26_1Subdir,
+			expectedExists: false,
+		},
 	}
 
 	for _, tc := range testcases {
@@ -555,6 +553,9 @@ func TestIndexExists(t *testing.T) {
 			) (cloud.ExternalStorage, error) {
 				return externalStorage, nil
 			}
+			writeFullMetadata(t, ctx, externalStorage, subdir1, clusterversion.Latest.Version())
+			writeFullMetadata(t, ctx, externalStorage, subdir2, clusterversion.Latest.Version())
+			writeFullMetadata(t, ctx, externalStorage, pre26_1Subdir, clusterversion.V25_4.Version())
 
 			// Fill up our external storage with the index files
 			for _, sub := range tc.subdirs {
@@ -572,13 +573,13 @@ func TestIndexExists(t *testing.T) {
 						URI: collectionURI + "/" + sub.name,
 					}
 					require.NoError(t, WriteBackupIndexMetadata(
-						ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{},
+						ctx, execCfg, username.RootUserName(), makeExternalStorage, details, hlc.Timestamp{}, nil, /* kmsEnv */
 					))
 				}
 			}
 
 			exists, err := IndexExists(
-				ctx, externalStorage, tc.targetSubdir,
+				ctx, &mem, externalStorage, tc.targetSubdir, nil /* encryption */, nil, /* kmsEnv */
 			)
 			require.NoError(t, err)
 			require.Equal(t, tc.expectedExists, exists)
@@ -596,7 +597,10 @@ func TestGetBackupTreeIndexMetadata(t *testing.T) {
 		clusterversion.Latest.Version(),
 		true,
 	)
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
 
 	const collectionURI = "nodelocal://1/backup"
 	dir, dirCleanupFn := testutils.TempDir(t)
@@ -699,7 +703,10 @@ func TestListRestorableBackups(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
 	const collectionURI = "nodelocal://1/backup"
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -828,11 +835,14 @@ func TestListRestorableBackups(t *testing.T) {
 
 			backups, _, err := ListRestorableBackups(
 				ctx, externalStorage, afterTS, beforeTS, 0,
+				true, /* openIndex */
 			)
 			require.NoError(t, err)
 
 			actualOutput := util.Map(backups, func(b RestorableBackup) output {
-				return output{end: int(b.EndTime.WallTime / 1e9), rev: !b.RevisionStartTime.IsEmpty()}
+				return output{
+					end: int(b.EndTime.WallTime / 1e9), rev: !b.RevisionStartTime(ctx, &st.SV).IsEmpty(),
+				}
 			})
 			require.Equal(t, tc.expectedOutput, actualOutput)
 		})
@@ -870,12 +880,29 @@ func TestListRestorableBackups(t *testing.T) {
 
 			backups, exceeded, err := ListRestorableBackups(
 				ctx, externalStorage, afterTS, beforeTS, tc.maxCount,
+				true, /* openIndex */
 			)
 			require.NoError(t, err)
 			require.LessOrEqual(t, len(backups), int(tc.maxCount))
 			require.Equal(t, tc.expectedExceeded, exceeded)
 		})
 	}
+
+	t.Run("withRevStartTime = false omits revision history metadata", func(t *testing.T) {
+		afterTS := hlc.Timestamp{WallTime: 60 * 1e9}.GoTime()
+		beforeTS := hlc.Timestamp{WallTime: 66 * 1e9}.GoTime()
+
+		backups, _, err := ListRestorableBackups(
+			ctx, externalStorage, afterTS, beforeTS, 0,
+			false, /* openIndex */
+		)
+		require.NoError(t, err)
+		require.Len(t, backups, 4)
+
+		for _, b := range backups {
+			require.False(t, b.OpenedIndex())
+		}
+	})
 }
 
 func TestConvertIndexSubdirToSubdir(t *testing.T) {
@@ -944,7 +971,10 @@ func TestFindLatestBackup(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
 	const collectionURI = "nodelocal://1/backup"
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -1067,39 +1097,95 @@ func TestFindLatestBackup(t *testing.T) {
 func TestEncodeDecodeBackupID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// We truncate to 10ms precision since that's the precision we use in the ID.
-	precision := 10 * time.Millisecond
-	fullEnd := time.Now().UTC().Truncate(precision)
+	// The following testcases will roundtrip through encoding and decoding.
+	testcases := []struct {
+		name      string
+		fullEnd   time.Time
+		backupEnd time.Time
+		id        string
+		errMsg    string
+	}{
+		{
+			name:      "full backup",
+			fullEnd:   time.Date(2026, 1, 22, 21, 10, 12, 340000000, time.UTC),
+			backupEnd: time.Date(2026, 1, 22, 21, 10, 12, 340000000, time.UTC),
+			id:        "dByL55sB",
+		},
+		{
+			name:      "incremental backup",
+			fullEnd:   time.Date(2026, 1, 22, 21, 10, 12, 340000000, time.UTC),
+			backupEnd: time.Date(2026, 1, 22, 21, 10, 45, 560000000, time.UTC),
+			id:        "OJ6L55sBAABMgg==",
+		},
+		{
+			name:      "invalid full time granularity",
+			fullEnd:   time.Date(2026, 1, 22, 21, 10, 12, 345678901, time.UTC),
+			backupEnd: time.Date(2026, 1, 22, 21, 10, 45, 560000000, time.UTC),
+			errMsg:    "end times encoded in backup ID can have a maximum granularity of",
+		},
+		{
+			name:      "invalid incremental time granularity",
+			fullEnd:   time.Date(2026, 1, 22, 21, 10, 12, 340000000, time.UTC),
+			backupEnd: time.Date(2026, 1, 22, 21, 10, 45, 567890123, time.UTC),
+			errMsg:    "end times encoded in backup ID can have a maximum granularity of",
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := encodeBackupID(tc.fullEnd, tc.backupEnd)
+			if tc.errMsg != "" {
+				require.ErrorContains(t, err, tc.errMsg)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.id, id)
 
-	t.Run("full backup ID", func(t *testing.T) {
-		endTime := fullEnd
-		id := encodeBackupID(fullEnd, endTime)
-		decodedFullEnd, decodedEnd, err := DecodeBackupID(id)
-		require.NoError(t, err)
-		require.Equal(t, fullEnd, decodedFullEnd)
-		require.Equal(t, endTime, decodedEnd)
+			decodedFullEnd, decodedEnd, err := DecodeBackupID(id)
+			require.NoError(t, err)
+			require.Equal(t, tc.fullEnd, decodedFullEnd)
+			require.Equal(t, tc.backupEnd, decodedEnd)
+		})
+	}
+
+	t.Run("randomly generated IDs", func(t *testing.T) {
+		// We test against "random" IDs (current time) to cover a wide variety of
+		// timestamps and stress test the encoding.
+		// We truncate to match the precision we support.
+		precision := backupbase.BackupIndexFilenameTSGranularity
+		fullEnd := time.Now().UTC().Truncate(precision)
+
+		t.Run("full backup ID", func(t *testing.T) {
+			endTime := fullEnd
+			id, err := encodeBackupID(fullEnd, endTime)
+			require.NoError(t, err)
+			decodedFullEnd, decodedEnd, err := DecodeBackupID(id)
+			require.NoError(t, err)
+			require.Equal(t, fullEnd, decodedFullEnd)
+			require.Equal(t, endTime, decodedEnd)
+		})
+
+		t.Run("incremental backup ID", func(t *testing.T) {
+			// We test in increasing differences up to one week to stress test the
+			// XOR encoding.
+			var delta time.Duration
+			for i := 0; i < 8; i++ {
+				// This effectively adds one more random digit to the delta starting at
+				// the minimum precision.
+				delta += time.Duration(int(math.Pow10(i))*rand.Intn(10)) * precision
+				t.Run(fmt.Sprintf("delta=%s", delta), func(t *testing.T) {
+					endTime := fullEnd.Add(delta)
+					id, err := encodeBackupID(fullEnd, endTime)
+					require.NoError(t, err)
+					decodedFullEnd, decodedEnd, err := DecodeBackupID(id)
+					require.NoError(t, err)
+					require.Equal(t, fullEnd, decodedFullEnd)
+					require.Equal(t, endTime, decodedEnd)
+				})
+			}
+		})
 	})
 
-	t.Run("incremental backup ID", func(t *testing.T) {
-		// We test in increasing differences up to one week to stress test the
-		// XOR encoding.
-		var delta time.Duration
-		for i := 0; i < 8; i++ {
-			// This effectively adds one more random digit to the delta starting at
-			// the minimum precision.
-			delta += time.Duration(int(math.Pow10(i))*rand.Intn(10)) * precision
-			t.Run(fmt.Sprintf("delta=%s", delta), func(t *testing.T) {
-				endTime := fullEnd.Add(delta)
-				id := encodeBackupID(fullEnd, endTime)
-				decodedFullEnd, decodedEnd, err := DecodeBackupID(id)
-				require.NoError(t, err)
-				require.Equal(t, fullEnd, decodedFullEnd)
-				require.Equal(t, endTime, decodedEnd)
-			})
-		}
-	})
-
-	t.Run("invalid ID", func(t *testing.T) {
+	t.Run("decoding invalid IDs", func(t *testing.T) {
 		invalidIDs := map[string]string{
 			"empty":          "",
 			"invalid base64": "#!@($*%!)",
@@ -1120,7 +1206,10 @@ func TestResolveBackupIDtoIndex(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	execCfg := &sql.ExecutorConfig{Settings: st}
+	execCfg := &sql.ExecutorConfig{
+		Settings:          st,
+		RootMemoryMonitor: execinfra.NewTestMemMonitor(ctx, st),
+	}
 	const collectionURI = "nodelocal://1/backup"
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -1210,7 +1299,8 @@ func TestResolveBackupIDtoIndex(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fullEnd := intToTime(tc.endTimesToID[0]).GoTime()
 			endTime := intToTime(tc.endTimesToID[1]).GoTime()
-			id := encodeBackupID(fullEnd, endTime)
+			id, err := encodeBackupID(fullEnd, endTime)
+			require.NoError(t, err)
 
 			index, err := ResolveBackupIDtoIndex(ctx, externalStorage, id)
 			require.NoError(t, err)
@@ -1228,18 +1318,20 @@ func TestResolveBackupIDtoIndex(t *testing.T) {
 		t.Run("no matching full subdir", func(t *testing.T) {
 			fullEnd := intToTime(100).GoTime()
 			endTime := intToTime(200).GoTime()
-			id := encodeBackupID(fullEnd, endTime)
+			id, err := encodeBackupID(fullEnd, endTime)
+			require.NoError(t, err)
 
-			_, err := ResolveBackupIDtoIndex(ctx, externalStorage, id)
+			_, err = ResolveBackupIDtoIndex(ctx, externalStorage, id)
 			require.ErrorContains(t, err, fmt.Sprintf("backup with ID %s not found", id))
 		})
 
 		t.Run("no matching backup end time", func(t *testing.T) {
 			fullEnd := intToTime(28).GoTime()
 			endTime := intToTime(30).GoTime()
-			id := encodeBackupID(fullEnd, endTime)
+			id, err := encodeBackupID(fullEnd, endTime)
+			require.NoError(t, err)
 
-			_, err := ResolveBackupIDtoIndex(ctx, externalStorage, id)
+			_, err = ResolveBackupIDtoIndex(ctx, externalStorage, id)
 			require.ErrorContains(t, err, fmt.Sprintf("backup with ID %s not found", id))
 		})
 	})
@@ -1364,6 +1456,10 @@ func (c fakeBackupChain) writeIndexes(
 			)
 		} else {
 			uri.Path = path.Join(uri.Path, subdir)
+			store, err := storageFactory(ctx, collectionURI, username.RootUserName())
+			require.NoError(t, err)
+			defer store.Close()
+			writeFullMetadata(t, ctx, store, subdir, clusterversion.Latest.Version())
 		}
 
 		isCompacted := idx < len(sorted)-1 && sorted[idx].end == sorted[idx+1].end
@@ -1392,8 +1488,31 @@ func (c fakeBackupChain) writeIndexes(
 			t,
 			WriteBackupIndexMetadata(
 				ctx, execCfg, username.RootUserName(),
-				storageFactory, details, revStartTS,
+				storageFactory, details, revStartTS, nil, /* kmsEnv */
 			),
 		)
 	}
+}
+
+// This can be removed in 26.4 when we no longer need to check the
+// manifest of the full backup when determining whether we need to write
+// the index.
+func writeFullMetadata(
+	t *testing.T,
+	ctx context.Context,
+	store cloud.ExternalStorage,
+	subdir string,
+	version roachpb.Version,
+) {
+	t.Helper()
+	manifest := &backuppb.BackupManifest{
+		ClusterVersion: version,
+	}
+	manifestBytes, err := protoutil.Marshal(manifest)
+	require.NoError(t, err)
+	manifestWriter, err := store.Writer(ctx, path.Join(subdir, backupbase.BackupMetadataName))
+	require.NoError(t, err)
+	defer manifestWriter.Close()
+	_, err = manifestWriter.Write(manifestBytes)
+	require.NoError(t, err)
 }

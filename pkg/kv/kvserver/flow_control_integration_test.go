@@ -319,6 +319,9 @@ func TestFlowControlBlockedAdmissionV2(t *testing.T) {
 							return disableWorkQueueGranting.Load()
 						},
 					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
+					},
 				},
 			},
 		})
@@ -431,6 +434,9 @@ func TestFlowControlAdmissionPostSplitMergeV2(t *testing.T) {
 						DisableWorkQueueGranting: func() bool {
 							return disableWorkQueueGranting.Load()
 						},
+					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
 					},
 				},
 			},
@@ -559,8 +565,7 @@ func TestFlowControlCrashedNodeV2(t *testing.T) {
 		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				DefaultDRPCOption: base.TestDRPCDisabled,
-				Settings:          settings,
+				Settings: settings,
 				RaftConfig: base.RaftConfig{
 					// Reduce the RangeLeaseDuration to speeds up failure detection
 					// below.
@@ -587,6 +592,9 @@ func TestFlowControlCrashedNodeV2(t *testing.T) {
 						DisableWorkQueueGranting: func() bool {
 							return true
 						},
+					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
 					},
 				},
 			},
@@ -707,6 +715,9 @@ func TestFlowControlRaftSnapshotV2(t *testing.T) {
 						DisableWorkQueueGranting: func() bool {
 							return disableWorkQueueGranting.Load()
 						},
+					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
 					},
 					RaftTransport: &kvserver.RaftTransportTestingKnobs{
 						OverrideIdleTimeout: func() time.Duration {
@@ -942,6 +953,9 @@ func TestFlowControlRaftMembershipV2(t *testing.T) {
 							return disableWorkQueueGranting.Load()
 						},
 					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
+					},
 					Server: &server.TestingKnobs{
 						WallClock: manualClock,
 					},
@@ -1003,6 +1017,14 @@ func TestFlowControlRaftMembershipV2(t *testing.T) {
 		h.comment(`-- (Adding non-voting replica to n5.)`)
 		tc.AddNonVotersOrFatal(t, k, tc.Target(4))
 		h.waitForConnectedStreams(ctx, desc.RangeID, 4, 0 /* serverIdx */)
+		// Wait for all send queues to drain before issuing the next write. In
+		// MsgAppPull mode (apply_to_all), entries routed through a send queue
+		// are tracked at LowPri/elastic regardless of the original write
+		// priority. If the newly added non-voter still has a send queue (from
+		// catch-up entries) when the write arrives, its entry would be
+		// classified as entering the send queue and have its priority
+		// downgraded, causing regular token metrics to be 1 MiB short.
+		h.waitForSendQueueSize(ctx, desc.RangeID, 0 /* expSize */, 0 /* serverIdx */)
 
 		h.comment(`-- (Issuing 1x1MiB, 4x replicated write (w/ one non-voter) that's not admitted.`)
 		h.put(ctx, k, 1, testFlowModeToPri(mode))
@@ -1075,6 +1097,9 @@ func TestFlowControlRaftMembershipRemoveSelfV2(t *testing.T) {
 							DisableWorkQueueGranting: func() bool {
 								return disableWorkQueueGranting.Load()
 							},
+						},
+						KVClient: &kvcoord.ClientTestingKnobs{
+							DontRandomizeLeaseholderOnCtxError: true,
 						},
 					},
 				},
@@ -1209,6 +1234,9 @@ func TestFlowControlClassPrioritizationV2(t *testing.T) {
 							return disableWorkQueueGranting.Load()
 						},
 					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
+					},
 				},
 			},
 		})
@@ -1315,6 +1343,9 @@ func TestFlowControlUnquiescedRangeV2(t *testing.T) {
 						DisableWorkQueueGranting: func() bool {
 							return disableWorkQueueGranting.Load()
 						},
+					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
 					},
 					RaftTransport: &kvserver.RaftTransportTestingKnobs{
 						DisableFallbackFlowTokenDispatch: func() bool {
@@ -1434,6 +1465,9 @@ func TestFlowControlTransferLeaseV2(t *testing.T) {
 							return disableWorkQueueGranting.Load()
 						},
 					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
+					},
 				},
 			},
 		})
@@ -1528,6 +1562,9 @@ func TestFlowControlLeaderNotLeaseholderV2(t *testing.T) {
 						DisableWorkQueueGranting: func() bool {
 							return disableWorkQueueGranting.Load()
 						},
+					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
 					},
 				},
 			},
@@ -1645,6 +1682,9 @@ func TestFlowControlGranterAdmitOneByOneV2(t *testing.T) {
 							return disableWorkQueueGranting.Load()
 						},
 						AlwaysTryGrantWhenAdmitted: true,
+					},
+					KVClient: &kvcoord.ClientTestingKnobs{
+						DontRandomizeLeaseholderOnCtxError: true,
 					},
 				},
 			},
@@ -1808,15 +1848,15 @@ func TestFlowControlSendQueue(t *testing.T) {
 						return disableWorkQueueGrantingServers[idx].Load()
 					},
 				},
+				KVClient: &kvcoord.ClientTestingKnobs{
+					DontRandomizeLeaseholderOnCtxError: true,
+				},
 			},
 		}
 	}
 
 	tc := testcluster.StartTestCluster(t, 5, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-		ServerArgs: base.TestServerArgs{
-			DefaultDRPCOption: base.TestDRPCDisabled,
-		},
+		ReplicationMode:   base.ReplicationManual,
 		ServerArgsPerNode: stickyArgsPerServer,
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -2229,6 +2269,9 @@ func TestFlowControlSendQueueManyInflight(t *testing.T) {
 						return disableWorkQueueGranting.Load()
 					},
 				},
+				KVClient: &kvcoord.ClientTestingKnobs{
+					DontRandomizeLeaseholderOnCtxError: true,
+				},
 			},
 		},
 	})
@@ -2417,6 +2460,9 @@ func TestFlowControlSendQueueRangeRelocate(t *testing.T) {
 								idx := i
 								return disableWorkQueueGrantingServers[idx].Load()
 							},
+						},
+						KVClient: &kvcoord.ClientTestingKnobs{
+							DontRandomizeLeaseholderOnCtxError: true,
 						},
 					},
 				}
@@ -2634,6 +2680,9 @@ func TestFlowControlRangeSplitMergeMixedVersion(t *testing.T) {
 						idx := i
 						return disableWorkQueueGrantingServers[idx].Load()
 					},
+				},
+				KVClient: &kvcoord.ClientTestingKnobs{
+					DontRandomizeLeaseholderOnCtxError: true,
 				},
 			},
 		}
@@ -2885,6 +2934,9 @@ func TestFlowControlSendQueueRangeMigrate(t *testing.T) {
 						idx := i
 						return disableWorkQueueGrantingServers[idx].Load()
 					},
+				},
+				KVClient: &kvcoord.ClientTestingKnobs{
+					DontRandomizeLeaseholderOnCtxError: true,
 				},
 			},
 		}
@@ -3341,15 +3393,15 @@ func TestFlowControlSendQueueRangeFeed(t *testing.T) {
 						return disableWorkQueueGrantingServers[idx].Load()
 					},
 				},
+				KVClient: &kvcoord.ClientTestingKnobs{
+					DontRandomizeLeaseholderOnCtxError: true,
+				},
 			},
 		}
 	}
 
 	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-		ServerArgs: base.TestServerArgs{
-			DefaultDRPCOption: base.TestDRPCDisabled,
-		},
+		ReplicationMode:   base.ReplicationManual,
 		ServerArgsPerNode: argsPerServer,
 	})
 	defer tc.Stopper().Stop(ctx)

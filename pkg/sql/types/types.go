@@ -62,12 +62,10 @@ import (
 // Implementation-wise, types.T wraps a protobuf-generated InternalType struct.
 // The generated protobuf code defines the struct fields, marshals/unmarshals
 // them, formats a string representation, etc. Meanwhile, the wrapper types.T
-// struct overrides the Marshal/Unmarshal methods in order to map to/from older
-// persisted InternalType representations. For example, older versions of
-// InternalType (previously called ColumnType) used a VisibleType field to
-// represent INT2, whereas newer versions use Width/Oid. Unmarshal upgrades from
-// this old format to the new, and Marshal downgrades, thus preserving backwards
-// compatibility.
+// struct overrides the Unmarshal method in order to upgrade older persisted
+// InternalType representations to the current format. For example, older
+// versions of InternalType stored NAME types with a special family value, but
+// these are now represented using StringFamily with Oid=T_name.
 //
 // Simple (unary) scalars types
 // ----------------------------
@@ -236,8 +234,12 @@ func (t *T) Canonical() *T {
 		return Interval
 	case StringFamily:
 		if t.Oid() == oid.T_name {
-			// Name uses StringFamily and DOidWrapper
+			// Name uses StringFamily and DOidWrapper.
 			return Name
+		}
+		if t.Oid() == oid.T_aclitem {
+			// AclItem uses StringFamily and DOidWrapper.
+			return AclItem
 		}
 		return String
 	case BytesFamily:
@@ -312,6 +314,9 @@ type UserDefinedTypeMetadata struct {
 	// EnumData is non-nil iff the metadata is for an ENUM type.
 	EnumData *EnumMetadata
 
+	// DomainData is non-nil iff the metadata is for a DOMAIN type.
+	DomainData *DomainMetadata
+
 	// Version is the descriptor version of the descriptor used to construct
 	// this version of the type metadata.
 	Version uint32
@@ -336,6 +341,38 @@ type EnumMetadata struct {
 	// TODO (rohany): For small enums, having a map would be slower
 	//  than just an array. Investigate at what point the tradeoff
 	//  should occur, if at all.
+}
+
+// DomainMetadata is metadata about a DOMAIN type needed for evaluation.
+type DomainMetadata struct {
+	// BaseType is the underlying type this domain constrains.
+	BaseType *T
+	// NotNull is true if the domain has a NOT NULL constraint.
+	NotNull bool
+	// NotNullConstraintName is the name of the NOT NULL constraint.
+	// Empty if the domain has no NOT NULL constraint.
+	NotNullConstraintName string
+	// NotNullConstraintID uniquely identifies the NOT NULL constraint.
+	// Zero if the domain has no NOT NULL constraint.
+	NotNullConstraintID catid.ConstraintID
+	// DefaultExpr is the default expression for the domain, serialized as
+	// a string. Empty if no default is specified.
+	DefaultExpr string
+	// CheckConstraints is the list of CHECK constraints on this domain.
+	CheckConstraints []DomainCheckConstraint
+}
+
+// DomainCheckConstraint is a single CHECK constraint on a domain type.
+type DomainCheckConstraint struct {
+	// Name is the name of the CHECK constraint.
+	Name string
+	// Expr is the CHECK expression, serialized as a string.
+	Expr string
+	// ConstraintID uniquely identifies this constraint within the domain.
+	ConstraintID catid.ConstraintID
+	// Validated indicates whether this constraint has been validated against
+	// all existing data. False for constraints added with NOT VALID.
+	Validated bool
 }
 
 func (e *EnumMetadata) debugString() string {
@@ -385,53 +422,29 @@ var (
 	// VarBit is the type of an ordered list of bits (0 or 1 valued), with no
 	// specified limit on the count of bits.
 	VarBit = &T{InternalType: InternalType{
-		Family: BitFamily, Oid: oid.T_varbit, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleVARBIT,
-	}}
+		Family: BitFamily, Oid: oid.T_varbit, Locale: &emptyLocale}}
 
 	// Int is the type of a 64-bit signed integer. This is the canonical type
 	// for IntFamily.
 	Int = &T{InternalType: InternalType{
-		Family: IntFamily, Width: 64, Oid: oid.T_int8, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleBIGINT,
-	}}
+		Family: IntFamily, Width: 64, Oid: oid.T_int8, Locale: &emptyLocale}}
 
 	// Int4 is the type of a 32-bit signed integer.
 	Int4 = &T{InternalType: InternalType{
-		Family: IntFamily, Width: 32, Oid: oid.T_int4, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleINTEGER,
-	}}
+		Family: IntFamily, Width: 32, Oid: oid.T_int4, Locale: &emptyLocale}}
 
 	// Int2 is the type of a 16-bit signed integer.
 	Int2 = &T{InternalType: InternalType{
-		Family: IntFamily, Width: 16, Oid: oid.T_int2, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleSMALLINT,
-	}}
+		Family: IntFamily, Width: 16, Oid: oid.T_int2, Locale: &emptyLocale}}
 
 	// Float is the type of a 64-bit base-2 floating-point number (IEEE 754).
 	// This is the canonical type for FloatFamily.
 	Float = &T{InternalType: InternalType{
-		Family: FloatFamily, Width: 64, Oid: oid.T_float8, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleDOUBLE,
-	}}
+		Family: FloatFamily, Width: 64, Oid: oid.T_float8, Locale: &emptyLocale}}
 
 	// Float4 is the type of a 32-bit base-2 floating-point number (IEEE 754).
 	Float4 = &T{InternalType: InternalType{
-		Family: FloatFamily, Width: 32, Oid: oid.T_float4, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleREAL,
-	}}
+		Family: FloatFamily, Width: 32, Oid: oid.T_float4, Locale: &emptyLocale}}
 
 	// Decimal is the type of a base-10 floating-point number, with no specified
 	// limit on precision (number of digits) or scale (digits to right of decimal
@@ -452,22 +465,14 @@ var (
 	// It is reported as BPCHAR in SHOW CREATE and "character" in introspection
 	// for compatibility with PostgreSQL.
 	BPChar = &T{InternalType: InternalType{
-		Family: StringFamily, Oid: oid.T_bpchar, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleCHAR,
-	}}
+		Family: StringFamily, Oid: oid.T_bpchar, Locale: &emptyLocale}}
 
 	// VarChar is equivalent to String, but has a differing OID (T_varchar),
 	// which makes it show up differently when displayed. It is reported as
 	// VARCHAR in SHOW CREATE and "character varying" in introspection for
 	// compatibility with PostgreSQL.
 	VarChar = &T{InternalType: InternalType{
-		Family: StringFamily, Oid: oid.T_varchar, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleVARCHAR,
-	}}
+		Family: StringFamily, Oid: oid.T_varchar, Locale: &emptyLocale}}
 
 	// CIText is the type of a case-insensitive string and is similar to AnyCollatedString,
 	// but has a differing Locale (case-insensitive) and a differing OID (T_citext).
@@ -481,17 +486,19 @@ var (
 	//
 	// See https://www.postgresql.org/docs/9.1/static/datatype-character.html
 	QChar = &T{InternalType: InternalType{
-		Family: StringFamily, Width: 1, Oid: oid.T_char, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleQCHAR,
-	}}
+		Family: StringFamily, Width: 1, Oid: oid.T_char, Locale: &emptyLocale}}
 
 	// Name is a type-alias for String with a different OID (T_name). It is
 	// reported as NAME in SHOW CREATE and "name" in introspection for
 	// compatibility with PostgreSQL.
 	Name = &T{InternalType: InternalType{
 		Family: StringFamily, Oid: oid.T_name, Locale: &emptyLocale}}
+
+	// AclItem is a type-alias for String with a different OID (T_aclitem).
+	// It represents a PostgreSQL access control list item in the format
+	// "grantee=privchars/grantor".
+	AclItem = &T{InternalType: InternalType{
+		Family: StringFamily, Oid: oid.T_aclitem, Locale: &emptyLocale}}
 
 	// Bytes is the type of a list of raw byte values.
 	Bytes = &T{InternalType: InternalType{
@@ -866,6 +873,10 @@ var (
 	VarBitArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: VarBit, Oid: oid.T__varbit, Locale: &emptyLocale}}
 
+	// OidArray is the type of an array value having Oid-typed elements.
+	OidArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: Oid, Oid: oid.T__oid, Locale: &emptyLocale}}
+
 	// AnyEnumArray is the type of an array value having AnyEnum-typed elements.
 	AnyEnumArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: AnyEnum, Oid: oid.T_anyarray, Locale: &emptyLocale}}
@@ -921,38 +932,6 @@ const (
 
 	// Deprecated after 19.1, since it's now represented using the Oid field.
 	oidvector Family = 201
-
-	visibleNONE = 0
-
-	// Deprecated after 2.1, since it's no longer used.
-	visibleINTEGER = 1
-
-	// Deprecated after 2.1, since it's now represented using the Width field.
-	visibleSMALLINT = 2
-
-	// Deprecated after 2.1, since it's now represented using the Width field.
-	visibleBIGINT = 3
-
-	// Deprecated after 2.0, since the original BIT representation was buggy.
-	visibleBIT = 4
-
-	// Deprecated after 19.1, since it's now represented using the Width field.
-	visibleREAL = 5
-
-	// Deprecated after 2.1, since it's now represented using the Width field.
-	visibleDOUBLE = 6
-
-	// Deprecated after 19.1, since it's now represented using the Oid field.
-	visibleVARCHAR = 7
-
-	// Deprecated after 19.1, since it's now represented using the Oid field.
-	visibleCHAR = 8
-
-	// Deprecated after 19.1, since it's now represented using the Oid field.
-	visibleQCHAR = 9
-
-	// Deprecated after 19.1, since it's now represented using the Oid field.
-	visibleVARBIT = 10
 
 	// OID returned for the unknown[] array type. PG has no OID for this case.
 	unknownArrayOid = 0
@@ -1077,11 +1056,7 @@ func MakeVarBit(width int32) *T {
 		panic(errors.AssertionFailedf("width %d cannot be negative", width))
 	}
 	return &T{InternalType: InternalType{
-		Family: BitFamily, Width: width, Oid: oid.T_varbit, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleVARBIT,
-	}}
+		Family: BitFamily, Width: width, Oid: oid.T_varbit, Locale: &emptyLocale}}
 }
 
 // MakeString constructs a new instance of the STRING type (oid = T_text) having
@@ -1107,11 +1082,7 @@ func MakeVarChar(width int32) *T {
 		panic(errors.AssertionFailedf("width %d cannot be negative", width))
 	}
 	return &T{InternalType: InternalType{
-		Family: StringFamily, Oid: oid.T_varchar, Width: width, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleVARCHAR,
-	}}
+		Family: StringFamily, Oid: oid.T_varchar, Width: width, Locale: &emptyLocale}}
 }
 
 // MakeChar constructs a new instance of the CHAR type (oid = T_bpchar) having
@@ -1124,11 +1095,7 @@ func MakeChar(width int32) *T {
 		panic(errors.AssertionFailedf("width %d cannot be negative", width))
 	}
 	return &T{InternalType: InternalType{
-		Family: StringFamily, Oid: oid.T_bpchar, Width: width, Locale: &emptyLocale,
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		VisibleType: visibleCHAR,
-	}}
+		Family: StringFamily, Oid: oid.T_bpchar, Width: width, Locale: &emptyLocale}}
 }
 
 // oidCanBeCollatedString returns true if the given oid can be a CollatedString.
@@ -1148,20 +1115,8 @@ func oidCanBeCollatedString(o oid.Oid) bool {
 //	VARCHAR(20) => VARCHAR(20) COLLATE EN
 func MakeCollatedString(strType *T, locale string) *T {
 	if oidCanBeCollatedString(strType.Oid()) {
-		// TODO(rafi): Once compatibility with 25.3 is no longer needed, remove
-		// VisibleType.
-		var visType int32
-		switch strType.Oid() {
-		case oid.T_varchar:
-			visType = visibleVARCHAR
-		case oid.T_bpchar:
-			visType = visibleCHAR
-		case oid.T_char:
-			visType = visibleQCHAR
-		}
 		return &T{InternalType: InternalType{
 			Family: CollatedStringFamily, Oid: strType.Oid(), Width: strType.Width(), Locale: &locale,
-			VisibleType: visType,
 		}}
 	}
 	panic(errors.AssertionFailedf("cannot apply collation to non-string type: %s", strType))
@@ -1476,6 +1431,28 @@ func NewCompositeType(typeOID, arrayTypeOID oid.Oid, contents []*T, labels []str
 	}}
 }
 
+// MakeDomain constructs a new instance of a domain type that wraps the given
+// base type. The domain uses the base type's Family but has its own OID
+// pointing to the domain's type descriptor. This allows existing operators and
+// functions to work on domain values without special-casing.
+func MakeDomain(baseType *T, typeOID, arrayTypeOID oid.Oid) *T {
+	// Copy the internal type from the base type to inherit Family, Width,
+	// Precision, etc. This is a shallow copy: pointer fields like Locale,
+	// TupleContents, and ArrayContents are shared with the original. This is
+	// safe for scalar base types (where these fields are nil or package-level
+	// constants), but would need revisiting if domain-of-array or
+	// domain-of-composite is supported in the future.
+	it := baseType.InternalType
+	it.Oid = typeOID
+	it.UDTMetadata = &PersistentUserDefinedTypeMetadata{
+		ArrayTypeOID: arrayTypeOID,
+	}
+	if baseType.Family() == ArrayFamily || baseType.Family() == TupleFamily {
+		panic(errors.AssertionFailedf("cannot make domain of array or tuple"))
+	}
+	return &T{InternalType: it}
+}
+
 // Family specifies a group of types that are compatible with one another. Types
 // in the same family can be compared, assigned, etc., but may differ from one
 // another in width, precision, locale, and other attributes. For example, it is
@@ -1640,6 +1617,13 @@ func (t *T) WithoutTypeModifiers() *T {
 		return MakeTuple(newContents)
 	case EnumFamily:
 		// Enums have no type modifiers.
+		return t
+	}
+	// Domain types share their base type's Family, so check for them before
+	// looking up the OID in OidToType. Domain OIDs are user defined and do not
+	// exist in OidToType, and domains do not have independent type modifiers to
+	// strip beyond the base type information already baked into the type.
+	if t.UserDefined() && t.TypeMeta.DomainData != nil {
 		return t
 	}
 
@@ -1857,6 +1841,8 @@ func (t *T) Name() string {
 			return "name"
 		case oidext.T_citext:
 			return "citext"
+		case oid.T_aclitem:
+			return "aclitem"
 		}
 		panic(errors.AssertionFailedf("unexpected OID: %d", t.Oid()))
 
@@ -1916,7 +1902,7 @@ func (t *T) PGName() string {
 //
 //	SELECT format_type(pg_typeof(1::int)::regtype, NULL)
 func (t *T) SQLStandardName() string {
-	return t.SQLStandardNameWithTypmod(false, 0)
+	return t.SQLStandardNameWithTypmod(false, 0, true /* useFQName */)
 }
 
 var telemetryNameReplaceRegex = regexp.MustCompile("[^a-zA-Z0-9]")
@@ -1937,9 +1923,26 @@ func (t *T) TelemetryName() string {
 // varchar(20) would appear as character varying(20) when provided the typmod
 // value for varchar(20), which happens to be 24.
 //
+// useFQName indicates if the fully qualified name should be specified, which for
+// format_type will be used when the name exists and is not visible or aliased in the
+// search_path.
 // This function is full of special cases. See backend/utils/adt/format_type.c
 // in Postgres.
-func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
+func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int, useFQName bool) string {
+	maybeFQName := func() string {
+		if useFQName {
+			return t.TypeMeta.Name.FQName(false /* explicitCatalog */)
+		}
+		return t.TypeMeta.Name.Basename()
+	}
+	// Domain types share their base type's Family, so check for them before
+	// the Family switch to avoid returning the base type name.
+	if t.UserDefined() && t.TypeMeta.DomainData != nil {
+		if t.TypeMeta.Name == nil {
+			return fmt.Sprintf("@%d", t.Oid())
+		}
+		return maybeFQName()
+	}
 	var buf strings.Builder
 	switch t.Family() {
 	case AnyFamily:
@@ -1956,10 +1959,10 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		// If we have a typemod specified then pass it down when
 		// formatting the array type.
 		if !haveTypmod {
-			return t.ArrayContents().SQLStandardName() + "[]"
+			return t.ArrayContents().SQLStandardNameWithTypmod(false, 0, useFQName) + "[]"
 		} else {
 			ac := t.ArrayContents()
-			return ac.SQLStandardNameWithTypmod(haveTypmod, typmod) + "[]"
+			return ac.SQLStandardNameWithTypmod(haveTypmod, typmod, useFQName) + "[]"
 		}
 	case BitFamily:
 		if t.Oid() == oid.T_varbit {
@@ -2051,7 +2054,13 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 	case PGLSNFamily:
 		return "pg_lsn"
 	case PGVectorFamily:
-		return "vector"
+		// pgvector stores the dimension directly in the typmod (no -4 header
+		// offset like varchar). A typmod of -1 means the dimension was not
+		// specified.
+		if !haveTypmod || typmod <= 0 {
+			return "vector"
+		}
+		return fmt.Sprintf("vector(%d)", typmod)
 	case RefCursorFamily:
 		return "refcursor"
 	case StringFamily, CollatedStringFamily:
@@ -2074,6 +2083,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 			return "name"
 		case oidext.T_citext:
 			return "citext"
+		case oid.T_aclitem:
+			return "aclitem"
 		default:
 			panic(errors.AssertionFailedf("unexpected OID: %d", t.Oid()))
 		}
@@ -2121,8 +2132,12 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		return "tsvector"
 	case TupleFamily:
 		if t.UserDefined() {
-			// If we have a user-defined tuple type, use its user-defined name.
-			return t.TypeMeta.Name.Basename()
+			if t.TypeMeta.Name == nil {
+				return fmt.Sprintf("@%d", t.Oid())
+			}
+			// If we have a user-defined tuple type, use its user-defined name
+			// with schema qualification but without catalog.
+			return maybeFQName()
 		}
 		return "record"
 	case UnknownFamily:
@@ -2132,7 +2147,13 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 	case VoidFamily:
 		return "void"
 	case EnumFamily:
-		return t.TypeMeta.Name.Basename()
+		if t.Oid() == oid.T_anyenum {
+			return "anyenum"
+		}
+		if t.TypeMeta.Name == nil {
+			return fmt.Sprintf("@%d", t.Oid())
+		}
+		return maybeFQName()
 	case LTreeFamily:
 		return t.Name()
 	default:
@@ -2161,6 +2182,14 @@ func (t *T) InformationSchemaName() string {
 // reproduce the type via parsing the string as a type. It is used in error
 // messages and also to produce the output of SHOW CREATE.
 func (t *T) SQLString() string {
+	// Domain types share their base type's Family, so check for them before
+	// the Family switch to avoid returning the base type name.
+	if t.UserDefined() && t.TypeMeta.DomainData != nil {
+		if t.TypeMeta.Name == nil {
+			return fmt.Sprintf("@%d", t.Oid())
+		}
+		return t.TypeMeta.Name.FQName(false /* explicitCatalog */)
+	}
 	switch t.Family() {
 	case BitFamily:
 		switch t.Oid() {
@@ -2526,18 +2555,7 @@ func (t *T) IsPseudoType() bool {
 //
 // Marshal is part of the protoutil.Message interface.
 func (t *T) Size() (n int) {
-	// non-NAME types don't need any serialization changes to be backwards compatible.
-	if t.InternalType.Oid != oid.T_name {
-		return t.InternalType.Size()
-	}
-	// Need to first downgrade the type before delegating to InternalType,
-	// because Marshal will downgrade.
-	temp := *t
-	err := temp.downgradeType()
-	if err != nil {
-		panic(errors.NewAssertionErrorWithWrappedErrf(err, "error during Size call"))
-	}
-	return temp.InternalType.Size()
+	return t.InternalType.Size()
 }
 
 // Identical is the internal implementation for T.Identical. See that comment
@@ -2645,74 +2663,39 @@ func (t *T) Unmarshal(data []byte) error {
 // according to the requirements of the latest version by remapping fields and
 // setting required values. This is necessary to preserve backwards-
 // compatibility with older formats (e.g. restoring database from old backup).
-//
-// This can be removed once we no longer need compatibility with v25.3 or
-// earlier. See https://github.com/cockroachdb/cockroach/issues/152629.
 func (t *T) upgradeType() error {
 	switch t.Family() {
 	case IntFamily:
-		// If the OID is not set already, check VisibleType field that was populated
-		// in previous versions.
+		// If the OID is not set already, infer it from Width.
 		if t.InternalType.Oid == 0 {
-			switch t.InternalType.VisibleType {
-			case visibleSMALLINT:
-				t.InternalType.Width = 16
+			switch t.Width() {
+			case 16:
 				t.InternalType.Oid = oid.T_int2
-			case visibleINTEGER:
-				t.InternalType.Width = 32
+			case 32:
 				t.InternalType.Oid = oid.T_int4
-			case visibleBIGINT:
-				t.InternalType.Width = 64
-				t.InternalType.Oid = oid.T_int8
-			case visibleBIT, visibleNONE:
-				// Pre-2.1 BIT was using IntFamily with arbitrary widths. Clamp them
-				// to fixed/known widths. See #34161.
-				switch t.Width() {
-				case 16:
-					t.InternalType.Oid = oid.T_int2
-				case 32:
-					t.InternalType.Oid = oid.T_int4
-				default:
-					// Assume INT8 if width is 0 or not valid.
-					t.InternalType.Oid = oid.T_int8
-					t.InternalType.Width = 64
-				}
 			default:
-				return errors.AssertionFailedf("unexpected visible type: %d", t.InternalType.VisibleType)
+				// Assume INT8 if width is 0 or not a standard width.
+				t.InternalType.Oid = oid.T_int8
+				t.InternalType.Width = 64
 			}
 		}
 
 	case FloatFamily:
-		// If the OID is not set already, map visible REAL type to 32-bit width.
+		// If the OID is not set already, infer it from Width or Precision.
 		if t.InternalType.Oid == 0 {
-			switch t.InternalType.VisibleType {
-			case visibleREAL:
+			switch t.Width() {
+			case 32:
 				t.InternalType.Oid = oid.T_float4
-				t.InternalType.Width = 32
-			case visibleDOUBLE:
+			case 64:
 				t.InternalType.Oid = oid.T_float8
-				t.InternalType.Width = 64
-			case visibleNONE:
-				switch t.Width() {
-				case 32:
-					t.InternalType.Oid = oid.T_float4
-				case 64:
-					t.InternalType.Oid = oid.T_float8
-				default:
-					// Pre-2.1 (before Width) there were 3 cases:
-					// - VisibleType = DOUBLE PRECISION, Width = 0 -> now clearly FLOAT8
-					// - VisibleType = NONE, Width = 0 -> now clearly FLOAT8
-					// - VisibleType = NONE, Precision > 0 -> we need to derive the width.
-					if t.Precision() >= 1 && t.Precision() <= 24 {
-						t.InternalType.Oid = oid.T_float4
-						t.InternalType.Width = 32
-					} else {
-						t.InternalType.Oid = oid.T_float8
-						t.InternalType.Width = 64
-					}
-				}
 			default:
-				return errors.AssertionFailedf("unexpected visible type: %d", t.InternalType.VisibleType)
+				if t.Precision() >= 1 && t.Precision() <= 24 {
+					t.InternalType.Oid = oid.T_float4
+					t.InternalType.Width = 32
+				} else {
+					t.InternalType.Oid = oid.T_float8
+					t.InternalType.Width = 64
+				}
 			}
 		}
 
@@ -2742,40 +2725,10 @@ func (t *T) upgradeType() error {
 			t.InternalType.TimePrecisionIsSet = true
 		}
 	case StringFamily, CollatedStringFamily:
-		// If the OID is not set, map string-related visible types to corresponding
-		// Oid values.
-		if t.InternalType.Oid == 0 {
-			switch t.InternalType.VisibleType {
-			case visibleVARCHAR:
-				t.InternalType.Oid = oid.T_varchar
-			case visibleCHAR:
-				t.InternalType.Oid = oid.T_bpchar
-			case visibleQCHAR:
-				t.InternalType.Oid = oid.T_char
-			case visibleNONE:
-				t.InternalType.Oid = oid.T_text
-			default:
-				return errors.AssertionFailedf("unexpected visible type: %d", t.InternalType.VisibleType)
-			}
-		}
 		if t.InternalType.Family == StringFamily {
 			if t.InternalType.Locale != nil && len(*t.InternalType.Locale) != 0 {
 				return errors.AssertionFailedf(
 					"STRING type should not have locale: %s", *t.InternalType.Locale)
-			}
-		}
-
-	case BitFamily:
-		// If the OID is not set already, map visible VARBIT type to T_varbit OID
-		// value.
-		if t.InternalType.Oid == 0 {
-			switch t.InternalType.VisibleType {
-			case visibleVARBIT:
-				t.InternalType.Oid = oid.T_varbit
-			case visibleNONE:
-				t.InternalType.Oid = oid.T_bit
-			default:
-				return errors.AssertionFailedf("unexpected visible type: %d", t.InternalType.VisibleType)
 			}
 		}
 
@@ -2843,85 +2796,31 @@ func (t *T) upgradeType() error {
 	return nil
 }
 
-// downgradeType transforms NAME types for backwards-compatibility with v25.3
-// and earlier versions during mixed-version clusters. For non-NAME types, this
-// is a no-op.
-//
-// NAME types are downgraded to use the legacy Family=name encoding so that v25.3
-// nodes can correctly interpret them without losing NAME semantics.
-//
-// TODO(sql-foundations): Remove this function entirely once v25.4 is the minimum
-// supported version and we no longer need to support mixed-version clusters with
-// v25.3 nodes.
-func (t *T) downgradeType() error {
-	// Set Family for NAME type for backwards-compatibility.
-	switch t.Family() {
-	case StringFamily, CollatedStringFamily:
-		t.InternalType.Family = name
-		// If locale is an empty string, we set it to nil to ensure older versions
-		// don’t misclassify the NAME as a collated string.
-		if t.InternalType.Locale != nil && len(*t.InternalType.Locale) == 0 {
-			t.InternalType.Locale = nil
-		}
-	}
-
-	return nil
-}
-
 // Marshal serializes a type into a byte representation using gogo protobuf
-// serialization rules. It returns the resulting bytes as a slice. The bytes
-// are serialized in a format that is backwards-compatible with the previous
-// version of CRDB so that clusters can run in mixed version mode during
-// upgrade.
+// serialization rules. It returns the resulting bytes as a slice.
 //
 //	bytes, err := protoutil.Marshal(&typ)
 func (t *T) Marshal() (data []byte, err error) {
-	// non-NAME types don't need any serialization changes to be backwards compatible.
-	if t.InternalType.Oid != oid.T_name {
-		return protoutil.Marshal(&t.InternalType)
-	}
-	// First downgrade to a struct that will be serialized in a backwards-
-	// compatible bytes format.
-	temp := *t
-	if err := temp.downgradeType(); err != nil {
-		return nil, err
-	}
-	return protoutil.Marshal(&temp.InternalType)
+	return protoutil.Marshal(&t.InternalType)
 }
 
-// MarshalToSizedBuffer is like Mashal, except that it deserializes to
+// MarshalToSizedBuffer is like Marshal, except that it serializes to
 // an existing byte slice with exactly enough remaining space for
 // Size().
 //
-// Marshal is part of the protoutil.Message interface.
+// MarshalToSizedBuffer is part of the protoutil.Message interface.
 func (t *T) MarshalToSizedBuffer(data []byte) (int, error) {
-	// non-NAME types don't need any serialization changes to be backwards compatible.
-	if t.InternalType.Oid != oid.T_name {
-		return t.InternalType.MarshalToSizedBuffer(data)
-	}
-	temp := *t
-	if err := temp.downgradeType(); err != nil {
-		return 0, err
-	}
-	return temp.InternalType.MarshalToSizedBuffer(data)
+	return t.InternalType.MarshalToSizedBuffer(data)
 }
 
-// MarshalTo behaves like Marshal, except that it deserializes to an existing
+// MarshalTo behaves like Marshal, except that it serializes to an existing
 // byte slice and returns the number of bytes written to it. The slice must
 // already have sufficient capacity. Callers can use the Size method to
 // determine how much capacity needs to be allocated.
 //
-// Marshal is part of the protoutil.Message interface.
+// MarshalTo is part of the protoutil.Message interface.
 func (t *T) MarshalTo(data []byte) (int, error) {
-	// non-NAME types don't need any serialization changes to be backwards compatible.
-	if t.InternalType.Oid != oid.T_name {
-		return t.InternalType.MarshalTo(data)
-	}
-	temp := *t
-	if err := temp.downgradeType(); err != nil {
-		return 0, err
-	}
-	return temp.InternalType.MarshalTo(data)
+	return t.InternalType.MarshalTo(data)
 }
 
 // String returns the name of the type, similar to the Name method. However, it
@@ -3244,6 +3143,8 @@ func (t *T) stringTypeSQL() string {
 		typName = `"char"`
 	case oid.T_name:
 		typName = "NAME"
+	case oid.T_aclitem:
+		typName = "ACLITEM"
 	}
 
 	// In general, if there is a specified width we want to print it next to the

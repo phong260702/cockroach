@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/password"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -260,6 +262,50 @@ var (
 		Category:    metric.Metadata_SQL,
 		HowToUse:    `See Description.`,
 	}
+	AuthCertSANConnTotal = metric.Metadata{
+		Name:        "auth.cert.san.conn.total",
+		Help:        "Total number of SQL connection attempts using SAN-based certificate authentication",
+		Measurement: "Connections",
+		Unit:        metric.Unit_COUNT,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_SQL,
+		HowToUse:    "This metric tracks all authentication attempts when SAN-based certificate validation is enabled. Compare with auth.cert.san.conn.success to calculate failure rate.",
+	}
+	AuthCertSANConnSuccess = metric.Metadata{
+		Name:        "auth.cert.san.conn.success",
+		Help:        "Number of successful SQL connections using SAN-based certificate authentication",
+		Measurement: "Connections",
+		Unit:        metric.Unit_COUNT,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_SQL,
+		HowToUse:    "This metric tracks successful authentications when SAN-based certificate validation is enabled. Use this to monitor adoption and success rate of SAN authentication. Failure rate = auth.cert.san.conn.total - auth.cert.san.conn.success.",
+	}
+	MetaPasswordEncryptionIsSCRAM = metric.Metadata{
+		Name: "auth.password_encryption.is_scram",
+		Help: "Whether server.user_login.password_encryption is set " +
+			"to scram-sha-256 (1) or crdb-bcrypt (0)",
+		Measurement: "State",
+		Unit:        metric.Unit_CONST,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_SQL,
+		HowToUse: "Use this metric to verify that SCRAM-SHA-256 password " +
+			"encryption is enabled across your cluster. A value of 0 " +
+			"indicates crdb-bcrypt is in use and the cluster has not " +
+			"adopted the stronger SCRAM-SHA-256 hashing method.",
+	}
+	MetaMinPasswordLength = metric.Metadata{
+		Name: "auth.min_password_length",
+		Help: "The configured minimum password length " +
+			"(server.user_login.min_password_length)",
+		Measurement: "Characters",
+		Unit:        metric.Unit_COUNT,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_SQL,
+		HowToUse: "Use this metric to confirm minimum password length " +
+			"policy is enforced. Alert if the value drops below your " +
+			"organization's required minimum to detect configuration " +
+			"drift.",
+	}
 )
 
 const (
@@ -420,10 +466,14 @@ type tenantSpecificMetrics struct {
 	AuthGSSConnLatency          metric.IHistogram
 	AuthScramConnLatency        metric.IHistogram
 	AuthLDAPConnLatencyInternal metric.IHistogram
+	AuthCertSANConnTotal        *metric.Counter
+	AuthCertSANConnSuccess      *metric.Counter
+	PasswordEncryptionIsSCRAM   *metric.FunctionalGauge
+	MinPasswordLength           *metric.FunctionalGauge
 }
 
 func newTenantSpecificMetrics(
-	sqlMemMetrics sql.MemoryMetrics, histogramWindow time.Duration,
+	sqlMemMetrics sql.MemoryMetrics, histogramWindow time.Duration, sv *settings.Values,
 ) *tenantSpecificMetrics {
 	return &tenantSpecificMetrics{
 		Conns:               metric.NewGauge(MetaConns),
@@ -456,6 +506,19 @@ func newTenantSpecificMetrics(
 			getHistogramOptionsForIOLatency(AuthScramConnLatency, histogramWindow)),
 		AuthLDAPConnLatencyInternal: metric.NewHistogram(
 			getHistogramOptionsForIOLatency(AuthLDAPConnLatencyInternal, histogramWindow)),
+		AuthCertSANConnTotal:   metric.NewCounter(AuthCertSANConnTotal),
+		AuthCertSANConnSuccess: metric.NewCounter(AuthCertSANConnSuccess),
+		PasswordEncryptionIsSCRAM: metric.NewFunctionalGauge(
+			MetaPasswordEncryptionIsSCRAM, func() int64 {
+				if security.GetConfiguredPasswordHashMethod(sv) == password.HashSCRAMSHA256 {
+					return 1
+				}
+				return 0
+			}),
+		MinPasswordLength: metric.NewFunctionalGauge(
+			MetaMinPasswordLength, func() int64 {
+				return security.MinPasswordLength.Get(sv)
+			}),
 	}
 }
 
@@ -488,7 +551,7 @@ func MakeServer(
 		cfg:        cfg,
 		execCfg:    executorConfig,
 
-		tenantMetrics: newTenantSpecificMetrics(sqlMemMetrics, histogramWindow),
+		tenantMetrics: newTenantSpecificMetrics(sqlMemMetrics, histogramWindow, &st.SV),
 		destinationMetrics: destinationAggMetrics{
 			BytesInCount:  aggmetric.NewCounter(MetaBytesIn, "remote"),
 			BytesOutCount: aggmetric.NewCounter(MetaBytesOut, "remote"),
@@ -534,6 +597,16 @@ func MakeServer(
 	})
 	ConnIdentityMapConf.SetOnChange(&st.SV, func(ctx context.Context) {
 		loadLocalIdentityMapUponRemoteSettingChange(ctx, server, st)
+	})
+
+	// Track SAN authentication feature enablement.
+	security.ClientCertSANRequired.SetOnChange(&st.SV, func(ctx context.Context) {
+		if security.ClientCertSANRequired.Get(&st.SV) {
+			telemetry.Inc(sqltelemetry.CertSANEnableCounter)
+			log.Ops.Infof(ctx, "SAN-based certificate authentication has been enabled")
+		} else {
+			log.Ops.Infof(ctx, "SAN-based certificate authentication has been disabled")
+		}
 	})
 
 	return server
@@ -932,10 +1005,11 @@ func (s *Server) ServeConn(
 	defer onCloseFn()
 
 	sessionID := s.execCfg.GenerateID()
+	remoteAddr := conn.RemoteAddr().String()
 	connDetails := eventpb.CommonConnectionDetails{
 		InstanceID:    int32(s.execCfg.NodeInfo.NodeID.SQLInstanceID()),
 		Network:       conn.RemoteAddr().Network(),
-		RemoteAddress: conn.RemoteAddr().String(),
+		RemoteAddress: redact.Sprintf("%s", redact.HashString(remoteAddr)),
 		SessionID:     sessionID.String(),
 	}
 
@@ -989,14 +1063,15 @@ func (s *Server) ServeConn(
 	// shared struct for structured logging.
 	// Only now do we know the remote client address for sure (it may have
 	// been overridden by a status parameter).
-	connDetails.RemoteAddress = sArgs.RemoteAddr.String()
+	remoteAddr = sArgs.RemoteAddr.String()
+	connDetails.RemoteAddress = redact.Sprintf("%s", redact.HashString(remoteAddr))
 	sp := tracing.SpanFromContext(ctx)
 	tags := logtags.BuildBuffer()
-	tags.Add("client", log.SafeOperational(connDetails.RemoteAddress))
+	tags.Add("client", log.SafeOperational(remoteAddr))
 	tags.Add(preServeStatus.ConnType.String(), nil)
 	ctx = logtags.AddTags(ctx, tags.Finish())
 	sp.SetTag("conn_type", attribute.StringValue(preServeStatus.ConnType.String()))
-	sp.SetTag("client", attribute.StringValue(connDetails.RemoteAddress))
+	sp.SetTag("client", attribute.StringValue(remoteAddr))
 
 	// If a test is hooking in some authentication option, load it.
 	var testingAuthHook func(context.Context) error

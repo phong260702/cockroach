@@ -108,6 +108,15 @@ func (r *testRegistryImpl) prepareOpSpec(spec *registry.OperationSpec) error {
 		return fmt.Errorf(`%s: unknown owner %q`, spec.Name, spec.Owner)
 	}
 
+	if spec.LongRunning &&
+		spec.CanRunConcurrently == registry.OperationCannotRunConcurrently {
+		return fmt.Errorf(
+			"%s: LongRunning operations cannot use OperationCannotRunConcurrently; "+
+				"the long-running pool is single-threaded so exclusivity is implicit",
+			spec.Name,
+		)
+	}
+
 	return nil
 }
 
@@ -182,12 +191,23 @@ func (r testRegistryImpl) AllOperations() []registry.OperationSpec {
 }
 
 // FilteredOperations returns operations filtered by the given regex.
-func (r testRegistryImpl) FilteredOperations(regex *regexp.Regexp) []registry.OperationSpec {
+// If skipRegex is non-nil, operations matching it are excluded.
+// If cloud is set, operations incompatible with that cloud are excluded.
+func (r testRegistryImpl) FilteredOperations(
+	regex *regexp.Regexp, skipRegex *regexp.Regexp, cloud spec.Cloud,
+) []registry.OperationSpec {
 	var filteredOps []registry.OperationSpec
 	for _, opSpec := range r.AllOperations() {
-		if regex.MatchString(opSpec.Name) {
-			filteredOps = append(filteredOps, opSpec)
+		if !regex.MatchString(opSpec.Name) {
+			continue
 		}
+		if skipRegex != nil && skipRegex.MatchString(opSpec.Name) {
+			continue
+		}
+		if cloud.IsSet() && !opSpec.CompatibleClouds.Contains(cloud) {
+			continue
+		}
+		filteredOps = append(filteredOps, opSpec)
 	}
 	return filteredOps
 }

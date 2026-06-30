@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -87,7 +86,10 @@ func newRowLevelTTLTestJobTestHelper(
 		return st
 	}
 
-	jobsInterval := 2 * time.Second
+	jobsInterval := 5 * time.Second
+	if skip.Duress() {
+		jobsInterval = 30 * time.Second
+	}
 	requestFilter, _ := testutils.TestingRequestFilterRetryTxnWithPrefix(t, "ttljob-", 1)
 	baseTestingKnobs := base.TestingKnobs{
 		Server: &server.TestingKnobs{
@@ -128,8 +130,6 @@ func newRowLevelTTLTestJobTestHelper(
 			Settings:          makeSettings(),
 			Knobs:             baseTestingKnobs,
 			InsecureWebAccess: true,
-			// TODO(server): re-enable DRPC once flakiness is addressed, see #158387.
-			DefaultDRPCOption: base.TestDRPCDisabled,
 		},
 	})
 	th.testCluster = testCluster
@@ -754,14 +754,6 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 				// test is wrapping JSON objects in multiple single quotes which
 				// causes parsing errors.
 				return false
-			case types.CollatedStringFamily:
-				if typ.Oid() == oidext.T_citext || typ.Oid() == oidext.T__citext {
-					// CITEXT is only supported in 25.3+, so if we happen to run
-					// the test in the mixed version variant, we can't use the
-					// type.
-					return int(clusterversion.MinSupported) >= int(clusterversion.V25_3)
-				}
-				return true
 			case types.LTreeFamily:
 				// LTREE is only supported in 25.4+, so if we happen to run the
 				// test in the mixed version variant, we can't use the type.
@@ -1356,6 +1348,7 @@ func TestMakeTTLJobDescription(t *testing.T) {
 func TestRowLevelTTLJobCancelPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "job adoption interval is longer under duress, so the test is too slow")
 
 	type testCase struct {
 		name string
@@ -1484,7 +1477,7 @@ func TestRowLevelTTLJobCancelPrivileges(t *testing.T) {
 						return errors.Newf("job status is %q, waiting for 'canceled'", status)
 					}
 					return nil
-				}, 30*time.Second)
+				}, 5*time.Minute)
 			} else {
 				require.Errorf(t, err, "expected %s to not be able to cancel the job", tc.cancelUser)
 				require.ErrorContains(t, err, "does not have privileges")

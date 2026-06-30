@@ -1,4 +1,4 @@
-# LogicTest: !enterprise-configs !local-prepared
+# LogicTest: !enterprise-configs
 
 query IBIT colnames
 SELECT id, active, length(info), name FROM system.tenants ORDER BY id
@@ -250,12 +250,6 @@ id  active  name                  data_state  service_mode  deprecated_data_stat
 1   true    system                1           2             READY                  ·
 10  true    tenant-number-ten     1           0             READY                  ·
 11  true    tenant-number-eleven  1           0             READY                  ·
-
-query error tenant resource limits require a CCL binary
-SELECT crdb_internal.update_tenant_resource_limits(10, 1000, 100, 0, now(), 0)
-
-query error tenant resource limits require a CCL binary
-SELECT crdb_internal.update_tenant_resource_limits('tenant-number-ten', 1000, 100, 0)
 
 user testuser
 

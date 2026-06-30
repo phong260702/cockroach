@@ -334,12 +334,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.TestingKnobs.AdmissionControlOptions = &admission.Options{}
 	}
 
-	switch params.DefaultDRPCOption {
-	case base.TestDRPCEnabled:
-		rpcbase.ExperimentalDRPCEnabled.Override(context.Background(), &st.SV, true)
-	case base.TestDRPCDisabled:
-		rpcbase.ExperimentalDRPCEnabled.Override(context.Background(), &st.SV, false)
-	}
+	cfg.UseDRPC = params.DefaultDRPCOption == base.TestDRPCEnabled
 
 	return cfg
 }
@@ -1500,11 +1495,18 @@ func (ts *testServer) StartSharedProcessTenant(
 	// system tenant; for shared-process tenants, the system tenant's setting
 	// already applies at the KV layer.
 	if args.DisableElasticCPUAdmission {
-		if s, ok := settings.LookupForLocalAccessByKey(
-			settings.InternalKey("sqladmission.low_pri_read_response_elastic_control.enabled"),
-			false, /* forSystemTenant */
-		); ok {
-			s.(*settings.BoolSetting).Override(ctx, &sqlServer.cfg.Settings.SV, false)
+		for _, key := range []string{
+			"sqladmission.low_pri_read_response_elastic_control.enabled",
+			"bulkio.index_backfill.elastic_control.enabled",
+			"bulkio.ingest.sst_batcher_elastic_control.enabled",
+			"bulkio.import.elastic_control.enabled",
+			"bulkio.backup.file_sst_sink_elastic_control.enabled",
+		} {
+			if s, ok := settings.LookupForLocalAccessByKey(
+				settings.InternalKey(key), false, /* forSystemTenant */
+			); ok {
+				s.(*settings.BoolSetting).Override(ctx, &sqlServer.cfg.Settings.SV, false)
+			}
 		}
 	}
 	admission.YieldForElasticCPU.Override(ctx, &sqlServer.cfg.Settings.SV, false)
@@ -1766,7 +1768,6 @@ func (ts *testServer) StartTenant(
 	if st == nil {
 		st = cluster.MakeTestingClusterSettings()
 	}
-
 	sqlCfg := makeTestSQLConfig(st, params.TenantID, params.TenantName)
 	sqlCfg.TenantLoopbackAddr = ts.AdvRPCAddr()
 	if params.MemoryPoolSize != 0 {
@@ -1829,6 +1830,7 @@ func (ts *testServer) StartTenant(
 	baseCfg.GoroutineDumpDirName = ts.Cfg.BaseConfig.GoroutineDumpDirName
 	baseCfg.ExternalIODirConfig = params.ExternalIODirConfig
 	baseCfg.ExternalIODir = params.ExternalIODir
+	baseCfg.UseDRPC = ts.Cfg.UseDRPC
 
 	// Grant the tenant the default capabilities.
 	if err := ts.grantDefaultTenantCapabilities(ctx, params.TenantID, params.SkipTenantCheck); err != nil {
@@ -1902,11 +1904,18 @@ func (ts *testServer) StartTenant(
 	// NB: ElasticAdmission is a SystemOnly setting so it can only be set on the
 	// system tenant; the setting on the host cluster already applies at the KV layer.
 	if params.DisableElasticCPUAdmission {
-		if s, ok := settings.LookupForLocalAccessByKey(
-			settings.InternalKey("sqladmission.low_pri_read_response_elastic_control.enabled"),
-			false, /* forSystemTenant */
-		); ok {
-			s.(*settings.BoolSetting).Override(ctx, &st.SV, false)
+		for _, key := range []string{
+			"sqladmission.low_pri_read_response_elastic_control.enabled",
+			"bulkio.index_backfill.elastic_control.enabled",
+			"bulkio.ingest.sst_batcher_elastic_control.enabled",
+			"bulkio.import.elastic_control.enabled",
+			"bulkio.backup.file_sst_sink_elastic_control.enabled",
+		} {
+			if s, ok := settings.LookupForLocalAccessByKey(
+				settings.InternalKey(key), false, /* forSystemTenant */
+			); ok {
+				s.(*settings.BoolSetting).Override(ctx, &st.SV, false)
+			}
 		}
 	}
 	admission.YieldForElasticCPU.Override(ctx, &st.SV, false)
@@ -2690,7 +2699,7 @@ func (ts *testServer) RPCClientConn(
 func (ts *testServer) RPCClientConnE(user username.SQLUsername) (serverutils.RPCConn, error) {
 	ctx := context.Background()
 	rpcCtx := ts.NewClientRPCContext(ctx, user)
-	if !rpcbase.DRPCEnabled(ctx, rpcCtx.Settings) {
+	if !rpcCtx.UseDRPC {
 		conn, err := rpcCtx.GRPCDialNode(ts.AdvRPCAddr(), ts.NodeID(), ts.Locality(), rpcbase.DefaultClass).Connect(ctx)
 		if err != nil {
 			return nil, err
@@ -2742,7 +2751,7 @@ func (t *testTenant) RPCClientConn(
 func (t *testTenant) RPCClientConnE(user username.SQLUsername) (serverutils.RPCConn, error) {
 	ctx := context.Background()
 	rpcCtx := t.NewClientRPCContext(ctx, user)
-	if !rpcbase.DRPCEnabled(ctx, rpcCtx.Settings) {
+	if !rpcCtx.UseDRPC {
 		conn, err := rpcCtx.GRPCDialPod(t.AdvRPCAddr(), t.SQLInstanceID(), t.Locality(), rpcbase.DefaultClass).Connect(ctx)
 		if err != nil {
 			return nil, err

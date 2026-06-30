@@ -727,10 +727,10 @@ func (r *Replica) computeChecksumPostApply(
 		tag := fmt.Sprintf("r%d_at_%d", r.RangeID, as.RaftAppliedIndex)
 		spans := r.store.checkpointSpans(&desc)
 		log.KvExec.Warningf(ctx, "creating checkpoint %s with spans %+v", tag, spans)
-		if dir, err := r.store.checkpoint(tag, spans); err != nil {
+		if dirs, err := r.store.checkpoint(tag, spans); err != nil {
 			log.KvExec.Warningf(ctx, "unable to create checkpoint %s: %+v", tag, err)
 		} else {
-			log.KvExec.Warningf(ctx, "created checkpoint %s", dir)
+			log.KvExec.Warningf(ctx, "created checkpoint(s) %v", dirs)
 		}
 	}
 

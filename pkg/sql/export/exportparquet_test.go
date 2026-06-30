@@ -114,59 +114,11 @@ func validateParquetFile(
 			return fmt.Errorf("reading record failed: %w", err)
 		}
 		for j := 0; j < len(test.cols); j++ {
-			// If we're encoding a DOidWrapper, then we want to cast the wrapped
-			// datum. Note that we don't use eval.UnwrapDatum since we're not
-			// interested in evaluating the placeholders.
-			// TODO(#104278): use ValidateDatum from util/parquet.
-			validateDatum(t, tree.UnwrapDOidWrapper(test.datums[i][j]), tree.UnwrapDOidWrapper(row[j]), test.cols[j].Typ)
+			parquet.ValidateDatum(t, test.datums[i][j], row[j])
 		}
 		i++
 	}
 	return nil
-}
-
-func validateDatum(t *testing.T, expected tree.Datum, actual tree.Datum, typ *types.T) {
-	switch expected.ResolvedType().Family() {
-	case types.ArrayFamily:
-		eArr := expected.(*tree.DArray)
-		aArr := actual.(*tree.DArray)
-		for i := 0; i < eArr.Len(); i++ {
-			validateDatum(t, tree.UnwrapDOidWrapper(eArr.Array[i]),
-				tree.UnwrapDOidWrapper(aArr.Array[i]), typ.ArrayContents())
-		}
-	case types.DateFamily:
-		// pgDate.orig property doesn't matter and can cause the test to fail
-		require.Equal(t, expected.(*tree.DDate).Date.UnixEpochDays(),
-			actual.(*tree.DDate).Date.UnixEpochDays())
-	case types.JsonFamily:
-		// Only the value of the json object matters, not that additional properties
-		require.Equal(t, expected.(*tree.DJSON).JSON.String(),
-			actual.(*tree.DJSON).JSON.String())
-	case types.EnumFamily:
-		// Only the value of the enum string matters, not that additional properties
-		require.Equal(t, expected.(*tree.DEnum).LogicalRep,
-			actual.(*tree.DEnum).LogicalRep)
-	case types.CollatedStringFamily:
-		// Only the value of the collated string matters, not that additional properties
-		require.Equal(t, expected.(*tree.DCollatedString).Contents,
-			actual.(*tree.DCollatedString).Contents)
-	case types.FloatFamily:
-		if typ.Equal(types.Float4) && expected.(*tree.DFloat).String() != "NaN" {
-			// CRDB currently doesn't truncate non NAN float4's correctly, so this
-			// test does it manually :(
-			// https://github.com/cockroachdb/cockroach/issues/73743
-			e := float32(*expected.(*tree.DFloat))
-			a := float32(*expected.(*tree.DFloat))
-			require.Equal(t, e, a)
-		} else {
-			require.Equal(t, expected.String(), actual.String())
-		}
-	case types.DecimalFamily:
-		require.Equal(t, expected.String(), actual.String())
-
-	default:
-		require.Equal(t, expected, actual)
-	}
 }
 
 func TestRandomParquetExports(t *testing.T) {
@@ -229,22 +181,6 @@ func TestRandomParquetExports(t *testing.T) {
 					require.NoError(t, err)
 
 					for _, col := range cols {
-						// Skip tables with BIT(0) columns (or arrays of BIT(0)).
-						// The testutils parquet decoder cannot decode these as
-						// into the expected empty bit array and decodes the as
-						// nil. Ignore these to avoid these flakes.
-						colTyp := col.Typ
-						if colTyp.Family() == types.ArrayFamily {
-							colTyp = colTyp.ArrayContents()
-						}
-						if colTyp.Family() == types.BitFamily && colTyp.Width() == 0 {
-							// We skip these because of the aforementioned
-							// decoder issue.
-							t.Logf("skipping table '%s' because it has BIT(0) column '%s' (type: %s)",
-								tableName, col.Name, colTyp.String())
-							return fmt.Errorf("table has BIT(0) column")
-						}
-
 						// TODO(#104278): don't call this function to check if a type is supported.
 						// We should explicitly use the ones supported by  util/parquet).
 						_, err := parquet.NewSchema([]string{"test"}, []*types.T{col.Typ})

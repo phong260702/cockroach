@@ -129,6 +129,10 @@ type Smither struct {
 	bulkFiles   map[string][]byte
 	bulkBackups map[string]tree.BackupTargetList
 	bulkExports []string
+
+	// logFn, if set, is called to emit progress messages during schema loading
+	// and other potentially slow operations.
+	logFn func(format string, args ...interface{})
 }
 
 type (
@@ -201,6 +205,14 @@ var TestingPrettyCfg = prettyCfg
 
 // Generate returns a random SQL string.
 func (s *Smither) Generate() string {
+	stmt, _ := s.GenerateWithTag()
+	return stmt
+}
+
+// GenerateWithTag returns a random SQL string along with the statement's
+// StatementType (e.g. TypeDDL, TypeDML). Callers can use the type to
+// adjust behavior, for example increasing the statement timeout for DDL.
+func (s *Smither) GenerateWithTag() (string, tree.StatementType) {
 	i := 0
 	for {
 		stmt, ok := s.makeStmt()
@@ -224,7 +236,7 @@ func (s *Smither) Generate() string {
 			// Use simple printing if pretty-printing fails.
 			p = tree.AsStringWithFlags(stmt, fl)
 		}
-		return p
+		return p, stmt.StatementType()
 	}
 }
 
@@ -627,6 +639,18 @@ var DisableDoBlocks = simpleOption("disable do block", func(s *Smither) {
 var DisableIsolationChange = simpleOption("disable isolation change", func(s *Smither) {
 	s.disableIsolationChange = true
 })
+
+// SetLogger configures a logging function for the Smither. The function is
+// called to emit progress messages during schema loading and other potentially
+// slow operations.
+func SetLogger(logFn func(format string, args ...interface{})) SmitherOption {
+	return option{
+		name: "set logger",
+		apply: func(s *Smither) {
+			s.logFn = logFn
+		},
+	}
+}
 
 // CompareMode causes the Smither to generate statements that have
 // deterministic output.

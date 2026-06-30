@@ -65,6 +65,14 @@ type StoreTestingKnobs struct {
 	// handled and the batch is retried.
 	TestingConcurrencyRetryFilter kvserverbase.ReplicaConcurrencyRetryFilter
 
+	// TestingBackpressureCallbackRegistered, if set, is called from
+	// (*Replica).maybeBackpressureBatch after a backpressure callback has been
+	// successfully registered with the split queue. Tests use this to
+	// deterministically learn that a backpressured write is waiting on the
+	// callback (and thus will observe the split's outcome), which avoids
+	// time-based coordination on slow hardware.
+	TestingBackpressureCallbackRegistered func(roachpb.RangeID)
+
 	// TestingProposalFilter is called before proposing each command.
 	TestingProposalFilter kvserverbase.ReplicaProposalFilter
 	// TestingProposalSubmitFilter can be used by tests to observe and optionally
@@ -286,6 +294,19 @@ type StoreTestingKnobs struct {
 	// spin attempting to acquire a split or merge lock on a RHS which will
 	// always fail and is generally not safe but is useful for testing.
 	DisableEagerReplicaRemoval bool
+	// TestingReplicaDestroyErr, if set, is called before staging a replica
+	// destruction batch in removal paths that set DestroyData (i.e. GC queue,
+	// direct RemoveReplica, and getOrCreateReplica — but NOT the eager
+	// self-removal via ChangeReplicasTrigger, which uses DestroyData: false).
+	// If it returns a non-nil error, the staging is short-circuited and the
+	// error is returned to the caller.
+	TestingReplicaDestroyErr func() error
+	// DisableReplicaGCQueueAddOnRaftGroupDeleted, when set, prevents
+	// HandleRaftResponse from adding replicas to the GC queue when a
+	// RaftGroupDeletedError is received. This is useful for testing the
+	// merge watcher's ability to queue replicas for GC independently of
+	// Raft traffic.
+	DisableReplicaGCQueueAddOnRaftGroupDeleted bool
 	// RefreshReasonTicksPeriod overrides the default period over which
 	// pending commands are refreshed. The period is specified as a multiple
 	// of Raft group ticks.
@@ -340,6 +361,9 @@ type StoreTestingKnobs struct {
 	// HandleSnapshotDone is run after the entirety of receiving a snapshot,
 	// regardless of whether it succeeds, gets cancelled, times out, or errors.
 	HandleSnapshotDone func()
+	// BeforeClearSnapshotScratchOnStart is called just before cleaning scratch
+	// files on startup is executed.
+	BeforeClearSnapshotScratchOnStart func()
 	// ReplicaAddSkipLearnerRollback causes replica addition to skip the learner
 	// rollback that happens when either the initial snapshot or the promotion of
 	// a learner to a voter fails.
@@ -585,6 +609,10 @@ type StoreTestingKnobs struct {
 	// DisableLeaderlessWatcherRefreshOnRaftTick, if set, disables refreshing
 	// the leaderless watcher's unavailable state during raft ticks.
 	DisableLeaderlessWatcherRefreshOnRaftTick bool
+
+	// BeforeSplitAcquiresLocksOnRHS is invoked during a split application before
+	// we start acquiring locks on the right hand side.
+	BeforeSplitAcquiresLocksOnRHS func(context.Context, *Replica)
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

@@ -13,6 +13,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -25,6 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -78,6 +83,11 @@ type Outbox struct {
 	// A copy of Run's caller ctx, with no StreamID tag.
 	// Used to pass a clean context to the input.Next.
 	runnerCtx context.Context
+
+	// cpuStopWatch measures goroutine CPU time for the outbox goroutine.
+	// The zero value is valid; Stop() returns 0 if grunning is not
+	// supported or Start was not called.
+	cpuStopWatch timeutil.CPUStopWatch
 }
 
 // NewOutbox creates a new Outbox.
@@ -130,6 +140,61 @@ func (o *Outbox) close(ctx context.Context) {
 	o.unlimitedAllocator.ReleaseAll()
 }
 
+// tenantID returns the TenantID from the flow context's codec, or the
+// system tenant ID if the flow context or EvalCtx is nil (which happens
+// in tests).
+func (o *Outbox) tenantID() roachpb.TenantID {
+	if o.flowCtx != nil && o.flowCtx.EvalCtx != nil {
+		return o.flowCtx.Codec().TenantID
+	}
+	return roachpb.SystemTenantID
+}
+
+// workloadID returns the WorkloadID from the flow context's EvalCtx,
+// or 0 if EvalCtx is nil (which happens in tests).
+func (o *Outbox) workloadID() uint64 {
+	if o.flowCtx != nil && o.flowCtx.EvalCtx != nil {
+		return o.flowCtx.EvalCtx.WorkloadID
+	}
+	return 0
+}
+
+// appNameID returns the AppNameID from the flow context's EvalCtx, or
+// 0 if EvalCtx is nil (which happens in tests).
+func (o *Outbox) appNameID() uint64 {
+	if o.flowCtx != nil && o.flowCtx.EvalCtx != nil {
+		return o.flowCtx.EvalCtx.AppNameID
+	}
+	return 0
+}
+
+// gatewayNodeID returns the GatewayNodeID derived from the flow
+// context's NodeID, or 0 if the flow context or NodeID is nil (which
+// happens in tests).
+func (o *Outbox) gatewayNodeID() roachpb.NodeID {
+	if o.flowCtx != nil && o.flowCtx.NodeID != nil {
+		return roachpb.NodeID(o.flowCtx.NodeID.SQLInstanceID())
+	}
+	return 0
+}
+
+// workloadType returns the WorkloadType from the flow context's
+// EvalCtx, or WorkloadTypeUnknown if EvalCtx is nil (which happens in
+// tests).
+func (o *Outbox) workloadType() workloadid.WorkloadType {
+	if o.flowCtx != nil && o.flowCtx.EvalCtx != nil {
+		return o.flowCtx.EvalCtx.WorkloadType
+	}
+	return workloadid.WorkloadTypeUnknown
+}
+
+func (o *Outbox) cfgStopper() *stop.Stopper {
+	if o.flowCtx != nil && o.flowCtx.Cfg != nil {
+		return o.flowCtx.Cfg.Stopper
+	}
+	return nil
+}
+
 // Run starts an outbox by connecting to the provided node and pushing
 // coldata.Batches over the stream after sending a header with the provided flow
 // and stream ID. Note that an extra goroutine is spawned so that Recv may be
@@ -158,6 +223,7 @@ func (o *Outbox) Run(
 	flowCtxCancel context.CancelFunc,
 	connectionTimeout time.Duration,
 ) {
+	o.cpuStopWatch.Start()
 	flowCtx := ctx
 	// Derive a child context so that we can cancel all components rooted in
 	// this outbox.
@@ -181,7 +247,7 @@ func (o *Outbox) Run(
 
 	var stream execinfrapb.RPCDistSQL_FlowStreamClient
 	if err := func() error {
-		client, err := execinfra.GetDistSQLClientForOutbox(ctx, dialer, o.flowCtx.Cfg.Settings, sqlInstanceID, connectionTimeout)
+		client, err := execinfra.GetDistSQLClientForOutbox(ctx, dialer, sqlInstanceID, connectionTimeout, o.flowCtx.Cfg.RPCContext.UseDRPC)
 		if err != nil {
 			log.Dev.VWarningf(ctx, 1, "Outbox Dial connection error, distributed query will fail: %+v", err)
 			return err
@@ -203,7 +269,13 @@ func (o *Outbox) Run(
 		log.VEvent(ctx, 2, "Outbox sending header")
 		// Send header message to establish the remote server (consumer).
 		if err = stream.Send(
-			&execinfrapb.ProducerMessage{Header: &execinfrapb.ProducerHeader{FlowID: o.flowCtx.ID, StreamID: streamID}},
+			&execinfrapb.ProducerMessage{
+				Header: &execinfrapb.ProducerHeader{
+					FlowID:   o.flowCtx.ID,
+					StreamID: streamID,
+					Producer: o.flowCtx.NodeID.SQLInstanceID(),
+				},
+			},
 		); err != nil {
 			log.Dev.VWarningf(ctx, 1, "Outbox Send header error, distributed query will fail: %+v", err)
 			return err
@@ -277,8 +349,19 @@ func (o *Outbox) sendBatches(
 				// message that we'll send with the next batch, if we ever need
 				// to reduce the number of DistSQL messages. We'll need to teach
 				// the Inbox about that too.
-				if err := stream.Send(o.scratch.msg); err != nil {
-					flowinfra.HandleStreamErr(ctx, "Send (streaming metadata)", err, flowCtxCancel, outboxCtxCancel)
+				sendCleanup := ash.SetWorkState(
+					o.tenantID(),
+					ash.WorkloadInfo{
+						WorkloadID:    o.workloadID(),
+						AppNameID:     o.appNameID(),
+						GatewayNodeID: o.gatewayNodeID(),
+						WorkloadType:  o.workloadType(),
+					},
+					ash.WorkNetwork, "OutboxSend")
+				err := stream.Send(o.scratch.msg)
+				sendCleanup()
+				if err != nil {
+					flowinfra.HandleStreamErr(ctx, "Send (streaming metadata)", err, flowCtxCancel, outboxCtxCancel, o.cfgStopper())
 					return
 				}
 				continue
@@ -316,8 +399,19 @@ func (o *Outbox) sendBatches(
 			// soon as the message is written to the control buffer. The message is
 			// marshaled (bytes are copied) before writing.
 			log.VEvent(ctx, 2, "Outbox sending batch")
-			if err := stream.Send(o.scratch.msg); err != nil {
-				flowinfra.HandleStreamErr(ctx, "Send (batches)", err, flowCtxCancel, outboxCtxCancel)
+			sendCleanup := ash.SetWorkState(
+				o.tenantID(),
+				ash.WorkloadInfo{
+					WorkloadID:    o.workloadID(),
+					AppNameID:     o.appNameID(),
+					GatewayNodeID: o.gatewayNodeID(),
+					WorkloadType:  o.workloadType(),
+				},
+				ash.WorkNetwork, "OutboxSend")
+			err = stream.Send(o.scratch.msg)
+			sendCleanup()
+			if err != nil {
+				flowinfra.HandleStreamErr(ctx, "Send (batches)", err, flowCtxCancel, outboxCtxCancel, o.cfgStopper())
 				return
 			}
 		}
@@ -349,6 +443,16 @@ func (o *Outbox) sendDrainedMetadata(
 		for _, meta := range o.inputMetaInfo.MetadataSources.DrainMeta() {
 			msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, meta))
 		}
+	}
+	// Always-on: each outbox emits its goroutine's raw CPU time via Metrics
+	// metadata. The gateway sums all RawSQLCPUTime entries and subtracts
+	// total LocalKVCPUTime to derive SQL CPU.
+	if delta := o.cpuStopWatch.Stop(); delta > 0 {
+		sqlCPUMeta := execinfrapb.ProducerMetadata{}
+		sqlCPUMeta.Metrics = execinfrapb.GetMetricsMeta()
+		sqlCPUMeta.Metrics.RawSQLCPUTime = int64(delta)
+		msg.Data.Metadata = append(msg.Data.Metadata,
+			execinfrapb.LocalMetaToRemoteProducerMeta(ctx, sqlCPUMeta))
 	}
 	if !o.flowCtx.Gateway {
 		if trace := tracing.SpanFromContext(ctx).GetConfiguredRecording(); trace != nil {
@@ -400,7 +504,7 @@ func (o *Outbox) runWithStream(
 		for {
 			msg, err := stream.Recv()
 			if err != nil {
-				flowinfra.HandleStreamErr(ctx, "watchdog Recv", err, flowCtxCancel, outboxCtxCancel)
+				flowinfra.HandleStreamErr(ctx, "watchdog Recv", err, flowCtxCancel, outboxCtxCancel, o.cfgStopper())
 				break
 			}
 			switch {
@@ -424,14 +528,14 @@ func (o *Outbox) runWithStream(
 		}
 		o.moveToDraining(ctx, reason)
 		if err := o.sendDrainedMetadata(ctx, stream, errToSend); err != nil {
-			flowinfra.HandleStreamErr(ctx, "Send (draining metadata)", err, flowCtxCancel, outboxCtxCancel)
+			flowinfra.HandleStreamErr(ctx, "Send (draining metadata)", err, flowCtxCancel, outboxCtxCancel, o.cfgStopper())
 		} else {
 			// Close the stream. Note that if this block isn't reached, the stream
 			// is unusable.
 			// The receiver goroutine will read from the stream until any error
 			// is returned (most likely an io.EOF).
 			if err := stream.CloseSend(); err != nil {
-				flowinfra.HandleStreamErr(ctx, "CloseSend", err, flowCtxCancel, outboxCtxCancel)
+				flowinfra.HandleStreamErr(ctx, "CloseSend", err, flowCtxCancel, outboxCtxCancel, o.cfgStopper())
 			}
 		}
 	}

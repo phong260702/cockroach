@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	pbtypes "github.com/gogo/protobuf/types"
 )
 
 const (
@@ -198,6 +197,7 @@ func (sf *streamIngestionFrontier) Next() (
 		}
 		if row == nil {
 			sf.MoveToDrainingAndLogError(nil /* err */)
+
 			break
 		}
 
@@ -239,6 +239,11 @@ func (sf *streamIngestionFrontier) Next() (
 			}
 			sf.MoveToDrainingAndLogError(err)
 			return nil, sf.DrainHelper()
+		default:
+			// If the heartbeat sender is not ready to receive a frontier
+			// update (e.g. it's blocked on a network call to a partitioned
+			// source cluster), skip this update to avoid blocking the
+			// frontier processor. The next iteration will try again.
 		}
 	}
 	return nil, sf.DrainHelper()
@@ -341,8 +346,9 @@ func (sf *streamIngestionFrontier) maybeUpdateProgress() error {
 
 	sf.aggregateAndUpdateRangeMetrics()
 
-	if err := registry.UpdateJobWithTxn(ctx, jobID, nil /* txn */, func(
-		txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+	//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+	if err := registry.DeprecatedUpdateJobWithTxn(ctx, jobID, nil /* txn */, func(
+		txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater,
 	) error {
 		if err := md.CheckRunningOrReverting(); err != nil {
 			return err
@@ -429,12 +435,12 @@ func (sf *streamIngestionFrontier) maybeCollectRangeStats(
 		return nil
 	}
 
-	var stats streampb.StreamEvent_RangeStats
-	if err := pbtypes.UnmarshalAny(&meta.BulkProcessorProgress.ProgressDetails, &stats); err != nil {
-		return errors.Wrap(err, "unable to unmarshal progress details")
+	stats, err := replicationutils.UnmarshalRangeStats(&meta.BulkProcessorProgress.ProgressDetails)
+	if err != nil {
+		return err
 	}
 
-	sf.rangeStats.Add(meta.BulkProcessorProgress.ProcessorID, &stats)
+	sf.rangeStats.Add(meta.BulkProcessorProgress.ProcessorID, stats)
 	return nil
 }
 

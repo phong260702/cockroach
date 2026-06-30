@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -174,12 +175,21 @@ func changeStateOrCreateChangefeed(
 		return nil
 	}
 
-	// Initialize a random number generator to select a job randomly.
-	r, _ := randutil.NewPseudoRand()
-
-	// Randomly pick a job to perform the action on.
-	jobIndex := randutil.RandIntInRange(r, 0, len(cfJobs))
-	jobToAction := cfJobs[jobIndex]
+	// For RESUME, pick the longest-paused job (lowest high_water_timestamp) to
+	// prevent one changefeed from staying paused indefinitely while newer pauses
+	// get resumed first, which causes protected_age_sec to grow unboundedly.
+	// For other actions, pick a random job.
+	var jobToAction *jobDetails
+	if action == "RESUME" {
+		slices.SortFunc(cfJobs, func(a, b *jobDetails) int {
+			return a.highWaterTimestamp.Compare(b.highWaterTimestamp)
+		})
+		jobToAction = cfJobs[0]
+	} else {
+		r, _ := randutil.NewPseudoRand()
+		jobIndex := randutil.RandIntInRange(r, 0, len(cfJobs))
+		jobToAction = cfJobs[jobIndex]
+	}
 
 	// Execute the action (e.g., PAUSE or CANCEL) on the chosen job.
 	o.Status(fmt.Sprintf("Executing %s on job %s", action, jobToAction.jobID))
@@ -340,6 +350,12 @@ func createChangefeed(
 	o.Status(fmt.Sprintf("creating changefeed job to sink %s with options %v on table %s.%s",
 		sink, options, dbName, tableName))
 
+	// Ensure rangefeeds are enabled, as they are required for changefeeds.
+	_, err = conn.ExecContext(ctx, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
+	if err != nil {
+		return err
+	}
+
 	// Construct and execute the SQL statement to create the changefeed.
 	_, err = conn.ExecContext(ctx, fmt.Sprintf("CREATE CHANGEFEED FOR TABLE %s.%s INTO '%s' WITH %s;",
 		dbName, tableName, sink, strings.Join(options, ",")))
@@ -442,6 +458,9 @@ func calculateScanOption(allCFJobs []*jobDetails) (string, error) {
 		scanOnCount := 0
 		// Count the number of jobs that have initial scan set to 'yes' or "only".
 		for _, j := range allCFJobs {
+			if j.payload == nil {
+				continue
+			}
 			if v, ok := j.payload.Opts[changefeedbase.OptInitialScan]; ok {
 				if v == "yes" || v == "only" {
 					scanOnCount++

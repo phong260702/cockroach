@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -116,11 +117,6 @@ type Engines struct {
 	// stateEngine is the state machine engine, in which the committed raft state
 	// materializes after being "applied".
 	stateEngine storage.Engine
-	// todoEngine is a placeholder used in cases where:
-	// - the code does not yet cleanly separate between state and log engine
-	// - it is still unclear which of the two engines is the better choice for a
-	//   particular write, or there is a candidate, but it needs to be verified.
-	todoEngine storage.Engine
 	// logEngine is the engine holding mainly the raft state, such as HardState
 	// and logs, and the Store-local keys. This engine provides timely
 	// durability, by frequent and on-demand syncing.
@@ -139,12 +135,10 @@ func MakeEngines(eng storage.Engine) Engines {
 		return Engines{
 			stateEngine: spanset.NewEngine(eng, validateIsStateEngineSpan),
 			logEngine:   spanset.NewEngine(eng, validateIsRaftEngineSpan),
-			todoEngine:  eng,
 		}
 	}
 	return Engines{
 		stateEngine: eng,
-		todoEngine:  eng,
 		logEngine:   eng,
 	}
 }
@@ -161,28 +155,24 @@ func MakeSeparatedEnginesForTesting(state, log storage.Engine) Engines {
 		// accesses.
 		return Engines{
 			stateEngine: spanset.NewEngine(state, validateIsStateEngineSpan),
-			todoEngine:  nil,
 			logEngine:   spanset.NewEngine(log, validateIsRaftEngineSpan),
 			separated:   true,
 		}
 	}
 	return Engines{
 		stateEngine: state,
-		todoEngine:  nil,
 		logEngine:   log,
 		separated:   true,
 	}
 }
 
 // Engine returns the single engine. Used when the caller implements backwards
-// compatible code and neither StateEngine nor LogEngine can be used. This is
-// different from TODOEngine in that the caller explicitly acknowledges the fact
-// that they are using a combined engine.
+// compatible code and neither StateEngine nor LogEngine can be used.
 func (e *Engines) Engine() storage.Engine {
 	if buildutil.CrdbTestBuild && e.separated {
 		panic("engines are separated")
 	}
-	return e.todoEngine
+	return disableAccessAssertions(e.stateEngine)
 }
 
 // StateEngine returns the state machine engine.
@@ -195,11 +185,15 @@ func (e *Engines) LogEngine() storage.Engine {
 	return e.logEngine
 }
 
-// TODOEngine returns the combined engine, used in the code which currently does
-// not support separated engines. The caller must eventually "resolve" this call
-// to one of StateEngine, LogEngine, or Engine.
-func (e *Engines) TODOEngine() storage.Engine {
-	return e.todoEngine
+// TODOBothEngines returns the StateEngine, and indicates that the caller must
+// support a certain operation over both engines. For example, introspection and
+// metrics should eventually be per-engine, or combined from information
+// returned by both.
+//
+// TODO(sep-raft-log): the callers must migrate off as part of separated engines
+// productionization.
+func (e *Engines) TODOBothEngines() storage.Engine {
+	return disableAccessAssertions(e.stateEngine)
 }
 
 // Separated returns true iff the engines are logically or physically separated.
@@ -243,6 +237,212 @@ func (e *Engines) SetStoreID(ctx context.Context, id roachpb.StoreID) error {
 		return errors.Wrapf(err, "error setting store ID on engine %s", e.LogEngine())
 	}
 	return nil
+}
+
+// Sync ensures that everything written to the engine(s) up to this point is
+// durable.
+func (e *Engines) Sync() error {
+	// Flush the state machine engine first. Use the Flush method since
+	// StateEngine does not support WAL / incremental syncs.
+	if e.Separated() {
+		// TODO(sep-raft-log): ensure that StateEngine uses the DisableWAL option,
+		// otherwise we would need to WriteSyncNoop here.
+		if err := e.StateEngine().Flush(); err != nil {
+			return err
+		}
+	}
+	// Sync the LogEngine second, to ensure that the state machine engine
+	// doesn't run in front of it. Latest updates are captured by the LogEngine,
+	// before they are written to the state machine.
+	//
+	// NB: if engines are not separated, this syncs the entire engine.
+	return storage.WriteSyncNoop(e.LogEngine())
+}
+
+// newWriteBatch creates a new write batch to storage. When engines are
+// separated, the raft engine batch is lazily initialized on first access via
+// Raft(). Callers outside this package should use BatchFactory.
+func (e *Engines) newWriteBatch() Batch[storage.WriteBatch] {
+	if e.Separated() {
+		return Batch[storage.WriteBatch]{
+			state:     e.StateEngine().NewWriteBatch(),
+			logEngine: e.LogEngine(),
+		}
+	}
+	// With a single engine, create one batch, and reference it by both pointers.
+	b := e.Engine().NewWriteBatch()
+	if !spanset.EnableAssertions {
+		return Batch[storage.WriteBatch]{state: b, raft: b}
+	}
+	// Additionally, if assertions are enabled, enclose the batch into the
+	// corresponding per-engine wrappers. With EnableAssertions, State/LogEngine
+	// are always wrapped, so we don't use conditional type assertions.
+	return Batch[storage.WriteBatch]{
+		state: e.StateEngine().(batchWrapper).WrapWriteBatch(b),
+		raft:  e.LogEngine().(batchWrapper).WrapWriteBatch(b),
+	}
+}
+
+// newBatch is like newWriteBatch, but the StateEngine batch is a read-write
+// storage.Batch rather than a write-only storage.WriteBatch. Callers outside
+// this package should use BatchFactory.
+func (e *Engines) newBatch() Batch[storage.Batch] {
+	if e.Separated() {
+		return Batch[storage.Batch]{
+			state:     e.StateEngine().NewBatch(),
+			logEngine: e.LogEngine(),
+		}
+	}
+	// With a single engine, create one batch, and reference it by both pointers.
+	b := e.Engine().NewBatch()
+	if !spanset.EnableAssertions {
+		return Batch[storage.Batch]{state: b, raft: b}
+	}
+	// Additionally, if assertions are enabled, enclose the batch into the
+	// corresponding per-engine wrappers. With EnableAssertions, State/LogEngine
+	// are always wrapped, so we don't use conditional type assertions.
+	return Batch[storage.Batch]{
+		state: e.StateEngine().(batchWrapper).WrapBatch(b),
+		raft:  e.LogEngine().(batchWrapper).WrapWriteBatch(b),
+	}
+}
+
+// BatchFactory is used to create engine separation aware and WAG aware batches.
+type BatchFactory struct {
+	eng *Engines
+	seq *wag.Seq
+}
+
+// MakeBatchFactory creates a BatchFactory for the given engines and WAG
+// sequencer.
+func MakeBatchFactory(eng *Engines, seq *wag.Seq) BatchFactory {
+	return BatchFactory{eng: eng, seq: seq}
+}
+
+// NewWriteBatch creates a new write-only batch. The batch is aware of engine
+// separation and handles WAG writing transparently.
+func (f *BatchFactory) NewWriteBatch() Batch[storage.WriteBatch] {
+	b := f.eng.newWriteBatch()
+	if b.separated() {
+		b.w = wag.MakeWriter(f.seq)
+	}
+	return b
+}
+
+// NewBatch creates a new read-write batch. The batch is aware of engine
+// separation and handles WAG writing transparently.
+func (f *BatchFactory) NewBatch() Batch[storage.Batch] {
+	b := f.eng.newBatch()
+	if b.separated() {
+		b.w = wag.MakeWriter(f.seq)
+	}
+	return b
+}
+
+// Batch is a write batch to storage which is aware whether the log and state
+// machine engines are separated. It supports any wrapper around
+// storage.WriteBatch, in particular a read-write storage.Batch.
+//
+// When engines are separated, the raft engine batch is lazily initialized on
+// the first call to Raft(). This avoids creating a raft batch for operations
+// that only touch the state engine.
+type Batch[B storage.WriteBatch] struct {
+	state B
+	// raft is the LogEngine batch. When engines are not separated, it points to
+	// the same underlying batch as state. When separated, it is lazily
+	// initialized on the first call to Raft().
+	raft storage.WriteBatch
+	// logEngine is a reference to the LogEngine, used for lazy raft batch
+	// creation. Only set when engines are separated.
+	logEngine storage.Engine
+	// w is the WAG writer for staging lifecycle events. Initialized eagerly
+	// when engines are separated; zero-value (no-op) otherwise.
+	w wag.Writer
+}
+
+// separated returns true if the log and state machine engines are separated.
+func (b *Batch[B]) separated() bool {
+	return b.logEngine != nil
+}
+
+// State returns the StateEngine batch.
+func (b *Batch[B]) State() B {
+	return b.state
+}
+
+// Raft returns the LogEngine writer. When engines are separated, the raft
+// batch is lazily created on first access.
+//
+// TODO(pav-kv): return RaftWO when the callers needing the Repr() of the batch
+// find a workaround.
+func (b *Batch[B]) Raft() storage.WriteBatch {
+	if b.raft == nil {
+		assertTrue(b.separated(), "raft batch unexpectedly nil with non-separated engines")
+		b.raft = b.logEngine.NewWriteBatch()
+	}
+	return b.raft
+}
+
+// WagWriter returns a pointer to the batch's WAG writer. When engines are
+// not separated, the writer is a zero-value no-op.
+func (b *Batch[B]) WagWriter() *wag.Writer {
+	return &b.w
+}
+
+// TestingFlushWAG flushes the WAG node to the Raft() batch and empties the
+// staged WAG events. The batch can be then committed with the Commit method.
+//
+// Used only in tests for introspecting into the Raft() batch before the commit.
+func (b *Batch[B]) TestingFlushWAG() error {
+	if !b.separated() || b.w.Empty() {
+		return nil
+	}
+	if err := b.w.Flush(b.Raft(), b.state.Repr()); err != nil {
+		return err
+	}
+	b.w.Clear()
+	return nil
+}
+
+// Commit commits the batch to storage.
+//
+// The sync flag is one-way. If true, the sync is guaranteed. If false, syncing
+// might still happen, specifically when engines are separated and this is a
+// cross-engine write.
+//
+// When engines are separated, any staged WAG events are flushed to the raft
+// batch before committing.
+func (b *Batch[B]) Commit(sync bool) error {
+	if !b.separated() {
+		return b.state.Commit(sync)
+	}
+	// Avoid eagerly creating a raft batch and computing Repr() when no WAG
+	// events were staged.
+	if !b.w.Empty() {
+		if err := b.w.Flush(b.Raft(), b.state.Repr()); err != nil {
+			return err
+		}
+	}
+	if b.raft != nil {
+		if err := b.raft.Commit(true /* sync */); err != nil {
+			return err
+		}
+	}
+	return b.state.Commit(false /* sync */)
+}
+
+// Close closes the batch. It is idempotent, but the batch must not be used
+// after the first call to Close.
+func (b *Batch[B]) Close() {
+	if any(b.state) == nil {
+		return
+	}
+	b.state.Close()
+	if b.separated() && b.raft != nil {
+		b.raft.Close()
+	}
+	var zero B
+	b.state = zero
 }
 
 // validateIsStateEngineSpan asserts that the provided span only overlaps with
@@ -290,27 +490,18 @@ func validateIsStateEngineSpan(span spanset.TrickySpan) error {
 			"could not decode range ID for span: %s", span)
 	}
 
-	// If the span is inside RangeIDLocalSpans but outside RangeIDUnreplicated,
-	// it cannot overlap local raft keys.
-	rangeIDPrefixBuf := keys.MakeRangeIDPrefixBuf(rangeID)
+	// The only RangeID-local keys not belonging to StateEngine are unreplicated
+	// keys > RangeTombstoneKey, with one exception of the RaftReplicaIDKey.
+	rangeIDBuf := keys.MakeRangeIDPrefixBuf(rangeID)
+	unreplEnd := rangeIDBuf.UnreplicatedPrefix().PrefixEnd() // NB: copies
 	if !spanset.Overlaps(roachpb.Span{
-		Key:    rangeIDPrefixBuf.UnreplicatedPrefix(),
-		EndKey: rangeIDPrefixBuf.UnreplicatedPrefix().PrefixEnd(),
+		Key:    rangeIDBuf.RangeTombstoneKey().Next(),
+		EndKey: unreplEnd,
 	}, span) {
 		return nil
 	}
-
-	// RangeTombstoneKey and RaftReplicaIDKey belong to the StateEngine, and can
-	// be accessed as point keys.
-	if roachpb.Span(span).Equal(roachpb.Span{
-		Key: rangeIDPrefixBuf.RangeTombstoneKey(),
-	}) {
-		return nil
-	}
-
-	if roachpb.Span(span).Equal(roachpb.Span{
-		Key: rangeIDPrefixBuf.RaftReplicaIDKey(),
-	}) {
+	// RaftReplicaIDKey is in the StateEngine, and can be accessed as a point key.
+	if roachpb.Span(span).Equal(roachpb.Span{Key: rangeIDBuf.RaftReplicaIDKey()}) {
 		return nil
 	}
 
@@ -368,4 +559,25 @@ func validateIsRaftEngineSpan(span spanset.TrickySpan) error {
 	}
 
 	return nil
+}
+
+// batchWrapper is a sub-interface of storage.Engine wrapper in the spanset
+// package used here for engine access assertions.
+type batchWrapper interface {
+	WrapWriteBatch(storage.WriteBatch) storage.WriteBatch
+	WrapBatch(storage.Batch) storage.Batch
+}
+
+// disableAccessAssertions strips the engine from the access assertion wrapper.
+func disableAccessAssertions(eng storage.Engine) storage.Engine {
+	if !spanset.EnableAssertions {
+		return eng
+	}
+	return eng.(interface{ UnderlyingEngine() storage.Engine }).UnderlyingEngine()
+}
+
+func assertTrue(cond bool, msg string) {
+	if buildutil.CrdbTestBuild && !cond {
+		panic(msg)
+	}
 }

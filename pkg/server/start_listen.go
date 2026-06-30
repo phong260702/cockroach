@@ -7,10 +7,10 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -105,7 +105,7 @@ func startListenRPCAndSQL(
 	// either via the returned startRPCServer() or upon stopping.
 	var serveOnMux sync.Once
 
-	m := cmux.New(ln)
+	m := cmux.NewWithTimeout(ln, time.Minute)
 	// cmux auto-retries Accept() by default. Tell it
 	// to stop doing work if we see a request to shut down.
 	m.HandleError(func(err error) bool {
@@ -197,23 +197,13 @@ func startListenRPCAndSQL(
 			netutil.FatalIfUnexpected(grpc.Serve(grpcL))
 		})
 		_ = stopper.RunAsyncTask(drpcCtx, "serve-drpc", func(ctx context.Context) {
-			if cfg := drpc.tlsCfg; cfg != nil {
-				drpcTLSL := tls.NewListener(drpcL, cfg)
-				netutil.FatalIfUnexpected(drpc.Serve(ctx, drpcTLSL))
-			} else {
-				netutil.FatalIfUnexpected(drpc.Serve(ctx, drpcL))
-			}
+			netutil.FatalIfUnexpected(drpc.Serve(ctx, drpcL))
 		})
 		_ = stopper.RunAsyncTask(workersCtx, "serve-loopback-grpc", func(context.Context) {
 			netutil.FatalIfUnexpected(grpc.Serve(grpcLoopbackL))
 		})
-		_ = stopper.RunAsyncTask(workersCtx, "serve-loopback-drpc", func(context.Context) {
-			if cfg := drpc.tlsCfg; cfg != nil {
-				drpcdrpcLoopbackTLSL := tls.NewListener(drpcLoopbackL, cfg)
-				netutil.FatalIfUnexpected(drpc.Serve(ctx, drpcdrpcLoopbackTLSL))
-			} else {
-				netutil.FatalIfUnexpected(drpc.Serve(ctx, drpcLoopbackL))
-			}
+		_ = stopper.RunAsyncTask(drpcCtx, "serve-loopback-drpc", func(ctx context.Context) {
+			netutil.FatalIfUnexpected(drpc.Serve(ctx, drpcLoopbackL))
 		})
 
 		_ = stopper.RunAsyncTask(ctx, "serve-mux", func(context.Context) {

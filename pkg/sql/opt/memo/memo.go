@@ -17,7 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -192,6 +194,7 @@ type Memo struct {
 	useImprovedTrigramSimilaritySelectivity    bool
 	trigramSimilarityThreshold                 float64
 	splitScanLimit                             int32
+	spanLimit                                  int32
 	useImprovedZigzagJoinCosting               bool
 	useImprovedMultiColumnSelectivityEstimate  bool
 	proveImplicationWithVirtualComputedCols    bool
@@ -219,11 +222,41 @@ type Memo struct {
 	useSwapMutations                           bool
 	preventUpdateSetColumnDrop                 bool
 	useImprovedRoutineDepsTriggersComputedCols bool
+	inlineAnyUnnestSubquery                    bool
+	inlinePlaceholderEqualities                bool
+	useMinRowCountAntiJoinFix                  bool
+	useBackupsWithIDs                          bool
+	pgDumpCompatibility                        string
+	// builtWithStatsRollout records the stats rollout mode under which
+	// this memo was built.
+	//
+	// Motivation: consider PREPARE with StatsRolloutStable, then SET
+	// canary_fraction = 0 (making the rollout mode Default), then
+	// EXECUTE. Without this field the prepared memo would be silently
+	// reused even though it was planned against different (older) stats.
+	//
+	// IsStale uses this field to detect Default↔Stable transitions and
+	// invalidate the memo so it is rebuilt with the correct stats.
+	//
+	// Canary↔Default is not stale because both use the newest stats.
+	//
+	// Canary↔Stable is not checked here because a canary-built memo is
+	// only cached when canary and stable stats are identical (the
+	// write-side guard prevents caching otherwise). The Stable→Canary
+	// direction is handled by the read-side guard
+	// (skipMemoReuseForCanaryExec).
+	builtWithStatsRollout eval.StatsRolloutSelection
 
 	// txnIsoLevel is the isolation level under which the plan was created. This
 	// affects the planning of some locking operations, so it must be included in
 	// memo staleness calculation.
 	txnIsoLevel isolation.Level
+
+	// skipUnderlyingViewPrivilegeChecks is the value of the
+	// SkipUnderlyingViewPrivilegeChecks cluster setting when the memo was
+	// created. This setting affects which privileges are checked when building
+	// view queries, so the memo must be invalidated when it changes.
+	skipUnderlyingViewPrivilegeChecks bool
 
 	// curRank is the highest currently in-use scalar expression rank.
 	curRank opt.ScalarRank
@@ -311,6 +344,7 @@ func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 		useImprovedTrigramSimilaritySelectivity:    evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity,
 		trigramSimilarityThreshold:                 evalCtx.SessionData().TrigramSimilarityThreshold,
 		splitScanLimit:                             evalCtx.SessionData().OptSplitScanLimit,
+		spanLimit:                                  evalCtx.SessionData().OptimizerSpanLimit,
 		useImprovedZigzagJoinCosting:               evalCtx.SessionData().OptimizerUseImprovedZigzagJoinCosting,
 		useImprovedMultiColumnSelectivityEstimate:  evalCtx.SessionData().OptimizerUseImprovedMultiColumnSelectivityEstimate,
 		proveImplicationWithVirtualComputedCols:    evalCtx.SessionData().OptimizerProveImplicationWithVirtualComputedColumns,
@@ -338,7 +372,14 @@ func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 		useSwapMutations:                           evalCtx.SessionData().UseSwapMutations,
 		preventUpdateSetColumnDrop:                 evalCtx.SessionData().PreventUpdateSetColumnDrop,
 		useImprovedRoutineDepsTriggersComputedCols: evalCtx.SessionData().UseImprovedRoutineDepsTriggersAndComputedCols,
+		inlineAnyUnnestSubquery:                    evalCtx.SessionData().OptimizerInlineAnyUnnestSubquery,
+		inlinePlaceholderEqualities:                evalCtx.SessionData().OptimizerInlinePlaceholderEqualities,
+		useMinRowCountAntiJoinFix:                  evalCtx.SessionData().OptimizerUseMinRowCountAntiJoinFix,
+		skipUnderlyingViewPrivilegeChecks:          sqlclustersettings.SkipUnderlyingViewPrivilegeChecks.Get(&evalCtx.Settings.SV),
 		txnIsoLevel:                                evalCtx.TxnIsoLevel,
+		useBackupsWithIDs:                          evalCtx.SessionData().UseBackupsWithIDs,
+		pgDumpCompatibility:                        evalCtx.SessionData().PgDumpCompatibility,
+		builtWithStatsRollout:                      evalCtx.StatsRollout,
 	}
 	m.metadata.Init()
 	m.logPropsBuilder.init(ctx, evalCtx, m)
@@ -494,6 +535,7 @@ func (m *Memo) IsStale(
 		m.useImprovedTrigramSimilaritySelectivity != evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity ||
 		m.trigramSimilarityThreshold != evalCtx.SessionData().TrigramSimilarityThreshold ||
 		m.splitScanLimit != evalCtx.SessionData().OptSplitScanLimit ||
+		m.spanLimit != evalCtx.SessionData().OptimizerSpanLimit ||
 		m.useImprovedZigzagJoinCosting != evalCtx.SessionData().OptimizerUseImprovedZigzagJoinCosting ||
 		m.useImprovedMultiColumnSelectivityEstimate != evalCtx.SessionData().OptimizerUseImprovedMultiColumnSelectivityEstimate ||
 		m.proveImplicationWithVirtualComputedCols != evalCtx.SessionData().OptimizerProveImplicationWithVirtualComputedColumns ||
@@ -521,14 +563,42 @@ func (m *Memo) IsStale(
 		m.useSwapMutations != evalCtx.SessionData().UseSwapMutations ||
 		m.preventUpdateSetColumnDrop != evalCtx.SessionData().PreventUpdateSetColumnDrop ||
 		m.useImprovedRoutineDepsTriggersComputedCols != evalCtx.SessionData().UseImprovedRoutineDepsTriggersAndComputedCols ||
-		m.txnIsoLevel != evalCtx.TxnIsoLevel {
+		m.inlineAnyUnnestSubquery != evalCtx.SessionData().OptimizerInlineAnyUnnestSubquery ||
+		m.inlinePlaceholderEqualities != evalCtx.SessionData().OptimizerInlinePlaceholderEqualities ||
+		m.useMinRowCountAntiJoinFix != evalCtx.SessionData().OptimizerUseMinRowCountAntiJoinFix ||
+		m.skipUnderlyingViewPrivilegeChecks != sqlclustersettings.SkipUnderlyingViewPrivilegeChecks.Get(&evalCtx.Settings.SV) ||
+		m.txnIsoLevel != evalCtx.TxnIsoLevel ||
+		m.useBackupsWithIDs != evalCtx.SessionData().UseBackupsWithIDs ||
+		m.pgDumpCompatibility != evalCtx.SessionData().PgDumpCompatibility {
+		log.VEventf(ctx, 1, "memo is stale: session settings changed")
+		return true, nil
+	}
+
+	// Memo is stale if the stats rollout mode changed between Default and
+	// Stable. Default uses the newest stats while Stable uses the
+	// second-newest (older-generation) stats. Switching between these
+	// modes (e.g. canary_fraction going from >0 to 0 or vice versa)
+	// means the memo was planned against the wrong stats.
+	//
+	// Canary↔Default is not stale because both use the newest stats.
+	//
+	// Canary↔Stable is not checked here. A canary-built memo is only
+	// cached when canary and stable stats are identical (the write-side
+	// guard prevents caching otherwise), so reuse is correct. The
+	// Stable→Canary direction is handled by the read-side guard
+	// (skipMemoReuseForCanaryExec) which skips the memo without
+	// evicting it, avoiding cache thrashing.
+	if (m.builtWithStatsRollout == eval.StatsRolloutStable && evalCtx.StatsRollout == eval.StatsRolloutDefault) ||
+		(m.builtWithStatsRollout == eval.StatsRolloutDefault && evalCtx.StatsRollout == eval.StatsRolloutStable) {
+		log.VEventf(ctx, 1, "memo is stale: stats rollout mode changed")
 		return true, nil
 	}
 
 	// Memo is stale if the fingerprint of any object in the memo's metadata has
 	// changed, or if the current user no longer has sufficient privilege to
 	// access the object.
-	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil || !depsUpToDate {
+	if reason, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil || reason != "" {
+		log.VEventf(ctx, 1, "memo is stale: %s", reason)
 		return true, err
 	}
 	return false, nil

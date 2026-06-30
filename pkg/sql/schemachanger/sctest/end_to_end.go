@@ -3,8 +3,8 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-// Package sctest contains tools to run end-to-end datadriven tests in both
-// ccl and non-ccl settings.
+// Package sctest contains tools to run end-to-end datadriven tests for the
+// declarative schema changer.
 package sctest
 
 import (
@@ -132,8 +132,9 @@ func EndToEndSideEffects(t *testing.T, relTestCaseDir string, factory TestServer
 				)
 				defer refFactoryCleanup()
 
+				allDescs := sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb)
 				deps = sctestdeps.NewTestDependencies(
-					sctestdeps.WithDescriptors(sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb).Catalog),
+					sctestdeps.WithDescriptors(allDescs.Catalog),
 					sctestdeps.WithSystemDatabaseDescriptor(),
 					sctestdeps.WithNamespace(sctestdeps.ReadNamespaceFromDB(t, tdb).Catalog),
 					sctestdeps.WithCurrentDatabase(sctestdeps.ReadCurrentDatabaseFromDB(t, tdb)),
@@ -160,6 +161,7 @@ func EndToEndSideEffects(t *testing.T, relTestCaseDir string, factory TestServer
 					sctestdeps.WithReferenceProviderFactory(refFactory),
 					sctestdeps.WithClusterSettings(s.ClusterSettings()),
 					sctestdeps.WithCodec(s.Codec()),
+					sctestdeps.WithZoneConfigs(sctestdeps.ReadZoneConfigsFromDB(t, tdb, allDescs.Catalog)),
 				)
 				stmtStates := execStatementWithTestDeps(ctx, t, deps, stmts...)
 				var fileNameSuffix string

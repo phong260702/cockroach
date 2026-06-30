@@ -17,13 +17,13 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -1267,6 +1267,9 @@ type MVCCGetOptions struct {
 	// roachpb.Value whose RawBytes may contain MVCCValueHeader
 	// data.
 	ReturnRawMVCCValues bool
+	// WorkloadID identifies the workload that triggered the get (e.g.
+	// statement fingerprint ID, job ID). Used for ASH sampling.
+	WorkloadID uint64
 }
 
 // MVCCGetResult bundles return values for the MVCCGet family of functions.
@@ -3972,7 +3975,6 @@ func MVCCPredicateDeleteRange(
 ) (*roachpb.Span, error) {
 	// TODO(jeffswenson): delete the range tombstone predicate delete once V25_2
 	// is no longer supported as an upgrade path.
-	_ = clusterversion.V25_2
 
 	if endTime.IsEmpty() {
 		return nil, errors.AssertionFailedf("MVCCPredicateDeleteRange expects non-empty endTime")
@@ -4940,6 +4942,11 @@ type MVCCScanOptions struct {
 	// roachpb.Value whose RawBytes may contain MVCCValueHeader
 	// data.
 	ReturnRawMVCCValues bool
+	// WorkloadID identifies the workload that triggered the scan (e.g.
+	// statement fingerprint ID, job ID). Used for ASH sampling.
+	WorkloadID uint64
+	// WorkloadType distinguishes the kind of workload for ASH sampling.
+	WorkloadType workloadid.WorkloadType
 }
 
 func (opts *MVCCScanOptions) validate() error {
@@ -8337,6 +8344,7 @@ func mvccExportToWriter(
 		return maxSize
 	}
 
+	var yieldDelays time.Duration
 	var valueScratch []byte
 	iter.SeekGE(opts.StartKey)
 	for {
@@ -8369,7 +8377,23 @@ func mvccExportToWriter(
 			// accounted for in admission control by penalizing the subsequent
 			// request, so doing it slightly is fine.
 			stopAllowed := isNewKey || opts.StopMidKey
-			if overLimit, _, _ := elasticCPUHandle.IsOverLimitAndPossiblyYield(); overLimit && stopAllowed {
+			overLimit, _, yieldDelay := elasticCPUHandle.IsOverLimitAndPossiblyYield()
+
+			// Inject a tracing span to reflect yield delays if the cumulative delay,
+			// including the most recent delay, exceeds the threshold. This should
+			// indicate large delays, that individually exceed the threshold, as they
+			// happen while still broadly reflecting any significant number of smaller
+			// delays that in aggregate become notable.
+			if yieldDelay != 0 {
+				yieldDelays += yieldDelay
+				if yieldDelays >= 2*time.Millisecond {
+					now := timeutil.Now()
+					tracing.InjectCompletedSpan(ctx, "admission.yield", now.Add(-yieldDelays), yieldDelays)
+					yieldDelays = 0
+				}
+			}
+
+			if overLimit && stopAllowed {
 				resumeKey = unsafeKey.Clone()
 				if isNewKey {
 					resumeKey.Timestamp = hlc.Timestamp{}

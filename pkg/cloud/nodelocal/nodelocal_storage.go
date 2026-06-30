@@ -31,6 +31,21 @@ import (
 
 const scheme = "nodelocal"
 
+// ParseInstanceID parses a nodelocal URI and extracts the SQL instance ID
+// from the host component. Returns an error if the URI is invalid or not a
+// nodelocal URI.
+func ParseInstanceID(uri string) (base.SQLInstanceID, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed to parse URI %q", uri)
+	}
+	extStorage, err := parseLocalFileURI(cloud.ExternalStorageURIContext{}, u)
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed to parse nodelocal URI %q", uri)
+	}
+	return base.SQLInstanceID(extStorage.LocalFileConfig.NodeID), nil
+}
+
 func validateLocalFileURI(uri *url.URL) error {
 	if uri.Host == "" {
 		return errors.Newf(
@@ -233,6 +248,10 @@ func (*localFileStorage) Close() error {
 	return nil
 }
 
+func parseLocalFileURIEarlyBoot(uri *url.URL) (cloudpb.ExternalStorage, error) {
+	return parseLocalFileURI(cloud.ExternalStorageURIContext{}, uri)
+}
+
 func init() {
 	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_nodelocal,
 		cloud.RegisteredProvider{
@@ -241,4 +260,44 @@ func init() {
 			RedactedParams: cloud.RedactedParams(),
 			Schemes:        []string{scheme},
 		})
+}
+
+// EnableEarlyBootForDemo registers an EarlyBootConstructFn for nodelocal that
+// uses a local blob client rooted at the given directory. This allows demo
+// clusters and other single-machine deployments to use nodelocal with features
+// that require early boot access (like online restore's LinkExternalSSTable).
+//
+// The root directory should be the parent of the per-node directories (e.g.,
+// demoDir/nodelocal). Each node's files are in a subdirectory named "n<nodeID>".
+//
+// The returned function restores the default nodelocal implementation.
+func EnableEarlyBootForDemo(root string) func() {
+	makeFn := func(
+		ctx context.Context, args cloud.EarlyBootExternalStorageContext, es cloudpb.ExternalStorage,
+	) (cloud.ExternalStorage, error) {
+		c, err := blobs.NewLocalClient(root)
+		if err != nil {
+			return nil, err
+		}
+		// In demo mode, each node's files are in a subdirectory named "n<nodeID>".
+		// Construct the base path to include this subdirectory.
+		cfg := es.LocalFileConfig
+		basePath := path.Join(fmt.Sprintf("n%d", cfg.NodeID), cfg.Path)
+		return &localFileStorage{
+			cfg:        cfg,
+			ioConf:     base.ExternalIODirConfig{},
+			base:       basePath,
+			blobClient: c,
+			settings:   args.Settings,
+			uri:        es.URI,
+		}, nil
+	}
+	return cloud.ReplaceProviderForTesting(cloudpb.ExternalStorageProvider_nodelocal, cloud.RegisteredProvider{
+		ConstructFn:          makeLocalFileStorage,
+		ParseFn:              parseLocalFileURI,
+		EarlyBootConstructFn: makeFn,
+		EarlyBootParseFn:     parseLocalFileURIEarlyBoot,
+		RedactedParams:       cloud.RedactedParams(),
+		Schemes:              []string{scheme},
+	})
 }

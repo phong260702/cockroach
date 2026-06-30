@@ -399,6 +399,7 @@ func transferLeaseResultIsIgnorable(res Result) bool {
 	}
 	return kvserver.IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(err) ||
 		kvserver.IsLeaseTransferRejectedBecauseTargetCannotReceiveLease(err) ||
+		kvserver.IsLeaseTransferRejectedBecauseTargetHasSendQueueError(err) ||
 		// A lease transfer is not permitted while a range merge is in its
 		// critical phase.
 		resultIsErrorStr(res, `cannot transfer lease while merge in progress`) ||
@@ -496,20 +497,16 @@ func (v *validator) processOp(op Operation) {
 			Value: roachpb.MakeValueFromString(t.Value()),
 		}
 		var shouldObserveWrite bool
-		// Consider two cases based on whether the CPut hit a ConditionFailedError.
+		// If the CPut hit a ConditionFailedError, we don't observe the read or
+		// the write. The CPut's condition-check read is not added to the txn's
+		// read refresh spans and no write lock is acquired, so nothing protects
+		// this read from becoming stale if the txn's write timestamp is later
+		// pushed.
+		//
+		// If the CPut succeeded, the expected value is observed, and the CPut's
+		// write is also observed.
 		err := errorFromResult(t.Result)
-		if e := (*kvpb.ConditionFailedError)(nil); errors.As(err, &e) {
-			// If the CPut failed, the actual value (in the ConditionFailedError) is
-			// observed, and the CPut's write is not observed.
-			observedVal := roachpb.Value{}
-			if e.ActualValue != nil {
-				observedVal.RawBytes = e.ActualValue.RawBytes
-			}
-			readObservation.Value = observedVal
-			shouldObserveRead = true
-		} else {
-			// If the CPut succeeded, the expected value is observed, and the CPut's
-			// write is also observed.
+		if !errors.HasType(err, (*kvpb.ConditionFailedError)(nil)) {
 			if !t.AllowIfDoesNotExist {
 				// If AllowIfDoesNotExist == true, we don't know if the read found the
 				// expected value or no value, so we can't add a read observation.
@@ -903,7 +900,9 @@ func (v *validator) processOp(op Operation) {
 		//
 		// So we ignore the results of failIfError, calling it only for its side
 		// effect of perhaps registering a failure with the validator.
-		v.failIfError(op, t.Result, exceptRollback, exceptAmbiguous)
+		//
+		// Refer to the note in checkError about exceptBatchTimestampBeforeGC.
+		v.failIfError(op, t.Result, exceptRollback, exceptAmbiguous, exceptBatchTimestampBeforeGC)
 
 		ops := t.Ops
 		if t.CommitInBatch != nil {
@@ -1027,6 +1026,19 @@ func (v *validator) processOp(op Operation) {
 	case *CrashNodeOperation:
 		execTimestampStrictlyOptional = true
 		v.checkError(op, t.Result)
+	case *MvccGCOperation:
+		execTimestampStrictlyOptional = true
+		if resultHasErrorType(t.Result, (*kvpb.NotLeaseHolderError)(nil)) ||
+			resultHasErrorType(t.Result, (*kvpb.RangeNotFoundError)(nil)) ||
+			resultIsErrorStr(t.Result, `no valid lease`) {
+			// Ignore any transient errors due to not being able to find a leaseholder.
+		} else if resultIsErrorStr(
+			t.Result, `mismatched range suggestion not different from original desc`) {
+			// Ignore this error that occurred due to a GC/split race.
+			// TODO: revisit after https://github.com/cockroachdb/cockroach/issues/165995 is resolved.
+		} else {
+			v.failIfError(op, t.Result)
+		}
 	default:
 		panic(errors.AssertionFailedf(`unknown operation type: %T %v`, t, t))
 	}
@@ -1515,7 +1527,17 @@ func (v *validator) checkError(
 	op Operation, r Result, extraExceptions ...func(err error) bool,
 ) (ambiguous, hadError bool) {
 	sl := []func(error) bool{
-		exceptAmbiguous, exceptOmitted, exceptRetry, exceptDelRangeUsingTombstoneStraddlesRangeBoundary,
+		exceptAmbiguous,
+		exceptOmitted,
+		exceptRetry,
+		exceptDelRangeUsingTombstoneStraddlesRangeBoundary,
+		// NB: we need to exclude this error because with MVCC GC operations
+		// enabled with a low TTL, GC might advance past a transaction's
+		// timestamp, which is a violation of our assumption that GC is far
+		// enough behind us to not touch any ongoing transactions. So this error
+		// is expected and correct, and should be ignored in the context of
+		// KVNemesis.
+		exceptBatchTimestampBeforeGC,
 	}
 	sl = append(sl, extraExceptions...)
 	return v.failIfError(op, r, sl...)

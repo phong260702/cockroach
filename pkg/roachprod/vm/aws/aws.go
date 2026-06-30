@@ -11,10 +11,12 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -368,6 +370,10 @@ type ProviderOpts struct {
 	// BootDiskOnly ensures that no additional disks will be attached, other than
 	// the boot disk.
 	BootDiskOnly bool
+
+	// Managed uses a launch template and auto scaling group to create VMs.
+	// This enables cluster resizing via Grow/Shrink operations.
+	Managed bool
 }
 
 // Provider implements the vm.Provider interface for AWS.
@@ -559,6 +565,13 @@ var DefaultConfig = func() (cfg *awsConfig) {
 // https://github.com/cockroachdb/cockroach/issues/105968.
 var defaultZones = []string{
 	"us-east-2a",
+	"us-east-2b",
+	"us-east-2c",
+}
+
+// defaultGeoExtraZones are the additional zones used for geo-distributed
+// clusters, appended to a randomly selected zone from defaultZones.
+var defaultGeoExtraZones = []string{
 	"us-west-2b",
 	"eu-west-2b",
 }
@@ -654,6 +667,8 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 		"the IAM instance profile to associate with created VMs if non-empty")
 	flags.BoolVar(&o.BootDiskOnly, ProviderName+"-boot-disk-only", o.BootDiskOnly,
 		"Only attach the boot disk. No additional volumes will be provisioned even if specified.")
+	flags.BoolVar(&o.Managed, ProviderName+"-managed", o.Managed,
+		"use a launch template and auto scaling group to create VMs (enables Grow/Shrink operations)")
 }
 
 // ConfigureClusterCleanupFlags implements ProviderOpts.
@@ -717,6 +732,17 @@ func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 	}
 
 	return g.Wait()
+}
+
+// ConfiguredRegions returns the names of the AWS regions that roachprod is
+// configured to operate in (i.e. those declared in the embedded config where
+// SSH keys, AMIs and security groups are provisioned). This is the
+// authoritative region list for maintenance tasks that should only touch
+// resources roachprod actually creates -- in particular GC of imported SSH
+// key pairs, which must not iterate every account-enabled region (e.g.
+// opt-in regions that may be unreachable from the cronjob's network).
+func (p *Provider) ConfiguredRegions() []string {
+	return p.Config.regionNames()
 }
 
 // editLabels is a helper that adds or removes labels from the given VMs.
@@ -835,24 +861,13 @@ func (p *Provider) Create(
 		zones[i] = expandedZones[z]
 	}
 
-	var g errgroup.Group
-	limiter := rate.NewLimiter(rate.Limit(providerOpts.CreateRateLimit), 2 /* buckets */)
-	for i := range names {
-		index := i
-		capName := names[i]
-		placement := zones[i]
-		res := limiter.Reserve()
-		g.Go(func() error {
-			time.Sleep(res.Delay())
-			_, err := p.runInstance(l, capName, index, placement, machineType, opts, providerOpts)
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
+	// Use managed cluster creation (launch template + ASG) if --aws-managed is specified.
+	if providerOpts.Managed {
+		return p.createManagedCluster(l, names, zones, regions, machineType, opts, providerOpts)
 	}
-	if err := g.Wait(); err != nil {
+
+	// Create instances using the shared createInstances function.
+	if _, err := p.createInstances(l, names, zones, machineType, opts, providerOpts); err != nil {
 		return nil, err
 	}
 
@@ -868,18 +883,606 @@ func (p *Provider) Create(
 }
 
 func DefaultZones(geoDistributed bool) []string {
+	zones := DefaultRetryZoneCandidates()
+	zone := zones[rand.Intn(len(zones))]
 	if geoDistributed {
-		return defaultZones
+		return append([]string{zone}, defaultGeoExtraZones...)
 	}
-	return []string{defaultZones[0]}
+	return []string{zone}
 }
 
-func (p *Provider) Grow(*logger.Logger, vm.List, string, []string) (vm.List, error) {
-	return nil, vm.UnimplementedError
+// DefaultRetryZoneCandidates returns the default non-geo AWS zone pool.
+// DefaultZones chooses from this pool for ordinary creates, and roachtest uses
+// it to choose a different zone after provider capacity failures.
+func DefaultRetryZoneCandidates() []string {
+	return append([]string(nil), defaultZones...)
 }
 
-func (p *Provider) Shrink(*logger.Logger, vm.List, string) error {
-	return vm.UnimplementedError
+// createInstances creates EC2 instances in parallel with rate limiting.
+// It returns a map of region -> instance IDs for the created instances.
+func (p *Provider) createInstances(
+	l *logger.Logger,
+	names []string,
+	zones []string,
+	machineType string,
+	opts vm.CreateOpts,
+	providerOpts *ProviderOpts,
+) (map[string][]string, error) {
+	l.Printf("Creating %d instances...", len(names))
+
+	var mu syncutil.Mutex
+	instanceIDsByRegion := make(map[string][]string)
+	rateLimit := rate.Limit(providerOpts.CreateRateLimit)
+	limiter := rate.NewLimiter(rateLimit, 2)
+
+	var g errgroup.Group
+	for i := range names {
+		index := i
+		vmName := names[i]
+		zone := zones[i]
+		az := p.Config.getAvailabilityZone(zone)
+		region := az.Region.Name
+		res := limiter.Reserve()
+
+		g.Go(func() error {
+			time.Sleep(res.Delay())
+			v, err := p.runInstance(l, vmName, index, zone, machineType, opts, providerOpts)
+			if err != nil {
+				return errors.Wrapf(err, "failed to create instance %s", vmName)
+			}
+
+			mu.Lock()
+			instanceIDsByRegion[region] = append(instanceIDsByRegion[region], v.ProviderID)
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return instanceIDsByRegion, nil
+}
+
+// getIAMProfileForInstance returns the IAM instance profile name attached to the
+// given EC2 instance. Returns an empty string if no profile is attached.
+func (p *Provider) getIAMProfileForInstance(
+	ctx context.Context, l *logger.Logger, region, instanceID string,
+) (string, error) {
+	args := []string{
+		"ec2", "describe-instances",
+		"--instance-ids", instanceID,
+		"--region", region,
+	}
+	var descOutput DescribeInstancesOutput
+	if err := p.runJSONCommandWithContext(ctx, l, args, &descOutput); err != nil {
+		return "", err
+	}
+	if len(descOutput.Reservations) == 0 || len(descOutput.Reservations[0].Instances) == 0 {
+		return "", nil
+	}
+	arn := descOutput.Reservations[0].Instances[0].IamInstanceProfile.Arn
+	if arn == "" {
+		return "", nil
+	}
+	// ARN format: arn:aws:iam::<account>:instance-profile/<profile-name>
+	parts := strings.Split(arn, "/")
+	if len(parts) < 2 {
+		return "", errors.Errorf("unexpected IAM profile ARN format: %s", arn)
+	}
+	return parts[len(parts)-1], nil
+}
+
+// waitForInstancesStatus waits for instances to reach the specified target state.
+// It polls AWS until all instances reach the target state or the timeout is reached.
+func (p *Provider) waitForInstancesStatus(
+	ctx context.Context, l *logger.Logger, region string, instanceIDs []string, targetState string,
+) error {
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+
+	l.Printf("Waiting for %d instances in %s to reach %s state...", len(instanceIDs), region, targetState)
+
+	waitRetry := retry.Start(retry.Options{
+		InitialBackoff: 5 * time.Second,
+		MaxBackoff:     30 * time.Second,
+		MaxRetries:     30,
+	})
+
+	for waitRetry.Next() {
+		descArgs := []string{
+			"ec2", "describe-instances",
+			"--instance-ids",
+		}
+		descArgs = append(descArgs, instanceIDs...)
+		descArgs = append(descArgs, "--region", region)
+
+		var descOutput DescribeInstancesOutput
+		if err := p.runJSONCommandWithContext(ctx, l, descArgs, &descOutput); err != nil {
+			// If instances not found, they're already terminated (relevant for termination waits)
+			if strings.Contains(err.Error(), "InvalidInstanceID.NotFound") {
+				if targetState == "terminated" {
+					l.Printf("All %d instances in region %s terminated", len(instanceIDs), region)
+					return nil
+				}
+			}
+			l.Printf("Warning: failed to describe instances: %v", err)
+			continue
+		}
+
+		matchCount := 0
+		for _, res := range descOutput.Reservations {
+			for _, inst := range res.Instances {
+				if inst.State.Name == targetState {
+					matchCount++
+				}
+			}
+		}
+
+		if matchCount == len(instanceIDs) {
+			l.Printf("All %d instances in region %s reached %s state", len(instanceIDs), region, targetState)
+			return nil
+		}
+
+		l.Printf("Waiting for instances in %s: %d/%d %s", region, matchCount, len(instanceIDs), targetState)
+	}
+
+	return errors.Errorf("timed out waiting for instances in region %s to reach %s state", region, targetState)
+}
+
+// attachInstancesToASG attaches instances to an Auto Scaling Group.
+// The caller is responsible for ensuring the ASG has sufficient max size capacity
+// before calling this function.
+func (p *Provider) attachInstancesToASG(
+	ctx context.Context, l *logger.Logger, asgName, region string, instanceIDs []string,
+) error {
+	l.Printf("Attaching %d instances to ASG %s", len(instanceIDs), asgName)
+	attachArgs := []string{
+		"autoscaling", "attach-instances",
+		"--auto-scaling-group-name", asgName,
+		"--instance-ids",
+	}
+	attachArgs = append(attachArgs, instanceIDs...)
+	attachArgs = append(attachArgs, "--region", region)
+
+	if _, err := p.runCommandWithContext(ctx, l, attachArgs); err != nil {
+		return errors.Wrapf(err, "failed to attach instances to ASG")
+	}
+
+	return nil
+}
+
+// updateASGMaxSize updates the max size of an Auto Scaling Group.
+func (p *Provider) updateASGMaxSize(
+	ctx context.Context, l *logger.Logger, asgName, region string, maxSize int,
+) error {
+	l.Printf("Updating ASG %s max size to %d", asgName, maxSize)
+	args := []string{
+		"autoscaling", "update-auto-scaling-group",
+		"--auto-scaling-group-name", asgName,
+		"--max-size", strconv.Itoa(maxSize),
+		"--region", region,
+	}
+	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+		return errors.Wrapf(err, "failed to update ASG max size")
+	}
+	return nil
+}
+
+// asgInstance contains information about an instance in an Auto Scaling Group.
+type asgInstance struct {
+	InstanceID     string
+	LifecycleState string
+}
+
+// asgInfo contains information about an Auto Scaling Group.
+type asgInfo struct {
+	Name            string
+	DesiredCapacity int
+	MaxSize         int
+	MinSize         int
+	TargetGroupARNs []string
+	Instances       []asgInstance
+}
+
+// describeASG retrieves information about an Auto Scaling Group.
+// Returns nil (not an error) if the ASG doesn't exist.
+func (p *Provider) describeASG(
+	ctx context.Context, l *logger.Logger, asgName, region string,
+) (*asgInfo, error) {
+	args := []string{
+		"autoscaling", "describe-auto-scaling-groups",
+		"--auto-scaling-group-names", asgName,
+		"--region", region,
+	}
+
+	var output struct {
+		AutoScalingGroups []struct {
+			AutoScalingGroupName string   `json:"AutoScalingGroupName"`
+			DesiredCapacity      int      `json:"DesiredCapacity"`
+			MaxSize              int      `json:"MaxSize"`
+			MinSize              int      `json:"MinSize"`
+			TargetGroupARNs      []string `json:"TargetGroupARNs"`
+			Instances            []struct {
+				InstanceID     string `json:"InstanceId"`
+				LifecycleState string `json:"LifecycleState"`
+			} `json:"Instances"`
+		} `json:"AutoScalingGroups"`
+	}
+
+	if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+		return nil, errors.Wrapf(err, "failed to describe ASG %s", asgName)
+	}
+
+	if len(output.AutoScalingGroups) == 0 {
+		return nil, nil
+	}
+
+	asg := output.AutoScalingGroups[0]
+	instances := make([]asgInstance, len(asg.Instances))
+	for i, inst := range asg.Instances {
+		instances[i] = asgInstance{
+			InstanceID:     inst.InstanceID,
+			LifecycleState: inst.LifecycleState,
+		}
+	}
+
+	return &asgInfo{
+		Name:            asg.AutoScalingGroupName,
+		DesiredCapacity: asg.DesiredCapacity,
+		MaxSize:         asg.MaxSize,
+		MinSize:         asg.MinSize,
+		TargetGroupARNs: asg.TargetGroupARNs,
+		Instances:       instances,
+	}, nil
+}
+
+// createManagedCluster creates a cluster using Launch Templates and Auto Scaling Groups.
+//
+// AWS ASG doesn't support creating instances with custom names (unlike GCE MIG which has
+// `create-instance --instance <NAME>`). To preserve roachprod's naming conventions
+// (e.g., clustername-0001, clustername-0002), we:
+// 1. Create the launch template (stores instance configuration)
+// 2. Create the ASG with desiredCapacity=0 (management structure only)
+// 3. Create instances using runInstance() with proper names
+// 4. Attach instances to the ASG
+func (p *Provider) createManagedCluster(
+	l *logger.Logger,
+	names []string,
+	zones []string,
+	regions []string,
+	machineType string,
+	opts vm.CreateOpts,
+	providerOpts *ProviderOpts,
+) (vm.List, error) {
+	if len(names) == 0 {
+		return nil, errors.New("no VM names provided")
+	}
+
+	clusterName := opts.ClusterName
+
+	ctx := context.Background()
+
+	// Group zones by region for ASG creation.
+	// Each region gets one launch template and one ASG.
+	zonesByRegion := make(map[string][]string)
+	zoneForName := make(map[string]string)
+	for i, zone := range zones {
+		az := p.Config.getAvailabilityZone(zone)
+		if az == nil {
+			return nil, errors.Errorf("unknown availability zone %s", zone)
+		}
+		region := az.Region.Name
+		if !slices.Contains(zonesByRegion[region], zone) {
+			zonesByRegion[region] = append(zonesByRegion[region], zone)
+		}
+		zoneForName[names[i]] = zone
+	}
+
+	// Step 1: Create launch template and ASG (with desiredCapacity=0) in each region.
+	g := ctxgroup.WithContext(ctx)
+	for region, regionZones := range zonesByRegion {
+		// Use the first zone for instance configuration (AMI lookup, etc.)
+		zone := regionZones[0]
+		cfg, az, err := p.getInstanceConfig(l, zone, machineType, opts, providerOpts)
+		if err != nil {
+			return nil, err
+		}
+
+		g.GoCtx(func(ctx context.Context) error {
+			// Create launch template
+			ltID, err := p.createLaunchTemplate(ctx, l, clusterName, region, cfg, az, opts, providerOpts)
+			if err != nil {
+				return errors.Wrapf(err, "failed to create launch template in region %s", region)
+			}
+
+			// Create ASG with desiredCapacity=0 (we'll create and attach instances separately).
+			// Set maxSize upfront to allow room for the instances we'll attach plus future growth.
+			if err := p.createAutoScalingGroup(ctx, l, clusterName, region, ltID, regionZones, 0, len(names)*2, opts); err != nil {
+				return errors.Wrapf(err, "failed to create auto scaling group in region %s", region)
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Step 2: Create instances with proper names using createInstances().
+	// Add managed label so instances are tagged at creation time.
+	if opts.CustomLabels == nil {
+		opts.CustomLabels = make(map[string]string)
+	}
+	opts.CustomLabels[vm.TagManaged] = "true"
+	instanceIDsByRegion, err := p.createInstances(l, names, zones, machineType, opts, providerOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: Wait for instances to be running before attaching to ASG.
+	l.Printf("Waiting for instances to be running...")
+	for region, instanceIDs := range instanceIDsByRegion {
+		if err := p.waitForInstancesStatus(ctx, l, region, instanceIDs, "running"); err != nil {
+			return nil, err
+		}
+	}
+
+	// Step 4: Attach instances to the ASG.
+	// The ASG was created with sufficient maxSize to accommodate these instances.
+	g = ctxgroup.WithContext(ctx)
+	for region, instanceIDs := range instanceIDsByRegion {
+		asgName := autoScalingGroupName(clusterName, region)
+		g.GoCtx(func(ctx context.Context) error {
+			return p.attachInstancesToASG(ctx, l, asgName, region, instanceIDs)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Wait for IPs and return the VM list.
+	return p.waitForIPs(ctx, l, names, regions, providerOpts)
+}
+
+// Grow adds new VMs to a managed cluster.
+// For AWS, we create new EC2 instances using the launch template and attach them to the ASG.
+// This preserves roachprod's naming conventions while keeping the instances managed by the ASG.
+func (p *Provider) Grow(
+	l *logger.Logger, vms vm.List, clusterName string, names []string,
+) (vm.List, error) {
+	if !isManaged(vms) {
+		return nil, errors.New("growing is only supported for managed clusters (created with --aws-managed)")
+	}
+	if len(names) == 0 {
+		return nil, errors.New("no VM names provided for grow operation")
+	}
+
+	ctx := context.Background()
+
+	// For simplicity, add new VMs to the first region.
+	region, existingVMs, err := p.getFirstRegion(vms)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate ASG exists and expand capacity if needed.
+	asgName := autoScalingGroupName(clusterName, region)
+	asg, err := p.describeASG(ctx, l, asgName, region)
+	if err != nil {
+		return nil, err
+	}
+	if asg == nil {
+		return nil, errors.Errorf("ASG %s not found", asgName)
+	}
+	if newCapacity := asg.DesiredCapacity + len(names); newCapacity > asg.MaxSize {
+		if err := p.updateASGMaxSize(ctx, l, asgName, region, newCapacity*2); err != nil {
+			return nil, err
+		}
+	}
+
+	// Configure SSH and extract config from existing VMs.
+	zone := existingVMs[0].Zone
+	if err := p.ConfigSSH(l, []string{zone}); err != nil {
+		return nil, errors.Wrap(err, "failed to configure SSH keys")
+	}
+	machineType := existingVMs[0].MachineType
+	providerOpts := DefaultProviderOpts()
+
+	// Inherit the IAM profile from the existing instances so that new nodes
+	// have the same permissions (e.g., S3 access, CloudWatch, etc.).
+	if iamProfile, err := p.getIAMProfileForInstance(ctx, l, region, existingVMs[0].ProviderID); err != nil {
+		l.Printf("Warning: failed to get IAM profile from existing instance: %v", err)
+	} else if iamProfile != "" {
+		providerOpts.IAMProfile = iamProfile
+	}
+
+	opts := p.buildCreateOptsFromVM(clusterName, existingVMs[0])
+
+	// Create instances in parallel.
+	instanceIDs, err := p.createInstancesInParallel(ctx, l, names, zone, machineType, opts, providerOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for instances to be running, then attach to ASG.
+	if err := p.waitForInstancesStatus(ctx, l, region, instanceIDs, "running"); err != nil {
+		return nil, err
+	}
+	if err := p.attachInstancesToASG(ctx, l, asgName, region, instanceIDs); err != nil {
+		return nil, err
+	}
+
+	// Wait for IPs and copy labels from existing VMs.
+	newVMs, err := p.waitForIPs(ctx, l, names, []string{region}, providerOpts)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.copyLabelsToNewVMs(l, existingVMs[0], newVMs); err != nil {
+		l.Printf("Warning: failed to add labels to new VMs: %v", err)
+	}
+
+	l.Printf("Successfully added %d VMs to cluster %s", len(names), clusterName)
+	return newVMs, nil
+}
+
+// getFirstRegion returns the first region and its VMs from the given VM list.
+// This is used when we need to pick a single region for an operation.
+func (p *Provider) getFirstRegion(vms vm.List) (string, vm.List, error) {
+	byRegion, err := regionMap(vms)
+	if err != nil {
+		return "", nil, err
+	}
+	for region, regionVMs := range byRegion {
+		return region, regionVMs, nil
+	}
+	return "", nil, errors.New("no regions found in VM list")
+}
+
+// buildCreateOptsFromVM builds CreateOpts by extracting configuration from an existing VM.
+func (p *Provider) buildCreateOptsFromVM(clusterName string, existingVM vm.VM) vm.CreateOpts {
+	opts := vm.DefaultCreateOpts()
+	opts.ClusterName = clusterName
+	if lifetimeStr, ok := existingVM.Labels[vm.TagLifetime]; ok {
+		if lifetime, err := time.ParseDuration(lifetimeStr); err == nil {
+			opts.Lifetime = lifetime
+		}
+	}
+	return opts
+}
+
+// createInstancesInParallel creates EC2 instances in parallel and returns their IDs.
+func (p *Provider) createInstancesInParallel(
+	ctx context.Context,
+	l *logger.Logger,
+	names []string,
+	zone, machineType string,
+	opts vm.CreateOpts,
+	providerOpts *ProviderOpts,
+) ([]string, error) {
+	var mu syncutil.Mutex
+	var instanceIDs []string
+	limiter := rate.NewLimiter(rate.Limit(providerOpts.CreateRateLimit), 2)
+	g := ctxgroup.WithContext(ctx)
+
+	for i, vmName := range names {
+		index := i
+		name := vmName
+		res := limiter.Reserve()
+		g.GoCtx(func(ctx context.Context) error {
+			time.Sleep(res.Delay())
+			v, err := p.runInstance(l, name, index, zone, machineType, opts, providerOpts)
+			if err != nil {
+				return errors.Wrapf(err, "failed to create instance %s", name)
+			}
+			mu.Lock()
+			instanceIDs = append(instanceIDs, v.ProviderID)
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return instanceIDs, nil
+}
+
+// copyLabelsToNewVMs copies labels from a source VM to new VMs.
+// It skips instance-specific labels like Name and AWS-reserved tags.
+func (p *Provider) copyLabelsToNewVMs(l *logger.Logger, sourceVM vm.VM, newVMs vm.List) error {
+	labels := map[string]string{vm.TagManaged: "true"}
+	for key, value := range sourceVM.Labels {
+		// Skip instance-specific and AWS-reserved labels.
+		if key == "Name" || key == vm.TagManaged || strings.HasPrefix(key, "aws:") {
+			continue
+		}
+		labels[key] = value
+	}
+	if err := p.AddLabels(l, newVMs, labels); err != nil {
+		return err
+	}
+
+	// Update the VM objects in memory to match the AWS tags we just added.
+	// This ensures that when saveCluster() is called, the cache file has the correct labels.
+	for i := range newVMs {
+		if newVMs[i].Labels == nil {
+			newVMs[i].Labels = make(map[string]string)
+		}
+		for key, value := range labels {
+			newVMs[i].Labels[key] = value
+		}
+	}
+	return nil
+}
+
+// Shrink removes VMs from a managed cluster.
+// For AWS, we use terminate-instance-in-auto-scaling-group to remove specific instances.
+// This decrements the ASG's desired capacity and terminates the specified instances.
+func (p *Provider) Shrink(l *logger.Logger, vmsToDelete vm.List, clusterName string) error {
+	if !isManaged(vmsToDelete) {
+		return errors.New("shrinking is only supported for managed clusters (created with --aws-managed)")
+	}
+
+	if len(vmsToDelete) == 0 {
+		return nil
+	}
+
+	ctx := context.Background()
+
+	// Group VMs by region
+	byRegion, err := regionMap(vmsToDelete)
+	if err != nil {
+		return err
+	}
+
+	// Terminate instances in each region
+	g := ctxgroup.WithContext(ctx)
+	for region, regionVMs := range byRegion {
+		asgName := autoScalingGroupName(clusterName, region)
+
+		// Terminate each instance
+		for _, v := range regionVMs {
+			instanceID := v.ProviderID
+			g.GoCtx(func(ctx context.Context) error {
+				l.Printf("Terminating instance %s from ASG %s", instanceID, asgName)
+
+				// Use terminate-instance-in-auto-scaling-group to properly remove from ASG
+				// and decrement desired capacity
+				args := []string{
+					"autoscaling", "terminate-instance-in-auto-scaling-group",
+					"--instance-id", instanceID,
+					"--should-decrement-desired-capacity",
+					"--region", region,
+				}
+
+				if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+					return errors.Wrapf(err, "failed to terminate instance %s", instanceID)
+				}
+
+				return nil
+			})
+		}
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Wait for instances to be fully terminated in each region.
+	for region, regionVMs := range byRegion {
+		if err := p.waitForInstancesStatus(ctx, l, region, regionVMs.ProviderIDs(), "terminated"); err != nil {
+			return err
+		}
+	}
+
+	l.Printf("Successfully removed %d VMs from cluster", len(vmsToDelete))
+	return nil
 }
 
 // waitForIPs waits until AWS reports both internal and external IP addresses
@@ -921,14 +1524,29 @@ func (p *Provider) waitForIPs(
 
 // Delete is part of vm.Provider.
 // This will delete all instances in a single AWS command.
+// For managed clusters, it also deletes the ASG and launch template.
 func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 	if len(vms) == 0 {
 		return nil
 	}
 
-	// clean up any load balancers that may exist.
+	// Clean up any load balancers that may exist.
 	if err := p.DeleteLoadBalancer(l, vms, 0); err != nil {
 		l.Printf("Warning: failed to delete load balancers: %v", err)
+	}
+
+	// For managed clusters, delete the ASG and launch template in addition to
+	// instances. For empty cluster placeholders (synthetic entries representing
+	// orphaned launch templates/ASGs), this is the only cleanup needed since
+	// there are no real instances to terminate.
+	if isManaged(vms) {
+		return p.deleteManagedCluster(l, vms)
+	}
+
+	// Empty cluster placeholders with no managed resources have nothing
+	// further to clean up.
+	if vms[0].EmptyCluster {
+		return nil
 	}
 
 	byRegion, err := regionMap(vms)
@@ -956,6 +1574,40 @@ func (p *Provider) Delete(l *logger.Logger, vms vm.List) error {
 			return p.runJSONCommand(l, args, &data)
 		})
 	}
+	return g.Wait()
+}
+
+// deleteManagedCluster deletes a managed cluster's ASG, launch template, and instances.
+func (p *Provider) deleteManagedCluster(l *logger.Logger, vms vm.List) error {
+	clusterName, err := vms[0].ClusterName()
+	if err != nil {
+		return err
+	}
+
+	byRegion, err := regionMap(vms)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	g := ctxgroup.WithContext(ctx)
+
+	for region := range byRegion {
+		g.GoCtx(func(ctx context.Context) error {
+			// Delete the ASG first (this terminates instances)
+			if err := p.deleteAutoScalingGroup(ctx, l, clusterName, region); err != nil {
+				l.Printf("Warning: failed to delete ASG: %v", err)
+			}
+
+			// Delete the launch template
+			if err := p.deleteLaunchTemplate(ctx, l, clusterName, region); err != nil {
+				l.Printf("Warning: failed to delete launch template: %v", err)
+			}
+
+			return nil
+		})
+	}
+
 	return g.Wait()
 }
 
@@ -1002,6 +1654,11 @@ func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 	var err error
 	if p.Profile == "" {
 		account, err = p.iamGetUser(l)
+		if err != nil {
+			// iamGetUser fails with role-based credentials;
+			// fall back to stsGetCallerIdentity.
+			account, err = p.stsGetCallerIdentity(l)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -1094,11 +1751,16 @@ func (p *Provider) listRegionsFiltered(
 		namesFilter = fmt.Sprintf("Name=tag:Name,Values=%s", strings.Join(names, ","))
 	}
 
+	failedRegions := make(map[string]bool)
+	var failedRegionsMux syncutil.Mutex
 	for _, r := range regions {
 		g.GoCtx(func(ctx context.Context) error {
 			vms, err := p.describeInstances(ctx, l, r, opts, listOpts, namesFilter)
 			if err != nil {
 				l.Printf("Failed to list AWS VMs in region: %s\n%v\n", r, err)
+				failedRegionsMux.Lock()
+				failedRegions[r] = true
+				failedRegionsMux.Unlock()
 				return nil
 			}
 			mux.Lock()
@@ -1110,6 +1772,51 @@ func (p *Provider) listRegionsFiltered(
 
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	if listOpts.IncludeEmptyClusters {
+		// Find managed launch templates that have no active instances and create
+		// placeholder EmptyCluster VMs for them. This allows GC to discover and
+		// clean up orphaned ASGs and launch templates when instances have already
+		// been terminated.
+		clusterSeen := make(map[string]struct{})
+		for i := range ret {
+			clusterName, err := ret[i].ClusterName()
+			if err == nil {
+				clusterSeen[clusterName] = struct{}{}
+			}
+		}
+
+		for _, r := range regions {
+			if failedRegions[r] {
+				l.Printf("Skipping empty cluster detection in region %s: instance listing failed", r)
+				continue
+			}
+			clusterNames, err := p.listManagedLaunchTemplates(l, r)
+			if err != nil {
+				l.Printf("Failed to list managed launch templates in region %s: %v", r, err)
+				continue
+			}
+			for _, clusterName := range clusterNames {
+				if _, ok := clusterSeen[clusterName]; ok {
+					continue
+				}
+				clusterSeen[clusterName] = struct{}{}
+				ret = append(ret, vm.VM{
+					Name:     vm.Name(clusterName, 0),
+					Provider: ProviderName,
+					// Use region + "a" as a synthetic availability zone so that
+					// regionMap() can derive the region during deletion.
+					Zone: r + "a",
+					Labels: map[string]string{
+						vm.TagCluster:   clusterName,
+						vm.TagManaged:   "true",
+						vm.TagRoachprod: "true",
+					},
+					EmptyCluster: true,
+				})
+			}
+		}
 	}
 
 	return ret, nil
@@ -1434,17 +2141,19 @@ func (p *Provider) runInstance(
 	opts vm.CreateOpts,
 	providerOpts *ProviderOpts,
 ) (*vm.VM, error) {
-	az, ok := p.Config.AZByName[zone]
-	if !ok {
-		return nil, fmt.Errorf("no region in %v corresponds to availability zone %v",
-			p.Config.regionNames(), zone)
-	}
-
-	keyName, err := p.sshKeyName(l)
+	cfg, az, err := p.getInstanceConfig(l, zone, machineType, opts, providerOpts)
 	if err != nil {
 		return nil, err
 	}
-	cpuOptions := providerOpts.CPUOptions
+
+	// Log AMI selection
+	if instanceIdx == 0 {
+		if isArmMachineType(machineType) {
+			l.Printf("Using ARM64 AMI: %s for machine type: %s", cfg.imageID, machineType)
+		} else if opts.Arch == string(vm.ArchFIPS) {
+			l.Printf("Using FIPS-enabled AMI: %s for machine type: %s", cfg.imageID, machineType)
+		}
+	}
 
 	// We avoid the need to make a second call to set the tags by jamming
 	// all of our metadata into the tagSpec.
@@ -1486,12 +2195,8 @@ func (p *Provider) runInstance(
 
 	// Create AWS startup script file.
 	extraMountOpts := ""
-	// Dynamic args.
-	if opts.SSDOpts.UseLocalSSD {
-		// Disable ext4 barriers if specified and using ext4.
-		if opts.SSDOpts.NoExt4Barrier && opts.SSDOpts.FileSystem == vm.Ext4 {
-			extraMountOpts = "nobarrier"
-		}
+	if opts.SSDOpts.UseLocalSSD && opts.SSDOpts.NoExt4Barrier && opts.SSDOpts.FileSystem == vm.Ext4 {
+		extraMountOpts = "nobarrier"
 	}
 
 	filename, err := writeStartupScript(
@@ -1510,68 +2215,42 @@ func (p *Provider) runInstance(
 		_ = os.Remove(filename)
 	}()
 
-	withFlagOverride := func(cfg string, fl *string) string {
-		if *fl == "" {
-			return cfg
-		}
-		return *fl
-	}
-	imageID := withFlagOverride(az.Region.AMI_X86_64, &providerOpts.ImageAMI)
-	useArmAMI := strings.Index(machineType, "6g.") == 1 || strings.Index(machineType, "6gd.") == 1 ||
-		strings.Index(machineType, "7g.") == 1 || strings.Index(machineType, "7gd.") == 1 ||
-		strings.Index(machineType, "8g.") == 1 || strings.Index(machineType, "8gd.") == 1
-	if useArmAMI && (opts.Arch != "" && opts.Arch != string(vm.ArchARM64)) {
-		return nil, errors.Errorf("machine type %s is arm64, but requested arch is %s", machineType, opts.Arch)
-	}
-	//TODO(srosenberg): remove this once we have a better way to detect ARM64 machines
-	if useArmAMI {
-		imageID = withFlagOverride(az.Region.AMI_ARM64, &providerOpts.ImageAMI)
-		// N.B. use arbitrary instanceIdx to suppress the same info for every other instance being created.
-		if instanceIdx == 0 {
-			l.Printf("Using ARM64 AMI: %s for machine type: %s", imageID, machineType)
-		}
-	}
-	if opts.Arch == string(vm.ArchFIPS) {
-		imageID = withFlagOverride(az.Region.AMI_FIPS, &providerOpts.ImageAMI)
-		if instanceIdx == 0 {
-			l.Printf("Using FIPS-enabled AMI: %s for machine type: %s", imageID, machineType)
-		}
-	}
 	args := []string{
 		"ec2", "run-instances",
 		"--associate-public-ip-address",
 		"--count", "1",
-		"--instance-type", machineType,
-		"--image-id", imageID,
-		"--key-name", keyName,
+		"--instance-type", cfg.machineType,
+		"--image-id", cfg.imageID,
+		"--key-name", cfg.keyName,
 		"--region", az.Region.Name,
-		"--security-group-ids", az.Region.SecurityGroup,
+		"--security-group-ids", cfg.securityGroup,
 		"--subnet-id", az.SubnetID,
 		"--tag-specifications", vmTagSpecs, volumeTagSpecs,
 		"--user-data", "file://" + filename,
 	}
 
-	if cpuOptions != "" {
-		args = append(args, "--cpu-options", cpuOptions)
+	if cfg.cpuOptions != "" {
+		args = append(args, "--cpu-options", cfg.cpuOptions)
 	}
 
-	if providerOpts.IAMProfile != "" {
-		args = append(args, "--iam-instance-profile", "Name="+providerOpts.IAMProfile)
+	if cfg.iamProfile != "" {
+		args = append(args, "--iam-instance-profile", "Name="+cfg.iamProfile)
 	}
-	ebsVolumes := assignEBSVolumes(&opts, providerOpts)
-	args, err = genDeviceMapping(ebsVolumes, args)
+
+	args, err = genDeviceMapping(cfg.ebsVolumes, args)
 	if err != nil {
 		return nil, err
 	}
 
 	if providerOpts.UseSpot {
-		return runSpotInstance(l, p, args, az.Region.Name, providerOpts)
 		//todo(babusrithar): Add fallback to on-demand instances if spot instances are not available.
+		return runSpotInstance(l, p, args, az.Name, az.Region.Name, cfg.machineType, providerOpts)
 	}
+
 	runInstancesOutput := RunInstancesOutput{}
 	err = p.runJSONCommand(l, args, &runInstancesOutput)
 	if err != nil {
-		return nil, err
+		return nil, annotateAWSCapacityError(err, az.Name, cfg.machineType)
 	}
 
 	if len(runInstancesOutput.Instances) == 0 {
@@ -1586,11 +2265,24 @@ func (p *Provider) runInstance(
 	return v, err
 }
 
+// isArmMachineType returns true if the machine type uses ARM64 architecture.
+func isArmMachineType(machineType string) bool {
+	return strings.Index(machineType, "6g.") == 1 || strings.Index(machineType, "6gd.") == 1 ||
+		strings.Index(machineType, "7g.") == 1 || strings.Index(machineType, "7gd.") == 1 ||
+		strings.Index(machineType, "8g.") == 1 || strings.Index(machineType, "8gd.") == 1
+}
+
 // runSpotInstance uses run-instances command to create a spot instance.
 // It returns an error if the spot request is not fulfilled within 2 minutes.
 // It uses describe-spot-instance-requests command to get the status of the spot request.
 func runSpotInstance(
-	l *logger.Logger, p *Provider, args []string, regionName string, providerOpts *ProviderOpts,
+	l *logger.Logger,
+	p *Provider,
+	args []string,
+	zoneName string,
+	regionName string,
+	machineType string,
+	providerOpts *ProviderOpts,
 ) (*vm.VM, error) {
 	waitForSpotDuration := 2 * time.Minute
 
@@ -1601,7 +2293,7 @@ func runSpotInstance(
 	runInstancesOutput := RunInstancesOutput{}
 	err := p.runJSONCommand(l, spotArgs, &runInstancesOutput)
 	if err != nil {
-		return nil, err
+		return nil, annotateAWSCapacityError(err, zoneName, machineType)
 	}
 	// If the spot request is accepted, the run-instances command will return an instance-id.
 	if len(runInstancesOutput.Instances) == 0 {
@@ -1624,7 +2316,9 @@ func runSpotInstance(
 		if err != nil {
 			return nil, err
 		}
-		spotRequestFulfilled, err := processSpotInstanceRequestStatus(l, describeSpotInstanceRequestsOutput, spotInstanceRequestId, instanceId)
+		spotRequestFulfilled, err := processSpotInstanceRequestStatus(
+			l, describeSpotInstanceRequestsOutput, spotInstanceRequestId, instanceId, zoneName, machineType,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -1639,7 +2333,9 @@ func runSpotInstance(
 			if err != nil {
 				return nil, err
 			}
-			return nil, errors.New("waitForSpotDuration over")
+			return nil, newAWSSpotCapacityTimeoutError(
+				zoneName, machineType, spotInstanceRequestId, waitForSpotDuration,
+			)
 		}
 		l.Printf("Sleeping for 10 seconds before checking the status of the spot instance request again")
 		time.Sleep(10 * time.Second)
@@ -1686,15 +2382,24 @@ func processSpotInstanceRequestStatus(
 	describeSpotInstanceRequestsOutput DescribeSpotInstanceRequestsOutput,
 	spotInstanceRequestId string,
 	instanceId string,
+	zoneName string,
+	machineType string,
 ) (fullFilled bool, err error) {
 	if len(describeSpotInstanceRequestsOutput.SpotInstanceRequests) == 0 {
 		return false, errors.Errorf("No Spot Instance Request found for instance-id: %s", instanceId)
 	}
 	requestState := describeSpotInstanceRequestsOutput.SpotInstanceRequests[0].State
 	requestStatusCode := describeSpotInstanceRequestsOutput.SpotInstanceRequests[0].Status.Code
+	requestStatusMessage := describeSpotInstanceRequestsOutput.SpotInstanceRequests[0].Status.Message
 	if requestState == "closed" || requestState == "cancelled" || requestState == "failed" {
-		return false, errors.Errorf("Spot request %s for instance %s not active with state: %s",
-			spotInstanceRequestId, instanceId, requestState)
+		if err := newAWSSpotTerminalCapacityError(
+			zoneName, machineType, spotInstanceRequestId, instanceId,
+			requestState, requestStatusCode, requestStatusMessage,
+		); err != nil {
+			return false, err
+		}
+		return false, errors.Errorf("Spot request %s for instance %s not active with state: %s and status: %s",
+			spotInstanceRequestId, instanceId, requestState, requestStatusCode)
 	}
 	if requestStatusCode == "fulfilled" {
 		l.Printf("Spot request %s for instance %s fulfilled.", spotInstanceRequestId, instanceId)
@@ -1864,8 +2569,11 @@ type attachJsonResponse struct {
 }
 
 func (p *Provider) AttachVolume(l *logger.Logger, volume vm.Volume, vm *vm.VM) (string, error) {
-	// TODO(leon): what happens if this device already exists?
-	deviceName := "/dev/sdf"
+	// Use the same device naming convention as newVolume() (starting at
+	// /dev/sdd). The caller appends the volume to NonBootAttachedVolumes
+	// before calling this method, so len-1 gives the 0-based index.
+	devIdx := len(vm.NonBootAttachedVolumes) - 1
+	deviceName := fmt.Sprintf("/dev/sd%c", 'd'+devIdx)
 	args := []string{
 		"ec2",
 		"attach-volume",
@@ -1917,9 +2625,9 @@ type createVolume struct {
 func (p *Provider) CreateVolume(
 	l *logger.Logger, vco vm.VolumeCreateOpts,
 ) (vol vm.Volume, err error) {
-	// TODO(leon): SourceSnapshotID and IOPS, are not handled
-	if vco.SourceSnapshotID != "" || vco.IOPS != 0 {
-		err = errors.New("Creating a volume with SourceSnapshotID or IOPS is not supported at this time.")
+	// TODO(leon): IOPS is not handled.
+	if vco.IOPS != 0 {
+		err = errors.New("creating a volume with IOPS is not supported at this time")
 		return vol, err
 	}
 
@@ -1929,6 +2637,9 @@ func (p *Provider) CreateVolume(
 		"create-volume",
 		"--availability-zone", vco.Zone,
 		"--region", region,
+	}
+	if vco.SourceSnapshotID != "" {
+		args = append(args, "--snapshot-id", vco.SourceSnapshotID)
 	}
 	if vco.Encrypted {
 		args = append(args, "--encrypted")
@@ -1956,6 +2667,7 @@ func (p *Provider) CreateVolume(
 		args = append(args, "--volume-type", vco.Type)
 	case "":
 		// Use the default.
+		args = append(args, "--volume-type", defaultEBSVolumeType)
 	default:
 		return vol, errors.Newf("Invalid volume type %q", vco.Type)
 	}
@@ -2010,12 +2722,115 @@ func (p *Provider) CreateVolume(
 	return vol, err
 }
 
-func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, _ *vm.VM) error {
-	return vm.UnimplementedError
+func (p *Provider) DeleteVolume(l *logger.Logger, volume vm.Volume, v *vm.VM) error {
+	region := volume.Zone[:len(volume.Zone)-1]
+
+	// Detach the volume from the instance.
+	{
+		args := []string{
+			"ec2", "detach-volume",
+			"--region", region,
+			"--volume-id", volume.ProviderResourceID,
+			"--instance-id", v.ProviderID,
+		}
+		if _, err := p.runCommand(l, args); err != nil {
+			return errors.Wrap(err, "detaching volume")
+		}
+	}
+
+	// Wait for the volume to become available (detached) before deleting.
+	{
+		args := []string{
+			"ec2", "wait", "volume-available",
+			"--region", region,
+			"--volume-ids", volume.ProviderResourceID,
+		}
+		if _, err := p.runCommand(l, args); err != nil {
+			return errors.Wrap(err, "waiting for volume to detach")
+		}
+	}
+
+	// Delete the volume.
+	{
+		args := []string{
+			"ec2", "delete-volume",
+			"--region", region,
+			"--volume-id", volume.ProviderResourceID,
+		}
+		if _, err := p.runCommand(l, args); err != nil {
+			return errors.Wrap(err, "deleting volume")
+		}
+	}
+	return nil
 }
 
-func (p *Provider) ListVolumes(l *logger.Logger, vm *vm.VM) ([]vm.Volume, error) {
-	return vm.NonBootAttachedVolumes, nil
+func (p *Provider) ListVolumes(l *logger.Logger, v *vm.VM) ([]vm.Volume, error) {
+	if v.ProviderID == "" {
+		return nil, nil
+	}
+	region := v.Zone[:len(v.Zone)-1]
+
+	// Describe this instance to get block device mappings and the root device
+	// name, which we need to identify (and exclude) the boot volume.
+	var descResp DescribeInstancesOutput
+	descArgs := []string{
+		"ec2", "describe-instances",
+		"--region", region,
+		"--instance-ids", v.ProviderID,
+	}
+	if err := p.runJSONCommand(l, descArgs, &descResp); err != nil {
+		return nil, err
+	}
+	var instance *DescribeInstancesOutputInstance
+	for _, res := range descResp.Reservations {
+		for i := range res.Instances {
+			if res.Instances[i].InstanceID == v.ProviderID {
+				instance = &res.Instances[i]
+				break
+			}
+		}
+	}
+	if instance == nil {
+		l.Printf("WARNING: instance %s not found in describe-instances response for region %s", v.ProviderID, region)
+		return nil, nil
+	}
+
+	// Collect non-boot volume device names from the block device
+	// mappings. The root device is excluded so we only return data volumes.
+	deviceByVolumeID := make(map[string]string)
+	for _, bdm := range instance.BlockDeviceMappings {
+		if bdm.DeviceName != instance.RootDeviceName {
+			deviceByVolumeID[bdm.Disk.VolumeID] = bdm.DeviceName
+		}
+	}
+	if len(deviceByVolumeID) == 0 {
+		return nil, nil
+	}
+
+	// Describe the non-boot volumes to get their full metadata.
+	volsByInstance, err := p.getVolumesForInstances(
+		context.Background(), l, region, []string{v.ProviderID},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var volumes []vm.Volume
+	for _, vol := range volsByInstance[v.ProviderID] {
+		if _, ok := deviceByVolumeID[vol.ProviderResourceID]; ok {
+			volumes = append(volumes, vol)
+		}
+	}
+
+	// Sort by device name to ensure deterministic ordering that matches
+	// the mount point assignment (/mnt/data1, /mnt/data2, etc.).
+	slices.SortFunc(volumes, func(a, b vm.Volume) int {
+		return strings.Compare(
+			deviceByVolumeID[a.ProviderResourceID],
+			deviceByVolumeID[b.ProviderResourceID],
+		)
+	})
+	return volumes, nil
 }
 
 type snapshotOutput struct {
@@ -2056,20 +2871,110 @@ func (p *Provider) CreateVolumeSnapshot(
 	if err := p.runJSONCommand(l, args, &so); err != nil {
 		return vm.VolumeSnapshot{}, err
 	}
+
 	return vm.VolumeSnapshot{
-		ID:   so.SnapshotID,
-		Name: vsco.Name,
+		ID:     so.SnapshotID,
+		Name:   vsco.Name,
+		Region: region,
+		Status: so.State,
 	}, nil
 }
 
 func (p *Provider) ListVolumeSnapshots(
 	l *logger.Logger, vslo vm.VolumeSnapshotListOpts,
 ) ([]vm.VolumeSnapshot, error) {
-	return nil, vm.UnimplementedError
+	regions, err := p.allRegions(p.Config.availabilityZoneNames())
+	if err != nil {
+		return nil, err
+	}
+
+	var filters []string
+	if vslo.NamePrefix != "" {
+		filters = append(filters, fmt.Sprintf("Name=tag:Name,Values=%s*", vslo.NamePrefix))
+	}
+	for k, v := range vslo.Labels {
+		filters = append(filters, fmt.Sprintf("Name=tag:%s,Values=%s", k, v))
+	}
+
+	var mu syncutil.Mutex
+	var snapshots []vm.VolumeSnapshot
+	g := ctxgroup.WithContext(context.Background())
+	for _, r := range regions {
+		g.GoCtx(func(ctx context.Context) error {
+			args := []string{
+				"ec2", "describe-snapshots",
+				"--region", r,
+				"--owner-ids", "self",
+			}
+			if len(filters) > 0 {
+				args = append(args, "--filters")
+				args = append(args, filters...)
+			}
+
+			var result struct {
+				Snapshots []snapshotOutput `json:"Snapshots"`
+			}
+			if err := p.runJSONCommand(l, args, &result); err != nil {
+				l.Printf("WARN: failed to list snapshots in region %s (results may be incomplete): %v", r, err)
+				return nil
+			}
+
+			var regionSnapshots []vm.VolumeSnapshot
+			for _, so := range result.Snapshots {
+				if !vslo.CreatedBefore.IsZero() && !so.StartTime.Before(vslo.CreatedBefore) {
+					continue
+				}
+				name := ""
+				for _, tag := range so.Tags {
+					if tag.Key == "Name" {
+						name = tag.Value
+						break
+					}
+				}
+				// Double-check prefix match since AWS wildcard matching may
+				// differ from exact prefix semantics.
+				if vslo.NamePrefix != "" && !strings.HasPrefix(name, vslo.NamePrefix) {
+					continue
+				}
+				regionSnapshots = append(regionSnapshots, vm.VolumeSnapshot{
+					ID:     so.SnapshotID,
+					Name:   name,
+					Region: r,
+					Status: so.State,
+				})
+			}
+			mu.Lock()
+			snapshots = append(snapshots, regionSnapshots...)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	sort.Sort(vm.VolumeSnapshots(snapshots))
+	return snapshots, nil
 }
 
 func (p *Provider) DeleteVolumeSnapshots(l *logger.Logger, snapshots ...vm.VolumeSnapshot) error {
-	return vm.UnimplementedError
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	g := ctxgroup.WithContext(context.Background())
+	for _, snap := range snapshots {
+		g.GoCtx(func(ctx context.Context) error {
+			args := []string{
+				"ec2", "delete-snapshot",
+				"--region", snap.Region,
+				"--snapshot-id", snap.ID,
+			}
+			_, err := p.runCommand(l, args)
+			return err
+		})
+	}
+	return g.Wait()
 }
 
 // loadBalancerResourceName returns the name of a load balancer resource.
@@ -2159,22 +3064,34 @@ func (p *Provider) getLoadBalancerTags(
 		return nil, nil
 	}
 
-	args := []string{
-		"elbv2", "describe-tags",
-		"--resource-arns",
-	}
-	args = append(args, arns...)
-	args = append(args, "--region", region)
-
-	var output describeTagsOutput
-	if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
-		return nil, err
-	}
-
 	result := make(map[string]map[string]string)
-	for _, td := range output.TagDescriptions {
-		result[td.ResourceArn] = td.Tags.MakeMap()
+
+	// AWS DescribeTags API has a limit of 20 resources per call.
+	const maxResourcesPerCall = 20
+	for i := 0; i < len(arns); i += maxResourcesPerCall {
+		end := i + maxResourcesPerCall
+		if end > len(arns) {
+			end = len(arns)
+		}
+		batch := arns[i:end]
+
+		args := []string{
+			"elbv2", "describe-tags",
+			"--resource-arns",
+		}
+		args = append(args, batch...)
+		args = append(args, "--region", region)
+
+		var output describeTagsOutput
+		if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+			return nil, err
+		}
+
+		for _, td := range output.TagDescriptions {
+			result[td.ResourceArn] = td.Tags.MakeMap()
+		}
 	}
+
 	return result, nil
 }
 
@@ -2272,23 +3189,41 @@ func (p *Provider) createRegionalLoadBalancer(
 	}
 	tgArn := tgOutput.TargetGroups[0].TargetGroupArn
 
-	// Step 2: Register targets (EC2 instances)
-	l.Printf("Registering %d targets with target group", len(vms))
-	targets := make([]string, 0, len(vms))
-	for _, v := range vms {
-		targets = append(targets, fmt.Sprintf("Id=%s", v.ProviderID))
-	}
+	// Step 2: Register targets with the target group.
+	// For managed clusters, attach the target group to the ASG so new instances
+	// are automatically registered. For non-managed clusters, manually register
+	// each instance.
+	if isManaged(vms) {
+		asgName := autoScalingGroupName(clusterName, region)
+		l.Printf("Attaching target group to ASG %s for automatic instance registration", asgName)
+		args = []string{
+			"autoscaling", "attach-load-balancer-target-groups",
+			"--auto-scaling-group-name", asgName,
+			"--target-group-arns", tgArn,
+			"--region", region,
+		}
+		if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+			return errors.Wrapf(err, "failed to attach target group to ASG")
+		}
+	} else {
+		// For non-managed clusters, manually register each instance
+		l.Printf("Registering %d targets with target group", len(vms))
+		targets := make([]string, 0, len(vms))
+		for _, v := range vms {
+			targets = append(targets, fmt.Sprintf("Id=%s", v.ProviderID))
+		}
 
-	args = []string{
-		"elbv2", "register-targets",
-		"--target-group-arn", tgArn,
-		"--targets",
-	}
-	args = append(args, targets...)
-	args = append(args, "--region", region)
+		args = []string{
+			"elbv2", "register-targets",
+			"--target-group-arn", tgArn,
+			"--targets",
+		}
+		args = append(args, targets...)
+		args = append(args, "--region", region)
 
-	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
-		return errors.Wrapf(err, "failed to register targets")
+		if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+			return errors.Wrapf(err, "failed to register targets")
+		}
 	}
 
 	// Step 3: Create Network Load Balancer
@@ -2448,6 +3383,7 @@ func (p *Provider) deleteLoadBalancerResources(
 }
 
 // deleteClusterTargetGroups deletes all target groups for a cluster in a region.
+// For managed clusters, it first detaches target groups from the ASG before deleting.
 func (p *Provider) deleteClusterTargetGroups(
 	ctx context.Context, l *logger.Logger, clusterName, region string,
 ) error {
@@ -2476,12 +3412,57 @@ func (p *Provider) deleteClusterTargetGroups(
 		return errors.Wrap(err, "could not get target group tags")
 	}
 
+	// Collect target group ARNs belonging to this cluster for potential ASG detachment
+	var clusterTgArns []string
 	for tgArn, tgTags := range tgTagsByArn {
 		// Match by cluster name and roachprod tag
 		if tgTags[vm.TagCluster] != clusterName || tgTags[vm.TagRoachprod] != "true" {
 			continue
 		}
+		clusterTgArns = append(clusterTgArns, tgArn)
+	}
 
+	// For managed clusters, check which target groups are actually attached to the ASG
+	// before attempting to detach them. This avoids spurious errors when no load balancer
+	// was created.
+	if len(clusterTgArns) > 0 {
+		asgName := autoScalingGroupName(clusterName, region)
+
+		// Query the ASG to get its attached target group ARNs
+		attachedTgArns := make(map[string]struct{})
+		if asg, err := p.describeASG(ctx, l, asgName, region); err == nil && asg != nil {
+			for _, arn := range asg.TargetGroupARNs {
+				attachedTgArns[arn] = struct{}{}
+			}
+		}
+
+		// Only detach target groups that are actually attached to the ASG
+		var tgArnsToDetach []string
+		for _, tgArn := range clusterTgArns {
+			if _, attached := attachedTgArns[tgArn]; attached {
+				tgArnsToDetach = append(tgArnsToDetach, tgArn)
+			}
+		}
+
+		if len(tgArnsToDetach) > 0 {
+			l.Printf("Detaching %d target groups from ASG %s", len(tgArnsToDetach), asgName)
+			detachArgs := []string{
+				"autoscaling", "detach-load-balancer-target-groups",
+				"--auto-scaling-group-name", asgName,
+				"--target-group-arns",
+			}
+			detachArgs = append(detachArgs, tgArnsToDetach...)
+			detachArgs = append(detachArgs, "--region", region)
+
+			if _, err := p.runCommandWithContext(ctx, l, detachArgs); err != nil {
+				// Log warning but continue - ASG may have been deleted already
+				l.Printf("Warning: failed to detach target groups from ASG: %v", err)
+			}
+		}
+	}
+
+	// Now delete the target groups
+	for _, tgArn := range clusterTgArns {
 		if err := p.deleteTargetGroup(l, tgArn, region); err != nil {
 			l.Printf("Warning: failed to delete target group: %v", err)
 		}
@@ -2603,6 +3584,424 @@ func (p *Provider) listClusterLoadBalancers(
 	}
 
 	return clusterLBs, clusterTagsByArn, nil
+}
+
+// instanceConfig holds the configuration needed to create EC2 instances,
+// either directly via run-instances or via a launch template.
+type instanceConfig struct {
+	imageID       string
+	machineType   string
+	keyName       string
+	securityGroup string
+	iamProfile    string
+	ebsVolumes    ebsVolumeList
+	cpuOptions    string
+}
+
+// getInstanceConfig builds the common instance configuration from the given options.
+// This is used by both runInstance (for unmanaged clusters) and createLaunchTemplate
+// (for managed clusters).
+func (p *Provider) getInstanceConfig(
+	l *logger.Logger, zone string, machineType string, opts vm.CreateOpts, providerOpts *ProviderOpts,
+) (*instanceConfig, *availabilityZone, error) {
+	az, ok := p.Config.AZByName[zone]
+	if !ok {
+		return nil, nil, fmt.Errorf("no region in %v corresponds to availability zone %v",
+			p.Config.regionNames(), zone)
+	}
+
+	keyName, err := p.sshKeyName(l)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Determine the AMI to use based on machine type and architecture
+	withFlagOverride := func(cfg string, fl *string) string {
+		if *fl == "" {
+			return cfg
+		}
+		return *fl
+	}
+	imageID := withFlagOverride(az.Region.AMI_X86_64, &providerOpts.ImageAMI)
+	useArmAMI := strings.Index(machineType, "6g.") == 1 || strings.Index(machineType, "6gd.") == 1 ||
+		strings.Index(machineType, "7g.") == 1 || strings.Index(machineType, "7gd.") == 1 ||
+		strings.Index(machineType, "8g.") == 1 || strings.Index(machineType, "8gd.") == 1
+	if useArmAMI && (opts.Arch != "" && opts.Arch != string(vm.ArchARM64)) {
+		return nil, nil, errors.Errorf("machine type %s is arm64, but requested arch is %s", machineType, opts.Arch)
+	}
+	if useArmAMI {
+		imageID = withFlagOverride(az.Region.AMI_ARM64, &providerOpts.ImageAMI)
+	}
+	if opts.Arch == string(vm.ArchFIPS) {
+		imageID = withFlagOverride(az.Region.AMI_FIPS, &providerOpts.ImageAMI)
+	}
+
+	ebsVolumes := assignEBSVolumes(&opts, providerOpts)
+
+	return &instanceConfig{
+		imageID:       imageID,
+		machineType:   machineType,
+		keyName:       keyName,
+		securityGroup: az.Region.SecurityGroup,
+		iamProfile:    providerOpts.IAMProfile,
+		ebsVolumes:    ebsVolumes,
+		cpuOptions:    providerOpts.CPUOptions,
+	}, az, nil
+}
+
+// launchTemplateName returns the name of the launch template for a cluster.
+func launchTemplateName(clusterName string) string {
+	return fmt.Sprintf("%s-lt", clusterName)
+}
+
+// autoScalingGroupName returns the name of the auto scaling group for a cluster in a region.
+// AWS ASGs are regional (can span multiple AZs within a region).
+func autoScalingGroupName(clusterName, region string) string {
+	return fmt.Sprintf("%s-%s-asg", clusterName, region)
+}
+
+// isManaged returns true if the VMs belong to a managed cluster (created with --aws-managed).
+// A managed cluster uses launch templates and auto scaling groups.
+func isManaged(vms vm.List) bool {
+	if len(vms) == 0 {
+		return false
+	}
+	return vms[0].Labels[vm.TagManaged] == "true"
+}
+
+// describeLaunchTemplatesOutput represents the output of describe-launch-templates.
+type describeLaunchTemplatesOutput struct {
+	LaunchTemplates []struct {
+		LaunchTemplateName string `json:"LaunchTemplateName"`
+		Tags               Tags   `json:"Tags"`
+	} `json:"LaunchTemplates"`
+}
+
+// listManagedLaunchTemplates returns the cluster names that have managed
+// launch templates in the given region. This is used during GC to discover
+// orphaned launch templates that no longer have active instances.
+func (p *Provider) listManagedLaunchTemplates(l *logger.Logger, region string) ([]string, error) {
+	args := []string{
+		"ec2", "describe-launch-templates",
+		"--filters",
+		fmt.Sprintf("Name=tag:%s,Values=true", vm.TagRoachprod),
+		fmt.Sprintf("Name=tag:%s,Values=true", vm.TagManaged),
+		"--region", region,
+	}
+
+	var output describeLaunchTemplatesOutput
+	if err := p.runJSONCommand(l, args, &output); err != nil {
+		return nil, errors.Wrap(err, "listing managed launch templates")
+	}
+
+	var clusterNames []string
+	for _, lt := range output.LaunchTemplates {
+		tagMap := lt.Tags.MakeMap()
+		if name, ok := tagMap[vm.TagCluster]; ok && name != "" {
+			clusterNames = append(clusterNames, name)
+		}
+	}
+	return clusterNames, nil
+}
+
+// createLaunchTemplateOutput represents the output of create-launch-template.
+type createLaunchTemplateOutput struct {
+	LaunchTemplate struct {
+		LaunchTemplateID   string `json:"LaunchTemplateId"`
+		LaunchTemplateName string `json:"LaunchTemplateName"`
+	} `json:"LaunchTemplate"`
+}
+
+// createLaunchTemplate creates an EC2 launch template for the cluster.
+// The launch template captures all instance configuration (AMI, instance type,
+// security groups, volumes, etc.) so that the ASG can launch identical instances.
+func (p *Provider) createLaunchTemplate(
+	ctx context.Context,
+	l *logger.Logger,
+	clusterName string,
+	region string,
+	cfg *instanceConfig,
+	az *availabilityZone,
+	opts vm.CreateOpts,
+	providerOpts *ProviderOpts,
+) (string, error) {
+	ltName := launchTemplateName(clusterName)
+
+	// Create startup script for user-data
+	extraMountOpts := ""
+	if opts.SSDOpts.UseLocalSSD {
+		if opts.SSDOpts.NoExt4Barrier && opts.SSDOpts.FileSystem == vm.Ext4 {
+			extraMountOpts = "nobarrier"
+		}
+	}
+
+	// For launch templates, we use a generic name since instances will be named by ASG
+	userData, err := generateStartupScript(
+		clusterName,
+		extraMountOpts,
+		opts.SSDOpts.FileSystem,
+		providerOpts.UseMultipleDisks,
+		opts.Arch == string(vm.ArchFIPS),
+		providerOpts.RemoteUserName,
+		providerOpts.BootDiskOnly,
+	)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not generate AWS startup script")
+	}
+
+	// Build launch template data as JSON
+	// We need to use a JSON file for complex launch template configurations
+	ltData := map[string]interface{}{
+		"ImageId":      cfg.imageID,
+		"InstanceType": cfg.machineType,
+		"KeyName":      cfg.keyName,
+		"SecurityGroupIds": []string{
+			cfg.securityGroup,
+		},
+		"UserData": userData,
+		"TagSpecifications": []map[string]interface{}{
+			{
+				"ResourceType": "instance",
+				"Tags": []map[string]string{
+					{"Key": vm.TagCluster, "Value": clusterName},
+					{"Key": vm.TagRoachprod, "Value": "true"},
+					{"Key": vm.TagManaged, "Value": "true"},
+					{"Key": "Cluster", "Value": clusterName}, // Legacy tag for cost analysis
+				},
+			},
+			{
+				"ResourceType": "volume",
+				"Tags": []map[string]string{
+					{"Key": vm.TagCluster, "Value": clusterName},
+					{"Key": vm.TagRoachprod, "Value": "true"},
+				},
+			},
+		},
+		"BlockDeviceMappings": cfg.ebsVolumes,
+	}
+
+	if cfg.iamProfile != "" {
+		ltData["IamInstanceProfile"] = map[string]string{
+			"Name": cfg.iamProfile,
+		}
+	}
+
+	if cfg.cpuOptions != "" {
+		// Parse cpuOptions string (format: "CoreCount=X,ThreadsPerCore=Y")
+		ltData["CpuOptions"] = cfg.cpuOptions
+	}
+
+	// Write launch template data to a temp file
+	ltDataJSON, err := json.Marshal(ltData)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal launch template data")
+	}
+
+	ltDataFile, err := os.CreateTemp("", "aws-launch-template-data")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to create temp file for launch template data")
+	}
+	defer func() {
+		ltDataFile.Close()
+		_ = os.Remove(ltDataFile.Name())
+	}()
+
+	if _, err := ltDataFile.Write(ltDataJSON); err != nil {
+		return "", errors.Wrap(err, "failed to write launch template data")
+	}
+	ltDataFile.Close()
+
+	l.Printf("Creating launch template %s in region %s", ltName, region)
+	args := []string{
+		"ec2", "create-launch-template",
+		"--launch-template-name", ltName,
+		"--launch-template-data", "file://" + ltDataFile.Name(),
+		"--tag-specifications",
+		fmt.Sprintf("ResourceType=launch-template,Tags=[{Key=%s,Value=%s},{Key=%s,Value=true},{Key=%s,Value=true}]",
+			vm.TagCluster, clusterName, vm.TagRoachprod, vm.TagManaged),
+		"--region", region,
+	}
+
+	var output createLaunchTemplateOutput
+	if err := p.runJSONCommandWithContext(ctx, l, args, &output); err != nil {
+		return "", errors.Wrapf(err, "failed to create launch template")
+	}
+
+	l.Printf("Created launch template: %s (ID: %s)", ltName, output.LaunchTemplate.LaunchTemplateID)
+	return output.LaunchTemplate.LaunchTemplateID, nil
+}
+
+// createAutoScalingGroup creates an Auto Scaling Group for the cluster in a region.
+// The ASG manages the desired number of instances using the launch template.
+// maxSize specifies the maximum number of instances the ASG can hold.
+func (p *Provider) createAutoScalingGroup(
+	ctx context.Context,
+	l *logger.Logger,
+	clusterName string,
+	region string,
+	launchTemplateID string,
+	zones []string,
+	desiredCapacity int,
+	maxSize int,
+	opts vm.CreateOpts,
+) error {
+	asgName := autoScalingGroupName(clusterName, region)
+
+	// Collect subnet IDs for the zones
+	var subnetIDs []string
+	for _, zone := range zones {
+		az, ok := p.Config.AZByName[zone]
+		if ok && az.SubnetID != "" {
+			subnetIDs = append(subnetIDs, az.SubnetID)
+		}
+	}
+
+	if len(subnetIDs) == 0 {
+		return errors.Errorf("no subnets found for zones %v", zones)
+	}
+
+	l.Printf("Creating Auto Scaling Group %s in region %s with %d instances", asgName, region, desiredCapacity)
+
+	// Build tags for the ASG
+	tags := []string{
+		fmt.Sprintf("Key=%s,Value=%s,PropagateAtLaunch=true", vm.TagCluster, clusterName),
+		fmt.Sprintf("Key=%s,Value=true,PropagateAtLaunch=true", vm.TagRoachprod),
+		fmt.Sprintf("Key=%s,Value=true,PropagateAtLaunch=true", vm.TagManaged),
+		fmt.Sprintf("Key=%s,Value=%s,PropagateAtLaunch=true", vm.TagLifetime, opts.Lifetime.String()),
+		fmt.Sprintf("Key=Cluster,Value=%s,PropagateAtLaunch=true", clusterName), // Legacy tag
+	}
+
+	args := []string{
+		"autoscaling", "create-auto-scaling-group",
+		"--auto-scaling-group-name", asgName,
+		"--launch-template", fmt.Sprintf("LaunchTemplateId=%s,Version=$Latest", launchTemplateID),
+		"--min-size", "0",
+		"--max-size", strconv.Itoa(maxSize),
+		"--desired-capacity", strconv.Itoa(desiredCapacity),
+		"--vpc-zone-identifier", strings.Join(subnetIDs, ","),
+		"--tags",
+	}
+	args = append(args, tags...)
+	args = append(args, "--region", region)
+
+	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+		return errors.Wrapf(err, "failed to create auto scaling group")
+	}
+
+	l.Printf("Created Auto Scaling Group: %s", asgName)
+
+	// When desiredCapacity is 0, we don't need to wait for instances.
+	// The caller will create and attach instances separately to preserve
+	// roachprod naming conventions (AWS ASG doesn't support custom instance names).
+	if desiredCapacity == 0 {
+		return nil
+	}
+
+	// Wait for instances to be running
+	l.Printf("Waiting for %d instances to launch...", desiredCapacity)
+	waitRetry := retry.Start(retry.Options{
+		InitialBackoff: 5 * time.Second,
+		MaxBackoff:     30 * time.Second,
+		MaxRetries:     60, // Wait up to ~10 minutes
+	})
+
+	for waitRetry.Next() {
+		// Check ASG status
+		asg, err := p.describeASG(ctx, l, asgName, region)
+		if err != nil {
+			l.Printf("Warning: failed to describe ASG: %v", err)
+			continue
+		}
+		if asg == nil {
+			continue
+		}
+
+		inServiceCount := 0
+		for _, inst := range asg.Instances {
+			if inst.LifecycleState == "InService" {
+				inServiceCount++
+			}
+		}
+
+		if inServiceCount >= desiredCapacity {
+			l.Printf("All %d instances are InService", inServiceCount)
+			return nil
+		}
+
+		l.Printf("Waiting for instances: %d/%d InService", inServiceCount, desiredCapacity)
+	}
+
+	return errors.Errorf("timed out waiting for ASG instances to become InService")
+}
+
+// deleteLaunchTemplate deletes the launch template for a cluster.
+func (p *Provider) deleteLaunchTemplate(
+	ctx context.Context, l *logger.Logger, clusterName, region string,
+) error {
+	ltName := launchTemplateName(clusterName)
+
+	l.Printf("Deleting launch template %s in region %s", ltName, region)
+	args := []string{
+		"ec2", "delete-launch-template",
+		"--launch-template-name", ltName,
+		"--region", region,
+	}
+
+	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+		// Ignore "not found" errors
+		if !strings.Contains(err.Error(), "InvalidLaunchTemplateName.NotFoundException") {
+			return errors.Wrapf(err, "failed to delete launch template")
+		}
+		l.Printf("Launch template %s not found, skipping", ltName)
+	}
+
+	return nil
+}
+
+// deleteAutoScalingGroup deletes the Auto Scaling Group for a cluster in a region.
+func (p *Provider) deleteAutoScalingGroup(
+	ctx context.Context, l *logger.Logger, clusterName, region string,
+) error {
+	asgName := autoScalingGroupName(clusterName, region)
+
+	l.Printf("Deleting Auto Scaling Group %s in region %s (with force-delete)", asgName, region)
+	args := []string{
+		"autoscaling", "delete-auto-scaling-group",
+		"--auto-scaling-group-name", asgName,
+		"--force-delete", // Terminates all instances
+		"--region", region,
+	}
+
+	if _, err := p.runCommandWithContext(ctx, l, args); err != nil {
+		// Ignore "not found" errors
+		if !strings.Contains(err.Error(), "AutoScalingGroup name not found") {
+			return errors.Wrapf(err, "failed to delete auto scaling group")
+		}
+		l.Printf("Auto Scaling Group %s not found, skipping", asgName)
+	}
+
+	// Wait for ASG to be deleted
+	l.Printf("Waiting for Auto Scaling Group deletion...")
+	waitRetry := retry.Start(retry.Options{
+		InitialBackoff: 5 * time.Second,
+		MaxBackoff:     30 * time.Second,
+		MaxRetries:     30, // Wait up to ~5 minutes
+	})
+
+	for waitRetry.Next() {
+		asg, err := p.describeASG(ctx, l, asgName, region)
+		if err != nil {
+			l.Printf("Warning: failed to describe ASG: %v", err)
+			continue
+		}
+
+		if asg == nil {
+			l.Printf("Auto Scaling Group %s deleted", asgName)
+			return nil
+		}
+	}
+
+	return errors.Errorf("timed out waiting for ASG deletion")
 }
 
 // String returns a human-readable string representation of the Provider.

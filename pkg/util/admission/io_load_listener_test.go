@@ -30,6 +30,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func newDiskWriteByteTokensUsedCounters() [admissionpb.NumStoreWorkTypes]*metric.Counter {
+	var c [admissionpb.NumStoreWorkTypes]*metric.Counter
+	c[admissionpb.RegularStoreWorkType] = metric.NewCounter(kvDiskWriteByteTokensUsedRegular)
+	c[admissionpb.SnapshotIngestStoreWorkType] = metric.NewCounter(kvDiskWriteByteTokensUsedSnapshot)
+	c[admissionpb.ElasticStoreWorkType] = metric.NewCounter(kvDiskWriteByteTokensUsedElastic)
+	return c
+}
+
 // TestIOLoadListener is a datadriven test with the following command that
 // sets the state for token calculation and then ticks adjustmentInterval
 // times to cause tokens to be set in the testGranterWithIOTokens:
@@ -55,12 +63,13 @@ func TestIOLoadListener(t *testing.T) {
 				walFailoverUnlimitedTokens.Override(ctx, &st.SV, false)
 				ElasticBandwidthMaxUtil.Override(ctx, &st.SV, 1)
 				ioll = &ioLoadListener{
-					settings:              st,
-					kvRequester:           req,
-					perWorkTokenEstimator: makeStorePerWorkTokenEstimator(),
-					diskBandwidthLimiter:  newDiskBandwidthLimiter(),
-					l0CompactedBytes:      metric.NewCounter(l0CompactedBytes),
-					l0TokensProduced:      metric.NewCounter(l0TokensProduced),
+					settings:                st,
+					kvRequester:             req,
+					perWorkTokenEstimator:   makeStorePerWorkTokenEstimator(),
+					diskBandwidthLimiter:    newDiskBandwidthLimiter(),
+					l0CompactedBytes:        metric.NewCounter(l0CompactedBytes),
+					l0TokensProduced:        metric.NewCounter(l0TokensProduced),
+					diskWriteByteTokensUsed: newDiskWriteByteTokensUsedCounters(),
 				}
 				// The mutex is needed by ioLoadListener but is not useful in this
 				// test -- the channels provide synchronization and prevent this
@@ -117,6 +126,14 @@ func TestIOLoadListener(t *testing.T) {
 				var minSize int64
 				d.ScanArgs(t, "size", &minSize)
 				L0MinimumSizePerSubLevel.Override(ctx, &st.SV, minSize)
+				return ""
+
+			case "set-disk-bw-tokens-enabled":
+				enabled := true
+				if d.HasArg("enabled") {
+					d.ScanArgs(t, "enabled", &enabled)
+				}
+				DiskBandwidthTokensForElasticEnabled.Override(ctx, &st.SV, enabled)
 				return ""
 
 			// TODO(sumeer): the output printed by set-state is hard to follow. It
@@ -209,6 +226,11 @@ func TestIOLoadListener(t *testing.T) {
 					kvGranter.diskBandwidthTokensUsed[admissionpb.RegularWorkClass] = diskTokens{}
 					kvGranter.diskBandwidthTokensUsed[admissionpb.ElasticWorkClass] = diskTokens{}
 				}
+				if d.HasArg("remaining-disk-write-tokens") {
+					d.ScanArgs(t, "remaining-disk-write-tokens", &kvGranter.remainingDiskWriteTokens)
+				} else {
+					kvGranter.remainingDiskWriteTokens = 0
+				}
 				var printOnlyFirstTick bool
 				if d.HasArg("print-only-first-tick") {
 					d.ScanArgs(t, "print-only-first-tick", &printOnlyFirstTick)
@@ -234,8 +256,7 @@ func TestIOLoadListener(t *testing.T) {
 				var buf strings.Builder
 				// Do the ticks until just before next adjustment.
 				res := ioll.adjustTokensResult
-				fmt.Fprintln(&buf, redact.StringWithoutMarkers(&res))
-				fmt.Fprintln(&buf, redact.StringWithoutMarkers(ioll.diskBandwidthLimiter))
+				fmt.Fprintln(&buf, strings.TrimSpace(string(ioll.formatLog())))
 				res.ioThreshold = nil // avoid nondeterminism
 				fmt.Fprintf(&buf, "%+v\n", (rawTokenResult)(res))
 				if req.buf.Len() > 0 {
@@ -266,11 +287,12 @@ func TestIOLoadListenerOverflow(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	ioll := ioLoadListener{
-		settings:             st,
-		kvRequester:          req,
-		diskBandwidthLimiter: newDiskBandwidthLimiter(),
-		l0CompactedBytes:     metric.NewCounter(l0CompactedBytes),
-		l0TokensProduced:     metric.NewCounter(l0TokensProduced),
+		settings:                st,
+		kvRequester:             req,
+		diskBandwidthLimiter:    newDiskBandwidthLimiter(),
+		l0CompactedBytes:        metric.NewCounter(l0CompactedBytes),
+		l0TokensProduced:        metric.NewCounter(l0TokensProduced),
+		diskWriteByteTokensUsed: newDiskWriteByteTokensUsedCounters(),
 	}
 	ioll.kvGranter = kvGranter
 	// Bug 1: overflow when totalNumByteTokens is too large.
@@ -335,9 +357,10 @@ func TestAdjustTokensInnerAndLogging(t *testing.T) {
 	for _, tt := range tests {
 		buf.Printf("%s:\n", tt.name)
 		ioll := &ioLoadListener{
-			settings:         cluster.MakeTestingClusterSettings(),
-			l0CompactedBytes: metric.NewCounter(l0CompactedBytes),
-			l0TokensProduced: metric.NewCounter(l0TokensProduced),
+			settings:                cluster.MakeTestingClusterSettings(),
+			l0CompactedBytes:        metric.NewCounter(l0CompactedBytes),
+			l0TokensProduced:        metric.NewCounter(l0TokensProduced),
+			diskWriteByteTokensUsed: newDiskWriteByteTokensUsedCounters(),
 		}
 		res := ioll.adjustTokensInner(
 			ctx, tt.prev, tt.l0Metrics, 12, cumStoreCompactionStats{numOutLevelsGauge: 1}, 0,
@@ -380,12 +403,13 @@ func TestBadIOLoadListenerStats(t *testing.T) {
 	kvGranter := &testGranterNonNegativeTokens{t: t}
 	st := cluster.MakeTestingClusterSettings()
 	ioll := ioLoadListener{
-		settings:              st,
-		kvRequester:           req,
-		perWorkTokenEstimator: makeStorePerWorkTokenEstimator(),
-		diskBandwidthLimiter:  newDiskBandwidthLimiter(),
-		l0CompactedBytes:      metric.NewCounter(l0CompactedBytes),
-		l0TokensProduced:      metric.NewCounter(l0TokensProduced),
+		settings:                st,
+		kvRequester:             req,
+		perWorkTokenEstimator:   makeStorePerWorkTokenEstimator(),
+		diskBandwidthLimiter:    newDiskBandwidthLimiter(),
+		l0CompactedBytes:        metric.NewCounter(l0CompactedBytes),
+		l0TokensProduced:        metric.NewCounter(l0TokensProduced),
+		diskWriteByteTokensUsed: newDiskWriteByteTokensUsedCounters(),
 	}
 	ioll.kvGranter = kvGranter
 	for i := 0; i < 100; i++ {
@@ -432,9 +456,10 @@ func (r *testRequesterForIOLL) setStoreRequestEstimates(estimates storeRequestEs
 }
 
 type testGranterWithIOTokens struct {
-	buf                     strings.Builder
-	allTokensUsed           bool
-	diskBandwidthTokensUsed [admissionpb.NumStoreWorkTypes]diskTokens
+	buf                      strings.Builder
+	allTokensUsed            bool
+	diskBandwidthTokensUsed  [admissionpb.NumStoreWorkTypes]diskTokens
+	remainingDiskWriteTokens int64
 }
 
 var _ granterWithIOTokens = &testGranterWithIOTokens{}
@@ -470,8 +495,9 @@ func (g *testGranterWithIOTokens) addAvailableTokens(
 func (g *testGranterWithIOTokens) getDiskTokensUsedAndReset() (
 	usedTokens [admissionpb.NumStoreWorkTypes]diskTokens,
 	_ diskErrorStats,
+	remainingDiskWriteTokens int64,
 ) {
-	return g.diskBandwidthTokensUsed, diskErrorStats{}
+	return g.diskBandwidthTokensUsed, diskErrorStats{}, g.remainingDiskWriteTokens
 }
 
 func (g *testGranterWithIOTokens) setLinearModels(
@@ -530,8 +556,9 @@ func (g *testGranterNonNegativeTokens) addAvailableTokens(
 func (g *testGranterNonNegativeTokens) getDiskTokensUsedAndReset() (
 	usedTokens [admissionpb.NumStoreWorkTypes]diskTokens,
 	_ diskErrorStats,
+	remainingDiskWriteTokens int64,
 ) {
-	return [admissionpb.NumStoreWorkTypes]diskTokens{}, diskErrorStats{}
+	return [admissionpb.NumStoreWorkTypes]diskTokens{}, diskErrorStats{}, 0
 }
 
 func (g *testGranterNonNegativeTokens) setLinearModels(
@@ -594,36 +621,6 @@ func TestTokenAllocationTickerAdjustmentCalculation(t *testing.T) {
 		}
 		time.Sleep(1 * time.Millisecond)
 	}
-}
-
-func TestTokenAllocationTickerErrorAdjustmentThreshold(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ticker := tokenAllocationTicker{}
-	defer ticker.stop()
-	ticker.adjustmentStart(false /* loaded */)
-
-	// Knowing we are using unloaded duration. The first iteration will have 60 ticks.
-	require.False(t, ticker.shouldAdjustForError(60 /* remainingTicks */, false /* loaded */))
-	// Verify that we correctly reset the lastErrorAdjustmentTick value.
-	require.Equal(t, uint64(60), ticker.lastErrorAdjustmentTick)
-
-	// We should not do error adjustment unless 1s has passed. i.e. 4 ticks.
-	require.False(t, ticker.shouldAdjustForError(58 /* remainingTicks */, false /* loaded */))
-	require.True(t, ticker.shouldAdjustForError(56 /* remainingTicks */, false /* loaded */))
-	require.Equal(t, uint64(56), ticker.lastErrorAdjustmentTick)
-
-	// We should adjust for error on the last tick.
-	require.True(t, ticker.shouldAdjustForError(0 /* remainingTicks */, false /* loaded */))
-
-	// Re-run the above with loaded system. Now the error adjustment threshold is every 1000 ticks.
-	require.False(t, ticker.shouldAdjustForError(15000 /* remainingTicks */, true /* loaded */))
-	require.Equal(t, uint64(15000), ticker.lastErrorAdjustmentTick)
-	require.False(t, ticker.shouldAdjustForError(14001 /* remainingTicks */, true /* loaded */))
-	require.True(t, ticker.shouldAdjustForError(14000 /* remainingTicks */, true /* loaded */))
-	require.Equal(t, uint64(14000), ticker.lastErrorAdjustmentTick)
-	require.True(t, ticker.shouldAdjustForError(0 /* remainingTicks */, true /* loaded */))
 }
 
 func TestTokenAllocationTicker(t *testing.T) {

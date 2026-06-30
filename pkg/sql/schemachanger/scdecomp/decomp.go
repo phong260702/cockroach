@@ -215,6 +215,65 @@ func (w *walkCtx) walkType(typ catalog.TypeDescriptor) {
 				Name:            comp.GetElementLabel(i),
 			})
 		}
+	} else if domain := typ.AsDomainTypeDescriptor(); domain != nil {
+		baseType := newTypeT(domain.GetBaseType())
+		w.ev(descriptorStatus(typ), &scpb.DomainType{
+			TypeID:      domain.GetID(),
+			ArrayTypeID: domain.GetArrayTypeID(),
+			BaseTypeT:   *baseType,
+		})
+		if domain.IsNotNull() {
+			constraintID := domain.GetNotNullConstraintID()
+			w.ev(descriptorStatus(typ), &scpb.DomainNotNull{
+				TypeID:       domain.GetID(),
+				ConstraintID: constraintID,
+			})
+			w.ev(descriptorStatus(typ), &scpb.DomainConstraintName{
+				TypeID:       domain.GetID(),
+				ConstraintID: constraintID,
+				Name:         domain.GetNotNullConstraintName(),
+			})
+		}
+		if defaultExpr := domain.GetDefaultExpr(); defaultExpr != "" {
+			expr, err := w.newExpression(catpb.Expression(defaultExpr))
+			if err != nil {
+				panic(errors.NewAssertionErrorWithWrappedErrf(err, "domain %q (%d) default expr",
+					typ.GetName(), typ.GetID()))
+			}
+			w.ev(descriptorStatus(typ), &scpb.DomainDefault{
+				TypeID:     domain.GetID(),
+				Expression: *expr,
+			})
+		}
+		for i := 0; i < domain.NumCheckConstraints(); i++ {
+			expr, err := w.newExpression(catpb.Expression(domain.GetCheckConstraintExpr(i)))
+			if err != nil {
+				panic(errors.NewAssertionErrorWithWrappedErrf(err, "domain %q (%d) check constraint %q",
+					typ.GetName(), typ.GetID(), domain.GetCheckConstraintName(i)))
+			}
+			constraintID := domain.GetCheckConstraintID(i)
+			validity := domain.GetCheckConstraintValidity(i)
+
+			if validity == descpb.ConstraintValidity_Unvalidated {
+				w.ev(descriptorStatus(typ), &scpb.DomainCheckConstraintUnvalidated{
+					TypeID:       domain.GetID(),
+					ConstraintID: constraintID,
+					Expression:   *expr,
+				})
+			} else {
+				w.ev(descriptorStatus(typ), &scpb.DomainCheckConstraint{
+					TypeID:       domain.GetID(),
+					ConstraintID: constraintID,
+					Expression:   *expr,
+				})
+			}
+
+			w.ev(descriptorStatus(typ), &scpb.DomainConstraintName{
+				TypeID:       domain.GetID(),
+				ConstraintID: constraintID,
+				Name:         domain.GetCheckConstraintName(i),
+			})
+		}
 	} else {
 		panic(errors.AssertionFailedf("unsupported type kind %q", typ.GetKind()))
 	}
@@ -384,7 +443,7 @@ func (w *walkCtx) walkRelation(tbl catalog.TableDescriptor) {
 		if ttl := tbl.GetRowLevelTTL(); ttl != nil {
 			// We pull out the TTL expression so that we can build proper column
 			// dependencies with whatever column is used.
-			ttlExpr, err := w.newExpression(string(ttl.GetTTLExpr()))
+			ttlExpr, err := w.newExpression(ttl.GetTTLExpr())
 			if err != nil {
 				panic(err)
 			}
@@ -486,7 +545,7 @@ func (w *walkCtx) walkRelation(tbl catalog.TableDescriptor) {
 // TableStorageParam elements for each non-null parameter.
 func (w *walkCtx) walkStorageParams(tbl catalog.TableDescriptor) {
 	tableID := tbl.GetID()
-	storageParams, err := tbl.GetStorageParams(false)
+	storageParams, err := tbl.GetStorageParams(false /* spaceBetweenEqual */)
 	if err != nil {
 		panic(err)
 	}
@@ -703,6 +762,7 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 			ConstraintID:        idx.GetConstraintID(),
 			IsNotVisible:        idx.GetInvisibility() != 0.0,
 			Invisibility:        idx.GetInvisibility(),
+			SkipUniqueChecks:    idx.SkipUniqueChecks(),
 		}
 		if geoConfig := idx.GetGeoConfig(); !geoConfig.IsEmpty() {
 			index.GeoConfig = protoutil.Clone(&geoConfig).(*geopb.Config)
@@ -890,11 +950,12 @@ func (w *walkCtx) walkTrigger(tbl catalog.TableDescriptor, t *descpb.TriggerDesc
 		TriggerID: t.ID,
 		Name:      t.Name,
 	})
-	w.ev(scpb.Status_PUBLIC, &scpb.TriggerEnabled{
-		TableID:   tbl.GetID(),
-		TriggerID: t.ID,
-		Enabled:   t.Enabled,
-	})
+	if t.Enabled {
+		w.ev(scpb.Status_PUBLIC, &scpb.TriggerEnabled{
+			TableID:   tbl.GetID(),
+			TriggerID: t.ID,
+		})
+	}
 	w.ev(scpb.Status_PUBLIC, &scpb.TriggerTiming{
 		TableID:    tbl.GetID(),
 		TriggerID:  t.ID,
@@ -925,14 +986,14 @@ func (w *walkCtx) walkTrigger(tbl catalog.TableDescriptor, t *descpb.TriggerDesc
 		w.ev(scpb.Status_PUBLIC, &scpb.TriggerWhen{
 			TableID:   tbl.GetID(),
 			TriggerID: t.ID,
-			WhenExpr:  t.WhenExpr,
+			WhenExpr:  string(t.WhenExpr),
 		})
 	}
 	w.ev(scpb.Status_PUBLIC, &scpb.TriggerFunctionCall{
 		TableID:   tbl.GetID(),
 		TriggerID: t.ID,
 		FuncID:    t.FuncID,
-		FuncBody:  t.FuncBody,
+		FuncBody:  string(t.FuncBody),
 		FuncArgs:  t.FuncArgs,
 	})
 	w.ev(scpb.Status_PUBLIC, &scpb.TriggerDeps{
@@ -958,6 +1019,14 @@ func (w *walkCtx) buildTriggerRelationDependencies(
 		err = toDesc.ForeachDependedOnBy(func(dep *descpb.TableDescriptor_Reference) error {
 			if dep.ID != tbl.GetID() {
 				return nil
+			}
+			// Only include backreferences for this specific trigger. Legacy backrefs
+			// created before V26_2_TriggerBackrefRepair have TriggerID=0, so we treat
+			// them as matching any trigger until the upgrade repairs them.
+			if dep.TriggerID != t.ID {
+				if w.clusterVersion.IsActive(clusterversion.V26_2_TriggerBackrefRepair) || dep.TriggerID != 0 {
+					return nil
+				}
 			}
 			usesRelations = append(usesRelations, scpb.TriggerDeps_RelationReference{
 				ID:        id,
@@ -1088,7 +1157,7 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 			Type:  *typeT,
 		}
 		if param.DefaultExpr != nil {
-			expr, err := w.newExpression(*param.DefaultExpr)
+			expr, err := w.newExpression(catpb.Expression(*param.DefaultExpr))
 			if err != nil {
 				panic(err)
 			}
@@ -1121,10 +1190,24 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 		FunctionID: fnDesc.GetID(),
 		Security:   catpb.FunctionSecurity{Security: fnDesc.GetSecurity()},
 	})
+	if w.clusterVersion.IsActive(clusterversion.V26_2) {
+		w.ev(scpb.Status_PUBLIC, &scpb.FunctionParams{
+			FunctionID: fnDesc.GetID(),
+			Params:     fn.Params,
+		})
+	}
+	if w.clusterVersion.IsActive(clusterversion.V26_3) {
+		if comment, ok := w.commentReader.GetFunctionComment(fnDesc.GetID()); ok {
+			w.ev(scpb.Status_PUBLIC, &scpb.FunctionComment{
+				FunctionID: fnDesc.GetID(),
+				Comment:    comment,
+			})
+		}
+	}
 
 	fnBody := &scpb.FunctionBody{
 		FunctionID:  fnDesc.GetID(),
-		Body:        fnDesc.GetFunctionBody(),
+		Body:        string(fnDesc.GetFunctionBody()),
 		Lang:        catpb.FunctionLanguage{Lang: fnDesc.GetLanguage()},
 		UsesTypeIDs: fnDesc.GetDependsOnTypes(),
 	}

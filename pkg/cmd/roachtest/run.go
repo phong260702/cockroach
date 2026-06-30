@@ -18,11 +18,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
-	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV1"
 	"github.com/cockroachdb/cockroach/pkg/cmd/bazci/githubpost/issues"
+	roachtestdd "github.com/cockroachdb/cockroach/pkg/cmd/roachtest/datadog"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/dlq"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestflags"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
@@ -45,9 +47,9 @@ type ddEventType int
 
 const (
 	eventOpStarted ddEventType = iota
-	eventOpRan
-	eventOpFinishedCleanup
-	eventOpError
+	eventOpCompleted
+	eventCleanupCompleted
+	eventDepCheckFailed
 )
 
 // runTests is the main function for the run and bench commands.
@@ -88,7 +90,7 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 	defer stopper.Stop(context.Background())
 	runner := newTestRunner(cr, stopper)
 
-	clusterType := roachprodCluster
+	clusterType := roachprodClusterType
 	bindTo := ""
 	parallelism := roachtestflags.Parallelism
 	if roachtestflags.Cloud == spec.Local {
@@ -123,7 +125,7 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 	runnerDir := filepath.Join(artifactsDir, runnerLogsDir)
 	runnerLogPath := filepath.Join(
 		runnerDir, fmt.Sprintf("test_runner-%d.log", timeutil.Now().Unix()))
-	l, tee := testRunnerLogger(context.Background(), parallelism, runnerLogPath)
+	runnerL, tee := testRunnerLogger(context.Background(), parallelism, runnerLogPath)
 	roachprod.ClearClusterCache = roachtestflags.ClearClusterCache
 
 	if runtime.GOOS == "darwin" {
@@ -158,7 +160,7 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 	}
 
 	lopt := loggingOpt{
-		l:                   l,
+		runnerL:             runnerL,
 		tee:                 tee,
 		stdout:              os.Stdout,
 		stderr:              os.Stderr,
@@ -167,27 +169,20 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 		runnerLogPath:       runnerLogPath,
 	}
 
-	github := &githubIssues{
-		disable:     runner.config.disableIssue,
-		dryRun:      runner.config.dryRunIssuePosting,
-		issuePoster: issues.Post,
-		teamLoader:  team.DefaultLoadTeams,
-	}
-
-	l.Printf("global random seed: %d", globalSeed)
+	runnerL.Printf("global random seed: %d", globalSeed)
 	go func() {
 		if err := http.ListenAndServe(
 			fmt.Sprintf(":%d", roachtestflags.PromPort),
 			promhttp.HandlerFor(r.promRegistry, promhttp.HandlerOpts{}),
 		); err != nil {
-			l.Errorf("error serving prometheus: %v", err)
+			runnerL.Errorf("error serving prometheus: %v", err)
 		}
 	}()
 	// We're going to run all the workers (and thus all the tests) in a context
 	// that gets canceled when the Interrupt signal is received.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	CtrlC(ctx, l, cancel, cr)
+	CtrlC(ctx, runnerL, cancel, cr)
 	if false {
 		// Install goroutine leak checker and run it at the end of the entire test
 		// run. If a test is leaking a goroutine, then it will likely be still around.
@@ -200,7 +195,7 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 		// output pollutes stdout and makes roachtest annoying to use.
 		//
 		// Tracking issue: https://github.com/cockroachdb/cockroach/issues/148196
-		defer leaktest.AfterTest(l)()
+		defer leaktest.AfterTest(runnerL)()
 	}
 
 	// We allow roachprod users to set a default auth-mode through the
@@ -209,6 +204,26 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 	// is being used.
 	if err = os.Unsetenv(install.DefaultAuthModeEnv); err != nil {
 		return err
+	}
+
+	// Wire up GitHub issue posting. If a DLQ bucket is configured, wrap the
+	// poster so failed posts (e.g. during a GitHub outage) are persisted to
+	// GCS for later replay. See pkg/cmd/roachtest/dlq.
+	var issuePoster dlq.PostFunc = issues.Post
+	if bucket := os.Getenv("GITHUB_DLQ_BUCKET"); bucket != "" {
+		wrapped, err := dlq.WrapIssuePoster(ctx, runnerL, bucket, issuePoster)
+		if err != nil {
+			runnerL.Printf("warning: GitHub DLQ writer init failed, DLQ disabled: %v", err)
+		} else {
+			issuePoster = wrapped
+			runnerL.Printf("GitHub DLQ enabled: bucket=%s", bucket)
+		}
+	}
+	github := &githubIssues{
+		disable:     runner.config.disableIssue,
+		dryRun:      runner.config.dryRunIssuePosting,
+		issuePoster: issuePoster,
+		teamLoader:  team.DefaultLoadTeams,
 	}
 
 	err = runner.Run(
@@ -226,14 +241,23 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 	// ctx above might be canceled in case a signal was received. If that's
 	// the case, we're running under a 5s timeout until the CtrlC() goroutine
 	// kills the process.
-	l.PrintfCtx(ctx, "runTests destroying all clusters")
-	cr.destroyAllClusters(context.Background(), l)
+	runnerL.PrintfCtx(ctx, "runTests destroying all unsaved clusters")
+	cr.destroyAllClusters(context.Background(), runnerL)
 
 	if roachtestflags.TeamCity {
 		// Collect the runner logs.
 		fmt.Printf("##teamcity[publishArtifacts '%s' => '%s']\n", filepath.Join(literalArtifactsDir, runnerLogsDir), runnerLogsDir)
 	}
-	runner.writeTestReports(ctx, l, artifactsDir)
+	runner.writeTestReports(ctx, runnerL, artifactsDir)
+
+	// Upload runner-level logs to Datadog (best effort).
+	if roachtestdd.ShouldUploadRunnerLogsToDatadog() {
+		m := roachtestdd.NewRunnerLogMetadata(runnerL, roachtestflags.Cloud)
+		runnerDir := filepath.Join(artifactsDir, runnerLogsDir)
+		if uploadErr := roachtestdd.MaybeUploadRunnerLogs(ctx, runnerL, runnerDir, m); uploadErr != nil {
+			runnerL.Printf("error uploading runner logs to Datadog: %v", uploadErr)
+		}
+	}
 
 	return err
 }
@@ -344,7 +368,7 @@ func initRunFlagsBinariesAndLibraries(cmd *cobra.Command) error {
 func CtrlC(ctx context.Context, l *logger.Logger, cancel func(), cr *clusterRegistry) {
 	// Shut down test clusters when interrupted (for example CTRL-C).
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	go func() {
 		select {
 		case <-sig:
@@ -355,12 +379,18 @@ func CtrlC(ctx context.Context, l *logger.Logger, cancel func(), cr *clusterRegi
 			"Signaled received. Canceling workers and waiting up to 5s for them.")
 		// Signal runner.Run() to stop.
 		cancel()
-		<-time.After(5 * time.Second)
 		if cr == nil {
-			shout(ctx, l, os.Stderr, "5s elapsed. No clusters registered; nothing to destroy.")
+			// Operation mode: no clusters to destroy, but operations may need
+			// time to run cleanup (e.g., DROP INDEX, restore license). Wait up
+			// to 2 minutes for workers to finish before force-exiting.
+			shout(ctx, l, os.Stderr,
+				"Signal received in operation mode. Waiting up to 2m for cleanup to finish.")
+			<-time.After(2 * time.Minute)
+			shout(ctx, l, os.Stderr, "2m elapsed. Force exiting.")
 			l.Printf("all stacks:\n\n%s\n", allstacks.Get())
 			os.Exit(2)
 		}
+		<-time.After(5 * time.Second)
 		shout(ctx, l, os.Stderr, "5s elapsed. Will brutally destroy all clusters.")
 		// Make sure there are no leftover clusters.
 		destroyCh := make(chan struct{})
@@ -425,61 +455,6 @@ func redirectCRDBLogger(ctx context.Context, path string) *logger.Logger {
 	}
 	shout(ctx, l, os.Stdout, "fallback runner logs in: %s", path)
 	return l
-}
-
-// maybeEmitDatadogEvent sends an event to Datadog if the passed in ctx has the
-// necessary values to communicate with Datadog.
-func maybeEmitDatadogEvent(
-	ctx context.Context,
-	datadogEventsAPI *datadogV1.EventsApi,
-	opSpec *registry.OperationSpec,
-	clusterName string,
-	eventType ddEventType,
-	operationID uint64,
-	datadogTags []string,
-) {
-	// The passed in context is not configured to communicate with Datadog.
-	_, hasAPIKeys := ctx.Value(datadog.ContextAPIKeys).(map[string]datadog.APIKey)
-	_, hasServerVariables := ctx.Value(datadog.ContextServerVariables).(map[string]string)
-	if !hasAPIKeys || !hasServerVariables {
-		return
-	}
-
-	status := "started"
-	alertType := datadogV1.EVENTALERTTYPE_INFO
-
-	switch eventType {
-	case eventOpStarted:
-		status = "started"
-		alertType = datadogV1.EVENTALERTTYPE_INFO
-	case eventOpRan:
-		status = "finished running; waiting for cleanup"
-		alertType = datadogV1.EVENTALERTTYPE_SUCCESS
-	case eventOpFinishedCleanup:
-		status = "cleaned up its state"
-		alertType = datadogV1.EVENTALERTTYPE_INFO
-	case eventOpError:
-		status = "ran with an error"
-		alertType = datadogV1.EVENTALERTTYPE_ERROR
-	}
-
-	title := fmt.Sprintf("op %s %s", opSpec.Name, status)
-	hostname, _ := os.Hostname()
-
-	// We're within a best effort function so we ignore return values.
-	_, _, _ = datadogEventsAPI.CreateEvent(ctx, datadogV1.EventCreateRequest{
-		AggregationKey: datadog.PtrString(fmt.Sprintf("operation-%d", operationID)),
-		AlertType:      &alertType,
-		DateHappened:   datadog.PtrInt64(timeutil.Now().Unix()),
-		Host:           &hostname,
-		SourceTypeName: datadog.PtrString("roachtest"),
-		Tags: append(datadogTags,
-			fmt.Sprintf("operation-name:%s", opSpec.Name),
-			fmt.Sprintf("operation-status:%s", status),
-		),
-		Text:  fmt.Sprintf("cluster: %s\n", clusterName),
-		Title: title,
-	})
 }
 
 // newDatadogContext adds values to the passed in ctx to configure it to

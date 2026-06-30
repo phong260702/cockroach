@@ -23,11 +23,11 @@ func TestMain(m *testing.M) {
 	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
-	serverutils.InitTestServerFactory(server.TestServerFactory)
+	// TODO(kev-cao): DRPC is currently flaky in backup tests; disable it
+	// package-wide while it is investigated. See #170394.
+	serverutils.InitTestServerFactory(server.TestServerFactory,
+		serverutils.WithDRPCOption(base.TestDRPCDisabled))
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
-	defer serverutils.TestingGlobalDRPCOption(
-		base.TestDRPCEnabledRandomly,
-	)()
 	os.Exit(m.Run())
 }
 

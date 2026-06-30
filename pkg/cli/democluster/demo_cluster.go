@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
@@ -95,6 +96,9 @@ type transientCluster struct {
 	// latencyEnabled controls whether simulated latency is currently enabled.
 	// It is only relevant when using SimulateLatency.
 	latencyEnabled atomic.Bool
+
+	// cleanupFns holds cleanup functions to call on Close.
+	cleanupFns []func()
 }
 
 // maxNodeInitTime is the maximum amount of time to wait for nodes to
@@ -208,6 +212,16 @@ func NewDemoCluster(
 	}
 
 	c.stickyVFSRegistry = fs.NewStickyRegistry()
+
+	// Enable nodelocal early boot access for features like online restore's
+	// LinkExternalSSTable. The root is the demo's nodelocal directory so that
+	// files written via nodelocal:// URIs can be accessed by Pebble.
+	nodelocalDir := filepath.Join(c.demoDir, "nodelocal")
+	if err := os.MkdirAll(nodelocalDir, 0755); err != nil {
+		return c, err
+	}
+	c.cleanupFns = append(c.cleanupFns, nodelocal.EnableEarlyBootForDemo(nodelocalDir))
+
 	return c, nil
 }
 
@@ -930,6 +944,7 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 		CacheSize:               demoCtx.CacheSize,
 		NoAutoInitializeCluster: true,
 		EnableDemoLoginEndpoint: true,
+		DefaultDRPCOption:       demoCtx.defaultDRPCOption(),
 		// Demo clusters by default will create their own tenants, so we
 		// don't need to create them here.
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
@@ -985,11 +1000,6 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 		args.SSLCertsDir = demoDir
 	}
 
-	// Allow access to system and crdb_internal tables in demo mode.
-	// Demo mode is for development/testing, so we want to allow access
-	// to these tables for debugging and introspection.
-	serverutils.SetUnsafeOverride(&args.Knobs)
-
 	return args
 }
 
@@ -1030,6 +1040,10 @@ func (c *transientCluster) Close(ctx context.Context) {
 			// There's nothing to do here anymore if err != nil.
 			_ = err
 		}
+	}
+	// Run any cleanup functions registered during setup.
+	for _, fn := range c.cleanupFns {
+		fn()
 	}
 }
 
@@ -1629,16 +1643,30 @@ func (c *transientCluster) GetSQLCredentials() (
 	return c.adminUser, c.adminPassword, c.demoDir
 }
 
+// internalDBConn opens a SQL connection to the given server using an internal
+// application name. This allows the connection to access system tables and
+// crdb_internal without setting the allow_unsafe_internals session variable.
+func (c *transientCluster) internalDBConn(
+	ctx context.Context, target serverSelection,
+) (*gosql.DB, error) {
+	u, err := c.getNetworkURLForServer(ctx, 0, false /* includeAppName */, target)
+	if err != nil {
+		return nil, err
+	}
+	if err := u.SetOption(
+		"application_name", catconstants.InternalAppNamePrefix+" cockroach demo",
+	); err != nil {
+		return nil, err
+	}
+	return gosql.Open("postgres", u.ToPQ().String())
+}
+
 func (c *transientCluster) maybeEnableMultiTenantMultiRegion(ctx context.Context) error {
 	if !c.demoCtx.Multitenant {
 		return nil
 	}
 
-	storageURL, err := c.getNetworkURLForServer(ctx, 0, false /* includeAppName */, forSystemTenant)
-	if err != nil {
-		return err
-	}
-	db, err := gosql.Open("postgres", storageURL.ToPQ().String())
+	db, err := c.internalDBConn(ctx, forSystemTenant)
 	if err != nil {
 		return err
 	}
@@ -1655,11 +1683,7 @@ func (c *transientCluster) maybeEnableMultiTenantMultiRegion(ctx context.Context
 func (c *transientCluster) SetClusterSetting(
 	ctx context.Context, setting string, value interface{},
 ) error {
-	storageURL, err := c.getNetworkURLForServer(ctx, 0, false /* includeAppName */, forSystemTenant)
-	if err != nil {
-		return err
-	}
-	db, err := gosql.Open("postgres", storageURL.ToPQ().String())
+	db, err := c.internalDBConn(ctx, forSystemTenant)
 	if err != nil {
 		return err
 	}
@@ -1669,7 +1693,9 @@ func (c *transientCluster) SetClusterSetting(
 		return err
 	}
 	if c.demoCtx.Multitenant {
-		_, err = db.Exec(fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING %s = '%v'", setting, value))
+		_, err = db.Exec(fmt.Sprintf(
+			"ALTER TENANT ALL SET CLUSTER SETTING %s = '%v'", setting, value,
+		))
 	}
 	return err
 }
@@ -1683,7 +1709,13 @@ func (c *transientCluster) SetupWorkload(ctx context.Context) error {
 	// fixture.
 	gen := c.demoCtx.WorkloadGenerator
 	if gen != nil {
-		db, err := gosql.Open("postgres", c.connURL)
+		// Use an internal connection for workload setup because the
+		// workload initialization code may access crdb_internal tables.
+		targetServer := forSystemTenant
+		if c.demoCtx.Multitenant {
+			targetServer = forSecondaryTenant
+		}
+		db, err := c.internalDBConn(ctx, targetServer)
 		if err != nil {
 			return err
 		}
@@ -1707,13 +1739,13 @@ func (c *transientCluster) SetupWorkload(ctx context.Context) error {
 				fmt.Println("#\n# Partitioning the demo database, please wait...")
 			}
 
-			db, err := gosql.Open("postgres", c.connURL)
+			pdb, err := c.internalDBConn(ctx, targetServer)
 			if err != nil {
 				return err
 			}
-			defer db.Close()
+			defer pdb.Close()
 			// Based on validation done in setup, we know that this workload has a partitioning step.
-			if err := gen.(workload.Hookser).Hooks().Partition(db); err != nil {
+			if err := gen.(workload.Hookser).Hooks().Partition(pdb); err != nil {
 				return errors.Wrapf(err, "partitioning the demo database")
 			}
 		}
@@ -1868,19 +1900,15 @@ func (c *transientCluster) runWorkload(
 	return nil
 }
 
-// EnableEnterprise enables enterprise features if available in this build.
-func (c *transientCluster) EnableEnterprise(ctx context.Context) (func(), error) {
-	purl, err := c.getNetworkURLForServer(ctx, 0, true /* includeAppName */, forSystemTenant)
+// EnableEnterprise enables enterprise features for this demo.
+func (c *transientCluster) EnableEnterprise(ctx context.Context) error {
+	db, err := c.internalDBConn(ctx, forSystemTenant)
 	if err != nil {
-		return nil, err
-	}
-	connURL := purl.ToPQ().String()
-	db, err := gosql.Open("postgres", connURL)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	defer db.Close()
-	return EnableEnterprise(db, demoOrg)
+	_, err = db.Exec(`SET CLUSTER SETTING cluster.organization = $1`, demoOrg)
+	return err
 }
 
 // sockForServer generates the metadata for a unix socket for the given node.

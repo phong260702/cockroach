@@ -613,6 +613,90 @@ WHERE
 user1         user1
 user1_schema  user1
 
+# Non-admins must be a member of the role specified in AUTHORIZATION.
+subtest authorization_membership_check
+
+user root
+
+statement ok
+CREATE ROLE auth_check_role;
+
+statement ok
+CREATE DATABASE auth_check_db;
+
+statement ok
+GRANT CREATE ON DATABASE auth_check_db TO testuser;
+
+user testuser
+
+statement ok
+USE auth_check_db
+
+statement error pq: role/user "auth_check_role2" does not exist
+CREATE SCHEMA AUTHORIZATION auth_check_role2
+
+statement error pq: must be member of role "auth_check_role"
+CREATE SCHEMA AUTHORIZATION auth_check_role
+
+statement error pq: must be member of role "auth_check_role"
+CREATE SCHEMA s_auth AUTHORIZATION auth_check_role
+
+# After granting auth_check_role to testuser, the CREATE SCHEMA should succeed.
+user root
+
+statement ok
+GRANT auth_check_role TO testuser
+
+user testuser
+
+statement ok
+USE auth_check_db
+
+statement ok
+CREATE SCHEMA AUTHORIZATION auth_check_role
+
+statement ok
+CREATE SCHEMA s_auth AUTHORIZATION auth_check_role
+
+# A user can always create a schema with authorization as themselves.
+statement ok
+CREATE SCHEMA s_testuser AUTHORIZATION testuser
+
+user root
+
+# Admin role must bypass role membership.
+statement ok
+CREATE USER db_admin_role;
+GRANT CREATE ON DATABASE auth_check_db TO db_admin_role;
+
+statement ok
+SET ROLE db_admin_role;
+USE auth_check_db
+
+statement error pq: must be member of role "auth_check_role"
+CREATE SCHEMA s_admin AUTHORIZATION auth_check_role
+
+statement ok
+RESET ROLE;
+REVOKE CREATE ON DATABASE auth_check_db FROM db_admin_role;
+GRANT ADMIN TO db_admin_role;
+SET ROLE db_admin_role
+
+statement ok
+CREATE SCHEMA s_admin AUTHORIZATION auth_check_role
+
+statement ok
+CREATE SCHEMA s_admin_root AUTHORIZATION root
+
+statement ok
+RESET ROLE;
+DROP USER db_admin_role
+
+statement ok
+USE defaultdb
+
+subtest end
+
 # Ensure that we need CREATE on a database to create a schema.
 statement ok
 CREATE DATABASE perms
@@ -1558,5 +1642,55 @@ CREATE TRIGGER trigger_w4_521 BEFORE UPDATE OR DELETE ON drop_schema_with_trigge
 skipif config local-legacy-schema-changer
 statement ok
 DROP SCHEMA drop_schema_with_triggers CASCADE;
+
+subtest end
+
+subtest concurrent_schema_drop
+
+statement ok
+CREATE SCHEMA concurrent_drop_sc;
+
+statement ok
+CREATE TABLE concurrent_drop_sc.t1 (id INT PRIMARY KEY);
+
+statement ok
+CREATE TABLE public.fk_ref_to_concurrent_t1 (
+    id INT PRIMARY KEY,
+    fk INT REFERENCES concurrent_drop_sc.t1(id)
+);
+
+statement ok
+CREATE OR REPLACE FUNCTION concurrent_rename_fn (a INT) RETURNS INT AS 'SELECT a*a' LANGUAGE SQL;
+
+statement ok
+SET CLUSTER SETTING jobs.debug.pausepoints = 'newschemachanger.before.exec';
+
+skipif config local-legacy-schema-changer
+statement error pq: job \d+ was paused before it completed with reason: pause point
+DROP SCHEMA concurrent_drop_sc CASCADE;
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+statement ok
+set autocommit_before_ddl=false;
+
+# Confirm we hit a retry error if attempt to us the schema.
+skipif config local-legacy-schema-changer
+statement error restart transaction: descriptor \d+ is undergoing another schema change
+ALTER FUNCTION concurrent_rename_fn SET SCHEMA concurrent_drop_sc;
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET autocommit_before_ddl;
+
+statement ok
+RESET CLUSTER SETTING jobs.debug.pausepoints;
+
+statement ok
+RESUME JOBS (SELECT job_id FROM crdb_internal.jobs WHERE status = 'paused');
+
 
 subtest end

@@ -9,14 +9,12 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"regexp"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/sqlwriter"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -35,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -43,12 +40,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/rangescanstats/rangescanstatspb"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -131,7 +130,7 @@ type logicalReplicationWriterProcessor struct {
 
 	checkpointCh chan []jobspb.ResolvedSpan
 
-	rangeStatsCh chan *streampb.StreamEvent_RangeStats
+	rangeStatsCh chan *rangescanstatspb.RangeStats
 
 	agg      *tracing.TracingAggregator
 	aggTimer timeutil.Timer
@@ -223,7 +222,7 @@ func newLogicalReplicationWriterProcessor(
 		frontier:       frontier,
 		stopCh:         make(chan struct{}),
 		checkpointCh:   make(chan []jobspb.ResolvedSpan),
-		rangeStatsCh:   make(chan *streampb.StreamEvent_RangeStats),
+		rangeStatsCh:   make(chan *rangescanstatspb.RangeStats),
 		errCh:          make(chan error, 1),
 		logBufferEvery: log.Every(30 * time.Second),
 		debug: streampb.DebugLogicalConsumerStatus{
@@ -407,7 +406,7 @@ func (lrw *logicalReplicationWriterProcessor) Next() (
 
 	case stats := <-lrw.rangeStatsCh:
 		meta, err := replicationutils.StreamRangeStatsToProgressMeta(
-			lrw.FlowCtx, lrw.ProcessorID, stats,
+			lrw.Ctx(), lrw.FlowCtx, lrw.ProcessorID, stats,
 		)
 		if err != nil {
 			lrw.MoveToDrainingAndLogError(err)
@@ -576,7 +575,7 @@ func (lrw *logicalReplicationWriterProcessor) maybeCheckpoint(
 }
 
 func (lrw *logicalReplicationWriterProcessor) rangeStats(
-	ctx context.Context, stats *streampb.StreamEvent_RangeStats,
+	ctx context.Context, stats *rangescanstatspb.RangeStats,
 ) error {
 	select {
 	case <-ctx.Done():
@@ -643,6 +642,11 @@ func (lrw *logicalReplicationWriterProcessor) handleStreamBuffer(
 	ctx context.Context, kvs []streampb.StreamEvent_KV,
 ) error {
 	const notRetry = false
+
+	if err := lrw.setupBatchHandlers(ctx); err != nil {
+		return err
+	}
+
 	unapplied, unappliedBytes, err := lrw.flushBuffer(ctx, kvs, notRetry, lrw.purgatory.Enabled())
 	if err != nil {
 		return err
@@ -672,10 +676,6 @@ func filterRemaining(kvs []streampb.StreamEvent_KV) []streampb.StreamEvent_KV {
 }
 
 func (lrw *logicalReplicationWriterProcessor) setupBatchHandlers(ctx context.Context) error {
-	if lrw.FlowCtx == nil {
-		return nil
-	}
-
 	poolSize := writerWorkers.Get(&lrw.FlowCtx.Cfg.Settings.SV)
 
 	if len(lrw.bh) >= int(poolSize) {
@@ -687,16 +687,6 @@ func (lrw *logicalReplicationWriterProcessor) setupBatchHandlers(ctx context.Con
 	}
 
 	writer := sqlclustersettings.LDRWriterType(lrw.spec.WriterType)
-	if writer == "" && !lrw.FlowCtx.Cfg.Settings.Version.IsActive(ctx, clusterversion.V25_2) {
-		var err error
-		writer, err = getWriterType(
-			ctx, lrw.spec.Mode, lrw.FlowCtx.Cfg.Settings,
-		)
-		if err != nil {
-			return err
-		}
-	}
-
 	flowCtx := lrw.FlowCtx
 	lrw.bh = make([]BatchHandler, poolSize)
 	for i := range lrw.bh {
@@ -730,6 +720,11 @@ func (lrw *logicalReplicationWriterProcessor) setupBatchHandlers(ctx context.Con
 			if err != nil {
 				return err
 			}
+		case sqlclustersettings.LDRWriterTypeTxn:
+			rp, err = newTxnBatchHandlerFromConfig(ctx, flowCtx, lrw.spec.Discard, lrw.configByTable)
+			if err != nil {
+				return err
+			}
 		default:
 			return errors.AssertionFailedf("unknown logical replication writer type: %s", lrw.spec.WriterType)
 		}
@@ -759,6 +754,10 @@ func getWriterType(
 			return sqlclustersettings.LDRWriterTypeSQL, nil
 		}
 		return sqlclustersettings.LDRWriterTypeCRUD, nil
+	case jobspb.LogicalReplicationDetails_Transactional:
+		// Transaction mode uses TxnLdrCoordinator instead of a writer processor,
+		// but we return a placeholder to avoid errors during job setup.
+		return "", nil
 	default:
 		return "", errors.Newf("unknown logical replication writer type: %s", mode)
 	}
@@ -780,10 +779,6 @@ func (lrw *logicalReplicationWriterProcessor) flushBuffer(
 
 	if len(kvs) == 0 {
 		return nil, 0, nil
-	}
-
-	if err := lrw.setupBatchHandlers(ctx); err != nil {
-		return kvs, int64(len(kvs)), err
 	}
 
 	preFlushTime := timeutil.Now()
@@ -848,10 +843,7 @@ func (lrw *logicalReplicationWriterProcessor) flushBuffer(
 	// if it takes longer to process some keys in a chunk, the other 3/4 can be
 	// stolen by other workers. That said, we don't want tiny chunks that are more
 	// channel overhead than work, nor giant chunks, so bound it by the settings.
-	minChunk, maxChunk := minChunkSize.Default(), maxChunkSize.Default()
-	if lrw.FlowCtx != nil {
-		minChunk, maxChunk = minChunkSize.Get(&lrw.FlowCtx.Cfg.Settings.SV), maxChunkSize.Get(&lrw.FlowCtx.Cfg.Settings.SV)
-	}
+	minChunk, maxChunk := minChunkSize.Get(&lrw.FlowCtx.Cfg.Settings.SV), maxChunkSize.Get(&lrw.FlowCtx.Cfg.Settings.SV)
 	chunkSize := min(max(len(kvs)/(len(lrw.bh)*4), int(minChunk)), int(maxChunk))
 
 	// Figure out how many workers we can utilize from the pool for the number of
@@ -866,11 +858,27 @@ func (lrw *logicalReplicationWriterProcessor) flushBuffer(
 	// rather than starting new ones for each flush.
 	chunks := make(chan []streampb.StreamEvent_KV)
 
+	// The LDR processor is running inside of a distsql flow and this
+	// goroutine will be executing SQL inside that flow. By default, the flow
+	// has a CPU handle that has `AtGateway: false`. This is an issue because
+	// the multi metric allocator assumes non-gateway sql cpu usage will
+	// follow the leaseholder when the leaseholder moves. LDR work is
+	// not collocated with leaseholders in the destination cluster.
+	handle := lrw.FlowCtx.Cfg.SQLCPUProvider.GetHandle(admission.WorkInfo{
+		TenantID:   lrw.FlowCtx.Codec().TenantID,
+		Priority:   admissionpb.LowPri,
+		CreateTime: timeutil.Now().UnixNano(),
+	}, false /*atGateway*/)
+	defer handle.Close()
+
+	ctx = admission.ContextWithSQLCPUHandle(ctx, handle)
 	g := ctxgroup.WithContext(ctx)
 	for worker := range lrw.bh[:requiredWorkers] {
 		w := worker
 		lrw.bhStats[w] = flushStats{}
 		g.GoCtx(func(ctx context.Context) error {
+			defer handle.RegisterGoroutine().Close(ctx)
+
 			for chunk := range chunks {
 				s, err := lrw.flushChunk(ctx, lrw.bh[w], chunk, canRetry)
 				if err != nil {
@@ -1006,18 +1014,16 @@ func (lrw *logicalReplicationWriterProcessor) flushChunk(
 		chunk = chunk[len(batch):]
 
 		// Make sure we're not ingesting events with origin TS in the future.
-		if lrw.FlowCtx != nil { // Some unit tests don't set this and that's fine.
-			hlcNow := lrw.FlowCtx.Cfg.DB.KV().Clock().Now()
-			logClock := true
-			for _, kv := range batch {
-				if ts := kv.KeyValue.Value.Timestamp; ts.After(hlcNow) {
-					if logClock || log.V(1) {
-						log.Dev.Warningf(ctx, "event timestamp %s is ahead of local clock %s; delaying batch...", ts, hlcNow)
-						logClock = false
-					}
-					if err := lrw.FlowCtx.Cfg.DB.KV().Clock().SleepUntil(ctx, ts); err != nil {
-						return flushStats{}, err
-					}
+		hlcNow := lrw.FlowCtx.Cfg.DB.KV().Clock().Now()
+		logClock := true
+		for _, kv := range batch {
+			if ts := kv.KeyValue.Value.Timestamp; ts.After(hlcNow) {
+				if logClock || log.V(1) {
+					log.Dev.Warningf(ctx, "event timestamp %s is ahead of local clock %s; delaying batch...", ts, hlcNow)
+					logClock = false
+				}
+				if err := lrw.FlowCtx.Cfg.DB.KV().Clock().SleepUntil(ctx, ts); err != nil {
+					return flushStats{}, err
 				}
 			}
 		}
@@ -1120,7 +1126,7 @@ func (lrw *logicalReplicationWriterProcessor) maybeDLQ(
 	applyErr error,
 	eligibility retryEligibility,
 ) error {
-	if err := canDlqError(applyErr); err != nil {
+	if err := sqlwriter.CanDLQError(applyErr); err != nil {
 		return errors.Wrapf(err, "dlq eligibility %s", eligibility)
 	}
 	if log.V(1) || logAllDLQs {
@@ -1143,42 +1149,6 @@ func (lrw *logicalReplicationWriterProcessor) maybeDLQ(
 		lrw.metrics.DLQedDueToErrType.Inc(1)
 	}
 	return lrw.dlqClient.Log(ctx, lrw.spec.JobID, event, row, applyErr, eligibility)
-}
-
-var internalPgErrors = func() *regexp.Regexp {
-	codePrefixes := []string{
-		// Section: Class 57 - Operator Intervention
-		"57",
-		// Section: Class 58 - System Error
-		"58",
-		// Section: Class 25 - Invalid Transaction State
-		"25",
-		// Section: Class 2D - Invalid Transaction Termination
-		"2D",
-		// Section: Class 40 - Transaction Rollback
-		"40",
-		// Section: Class XX - Internal Error
-		"XX",
-		// Section: Class 58C - System errors related to CockroachDB node problems.
-		"58C",
-	}
-	return regexp.MustCompile(fmt.Sprintf("^(%s)", strings.Join(codePrefixes, "|")))
-}()
-
-// canDlqError returns true if the error should send a row to the DLQ. We don't
-// want to DLQ rows that failed to apply because of some internal problem like
-// an unavailable range. The idea is it is better to fail the processor so the
-// job backs off until the system is healthy.
-func canDlqError(err error) error {
-	// If the error is not from the SQL layer, then we don't want to DQL it.
-	if !pgerror.HasCandidateCode(err) {
-		return errors.Wrap(err, "can only DLQ errors with pg codes")
-	}
-	code := pgerror.GetPGCode(err)
-	if internalPgErrors.MatchString(code.String()) {
-		return errors.Wrap(err, "unable to DLQ pgcode that indicates an internal or retryable error")
-	}
-	return nil
 }
 
 type batchStats struct {

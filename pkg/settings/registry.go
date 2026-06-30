@@ -284,6 +284,11 @@ var retiredSettings = map[InternalKey]struct{}{
 	"bulkio.import.write_import_epoch.enabled":                 {},
 	"physical_replication.consumer.stream_compression.enabled": {},
 	"kvadmission.export_request_elastic_control.enabled":       {},
+	"changefeed.shutdown_checkpoint.enabled":                   {},
+	"changefeed.aggregator.heartbeat":                          {},
+
+	// removed as of 26.3
+	"log.channel_compatibility_mode.enabled": {},
 }
 
 // grandfatheredDefaultSettings is the list of "grandfathered" existing sql.defaults

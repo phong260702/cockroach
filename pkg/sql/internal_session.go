@@ -8,6 +8,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -113,6 +114,20 @@ func (c *ConnectionStateMachine) Push(ctx context.Context, cmd Command) error {
 	return c.buffer.Push(ctx, cmd)
 }
 
+// Txn returns the current KV transaction if the session is in an open
+// transaction, along with true. Returns (nil, false) if the session is not in
+// a transaction.
+//
+// This method must only be called from the session's main goroutine. No lock
+// is needed because that goroutine is the only writer of mu.txn; the mutex
+// exists for readers on other goroutines (e.g. SHOW SESSIONS).
+func (c *ConnectionStateMachine) Txn() (*kv.Txn, bool) {
+	if _, ok := c.executor.machine.CurState().(stateOpen); !ok {
+		return nil, false
+	}
+	return c.executor.state.mu.txn, true
+}
+
 // SessionDataMutatorIterator returns the session data mutator iterator for this connection.
 func (c *ConnectionStateMachine) SessionDataMutatorIterator() *sessionmutator.SessionDataMutatorIterator {
 	return c.config.sdMutIterator
@@ -150,5 +165,12 @@ func (s *Server) NewInternalSession(
 	csm.config.sd = sd
 	csm.config.appStats = s.localSqlStats.GetApplicationStats(sessionName)
 
-	return ISessionFactoryHook(ctx, csm)
+	session, err := ISessionFactoryHook(ctx, csm)
+	if err != nil {
+		return nil, err
+	}
+	if w := s.cfg.TestingKnobs.SessionWrapper; w != nil {
+		session = w(session)
+	}
+	return session, nil
 }

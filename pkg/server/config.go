@@ -88,8 +88,6 @@ const (
 	minimumNetworkFileDescriptors     = 256
 	recommendedNetworkFileDescriptors = 5000
 
-	defaultSQLTableStatCacheSize = 256
-
 	// This comes out to 1024 cache entries.
 	defaultSQLQueryCacheSize = 8 * 1024 * 1024
 )
@@ -516,10 +514,6 @@ type SQLConfig struct {
 	// used by SQL clients to store row data in server RAM.
 	MemoryPoolSize int64
 
-	// TableStatCacheSize is the size (number of tables) of the table
-	// statistics cache.
-	TableStatCacheSize int
-
 	// QueryCacheSize is the memory size (in bytes) of the query plan cache.
 	QueryCacheSize int64
 
@@ -586,7 +580,6 @@ func (sqlCfg *SQLConfig) SetDefaults(tempStorageCfg base.TempStorageConfig) {
 	tenName := sqlCfg.TenantName
 	*sqlCfg = SQLConfig{TenantID: tenID, TenantName: tenName}
 	sqlCfg.MemoryPoolSize = defaultSQLMemoryPoolSize
-	sqlCfg.TableStatCacheSize = defaultSQLTableStatCacheSize
 	sqlCfg.QueryCacheSize = defaultSQLQueryCacheSize
 	sqlCfg.TempStorageConfig = tempStorageCfg
 	sqlCfg.LicenseEnforcer = license.NewEnforcer(nil)
@@ -805,6 +798,8 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 
+		// TODO(sep-raft-log): store Attributes only in the LogEngine or the
+		// overarching kvstorage.Engines.
 		storageConfigOpts := []storage.ConfigOption{
 			walFailoverConfig,
 			storage.Attributes(roachpb.Attributes{Attrs: spec.Attributes}),

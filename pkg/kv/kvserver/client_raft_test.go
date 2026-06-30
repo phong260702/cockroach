@@ -73,6 +73,8 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"storj.io/drpc"
+	"storj.io/drpc/drpcclient"
 )
 
 // mustGetInt decodes an int64 value from the bytes field of the receiver
@@ -2623,7 +2625,7 @@ func TestQuotaPool(t *testing.T) {
 		if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 			t.Fatal(err)
 		}
-		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
+		if _, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -2645,7 +2647,7 @@ func TestQuotaPool(t *testing.T) {
 				ch <- kvpb.NewError(err)
 				return
 			}
-			_, pErr := leaderRepl.Send(ctx, ba)
+			_, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba)
 			ch <- pErr
 		}()
 	}()
@@ -2780,7 +2782,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 		if err := ba.SetActiveTimestamp(leaderClock); err != nil {
 			t.Fatal(err)
 		}
-		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
+		if _, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -2803,7 +2805,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 
 			// Send another request to the leader replica. followerRepl is locked
 			// so it will not respond.
-			if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
+			if _, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba); pErr != nil {
 				t.Fatal(pErr)
 			}
 
@@ -2867,10 +2869,6 @@ func TestReportUnreachableHeartbeats(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
-			ServerArgs: base.TestServerArgs{
-				// TODO(server): enabled DRPC once serverutils adds support for DRPC.
-				DefaultDRPCOption: base.TestDRPCDisabled,
-			},
 			ReplicationMode: base.ReplicationManual,
 		})
 	defer tc.Stopper().Stop(ctx)
@@ -2932,10 +2930,6 @@ func TestReportUnreachableRemoveRace(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
-			ServerArgs: base.TestServerArgs{
-				// TODO(server): enabled DRPC once serverutils adds support for DRPC.
-				DefaultDRPCOption: base.TestDRPCDisabled,
-			},
 			ReplicationMode: base.ReplicationManual,
 		})
 	defer tc.Stopper().Stop(ctx)
@@ -3105,7 +3099,7 @@ func TestReplicaRemovalCampaign(t *testing.T) {
 			replica2 := store0.LookupReplica(roachpb.RKey(key2))
 
 			rg2 := func(s *kvserver.Store) kv.Sender {
-				return kv.Wrap(s, func(ba *kvpb.BatchRequest) *kvpb.BatchRequest {
+				return kv.Wrap(kvserver.ToSenderForTesting(s), func(ba *kvpb.BatchRequest) *kvpb.BatchRequest {
 					if ba.RangeID == 0 {
 						ba.RangeID = replica2.RangeID
 					}
@@ -3264,12 +3258,10 @@ func TestRaftRemoveRace(t *testing.T) {
 		tc.RemoveVotersOrFatal(t, key, tc.Target(2))
 		tc.AddVotersOrFatal(t, key, tc.Target(2))
 
-		replID, err := sl.LoadRaftReplicaID(ctx, s2.StateEngine())
+		// Verify the ReplicaMark does not indicate a destroyed replica. See #12130.
+		mark, err := sl.LoadReplicaMark(ctx, s2.StateEngine())
 		require.NoError(t, err)
-		ts, err := sl.LoadRangeTombstone(ctx, s2.StateEngine())
-		require.NoError(t, err)
-		// ReplicaID leads the RangeTombstone, which means a replica exists.
-		require.GreaterOrEqual(t, replID.ReplicaID, ts.NextReplicaID)
+		require.True(t, mark.Exists(), "replica must exist")
 	}
 }
 
@@ -4227,7 +4219,7 @@ func TestRemovedReplicaError(t *testing.T) {
 	// start seeing the RangeNotFoundError after a little bit of time has passed.
 	getArgs := getArgs(key)
 	testutils.SucceedsSoon(t, func() error {
-		_, pErr := kv.SendWrappedWith(ctx, store, kvpb.Header{}, getArgs)
+		_, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), kvpb.Header{}, getArgs)
 		switch pErr.GetDetail().(type) {
 		case *kvpb.AmbiguousResultError:
 			return pErr.GoError()
@@ -4283,7 +4275,7 @@ func TestTransferRaftLeadership(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, roachpb.VOTER_FULL, rd1.Type)
 
-			_, pErr := kv.SendWrappedWith(ctx, store0, kvpb.Header{RangeID: repl0.RangeID}, getArgs(key))
+			_, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store0), kvpb.Header{RangeID: repl0.RangeID}, getArgs(key))
 			require.NoError(t, pErr.GoError())
 
 			status := repl0.RaftStatus()
@@ -4294,7 +4286,7 @@ func TestTransferRaftLeadership(t *testing.T) {
 			// Transfer the lease. We'll then check that the leadership follows
 			// automatically.
 			transferLeaseArgs := adminTransferLeaseArgs(key, store1.StoreID())
-			_, pErr = kv.SendWrappedWith(ctx, store0, kvpb.Header{RangeID: repl0.RangeID}, transferLeaseArgs)
+			_, pErr = kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store0), kvpb.Header{RangeID: repl0.RangeID}, transferLeaseArgs)
 			require.NoError(t, pErr.GoError())
 
 			// Verify leadership is transferred.
@@ -5001,6 +4993,38 @@ func (cs *disablingClientStream) SendMsg(m interface{}) error {
 	return cs.ClientStream.SendMsg(m)
 }
 
+// disablingDRPCClientStream is the DRPC equivalent of disablingClientStream.
+// It wraps a drpc.Stream and delays MsgSend calls when the disabled function
+// returns true, buffering messages and flushing them when re-enabled.
+type disablingDRPCClientStream struct {
+	drpc.Stream
+	wasDisabled bool
+	buffer      []struct {
+		msg drpc.Message
+		enc drpc.Encoding
+	}
+	disabled func() bool
+}
+
+func (cs *disablingDRPCClientStream) MsgSend(msg drpc.Message, enc drpc.Encoding) error {
+	if cs.disabled() {
+		cs.buffer = append(cs.buffer, struct {
+			msg drpc.Message
+			enc drpc.Encoding
+		}{msg, enc})
+		cs.wasDisabled = true
+		return nil
+	}
+	if cs.wasDisabled {
+		for _, buf := range cs.buffer {
+			_ = cs.Stream.MsgSend(buf.msg, buf.enc)
+		}
+		cs.buffer = nil
+		cs.wasDisabled = false
+	}
+	return cs.Stream.MsgSend(msg, enc)
+}
+
 // TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic tests that
 // disconnection on connections of the rpc.DefaultClass do not interfere with
 // traffic on the SystemClass connection.
@@ -5042,6 +5066,27 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 				}, nil
 			}
 		},
+		StreamClientInterceptorDRPC: func(target string, class rpcbase.ConnectionClass) drpcclient.StreamClientInterceptor {
+			disabledFunc := func() bool {
+				if class == rpcbase.SystemClass {
+					return disabledSystem.Load().(bool)
+				}
+				return disabled.Load().(bool)
+			}
+			return func(
+				ctx context.Context, rpc string, enc drpc.Encoding, cc *drpcclient.ClientConn,
+				streamer drpcclient.Streamer,
+			) (drpc.Stream, error) {
+				s, err := streamer(ctx, rpc, enc, cc)
+				if err != nil {
+					return nil, err
+				}
+				return &disablingDRPCClientStream{
+					disabled: disabledFunc,
+					Stream:   s,
+				}, nil
+			}
+		},
 	}
 
 	// This test relies on epoch leases being invalidated when a node restart,
@@ -5074,10 +5119,7 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 		base.TestClusterArgs{
 			ReplicationMode:     base.ReplicationManual,
 			ReusableListenerReg: lisReg,
-			ServerArgs: base.TestServerArgs{
-				DefaultDRPCOption: base.TestDRPCDisabled,
-			},
-			ServerArgsPerNode: stickyServerArgs,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 	// Make a key that's in the user data space.
@@ -6398,7 +6440,7 @@ func TestInvalidConfChangeRejection(t *testing.T) {
 		},
 	})
 
-	_, pErr := repl.Send(ctx, &ba)
+	_, pErr := kvserver.ToSenderForTesting(repl).Send(ctx, &ba)
 	// Verify that we see the configuration change below raft, where we rejected it
 	// (since it would've otherwise blow up the Replica: after all, we intentionally
 	// proposed an invalid configuration change.

@@ -6,12 +6,18 @@
 package security
 
 import (
-	"crypto/fips140"
 	"crypto/tls"
 	"crypto/x509"
 
 	"github.com/cockroachdb/errors"
 )
+
+// CurvePreferencesOverride when non-nil, overrides the TLS curve preferences
+// for all TLS configs created by this package. Tests can use
+// testutils.TestingHook(&security.CurvePreferencesOverride, ...) to control
+// curve negotiation.
+// currently this is only used for testing purpose.
+var CurvePreferencesOverride []tls.CurveID
 
 // newServerTLSConfig creates a server TLSConfig from the supplied byte strings containing
 // - the certificate of this node (should be signed by the CA),
@@ -129,11 +135,9 @@ func newBaseTLSConfig(settings TLSSettings, caPEM []byte) (*tls.Config, error) {
 		MinVersion: tls.VersionTLS12,
 	}
 
-	// If the binary is compiled in FIPS mode, Go will refuse to use the
-	// default X25519 curve. We switch to a FIPS-friendly curve in this
-	// mode.
-	if fips140.Enabled() {
-		baseCfg.CurvePreferences = []tls.CurveID{tls.CurveP256}
+	// Allow tests to override curve preferences.
+	if CurvePreferencesOverride != nil {
+		baseCfg.CurvePreferences = CurvePreferencesOverride
 	}
 
 	return baseCfg, nil

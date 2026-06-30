@@ -33,20 +33,27 @@ type mutationTest struct {
 	// SQLRunner embeds testing.TB
 	testing.TB
 	*sqlutils.SQLRunner
-	kvDB      *kv.DB
-	tableDesc *tabledesc.Mutable
-	codec     keys.SQLCodec
+	kvDB         *kv.DB
+	tableDesc    *tabledesc.Mutable
+	codec        keys.SQLCodec
+	leaseManager *lease.Manager
 }
 
 func makeMutationTest(
-	t *testing.T, kvDB *kv.DB, db *gosql.DB, codec keys.SQLCodec, tableDesc *tabledesc.Mutable,
+	t *testing.T,
+	s serverutils.TestServerInterface,
+	kvDB *kv.DB,
+	db *gosql.DB,
+	codec keys.SQLCodec,
+	tableDesc *tabledesc.Mutable,
 ) mutationTest {
 	return mutationTest{
-		TB:        t,
-		SQLRunner: sqlutils.MakeSQLRunner(db),
-		kvDB:      kvDB,
-		tableDesc: tableDesc,
-		codec:     codec,
+		TB:           t,
+		SQLRunner:    sqlutils.MakeSQLRunner(db),
+		kvDB:         kvDB,
+		tableDesc:    tableDesc,
+		codec:        codec,
+		leaseManager: s.LeaseManager().(*lease.Manager),
 	}
 }
 
@@ -89,6 +96,11 @@ func (mt mutationTest) makeMutationsActive(ctx context.Context) {
 		catalogkeys.MakeDescMetadataKey(mt.codec, mt.tableDesc.ID),
 		mt.tableDesc.DescriptorProto(),
 	); err != nil {
+		mt.Fatal(err)
+	}
+	// Force the lease manager to acquire a fresh descriptor from the store,
+	// since we wrote it directly via KV above.
+	if err := mt.leaseManager.AcquireFreshestFromStore(ctx, mt.tableDesc.GetID()); err != nil {
 		mt.Fatal(err)
 	}
 }
@@ -151,6 +163,11 @@ func (mt mutationTest) writeMutation(ctx context.Context, m descpb.DescriptorMut
 	); err != nil {
 		mt.Fatal(err)
 	}
+	// Force the lease manager to acquire a fresh descriptor from the store,
+	// since we wrote it directly via KV above.
+	if err := mt.leaseManager.AcquireFreshestFromStore(ctx, mt.tableDesc.GetID()); err != nil {
+		mt.Fatal(err)
+	}
 }
 
 // Test that UPSERT with a column mutation that has a default value with a
@@ -168,9 +185,6 @@ func TestUpsertWithColumnMutationAndNotNullDefault(t *testing.T) {
 	server, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.Background()
 	defer server.Stopper().Stop(ctx)
-	// The descriptor changes made must have an immediate effect
-	// so disable leases on tables.
-	defer lease.TestingDisableTableLeases()()
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -185,7 +199,7 @@ ALTER TABLE t.test ADD COLUMN i VARCHAR NOT NULL DEFAULT 'i';
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, server.Codec(), "t", "test")
 
-	mTest := makeMutationTest(t, kvDB, sqlDB, server.Codec(), tableDesc)
+	mTest := makeMutationTest(t, server, kvDB, sqlDB, server.Codec(), tableDesc)
 	// Add column "i" as a mutation in delete/write.
 	mTest.writeColumnMutation(ctx, "i", descpb.DescriptorMutation{State: descpb.DescriptorMutation_WRITE_ONLY})
 
@@ -229,10 +243,6 @@ func TestOperationsWithColumnMutation(t *testing.T) {
 	defer server.Stopper().Stop(ctx)
 	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
 
-	// The descriptor changes made must have an immediate effect
-	// so disable leases on tables.
-	defer lease.TestingDisableTableLeases()()
-
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
 	// Add an index so that we test adding a column when a table has an index.
@@ -244,7 +254,7 @@ func TestOperationsWithColumnMutation(t *testing.T) {
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, server.Codec(), "t", "test")
 
-	mTest := makeMutationTest(t, kvDB, sqlDB, server.Codec(), tableDesc)
+	mTest := makeMutationTest(t, server, kvDB, sqlDB, server.Codec(), tableDesc)
 
 	starQuery := `SELECT * FROM t.test`
 	for _, useUpsert := range []bool{true, false} {
@@ -494,8 +504,6 @@ func TestOperationsWithIndexMutation(t *testing.T) {
 	server, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer server.Stopper().Stop(context.Background())
 	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
-	// The descriptor changes made must have an immediate effect.
-	defer lease.TestingDisableTableLeases()()
 
 	sqlRunner.Exec(t, `CREATE DATABASE t;`)
 	sqlRunner.Exec(t, `CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v)) WITH (schema_locked=false);`)
@@ -504,7 +512,7 @@ func TestOperationsWithIndexMutation(t *testing.T) {
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, server.Codec(), "t", "test")
 
-	mTest := makeMutationTest(t, kvDB, sqlDB, server.Codec(), tableDesc)
+	mTest := makeMutationTest(t, server, kvDB, sqlDB, server.Codec(), tableDesc)
 
 	starQuery := `SELECT * FROM t.test`
 	indexQuery := `SELECT v FROM t.test@foo`
@@ -660,9 +668,6 @@ func TestOperationsWithColumnAndIndexMutation(t *testing.T) {
 	ctx := context.Background()
 	defer server.Stopper().Stop(ctx)
 	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
-	// The descriptor changes made must have an immediate effect
-	// so disable leases on tables.
-	defer lease.TestingDisableTableLeases()()
 
 	// Create a table with column i and an index on v and i. Fix the column
 	// families so the key counts below don't change if the family heuristics
@@ -676,7 +681,7 @@ func TestOperationsWithColumnAndIndexMutation(t *testing.T) {
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, server.Codec(), "t", "test")
 
-	mTest := makeMutationTest(t, kvDB, sqlDB, server.Codec(), tableDesc)
+	mTest := makeMutationTest(t, server, kvDB, sqlDB, server.Codec(), tableDesc)
 
 	starQuery := `SELECT * FROM t.test`
 	indexQuery := `SELECT i FROM t.test@foo`
@@ -872,7 +877,7 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Disable external processing of mutations.
-	var params base.TestServerArgs
+	params := base.TestServerArgs{}
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			SchemaChangeJobNoOp: func() bool {
@@ -883,9 +888,6 @@ func TestSchemaChangeCommandsWithPendingMutations(t *testing.T) {
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
 	ctx := context.Background()
 	defer server.Stopper().Stop(ctx)
-	// The descriptor changes made must have an immediate effect
-	// so disable leases on tables.
-	defer lease.TestingDisableTableLeases()()
 
 	if _, err := sqlDB.Exec(`
 SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';
@@ -905,7 +907,7 @@ CREATE TABLE t.test (a STRING PRIMARY KEY, b STRING, c STRING, INDEX foo (c));
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 		kvDB, server.Codec(), "t", "test")
 
-	mt := makeMutationTest(t, kvDB, sqlDB, server.Codec(), tableDesc)
+	mt := makeMutationTest(t, server, kvDB, sqlDB, server.Codec(), tableDesc)
 
 	// Test CREATE INDEX in the presence of mutations.
 

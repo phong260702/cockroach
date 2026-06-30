@@ -76,6 +76,8 @@ func (op Operation) Result() *Result {
 		return &o.Result
 	case *CrashNodeOperation:
 		return &o.Result
+	case *MvccGCOperation:
+		return &o.Result
 	default:
 		panic(errors.AssertionFailedf(`unknown operation: %T %v`, o, o))
 	}
@@ -257,6 +259,8 @@ func (op Operation) format(w *strings.Builder, fctx formatCtx) {
 	case *RestartNodeOperation:
 		o.format(w, fctx)
 	case *CrashNodeOperation:
+		o.format(w, fctx)
+	case *MvccGCOperation:
 		o.format(w, fctx)
 	default:
 		fmt.Fprintf(w, "%v", op.GetValue())
@@ -478,6 +482,8 @@ func (op ChangeSettingOperation) format(w *strings.Builder, fctx formatCtx) {
 	switch op.Type {
 	case ChangeSettingType_SetLeaseType:
 		fmt.Fprintf(w, `env.SetClusterSetting(ctx, %s, %s)`, op.Type, op.LeaseType)
+	case ChangeSettingType_ToggleVirtualIntentResolution:
+		fmt.Fprintf(w, `env.SetClusterSetting(ctx, %s, %v)`, op.Type, op.VirEnabled)
 	default:
 		panic(errors.AssertionFailedf(`unknown ChangeSettingType: %v`, op.Type))
 	}
@@ -541,6 +547,11 @@ func (op RestartNodeOperation) format(w *strings.Builder, fctx formatCtx) {
 
 func (op CrashNodeOperation) format(w *strings.Builder, fctx formatCtx) {
 	fmt.Fprintf(w, `env.ServerController.CrashNode(%d)`, int(op.NodeId))
+	op.Result.format(w)
+}
+
+func (op MvccGCOperation) format(w *strings.Builder, _ formatCtx) {
+	fmt.Fprintf(w, `env.MvccGCController.MvccGCRangeForKey(%s)`, fmtKey(op.Key))
 	op.Result.format(w)
 }
 

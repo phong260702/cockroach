@@ -30,7 +30,7 @@ func TestIndexForDisplay(t *testing.T) {
 	table := tree.Name("bar")
 	tableName := tree.MakeTableNameWithSchema(database, catconstants.PublicSchemaName, table)
 
-	compExpr := "a + b"
+	compExpr := catpb.Expression("a + b")
 	cols := []descpb.ColumnDescriptor{
 		// a INT
 		{
@@ -112,6 +112,14 @@ func TestIndexForDisplay(t *testing.T) {
 		ColumnNames:  []string{"a"},
 	}
 
+	// Hash Sharded INDEX baz (a) STORING (c)
+	shardedStoringIndex := shardedIndex
+	shardedStoringIndex.StoreColumnNames = []string{"c"}
+
+	// UNIQUE INDEX baz (a ASC, b DESC) WITH (skip_unique_checks=true)
+	skipUniqueChecksIndex := uniqueIndex
+	skipUniqueChecksIndex.SkipUniqueChecks = true
+
 	// VECTOR INDEX baz (a)
 	vectorIndex := baseIndex
 	vectorIndex.Type = idxtype.VECTOR
@@ -177,6 +185,22 @@ func TestIndexForDisplay(t *testing.T) {
 			pgExpected:  "CREATE UNIQUE INDEX baz ON foo.public.bar USING btree (a ASC, b DESC)",
 		},
 		{
+			index:       skipUniqueChecksIndex,
+			tableName:   descpb.AnonymousTable,
+			partition:   "",
+			displayMode: IndexDisplayDefOnly,
+			expected:    "UNIQUE INDEX baz (a ASC, b DESC) WITH (skip_unique_checks=true)",
+			pgExpected:  "UNIQUE INDEX baz USING btree (a ASC, b DESC) WITH (skip_unique_checks=true)",
+		},
+		{
+			index:       skipUniqueChecksIndex,
+			tableName:   tableName,
+			partition:   "",
+			displayMode: IndexDisplayShowCreate,
+			expected:    "CREATE UNIQUE INDEX baz ON foo.public.bar (a ASC, b DESC) WITH (skip_unique_checks=true)",
+			pgExpected:  "CREATE UNIQUE INDEX baz ON foo.public.bar USING btree (a ASC, b DESC) WITH (skip_unique_checks=true)",
+		},
+		{
 			index:       jsonbInvertedIndex,
 			tableName:   descpb.AnonymousTable,
 			partition:   "",
@@ -198,7 +222,7 @@ func TestIndexForDisplay(t *testing.T) {
 			partition:   "",
 			displayMode: IndexDisplayDefOnly,
 			expected:    "INDEX baz (a ASC, b DESC) STORING (c)",
-			pgExpected:  "INDEX baz USING btree (a ASC, b DESC) STORING (c)",
+			pgExpected:  "INDEX baz USING btree (a ASC, b DESC) INCLUDE (c)",
 		},
 		{
 			index:       storingIndex,
@@ -206,7 +230,7 @@ func TestIndexForDisplay(t *testing.T) {
 			partition:   "",
 			displayMode: IndexDisplayShowCreate,
 			expected:    "CREATE INDEX baz ON foo.public.bar (a ASC, b DESC) STORING (c)",
-			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING btree (a ASC, b DESC) STORING (c)",
+			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING btree (a ASC, b DESC) INCLUDE (c)",
 		},
 		{
 			index:       partialIndex,
@@ -271,6 +295,24 @@ func TestIndexForDisplay(t *testing.T) {
 			displayMode: IndexDisplayShowCreate,
 			expected:    "CREATE INDEX baz ON foo.public.bar (a DESC) USING HASH WITH (bucket_count=8)",
 			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING btree (a DESC) USING HASH WITH (bucket_count=8)",
+		},
+		// Regression test for #161516: STORING should appear before WITH (bucket_count=...)
+		// so the output is valid SQL.
+		{
+			index:       shardedStoringIndex,
+			tableName:   descpb.AnonymousTable,
+			partition:   "",
+			displayMode: IndexDisplayDefOnly,
+			expected:    "INDEX baz (a DESC) USING HASH STORING (c) WITH (bucket_count=8)",
+			pgExpected:  "INDEX baz USING btree (a DESC) USING HASH INCLUDE (c) WITH (bucket_count=8)",
+		},
+		{
+			index:       shardedStoringIndex,
+			tableName:   tableName,
+			partition:   "",
+			displayMode: IndexDisplayShowCreate,
+			expected:    "CREATE INDEX baz ON foo.public.bar (a DESC) USING HASH STORING (c) WITH (bucket_count=8)",
+			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING btree (a DESC) USING HASH INCLUDE (c) WITH (bucket_count=8)",
 		},
 		{
 			index:       vectorIndex,

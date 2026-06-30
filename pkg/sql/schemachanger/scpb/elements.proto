@@ -64,6 +64,7 @@ message ElementProto {
     AliasType alias_type = 7;
     CompositeType composite_type = 8;
     Function function = 9;
+    DomainType domain_type = 10;
 
     // Zero-level elements.
     // These elements do not own a corresponding descriptor in the catalog,
@@ -129,12 +130,12 @@ message ElementProto {
 
     // Constraint elements.
     ConstraintWithoutIndexName constraint_without_index_name = 51 [(gogoproto.moretags) = "parent:\"UniqueWithoutIndexConstraint, CheckConstraint, ForeignKeyConstraint\""];
-    ConstraintComment constraint_comment = 52 [(gogoproto.moretags) = "parent:\"PrimaryIndex, SecondaryIndex, UniqueWithoutIndexConstraint, CheckConstraint, ForeignKeyConstraint\""];
+    ConstraintComment constraint_comment = 52 [(gogoproto.moretags) = "parent:\"PrimaryIndex, SecondaryIndex, UniqueWithoutIndexConstraint, CheckConstraint, ForeignKeyConstraint, DomainCheckConstraint\""];
 
     // Common elements.
-    Namespace namespace = 60 [(gogoproto.moretags) = "parent:\"Table, View, Sequence, Database, Schema, AliasType, EnumType\""];
-    Owner owner = 61 [(gogoproto.moretags) = "parent:\"Table, View, Sequence, Database, Schema, AliasType, EnumType\""];
-    UserPrivileges user_privileges = 62 [(gogoproto.moretags) = "parent:\"Table, View, Sequence, Database, Schema, AliasType, EnumType\""];
+    Namespace namespace = 60 [(gogoproto.moretags) = "parent:\"Table, View, Sequence, Database, Schema, AliasType, EnumType, DomainType\""];
+    Owner owner = 61 [(gogoproto.moretags) = "parent:\"Table, View, Sequence, Database, Schema, AliasType, EnumType, DomainType\""];
+    UserPrivileges user_privileges = 62 [(gogoproto.moretags) = "parent:\"Table, View, Sequence, Database, Schema, AliasType, EnumType, DomainType\""];
 
     // Database elements.
     DatabaseRegionConfig database_region_config = 80 [(gogoproto.moretags) = "parent:\"Database\""];
@@ -148,7 +149,7 @@ message ElementProto {
     SchemaComment schema_comment = 91 [(gogoproto.moretags) = "parent:\"Schema\""];
 
     // SchemaChild elements.
-    SchemaChild schema_child = 100 [(gogoproto.moretags) = "parent:\"AliasType, EnumType, Table, View, Sequence\""];
+    SchemaChild schema_child = 100 [(gogoproto.moretags) = "parent:\"AliasType, EnumType, DomainType, Table, View, Sequence\""];
 
     // Enum type elements.
     EnumTypeValue enum_type_value = 120 [(gogoproto.moretags) = "parent:\"EnumType\""];
@@ -164,9 +165,18 @@ message ElementProto {
     FunctionNullInputBehavior function_null_input_behavior = 163 [(gogoproto.moretags) = "parent:\"Function\""];
     FunctionBody function_body = 164 [(gogoproto.moretags) = "parent:\"Function\""];
     FunctionSecurity function_security = 165 [(gogoproto.moretags) = "parent:\"Function\""];
+    FunctionParams function_params = 166 [(gogoproto.moretags) = "parent:\"Function\""];
+    FunctionComment function_comment = 167 [(gogoproto.moretags) = "parent:\"Function\""];
+
+    // Domain type elements.
+    DomainDefault domain_default = 250 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainNotNull domain_not_null = 251 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainCheckConstraint domain_check_constraint = 252 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainCheckConstraintUnvalidated domain_check_constraint_unvalidated = 253 [(gogoproto.moretags) = "parent:\"DomainType\""];
+    DomainConstraintName domain_constraint_name = 254 [(gogoproto.moretags) = "parent:\"DomainCheckConstraint, DomainCheckConstraintUnvalidated, DomainNotNull\""];
 
     // Type elements.
-    TypeComment type_comment = 180 [(gogoproto.moretags) = "parent:\"CompositeType,EnumType\""];
+    TypeComment type_comment = 180 [(gogoproto.moretags) = "parent:\"CompositeType,EnumType,DomainType\""];
 
     // Trigger elements.
     TriggerName trigger_name = 200 [(gogoproto.moretags) = "parent:\"Trigger\""];
@@ -185,7 +195,7 @@ message ElementProto {
     PolicyWithCheckExpr policy_with_check_expr = 243 [(gogoproto.moretags) = "parent:\"Policy\""];
     PolicyDeps policy_deps = 244 [(gogoproto.moretags) = "parent:\"Policy\""];
 
-    // Next element group start id: 250
+    // Next element group start id: 260
   }
 
   // Reserved for the now-removed SecondaryIndexPartial element.
@@ -345,7 +355,12 @@ message Index {
 
   cockroach.sql.vecindex.vecpb.Config vec_config = 27 [(gogoproto.nullable) = true];
 
-  // Next field is 28.
+  // SkipUniqueChecks disables unique constraint checks for this index when set
+  // to true. This is useful in cases when the application can statically
+  // guarantee that indexed columns will not contain duplicates.
+  bool skip_unique_checks = 28;
+
+  // Next field is 29.
 
   reserved 3, 4, 5, 6, 7;
 }
@@ -606,10 +621,12 @@ message TriggerName {
   string name = 3;
 }
 
+// TriggerEnabled indicates that a trigger is enabled. If this element is
+// absent, the trigger is disabled.
 message TriggerEnabled {
   uint32 table_id = 1 [(gogoproto.customname) = "TableID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
   uint32 trigger_id = 2 [(gogoproto.customname) = "TriggerID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.TriggerID"];
-  bool enabled = 3;
+  reserved 3; // was: bool enabled
 }
 
 message TriggerTiming {
@@ -688,6 +705,40 @@ message AliasType {
 message CompositeType {
   uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
   uint32 array_type_id = 2 [(gogoproto.customname) = "ArrayTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+}
+
+message DomainType {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  uint32 array_type_id = 2 [(gogoproto.customname) = "ArrayTypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  TypeT base_type_t = 3 [(gogoproto.nullable) = false];
+}
+
+message DomainDefault {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  Expression embedded_expr = 2 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+message DomainNotNull {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  uint32 constraint_id = 2 [(gogoproto.customname) = "ConstraintID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.ConstraintID"];
+}
+
+message DomainCheckConstraint {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  uint32 constraint_id = 2 [(gogoproto.customname) = "ConstraintID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.ConstraintID"];
+  Expression embedded_expr = 3 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+message DomainCheckConstraintUnvalidated {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  uint32 constraint_id = 2 [(gogoproto.customname) = "ConstraintID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.ConstraintID"];
+  Expression embedded_expr = 3 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+message DomainConstraintName {
+  uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  uint32 constraint_id = 2 [(gogoproto.customname) = "ConstraintID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.ConstraintID"];
+  string name = 3;
 }
 
 message Schema {
@@ -801,6 +852,11 @@ message TableComment {
 
 message TypeComment {
   uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  string comment = 2;
+}
+
+message FunctionComment {
+  uint32 function_id = 1 [(gogoproto.customname) = "FunctionID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
   string comment = 2;
 }
 
@@ -1049,6 +1105,12 @@ message FunctionBody {
 message FunctionSecurity {
   uint32 function_id = 1 [(gogoproto.customname) = "FunctionID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
   cockroach.sql.catalog.catpb.FunctionSecurity security = 2 [(gogoproto.nullable) = false];
+}
+
+message FunctionParams {
+  uint32 function_id = 1 [(gogoproto.customname) = "FunctionID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/catid.DescID"];
+  repeated Function.Parameter params = 2 [(gogoproto.nullable) = false];
+  TypeT return_type = 3 [(gogoproto.nullable) = true];
 }
 
 message ElementCreationMetadata {

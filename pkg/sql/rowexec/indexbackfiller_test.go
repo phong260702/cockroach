@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulksst"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -61,7 +62,7 @@ func TestIndexBackfillSinkSelection(t *testing.T) {
 		ib.spec.UseDistributedMergeSink = false
 		sink, err := ib.makeIndexBackfillSink(ctx)
 		require.NoError(t, err)
-		require.IsType(t, &bulkAdderIndexBackfillSink{}, sink)
+		require.IsType(t, &bulksst.BulkAdderSink{}, sink)
 		sink.Close(ctx)
 
 		tempDir := t.TempDir()
@@ -85,7 +86,7 @@ func TestIndexBackfillSinkSelection(t *testing.T) {
 
 		sink, err = ib.makeIndexBackfillSink(ctx)
 		require.NoError(t, err)
-		require.IsType(t, &sstIndexBackfillSink{}, sink)
+		require.IsType(t, &bulksst.SSTSink{}, sink)
 		sink.Close(ctx)
 	})
 }
@@ -133,11 +134,21 @@ func TestSSTFileNamingConvention(t *testing.T) {
 	writeTS := hlc.Timestamp{WallTime: 1000000000}
 
 	prefix := fmt.Sprintf("nodelocal://%d/%s", nodeID, spec.DistributedMergeFilePrefix)
-	sink, err := newSSTIndexBackfillSink(ctx, flowCtx, prefix, writeTS, processorID)
+	sink, err := bulksst.NewSSTSink(
+		ctx,
+		flowCtx.Cfg.Settings,
+		flowCtx.Cfg.ExternalStorageFromURI,
+		flowCtx.Cfg.DB.KV().Clock(),
+		prefix,
+		nodeID,
+		writeTS,
+		processorID,
+		false, /* checkDuplicates */
+	)
 	require.NoError(t, err)
 	defer sink.Close(ctx)
 
-	sstSink := sink.(*sstIndexBackfillSink)
+	sstSink := sink.(*bulksst.SSTSink)
 
 	// Add some data to trigger SST file creation.
 	key := roachpb.Key("test-key-1")
@@ -161,7 +172,7 @@ func TestSSTFileNamingConvention(t *testing.T) {
 		t.Logf("SST file URI: %s", uri)
 
 		// Verify the URI follows the naming convention:
-		// nodelocal://<nodeID>/job/<jobID>/map/proc-<procID>/<hlc-walltime>-<hlc-logical>.sst
+		// nodelocal://<nodeID>/job/<jobID>/map/proc-<procID>/n<instanceID>-<hlc-walltime>-<hlc-logical>.sst
 		expectedPrefix := fmt.Sprintf("nodelocal://%d/job/%d/map/proc-%d/", nodeID, jobID, processorID)
 		require.True(t, strings.HasPrefix(uri, expectedPrefix),
 			"URI %q does not have expected prefix %q", uri, expectedPrefix)
@@ -173,17 +184,19 @@ func TestSSTFileNamingConvention(t *testing.T) {
 		require.True(t, strings.HasSuffix(filename, ".sst"),
 			"filename %q does not end with .sst", filename)
 
-		// Verify the format is <walltime>-<logical>.sst.
+		// Verify the format is n<instanceID>-<walltime>-<logical>.sst.
 		filenameWithoutExt := strings.TrimSuffix(filename, ".sst")
 		parts := strings.Split(filenameWithoutExt, "-")
-		require.Equal(t, 2, len(parts),
-			"filename %q should have format <walltime>-<logical>.sst", filename)
+		require.Equal(t, 3, len(parts),
+			"filename %q should have format n<instanceID>-<walltime>-<logical>.sst", filename)
+		require.Equal(t, fmt.Sprintf("n%d", nodeID), parts[0],
+			"filename %q should start with the instance ID prefix", filename)
 
-		// Verify both parts are numeric (HLC timestamp components).
-		for i, part := range parts {
+		// Verify the timestamp parts are numeric (HLC timestamp components).
+		for i, part := range parts[1:] {
 			for _, ch := range part {
 				require.True(t, ch >= '0' && ch <= '9',
-					"part %d of filename %q contains non-numeric character: %c", i, filename, ch)
+					"part %d of filename %q contains non-numeric character: %c", i+1, filename, ch)
 			}
 		}
 	}

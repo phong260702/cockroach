@@ -102,7 +102,7 @@ type inspectSpanCheck interface {
 	// CheckSpan performs a validation using the other checks run on the span
 	// and updates the processor progress with any span information for use by
 	// the cluster-level checks.
-	CheckSpan(ctx context.Context, checks inspectChecks, logger *inspectLoggerBundle, data *inspectpb.InspectProcessorSpanCheckData) error
+	CheckSpan(ctx context.Context, checks inspectChecks, span roachpb.Span, logger *inspectLoggerBundle, data *inspectpb.InspectProcessorSpanCheckData) error
 }
 
 // checkClusterState represents the state of a cluster-level check.
@@ -232,9 +232,18 @@ func (c *inspectRunner) Close(ctx context.Context) error {
 
 // spanContainsTable checks if the given span contains data for the specified table.
 func spanContainsTable(tableID descpb.ID, codec keys.SQLCodec, span roachpb.Span) (bool, error) {
-	_, spanTableID, err := codec.DecodeTablePrefix(span.Key)
+	spanTableID, err := getTableIDFromSpan(codec, span)
 	if err != nil {
 		return false, err
 	}
-	return descpb.ID(spanTableID) == tableID, nil
+	return spanTableID == tableID, nil
+}
+
+// getTableIDFromSpan extracts the table ID from a span key.
+func getTableIDFromSpan(codec keys.SQLCodec, span roachpb.Span) (descpb.ID, error) {
+	_, tableID, err := codec.DecodeTablePrefix(span.Key)
+	if err != nil {
+		return 0, err
+	}
+	return descpb.ID(tableID), nil
 }

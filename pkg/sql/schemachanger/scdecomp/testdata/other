@@ -162,6 +162,12 @@ ElementState:
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
+    privileges: "17592186046464"
+    userName: public
+    withGrantOption: "0"
+  Status: PUBLIC
+- UserPrivileges:
+    descriptorId: 104
     privileges: "2"
     userName: admin
     withGrantOption: "2"
@@ -171,12 +177,6 @@ ElementState:
     privileges: "2"
     userName: root
     withGrantOption: "2"
-  Status: PUBLIC
-- UserPrivileges:
-    descriptorId: 104
-    privileges: "2048"
-    userName: public
-    withGrantOption: "0"
   Status: PUBLIC
 
 decompose
@@ -348,7 +348,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -375,7 +374,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -402,7 +400,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 32
     typeName: INT4
   Status: PUBLIC
@@ -429,7 +426,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: OID
   Status: PUBLIC
@@ -456,7 +452,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -635,7 +630,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: STRING
   Status: PUBLIC
@@ -662,7 +656,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -689,7 +682,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -716,7 +708,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 32
     typeName: INT4
   Status: PUBLIC
@@ -743,7 +734,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: OID
   Status: PUBLIC
@@ -770,7 +760,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC

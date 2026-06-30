@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
@@ -100,8 +101,14 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 		if err != nil {
 			return nil, err
 		}
-		// Ensure that we can drop the array type as well.
-		if err := p.canDropTypeDesc(ctx, mutArrayDesc, n.DropBehavior); err != nil {
+		// Ensure that we can drop the array type as well. Exclude
+		// back-references from the type being dropped, since the type and
+		// its array type are always dropped together as a pair. Domain
+		// types add a back-reference from their array type during
+		// creation (via addBackRefsFromAllTypesInType), so without this
+		// exclusion the array type's back-reference to the domain would
+		// prevent dropping.
+		if err := p.canDropTypeDescExcluding(ctx, mutArrayDesc, n.DropBehavior, typeDesc.ID); err != nil {
 			return nil, err
 		}
 		// Record these descriptors for deletion.
@@ -114,20 +121,38 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 func (p *planner) canDropTypeDesc(
 	ctx context.Context, desc *typedesc.Mutable, behavior tree.DropBehavior,
 ) error {
+	return p.canDropTypeDescExcluding(ctx, desc, behavior, descpb.InvalidID)
+}
+
+// canDropTypeDescExcluding checks whether the type can be dropped, ignoring
+// back-references from excludeID. This is used when dropping a type and its
+// companion array type together — the array type may have a back-reference
+// from the main type that should not block the drop.
+func (p *planner) canDropTypeDescExcluding(
+	ctx context.Context, desc *typedesc.Mutable, behavior tree.DropBehavior, excludeID descpb.ID,
+) error {
 	if err := p.canModifyType(ctx, desc); err != nil {
 		return err
 	}
-	if len(desc.ReferencingDescriptorIDs) > 0 && behavior != tree.DropCascade {
-		dependentNames, err := p.getFullyQualifiedNamesFromIDs(ctx, desc.ReferencingDescriptorIDs)
-		if err != nil {
-			return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
+	if behavior != tree.DropCascade {
+		var refs []descpb.ID
+		for _, id := range desc.ReferencingDescriptorIDs {
+			if id != excludeID {
+				refs = append(refs, id)
+			}
 		}
-		return pgerror.Newf(
-			pgcode.DependentObjectsStillExist,
-			"cannot drop type %q because other objects (%v) still depend on it",
-			desc.Name,
-			dependentNames,
-		)
+		if len(refs) > 0 {
+			dependentNames, err := p.getFullyQualifiedNamesFromIDs(ctx, refs)
+			if err != nil {
+				return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
+			}
+			return pgerror.Newf(
+				pgcode.DependentObjectsStillExist,
+				"cannot drop type %q because other objects (%v) still depend on it",
+				desc.Name,
+				dependentNames,
+			)
+		}
 	}
 	return nil
 }
@@ -164,11 +189,25 @@ func (p *planner) addTypeBackReference(
 		return err
 	}
 
-	// Check if this user has USAGE privilege on the type. This function if an
-	// object has a dependency on a type, the user must have USAGE privilege on
-	// the type to create a dependency.
-	if err := p.CheckPrivilege(ctx, mutDesc, privilege.USAGE); err != nil {
-		return err
+	// Check if this user has USAGE privilege on the type. If an object has a
+	// dependency on a type, the user must have USAGE privilege on the type to
+	// create a dependency. For implicit array types (ALIAS), check the
+	// privilege on the base element type instead, matching PostgreSQL behavior.
+	if mutDesc.Kind == descpb.TypeDescriptor_ALIAS &&
+		mutDesc.Alias != nil &&
+		mutDesc.Alias.Family() == types.ArrayFamily {
+		baseTypeID := typedesc.GetUserDefinedTypeDescID(mutDesc.Alias.ArrayContents())
+		baseDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, baseTypeID)
+		if err != nil {
+			return err
+		}
+		if err := p.CheckPrivilege(ctx, baseDesc, privilege.USAGE); err != nil {
+			return err
+		}
+	} else {
+		if err := p.CheckPrivilege(ctx, mutDesc, privilege.USAGE); err != nil {
+			return err
+		}
 	}
 
 	if !mutDesc.AddReferencingDescriptorID(ref) {

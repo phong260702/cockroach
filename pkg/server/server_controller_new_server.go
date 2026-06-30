@@ -95,7 +95,9 @@ func (s *topLevelServer) newTenantServer(
 		serverutils.SetUnsafeOverride(&baseCfg.TestingKnobs)
 	}
 
-	tenantServer, err := newTenantServerInternal(ctx, baseCfg, sqlCfg, tenantStopper, tenantNameContainer, s.db.AdmissionPacerFactory)
+	tenantServer, err := newTenantServerInternal(
+		ctx, baseCfg, sqlCfg, tenantStopper, tenantNameContainer, s.db.AdmissionPacerFactory,
+		s.db.SQLCPUProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +154,7 @@ func newTenantServerInternal(
 	stopper *stop.Stopper,
 	tenantNameContainer *roachpb.TenantNameContainer,
 	elastic admission.PacerFactory,
+	sqlCPUProvider admission.SQLCPUProvider,
 ) (*SQLServerWrapper, error) {
 	ambientCtx := baseCfg.AmbientCtx
 	stopper.SetTracer(baseCfg.Tracer)
@@ -163,7 +166,8 @@ func newTenantServerInternal(
 	log.Dev.Infof(newCtx, "creating tenant server")
 
 	// Now instantiate the tenant server proper.
-	return newSharedProcessTenantServer(newCtx, stopper, baseCfg, sqlCfg, tenantNameContainer, elastic)
+	return newSharedProcessTenantServer(
+		newCtx, stopper, baseCfg, sqlCfg, tenantNameContainer, elastic, sqlCPUProvider)
 }
 
 func (s *topLevelServer) makeSharedProcessTenantConfig(
@@ -377,7 +381,6 @@ func makeSharedProcessTenantServerConfig(
 	// of them will be mostly idle.
 	// We might want to reconsider this if we use more than 1 in-memory tenant at a time.
 	sqlCfg.MemoryPoolSize = kvServerCfg.SQLConfig.MemoryPoolSize
-	sqlCfg.TableStatCacheSize = kvServerCfg.SQLConfig.TableStatCacheSize
 	sqlCfg.QueryCacheSize = kvServerCfg.SQLConfig.QueryCacheSize
 
 	// LocalKVServerInfo tells the rpc.Context of the tenant's server

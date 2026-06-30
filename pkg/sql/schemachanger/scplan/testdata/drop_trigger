@@ -22,12 +22,13 @@ StatementPhase stage 1 of 1 with 3 MutationType ops
       Trigger:
         TableID: 104
         TriggerID: 1
-    *scop.UpdateTableBackReferencesInRelations
+    *scop.UpdateTriggerBackReferencesInRelations
       RelationReferences:
       - id: 104
         columnids: []
         indexid: 0
       TableID: 104
+      TriggerID: 1
     *scop.RemoveTriggerBackReferencesInRoutines
       BackReferencedTableID: 104
       BackReferencedTriggerID: 1
@@ -49,12 +50,13 @@ PreCommitPhase stage 2 of 2 with 3 MutationType ops
       Trigger:
         TableID: 104
         TriggerID: 1
-    *scop.UpdateTableBackReferencesInRelations
+    *scop.UpdateTriggerBackReferencesInRelations
       RelationReferences:
       - id: 104
         columnids: []
         indexid: 0
       TableID: 104
+      TriggerID: 1
     *scop.RemoveTriggerBackReferencesInRoutines
       BackReferencedTableID: 104
       BackReferencedTriggerID: 1
@@ -64,7 +66,7 @@ PreCommitPhase stage 2 of 2 with 3 MutationType ops
 deps
 DROP TRIGGER t1_tg ON defaultdb.t1;
 ----
-- from: [TriggerDeps:{DescID: 104, TriggerID: 1, ReferencedFunctionIDs: [105]}, ABSENT]
-  to:   [Trigger:{DescID: 104, TriggerID: 1}, PUBLIC]
-  kind: Precedence
-  rule: trigger removed before dependents
+- from: [Trigger:{DescID: 104, TriggerID: 1}, ABSENT]
+  to:   [TriggerDeps:{DescID: 104, TriggerID: 1, ReferencedFunctionIDs: [105]}, ABSENT]
+  kind: SameStagePrecedence
+  rule: dependents remove trigger

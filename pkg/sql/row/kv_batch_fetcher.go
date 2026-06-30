@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -55,6 +57,21 @@ var defaultKVBatchSize = rowinfra.KeyLimit(metamorphic.ConstantWithTestRange(
 	1,                                   /* min */
 	100,                                 /* max */
 ))
+
+// TestingRaiseDefaultKVBatchSize raises defaultKVBatchSize to minSize if it is
+// currently lower; otherwise it leaves the value untouched. The returned
+// function restores the previous value. This is useful for tests that should
+// not run with extremely small metamorphic batch sizes.
+func TestingRaiseDefaultKVBatchSize(minSize int) func() {
+	if defaultKVBatchSize >= rowinfra.KeyLimit(minSize) {
+		return func() {}
+	}
+	prev := defaultKVBatchSize
+	defaultKVBatchSize = rowinfra.KeyLimit(minSize)
+	return func() {
+		defaultKVBatchSize = prev
+	}
+}
 
 // elasticCPUDurationPerLowPriReadResponse controls how many CPU tokens are allotted
 // each time we seek admission for response handling during internally submitted
@@ -216,6 +233,10 @@ type txnKVFetcher struct {
 	requestAdmissionHeader kvpb.AdmissionHeader
 	responseAdmissionQ     *admission.WorkQueue
 	admissionPacer         *admission.Pacer
+	// workloadID is the statement fingerprint ID or job ID for ASH sampling.
+	workloadID uint64
+	// workloadType distinguishes the kind of workload for ASH sampling.
+	workloadType workloadid.WorkloadType
 }
 
 var _ KVBatchFetcher = &txnKVFetcher{}
@@ -275,16 +296,30 @@ func makeSendFunc(
 	ext *fetchpb.IndexFetchSpec_ExternalRowData,
 	batchRequestsIssued *int64,
 	kvCPUTime *int64,
+	localKVCPUTime *int64,
 ) sendFunc {
 	if ext != nil {
-		return makeExternalSpanSendFunc(ext, txn.DB(), batchRequestsIssued, kvCPUTime)
+		return makeExternalSpanSendFunc(
+			ext, txn.DB(), batchRequestsIssued, kvCPUTime, localKVCPUTime,
+		)
 	}
 	return func(
 		ctx context.Context,
 		ba *kvpb.BatchRequest,
 	) (*kvpb.BatchResponse, error) {
 		log.VEventf(ctx, 2, "kv fetcher: sending a batch with %d requests", len(ba.Requests))
+		// NOTE: the streamer invokes Send concurrently on its worker goroutines,
+		// but passes in a nil localKVCPUTime.
+		var w timeutil.CPUStopWatch
+		if localKVCPUTime != nil {
+			w.Start()
+		}
 		res, err := txn.Send(ctx, ba)
+		if localKVCPUTime != nil {
+			if delta := w.Stop(); delta > 0 {
+				atomic.AddInt64(localKVCPUTime, int64(delta))
+			}
+		}
 		if err != nil {
 			return nil, err.GoError()
 		}
@@ -304,8 +339,11 @@ func makeExternalSpanSendFunc(
 	db *kv.DB,
 	batchRequestsIssued *int64,
 	kvCPUTime *int64,
+	localKVCPUTime *int64,
 ) sendFunc {
 	return func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+		var w timeutil.CPUStopWatch
+
 		for _, req := range ba.Requests {
 			// We only allow external row data for a few known types of request.
 			switch r := req.GetInner().(type) {
@@ -332,10 +370,14 @@ func makeExternalSpanSendFunc(
 				if err := txn.SetFixedTimestamp(ctx, ext.AsOf); err != nil {
 					return err
 				}
-				var err *kvpb.Error
-				res, err = txn.Send(ctx, ba)
-				if err != nil {
-					return err.GoError()
+				var pErr *kvpb.Error
+				w.Start()
+				res, pErr = txn.Send(ctx, ba)
+				if delta := w.Stop(); delta > 0 && localKVCPUTime != nil {
+					atomic.AddInt64(localKVCPUTime, int64(delta))
+				}
+				if pErr != nil {
+					return pErr.GoError()
 				}
 				return nil
 			})
@@ -367,7 +409,10 @@ type newTxnKVFetcherArgs struct {
 	kvPairsRead                *int64
 	batchRequestsIssued        *int64
 	kvCPUTime                  *int64
+	localKVCPUTime             *int64
 	rawMVCCValues              bool
+	workloadID                 uint64
+	workloadType               workloadid.WorkloadType
 
 	admission struct { // groups AC-related fields
 		requestHeader  kvpb.AdmissionHeader
@@ -398,6 +443,8 @@ func newTxnKVFetcherInternal(args newTxnKVFetcherArgs) *txnKVFetcher {
 		forceProductionKVBatchSize: args.forceProductionKVBatchSize,
 		requestAdmissionHeader:     args.admission.requestHeader,
 		responseAdmissionQ:         args.admission.responseQ,
+		workloadID:                 args.workloadID,
+		workloadType:               args.workloadType,
 	}
 
 	f.maybeInitAdmissionPacer(
@@ -405,7 +452,9 @@ func newTxnKVFetcherInternal(args newTxnKVFetcherArgs) *txnKVFetcher {
 		args.admission.pacerFactory,
 		args.admission.settingsValues,
 	)
-	f.kvBatchMetrics.init(args.kvPairsRead, args.batchRequestsIssued, args.kvCPUTime)
+	f.kvBatchMetrics.init(
+		args.kvPairsRead, args.batchRequestsIssued, args.kvCPUTime, args.localKVCPUTime,
+	)
 	return f
 }
 
@@ -443,9 +492,11 @@ func (f *txnKVFetcher) maybeInitAdmissionPacer(
 				// nodes running colocated SQL+KV code where all SQL code is run
 				// on behalf of the one tenant. So from an AC perspective, the
 				// tenant ID we pass through here is irrelevant.
-				TenantID:   roachpb.SystemTenantID,
-				Priority:   admissionPri,
-				CreateTime: admissionHeader.CreateTime,
+				TenantID:     roachpb.SystemTenantID,
+				Priority:     admissionPri,
+				CreateTime:   admissionHeader.CreateTime,
+				WorkloadID:   f.workloadID,
+				WorkloadType: f.workloadType,
 			})
 	}
 }
@@ -773,9 +824,11 @@ func (f *txnKVFetcher) maybeAdmitBatchResponse(ctx context.Context, br *kvpb.Bat
 		}
 	} else if f.responseAdmissionQ != nil {
 		responseAdmission := admission.WorkInfo{
-			TenantID:   roachpb.SystemTenantID,
-			Priority:   admissionpb.WorkPriority(f.requestAdmissionHeader.Priority),
-			CreateTime: f.requestAdmissionHeader.CreateTime,
+			TenantID:     roachpb.SystemTenantID,
+			Priority:     admissionpb.WorkPriority(f.requestAdmissionHeader.Priority),
+			CreateTime:   f.requestAdmissionHeader.CreateTime,
+			WorkloadID:   f.workloadID,
+			WorkloadType: f.workloadType,
 		}
 		if _, err := f.responseAdmissionQ.Admit(ctx, responseAdmission); err != nil {
 			return err
@@ -1087,13 +1140,15 @@ type kvBatchMetrics struct {
 		kvPairsRead         *int64
 		batchRequestsIssued *int64
 		kvCPUTime           *int64
+		localKVCPUTime      *int64
 	}
 }
 
-func (h *kvBatchMetrics) init(kvPairsRead, batchRequestsIssued, kvCPUTime *int64) {
+func (h *kvBatchMetrics) init(kvPairsRead, batchRequestsIssued, kvCPUTime, localKVCPUTime *int64) {
 	h.atomics.kvPairsRead = kvPairsRead
 	h.atomics.batchRequestsIssued = batchRequestsIssued
 	h.atomics.kvCPUTime = kvCPUTime
+	h.atomics.localKVCPUTime = localKVCPUTime
 }
 
 // Record records metrics for the given batch response. It should be called
@@ -1143,4 +1198,12 @@ func (h *kvBatchMetrics) GetKVCPUTime() int64 {
 		return 0
 	}
 	return atomic.LoadInt64(h.atomics.kvCPUTime)
+}
+
+// GetLocalKVCPUTime implements the KVBatchFetcher interface.
+func (h *kvBatchMetrics) GetLocalKVCPUTime() int64 {
+	if h == nil || h.atomics.localKVCPUTime == nil {
+		return 0
+	}
+	return atomic.LoadInt64(h.atomics.localKVCPUTime)
 }

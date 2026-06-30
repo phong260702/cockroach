@@ -9,8 +9,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -24,8 +24,7 @@ import (
 func TestMain(m *testing.M) {
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
-	serverutils.InitTestServerFactory(server.TestServerFactory)
+	serverutils.InitTestServerFactory(server.TestServerFactory, serverutils.WithDRPCOption(base.TestDRPCEnabledRandomly))
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
-	kvtenant.InitTestConnectorFactory()
 	os.Exit(m.Run())
 }

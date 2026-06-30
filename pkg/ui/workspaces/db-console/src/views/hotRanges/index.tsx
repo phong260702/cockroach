@@ -3,8 +3,6 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-import { createHash } from "crypto";
-
 import {
   Loading,
   Text,
@@ -13,26 +11,14 @@ import {
   TimezoneContext,
   SortSetting,
   ISortedTablePagination,
+  useNodesSummary,
 } from "@cockroachlabs/cluster-ui";
 import classNames from "classnames/bind";
 import React, { useRef, useMemo, useEffect, useContext, useState } from "react";
 import { Helmet } from "react-helmet";
-import { useDispatch, useSelector } from "react-redux";
 
-import { cockroach } from "src/js/protos";
+import { useHotRanges } from "src/hooks/useHotRanges";
 import { analytics } from "src/redux/analytics";
-import {
-  refreshHotRanges,
-  clearHotRanges,
-  refreshDatabases,
-} from "src/redux/apiReducers";
-import {
-  hotRangesSelector,
-  isLoadingSelector,
-  lastErrorSelector,
-  lastSetAtSelector,
-} from "src/redux/hotRanges";
-import { selectNodeLocalities } from "src/redux/localities";
 import { performanceBestPracticesHotSpots } from "src/util/docs";
 import { HotRangesFilter } from "src/views/hotRanges/hotRangesFilter";
 import useFilters, { filterRanges } from "src/views/hotRanges/useFilters";
@@ -43,7 +29,6 @@ import styles from "./hotRanges.module.scss";
 import HotRangesTable from "./hotRangesTable";
 
 const cx = classNames.bind(styles);
-const HotRangesRequest = cockroach.server.serverpb.HotRangesRequest;
 
 const emptyMessages = {
   SELECT_NODES: {
@@ -59,35 +44,31 @@ const emptyMessages = {
 };
 
 const HotRangesPage = () => {
-  const dispatch = useDispatch();
-  const hotRanges = useSelector(hotRangesSelector);
-  const lastError = useSelector(lastErrorSelector);
-  const lastSetAt = useSelector(lastSetAtSelector);
-  const isLoading = useSelector(isLoadingSelector);
-  const nodeIdToLocalityMap = useSelector(selectNodeLocalities);
+  const { nodeStatuses } = useNodesSummary();
+  const nodeIdToLocalityMap = useMemo(() => {
+    return new Map(
+      (nodeStatuses ?? []).map(n => {
+        const locality = (n.desc?.locality?.tiers || [])
+          .map(t => `${t.key}=${t.value}`)
+          .join(", ");
+        return [n.desc.node_id, locality];
+      }),
+    );
+  }, [nodeStatuses]);
   const timezone = useContext(TimezoneContext);
 
   const { filters, applyFilters } = useFilters();
-  const [sortSetting, setSortSetting] = useState<SortSetting>(null);
+  const { hotRanges, error, isLoading, lastSetAt } = useHotRanges(
+    filters.nodeIds,
+  );
+  const [sortSetting, setSortSetting] = useState<SortSetting>({
+    ascending: false,
+    columnTitle: "qps",
+  });
   const [pagination, setPagination] = useState<ISortedTablePagination>(null);
 
-  // dispatch hot ranges call whenever the filters change and are not empty
-  useEffect(() => {
-    if (filters.nodeIds.length > 0) {
-      dispatch(
-        refreshHotRanges(
-          new HotRangesRequest({ nodes: filters.nodeIds.map(String) }),
-        ),
-      );
-    } else {
-      dispatch(clearHotRanges());
-    }
-  }, [filters.nodeIds, dispatch]);
-
   // track analytics on filters, pagination and sort.
-  const analyticsKey = createHash("md5")
-    .update(JSON.stringify([filters, sortSetting, pagination]))
-    .digest("hex");
+  const analyticsKey = JSON.stringify([filters, sortSetting, pagination]);
   useEffect(() => {
     if (!filters.nodeIds.length || !pagination || !sortSetting) {
       return;
@@ -105,11 +86,6 @@ const HotRangesPage = () => {
     // when the contents haven't changed, but the references have.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [analyticsKey]);
-
-  // load the databases if possible.
-  useEffect(() => {
-    dispatch(refreshDatabases());
-  }, [dispatch]);
 
   const clearButtonRef = useRef<HTMLSpanElement>();
   const filteredRanges = useMemo(() => {
@@ -143,7 +119,7 @@ const HotRangesPage = () => {
         <Loading
           loading={isLoading}
           loadingText={`Loading ranges for ${filters.nodeIds?.length} nodes...`}
-          error={lastError}
+          error={error}
           render={() => (
             <HotRangesTable
               hotRangesList={filteredRanges}
@@ -157,16 +133,18 @@ const HotRangesPage = () => {
               }
               nodeIdToLocalityMap={nodeIdToLocalityMap}
               clearFilterContainer={<span ref={clearButtonRef} />}
+              sortSetting={sortSetting}
+              onSortChange={setSortSetting}
               emptyMessage={emptyMessage}
               onViewPropertiesChange={({
-                sortSetting,
-                pagination,
+                sortSetting: ss,
+                pagination: pg,
               }: {
                 sortSetting: SortSetting;
                 pagination: ISortedTablePagination;
               }) => {
-                setSortSetting(sortSetting);
-                setPagination(pagination);
+                setSortSetting(ss);
+                setPagination(pg);
               }}
             />
           )}

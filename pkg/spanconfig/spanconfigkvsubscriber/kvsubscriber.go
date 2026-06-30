@@ -366,11 +366,22 @@ func (s *KVSubscriber) ComputeSplitKey(
 // GetSpanConfigForKey is part of the spanconfig.KVSubscriber interface.
 func (s *KVSubscriber) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, roachpb.Span, error) {
+) (roachpb.SpanConfig, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	return s.mu.internal.GetSpanConfigForKey(ctx, key)
+}
+
+// ForEachOverlappingSpanConfig is part of the spanconfig.KVSubscriber
+// interface.
+func (s *KVSubscriber) ForEachOverlappingSpanConfig(
+	ctx context.Context, span roachpb.Span, f func(roachpb.Span, roachpb.SpanConfig) error,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.mu.internal.ForEachOverlappingSpanConfig(ctx, span, f)
 }
 
 // GetProtectionTimestamps is part of the spanconfig.KVSubscriber interface.

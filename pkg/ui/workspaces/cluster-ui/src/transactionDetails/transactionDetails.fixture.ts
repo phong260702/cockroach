@@ -8,7 +8,7 @@ import { createMemoryHistory } from "history";
 import Long from "long";
 import moment from "moment-timezone";
 
-import { StatementsResponse } from "src/store/sqlStats/sqlStats.reducer";
+type StatementsResponse = protos.cockroach.server.serverpb.StatementsResponse;
 
 import { TimeScale } from "../timeScaleDropdown";
 import { RequestError } from "../util";
@@ -131,7 +131,6 @@ export const transactionDetailsData: StatementsResponse = {
           query: "SELECT * FROM crdb_internal.node_build_info",
           app: "$ cockroach sql",
           distSQL: false,
-          implicit_txn: true,
           vec: true,
           full_scan: false,
           database: "movr",
@@ -242,7 +241,6 @@ export const transactionDetailsData: StatementsResponse = {
           query: "SET sql_safe_updates = _",
           app: "$ cockroach sql",
           distSQL: false,
-          implicit_txn: true,
           vec: true,
           full_scan: false,
           database: "movr",
@@ -347,7 +345,6 @@ export const transactionDetailsData: StatementsResponse = {
           query: "SELECT * FROM users",
           app: "$ cockroach sql",
           distSQL: false,
-          implicit_txn: true,
           vec: true,
           full_scan: true,
           database: "movr",

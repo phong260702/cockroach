@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"google.golang.org/protobuf/proto"
 )
 
 type validateStatus int
@@ -102,6 +101,7 @@ var validationMap = []struct {
 				status: todoIAmKnowinglyAddingTechDebt,
 				reason: "initial import: TODO(features): add validation"},
 			"IsMaterializedView":  {status: thisFieldReferencesNoObjects},
+			"SecurityInvoker":     {status: thisFieldReferencesNoObjects},
 			"RefreshViewRequired": {status: thisFieldReferencesNoObjects},
 			"DependsOn":           {status: iSolemnlySwearThisFieldIsValidated},
 			"DependsOnTypes":      {status: iSolemnlySwearThisFieldIsValidated},
@@ -190,6 +190,7 @@ var validationMap = []struct {
 			"CreatedAtNanos":              {status: thisFieldReferencesNoObjects},
 			"VecConfig":                   {status: thisFieldReferencesNoObjects},
 			"HideForPrimaryKeyRecreate":   {status: iSolemnlySwearThisFieldIsValidated},
+			"SkipUniqueChecks":            {status: thisFieldReferencesNoObjects},
 		},
 	},
 	{
@@ -270,6 +271,7 @@ var validationMap = []struct {
 			"RegionConfig":                  {status: iSolemnlySwearThisFieldIsValidated},
 			"DeclarativeSchemaChangerState": {status: thisFieldReferencesNoObjects},
 			"Composite":                     {status: iSolemnlySwearThisFieldIsValidated},
+			"Domain":                        {status: iSolemnlySwearThisFieldIsValidated},
 			"ReplicatedPCRVersion":          {status: thisFieldReferencesNoObjects},
 		},
 	},
@@ -465,12 +467,12 @@ func TestValidateCoversAllDescriptorFields(t *testing.T) {
 func TestValidateTableDesc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	computedExpr := "1 + 1"
+	computedExpr := descpb.Expression("1 + 1")
 	generatedAsIdentitySequenceOptionExpr := " START 2 INCREMENT 3 CACHE 10"
 	boolTrue := true
 	negativeOne := int64(-1)
 	negativeOneFloat := float64(-1)
-	pointer := func(s string) *string {
+	pointer := func(s descpb.Expression) *descpb.Expression {
 		return &s
 	}
 
@@ -1716,6 +1718,122 @@ func TestValidateTableDesc(t *testing.T) {
 				NextIndexID:      3,
 				NextConstraintID: 2,
 			}},
+		{err: `index "foo_crdb_internal_bar_shard_5_bar_baz_idx" shard column "other" is not in the index columns`,
+			desc: descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "foo",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "bar"},
+					{ID: 2, Name: "crdb_internal_bar_shard_5", Virtual: true, ComputeExpr: &computedExpr},
+					{ID: 3, Name: "baz"},
+					{ID: 4, Name: "other"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1, 3, 4},
+						ColumnNames: []string{"bar", "baz", "other"},
+					},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:                  1,
+					ConstraintID:        1,
+					Name:                "primary",
+					Unique:              true,
+					KeyColumnIDs:        []descpb.ColumnID{1},
+					KeyColumnNames:      []string{"bar"},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
+					StoreColumnNames:    []string{"baz", "other"},
+					StoreColumnIDs:      []descpb.ColumnID{3, 4},
+					EncodingType:        catenumpb.PrimaryIndexEncoding,
+					Version:             descpb.LatestIndexDescriptorVersion,
+				},
+				Indexes: []descpb.IndexDescriptor{
+					{ID: 2, Name: "foo_crdb_internal_bar_shard_5_bar_baz_idx",
+						KeyColumnIDs:        []descpb.ColumnID{2, 1, 3},
+						KeyColumnNames:      []string{"crdb_internal_bar_shard_5", "bar", "baz"},
+						KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+						Sharded: catpb.ShardedDescriptor{
+							IsSharded:    true,
+							Name:         "crdb_internal_bar_shard_5",
+							ShardBuckets: 5,
+							ColumnNames:  []string{"other"},
+						},
+					},
+				},
+				NextColumnID:     5,
+				NextFamilyID:     1,
+				NextIndexID:      3,
+				NextConstraintID: 2,
+			}},
+		// Test case for regional by row table where shard ColumnNames incorrectly
+		// includes crdb_region. The crdb_region column is an implicit index key
+		// column (via NumImplicitColumns), so it should not be valid for sharding.
+		{err: `index "idx_b" shard column "crdb_region" is not in the index columns`,
+			desc: descpb.TableDescriptor{
+				ID:            2,
+				ParentID:      1,
+				Name:          "t_test",
+				FormatVersion: descpb.InterleavedFormatVersion,
+				Columns: []descpb.ColumnDescriptor{
+					{ID: 1, Name: "a"},
+					{ID: 2, Name: "b"},
+					{ID: 3, Name: "crdb_internal_a_shard_16", Virtual: true, ComputeExpr: &computedExpr},
+					{ID: 4, Name: "crdb_internal_b_shard_16", Virtual: true, ComputeExpr: &computedExpr},
+					{ID: 5, Name: "crdb_region"},
+				},
+				Families: []descpb.ColumnFamilyDescriptor{
+					{ID: 0, Name: "primary",
+						ColumnIDs:   []descpb.ColumnID{1, 2, 5},
+						ColumnNames: []string{"a", "b", "crdb_region"},
+					},
+				},
+				PrimaryIndex: descpb.IndexDescriptor{
+					ID:                  1,
+					ConstraintID:        1,
+					Name:                "primary",
+					Unique:              true,
+					KeyColumnIDs:        []descpb.ColumnID{5, 3, 1},
+					KeyColumnNames:      []string{"crdb_region", "crdb_internal_a_shard_16", "a"},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+					StoreColumnNames:    []string{"b"},
+					StoreColumnIDs:      []descpb.ColumnID{2},
+					EncodingType:        catenumpb.PrimaryIndexEncoding,
+					Version:             descpb.LatestIndexDescriptorVersion,
+					Sharded: catpb.ShardedDescriptor{
+						IsSharded:    true,
+						Name:         "crdb_internal_a_shard_16",
+						ShardBuckets: 16,
+						ColumnNames:  []string{"a"},
+					},
+					Partitioning: catpb.PartitioningDescriptor{
+						NumImplicitColumns: 1,
+					},
+				},
+				Indexes: []descpb.IndexDescriptor{
+					{ID: 2, Name: "idx_b",
+						// Key columns: [crdb_region (implicit), crdb_internal_b_shard_16 (shard), b, a]
+						// Explicit columns (after skipping implicit + shard): [b, a]
+						KeyColumnIDs:        []descpb.ColumnID{5, 4, 2, 1},
+						KeyColumnNames:      []string{"crdb_region", "crdb_internal_b_shard_16", "b", "a"},
+						KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+						Sharded: catpb.ShardedDescriptor{
+							IsSharded:    true,
+							Name:         "crdb_internal_b_shard_16",
+							ShardBuckets: 16,
+							ColumnNames:  []string{"crdb_region"},
+						},
+						Partitioning: catpb.PartitioningDescriptor{
+							NumImplicitColumns: 1,
+						},
+					},
+				},
+				NextColumnID:     6,
+				NextFamilyID:     1,
+				NextIndexID:      3,
+				NextConstraintID: 2,
+			}},
 		{err: `TableID mismatch for unique without index constraint "bar_unique": "1" doesn't match descriptor: "2"`,
 			desc: descpb.TableDescriptor{
 				ID:            2,
@@ -2200,8 +2318,8 @@ func TestValidateTableDesc(t *testing.T) {
 					{
 						ID:           1,
 						Name:         "bar",
-						ComputeExpr:  proto.String("'blah'"),
-						OnUpdateExpr: proto.String("'blah'"),
+						ComputeExpr:  pointer("'blah'"),
+						OnUpdateExpr: pointer("'blah'"),
 					},
 				},
 				Families: []descpb.ColumnFamilyDescriptor{
@@ -2222,7 +2340,7 @@ func TestValidateTableDesc(t *testing.T) {
 						Name:                    "bar",
 						GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_ALWAYS,
 						UsesSequenceIds:         []descpb.ID{32},
-						OnUpdateExpr:            proto.String("'blah'"),
+						OnUpdateExpr:            pointer("'blah'"),
 					},
 				},
 				Families: []descpb.ColumnFamilyDescriptor{
@@ -2244,7 +2362,7 @@ func TestValidateTableDesc(t *testing.T) {
 						GeneratedAsIdentityType: catpb.GeneratedAsIdentityType_GENERATED_BY_DEFAULT,
 						UsesSequenceIds:         []descpb.ID{32},
 
-						OnUpdateExpr: proto.String("'blah'"),
+						OnUpdateExpr: pointer("'blah'"),
 					},
 				},
 				Families: []descpb.ColumnFamilyDescriptor{
@@ -3304,7 +3422,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	pointer := func(s string) *string {
+	pointer := func(s descpb.Expression) *descpb.Expression {
 		return &s
 	}
 

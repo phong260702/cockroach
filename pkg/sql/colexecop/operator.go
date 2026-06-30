@@ -32,6 +32,8 @@ type Operator interface {
 	//
 	// It might panic with an expected error, so there must be a "root"
 	// component that will catch that panic.
+	//
+	// Init and Next must be called from the same goroutine.
 	Init(ctx context.Context)
 
 	// Next returns the next Batch from this operator. Once the operator is
@@ -48,6 +50,8 @@ type Operator interface {
 	//
 	// It might panic with an expected error, so there must be a "root"
 	// component that will catch that panic.
+	//
+	// Init and Next must be called from the same goroutine.
 	Next() (coldata.Batch, *execinfrapb.ProducerMetadata)
 
 	execopnode.OpNode
@@ -91,10 +95,12 @@ type KVReader interface {
 	// GetConsumedRU returns the number of RUs that were consumed during the
 	// KV reads.
 	GetConsumedRU() uint64
-	// GetKVCPUTime returns the CPU time consumed *on the current goroutine* by
-	// KV requests. It must be safe for concurrent use. It is used to calculate
-	// the SQL CPU time.
-	GetKVCPUTime() time.Duration
+	// GetLocalKVCPUTime returns the SQL goroutine CPU time (in nanoseconds)
+	// spent inside KV calls, measured via grunning deltas around txn.Send.
+	// This is the portion of SQL goroutine CPU that overlapped with KV work,
+	// not the CPU consumed on KV servers (see GetKVResponseCPUTime for that).
+	// It must be safe for concurrent use.
+	GetLocalKVCPUTime() int64
 	// GetKVResponseCPUTime returns the CPU time as reported by KV BatchResponses
 	// processed by the KVReader throughout its lifetime so far.
 	GetKVResponseCPUTime() int64
@@ -538,9 +544,11 @@ type VectorizedStatsCollector interface {
 func NextNoMeta(op Operator) coldata.Batch {
 	b, meta := op.Next()
 	if meta != nil {
-		if buildutil.CrdbTestBuild && meta.RowNum != nil {
+		if buildutil.CrdbTestBuild && (meta.RowNum != nil || meta.Metrics != nil) {
 			// In test builds, the invariantsChecker can inject RowNum metadata
-			// in arbitrary Operator chains, so we'll just silently swallow it.
+			// in arbitrary Operator chains, and synchronizer / router / outbox
+			// wrappers may emit Metrics metadata carrying the always-on
+			// grunning measurement. Both are silently swallowed.
 			return NextNoMeta(op)
 		}
 		colexecerror.InternalError(errors.AssertionFailedf("non-nil metadata from %T: %v", op, meta))

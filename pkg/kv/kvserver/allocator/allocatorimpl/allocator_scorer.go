@@ -1231,17 +1231,24 @@ func rankedCandidateListForAllocation(
 	// count of those which are valid/not-full.
 	validCandidateStores := []roachpb.StoreDescriptor{}
 	for _, s := range candidateStores.Stores {
-		if !options.getDiskOptions().maxCapacityCheck(s) ||
-			!options.getIOOverloadOptions().allocateReplicaToCheck(
-				ctx,
-				s,
-				candidateStores,
-			) {
+		if !options.getDiskOptions().maxCapacityCheck(s) {
+			log.KvDistribution.VEventf(ctx, 3,
+				"not considering store s%d as a %s candidate: disk at or near capacity",
+				s.StoreID, targetType)
 			continue
 		}
-
+		if !options.getIOOverloadOptions().allocateReplicaToCheck(ctx, s, candidateStores) {
+			log.KvDistribution.VEventf(ctx, 3,
+				"not considering store s%d as a %s candidate: IO overloaded",
+				s.StoreID, targetType)
+			continue
+		}
 		if constraintsOK, _ := constraintsCheck(s); constraintsOK {
 			validCandidateStores = append(validCandidateStores, s)
+		} else {
+			log.KvDistribution.VEventf(ctx, 3,
+				"not considering store s%d as a %s candidate: failed constraints check",
+				s.StoreID, targetType)
 		}
 	}
 
@@ -1252,11 +1259,17 @@ func rankedCandidateListForAllocation(
 	for _, s := range validStoreList.Stores {
 		// Disregard all the stores that already have replicas.
 		if StoreHasReplica(s.StoreID, existingReplTargets) {
+			log.KvDistribution.VEventf(ctx, 3,
+				"not considering store s%d as a %s candidate: store already has a replica",
+				s.StoreID, targetType)
 			continue
 		}
 		// Unless the caller specifically allows us to allocate multiple replicas on
 		// the same node, we disregard nodes with existing replicas.
 		if !allowMultipleReplsPerNode && nodeHasReplica(s.Node.NodeID, existingReplTargets) {
+			log.KvDistribution.VEventf(ctx, 3,
+				"not considering store s%d as a %s candidate: node n%d already has a replica",
+				s.StoreID, targetType, s.Node.NodeID)
 			continue
 		}
 
@@ -1516,7 +1529,11 @@ func bestStoreToMinimizeLoadDelta(
 	// load delta.
 	domain := append(candidates, existing)
 	storeDescs := make([]roachpb.StoreDescriptor, 0, len(domain))
-	for _, desc := range storeDescMap {
+	for _, store := range domain {
+		desc, ok := storeDescMap[store]
+		if !ok {
+			continue
+		}
 		storeDescs = append(storeDescs, *desc)
 	}
 	domainStoreList := storepool.MakeStoreList(storeDescs)
@@ -1935,7 +1952,10 @@ func rankedCandidateListForRebalancing(
 // Contract: responsible for making sure that the returned bestIdx has the
 // corresponding MMA advisor in advisors.
 func bestRebalanceTarget(
-	randGen allocatorRand, options []rebalanceOptions, as *mmaintegration.AllocatorSync,
+	ctx context.Context,
+	randGen allocatorRand,
+	options []rebalanceOptions,
+	as *mmaintegration.AllocatorSync,
 ) (target, existingCandidate *candidate, bestIdx int) {
 	bestIdx = -1
 	var bestTarget *candidate
@@ -1965,7 +1985,7 @@ func bestRebalanceTarget(
 		for _, cand := range options[bestIdx].candidates {
 			stores = append(stores, cand.store.StoreID)
 		}
-		options[bestIdx].advisor = as.BuildMMARebalanceAdvisor(options[bestIdx].existing.store.StoreID, stores)
+		options[bestIdx].advisor = as.BuildMMARebalanceAdvisor(ctx, options[bestIdx].existing.store.StoreID, stores)
 	}
 
 	// Copy the selected target out of the candidates slice before modifying

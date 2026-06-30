@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -27,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
@@ -77,6 +79,7 @@ func TestRestoreResolveOptionsForJobDescription(t *testing.T) {
 		NewDBName:            tree.NewDString("test expr"),
 		DecryptionKMSURI:     []tree.Expr{tree.NewDString("http://example.com")},
 		EncryptionPassphrase: tree.NewDString("test expr"),
+		Grants:               true,
 	}
 
 	ensureAllStructFieldsSet := func(s tree.RestoreOptions, name string) {
@@ -317,7 +320,7 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 
 	t.Run("allocateDescriptorRewrite", func(t *testing.T) {
 		t.Run("succeeds on empty input", func(t *testing.T) {
-			rewrites, err := allocateDescriptorRewrites(
+			rewrites, _, err := allocateDescriptorRewrites(
 				ctx,
 				planner,
 				nil,
@@ -329,12 +332,13 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 				0,
 				tree.RestoreOptions{},
 				"",
-				"")
+				"",
+				false)
 			require.NoError(t, err)
 			require.Equal(t, jobspb.DescRewriteMap{}, rewrites)
 		})
 		t.Run("allocates into existing db", func(t *testing.T) {
-			rewrites, err := allocateDescriptorRewrites(
+			rewrites, _, err := allocateDescriptorRewrites(
 				ctx,
 				planner,
 				map[descpb.ID]*dbdesc.Mutable{
@@ -359,7 +363,8 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 				0,
 				tree.RestoreOptions{},
 				db2.GetName(),
-				"")
+				"",
+				false)
 			require.NoError(t, err)
 
 			// DB objects are not reallocated
@@ -392,7 +397,7 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 		})
 
 		t.Run("allocates into new db", func(t *testing.T) {
-			rewrites, err := allocateDescriptorRewrites(
+			rewrites, _, err := allocateDescriptorRewrites(
 				ctx,
 				planner,
 				map[descpb.ID]*dbdesc.Mutable{
@@ -419,7 +424,8 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 				0,
 				tree.RestoreOptions{},
 				"",
-				"db3")
+				"db3",
+				false)
 			require.NoError(t, err)
 
 			require.NoError(t, validateSelfIDs(rewrites, []catalog.Descriptor{
@@ -460,7 +466,7 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 		})
 
 		t.Run("allocates functions into new db", func(t *testing.T) {
-			rewrites, err := allocateDescriptorRewrites(
+			rewrites, _, err := allocateDescriptorRewrites(
 				ctx,
 				planner,
 				map[descpb.ID]*dbdesc.Mutable{
@@ -477,7 +483,8 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 				0,
 				tree.RestoreOptions{},
 				"",
-				"db3")
+				"db3",
+				false)
 
 			require.NoError(t, err)
 
@@ -504,7 +511,7 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 			// Get a new plan state after dropping the DB.
 			setupPlanner()
 
-			rewrites, err := allocateDescriptorRewrites(
+			rewrites, _, err := allocateDescriptorRewrites(
 				ctx,
 				planner,
 				map[descpb.ID]*dbdesc.Mutable{
@@ -534,7 +541,8 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 				0,
 				tree.RestoreOptions{},
 				"",
-				"")
+				"",
+				false)
 			require.NoError(t, err)
 
 			// DB objects are reallocated
@@ -573,6 +581,52 @@ func TestAllocateDescriptorRewrites(t *testing.T) {
 				)
 			}
 		})
+		t.Run("allocates system descriptors with setupTempDB", func(t *testing.T) {
+			namespaceTable := systemschema.NamespaceTable.
+				NewBuilder().BuildExistingMutable().(*tabledesc.Mutable)
+			usersTable := systemschema.UsersTable.
+				NewBuilder().BuildExistingMutable().(*tabledesc.Mutable)
+
+			rewrites, tempSysDBID, err := allocateDescriptorRewrites(
+				ctx,
+				planner,
+				nil,
+				nil,
+				map[descpb.ID]*tabledesc.Mutable{
+					namespaceTable.GetID(): namespaceTable,
+					usersTable.GetID():     usersTable,
+				},
+				nil,
+				nil,
+				nil,
+				0,
+				tree.RestoreOptions{},
+				"",
+				"",
+				true,
+			)
+
+			require.NoError(t, err)
+			require.NotEqual(t, descpb.InvalidID, tempSysDBID,
+				"tempSysDBID should be allocated when setupTempDB=true")
+			require.Len(t, rewrites, 2, "should have rewrites for both system tables")
+
+			for _, table := range []*tabledesc.Mutable{namespaceTable, usersTable} {
+				rewrite, ok := rewrites[table.GetID()]
+				require.True(t, ok, "no rewrite found for system table %s", table.GetName())
+
+				require.Equal(t, tempSysDBID, rewrite.ParentID,
+					"system table %s should have tempSysDBID as parent", table.GetName())
+
+				require.Equal(t, descpb.ID(keys.PublicSchemaIDForBackup), rewrite.ParentSchemaID,
+					"system table %s should have public schema as parent schema", table.GetName())
+
+				require.NotEqual(t, descpb.InvalidID, rewrite.ID,
+					"system table %s should be assigned new ID", table.GetName())
+				require.NotEqual(t, table.GetID(), rewrite.ID,
+					"system table %s should be assigned new ID different from original", table.GetName())
+			}
+		})
 	})
 }
 
@@ -581,8 +635,7 @@ func TestRestoreWithBackupIDs(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	_, sqlDB, _, cleanupFn := backuptestutils.StartBackupRestoreTestCluster(
-		t, singleNode, backuptestutils.WithInitFunc(InitManualReplication),
-	)
+		t, singleNode, backuptestutils.WithInitFunc(InitManualReplication))
 	defer cleanupFn()
 
 	const classicColl = "nodelocal://1/classic"
@@ -618,7 +671,7 @@ func TestRestoreWithBackupIDs(t *testing.T) {
 	//				i.   t0 (0 rows)
 	//				ii.  t1 (1 row)
 	//				iii. t2 (2 rows)
-	//	b. Incremental backup @ t4
+	//		b. Incremental backup @ t4
 	//				i.   t3 (3 row)
 	//				ii.  t4 (4 rows)
 	{
@@ -693,11 +746,11 @@ func TestRestoreWithBackupIDs(t *testing.T) {
 		// in time.
 		for _, coll := range []string{classicColl, rhColl} {
 			var ids []string
-			rows := sqlDB.Query(t, fmt.Sprintf("SHOW BACKUPS IN '%s'", coll))
+			rows := sqlDB.Query(t, "SHOW BACKUPS IN $1", coll)
 			for rows.Next() {
 				var id string
 				var unused any
-				require.NoError(t, rows.Scan(&id, &unused, &unused))
+				require.NoError(t, rows.Scan(&id, &unused))
 				ids = append([]string{id}, ids...)
 			}
 			backupIDsByColl[coll] = ids
@@ -707,7 +760,7 @@ func TestRestoreWithBackupIDs(t *testing.T) {
 		sqlDB.Exec(t, "SET SESSION use_backups_with_ids = false")
 		for _, coll := range []string{classicColl, rhColl} {
 			var subdirs []string
-			rows := sqlDB.Query(t, fmt.Sprintf("SHOW BACKUPS IN '%s'", coll))
+			rows := sqlDB.Query(t, "SHOW BACKUPS IN $1", coll)
 			for rows.Next() {
 				var subdir string
 				require.NoError(t, rows.Scan(&subdir))
@@ -824,12 +877,24 @@ func TestRestoreWithBackupIDs(t *testing.T) {
 			expectedErr: "not a revision history backup and cannot be used for AS OF SYSTEM TIME restores",
 		},
 		{
+			name:         "legacy/restore works on subdir",
+			collection:   classicColl,
+			token:        backupSubdirsByColl[classicColl][0],
+			expectedRows: 3,
+		},
+		{
+			name:         "legacy/LATEST resolves to legacy path",
+			collection:   classicColl,
+			token:        "LATEST",
+			expectedRows: 2,
+			disableIDs:   true,
+		},
+		{
 			name:         "legacy/AOST restore works on subdir",
 			collection:   classicColl,
 			token:        backupSubdirsByColl[classicColl][0],
 			aost:         classicTimes[2],
 			expectedRows: 2,
-			disableIDs:   true,
 		},
 		{
 			name:         "legacy/AOST restore works on LATEST",
@@ -838,12 +903,6 @@ func TestRestoreWithBackupIDs(t *testing.T) {
 			aost:         classicTimes[2],
 			expectedRows: 2,
 			disableIDs:   true,
-		},
-		{
-			name:        "subdir is not a valid backup ID",
-			collection:  classicColl,
-			token:       backupSubdirsByColl[classicColl][0],
-			expectedErr: "failed decoding backup ID",
 		},
 	}
 

@@ -6,6 +6,7 @@
 package scbuildstmt
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -16,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -45,8 +45,10 @@ func alterTableDropConstraint(
 	if dropPrimaryKeyConstraint(b, constraintElems, stmt, t) {
 		return
 	}
-	// Dropping UNIQUE constraint: error out as not implemented.
-	droppingUniqueConstraintNotImplemented(constraintElems, t)
+	// Dropping UNIQUE constraint backed by an index.
+	if dropUniqueIndexBackedConstraint(b, tn, tbl, constraintElems, stmt, t) {
+		return
+	}
 
 	_, _, constraintNameElem := scpb.FindConstraintWithoutIndexName(constraintElems)
 	constraintID := constraintNameElem.ConstraintID
@@ -76,10 +78,15 @@ func maybeDropAdditionallyForUniqueWithoutIndexConstraint(
 	if uwiElem == nil {
 		return
 	}
+	canUseSubset := b.ClusterSettings().Version.IsActive(b, clusterversion.V26_3)
 	maybeDropDependentFKConstraints(b, tableID, uwiElem.ConstraintID, constraintName, behavior,
 		func(fkReferencedColIDs []catid.ColumnID) bool {
-			return uwiElem.Predicate == nil &&
-				descpb.ColumnIDs(uwiElem.ColumnIDs).PermutationOf(fkReferencedColIDs)
+			if uwiElem.Predicate != nil {
+				return false
+			}
+			cols := descpb.ColumnIDs(uwiElem.ColumnIDs)
+			return cols.PermutationOf(fkReferencedColIDs) ||
+				(canUseSubset && cols.IsNonEmptySubsetOf(fkReferencedColIDs))
 		})
 }
 
@@ -133,20 +140,56 @@ func dropPrimaryKeyConstraint(
 	panic(scerrors.NotImplementedError(t))
 }
 
-func droppingUniqueConstraintNotImplemented(
-	constraintElems ElementResultSet, t *tree.AlterTableDropConstraint,
-) {
+// dropUniqueIndexBackedConstraint handles dropping a unique constraint that is
+// backed by a secondary index. Returns true if the constraint was handled,
+// false if not a unique index-backed constraint.
+func dropUniqueIndexBackedConstraint(
+	b BuildCtx,
+	tn *tree.TableName,
+	tbl *scpb.Table,
+	constraintElems ElementResultSet,
+	stmt tree.Statement,
+	t *tree.AlterTableDropConstraint,
+) bool {
 	_, _, sie := scpb.FindSecondaryIndex(constraintElems)
-	if sie != nil {
-		if sie.IsUnique {
-			panic(unimplemented.NewWithIssueDetailf(42840, "drop-constraint-unique",
-				"cannot drop UNIQUE constraint %q using ALTER TABLE DROP CONSTRAINT, use DROP INDEX CASCADE instead",
-				tree.ErrNameString(string(t.Constraint))))
-		} else {
-			panic(errors.AssertionFailedf("dropping an index-backed constraint but the " +
-				"index is not unique"))
-		}
+	if sie == nil {
+		return false
 	}
+	if !sie.IsUnique {
+		panic(errors.AssertionFailedf("dropping an index-backed constraint but the index is not unique"))
+	}
+
+	// Dropping a unique constraint via ALTER TABLE ... DROP CONSTRAINT was added
+	// in v26.2. In mixed-version clusters, fall back to the legacy schema changer
+	// to avoid inconsistent behavior across nodes.
+	if !b.EvalCtx().Settings.Version.ActiveVersion(b).IsActive(clusterversion.V26_2) {
+		panic(scerrors.NotImplementedErrorf(t,
+			"DROP CONSTRAINT for unique constraints is not supported before v26.2"))
+	}
+
+	// Since this will drop the index as well, guard this behind the
+	// sql_safe_updates flag.
+	failIfSafeUpdates(b, t)
+
+	panicIfRegionChangeUnderwayOnRBRTable(b, "ALTER TABLE DROP CONSTRAINT", sie.TableID)
+
+	// Build index name for error messages and dependency handling.
+	_, _, indexNameElem := scpb.FindIndexName(constraintElems)
+	indexName := &tree.TableIndexName{
+		Table: *tn,
+		Index: tree.UnrestrictedName(indexNameElem.Name),
+	}
+
+	// Reuse the DROP INDEX logic which handles all dependencies:
+	// - Dependent views
+	// - Dependent functions
+	// - Dependent FK constraints
+	// - Sharded index cleanup
+	// - Expression index cleanup
+	// - Dependent triggers
+	dropSecondaryIndex(b, indexName, t.DropBehavior, sie, stmt)
+
+	return true
 }
 
 func checkRegionalByRowConstraintConflict(

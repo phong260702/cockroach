@@ -82,8 +82,8 @@ func (po *Setter) RunPostChecks() error {
 	return nil
 }
 
-// IsNewTableObject implements the Setter interface.
-func (po *Setter) IsNewTableObject() bool {
+// IsNewObject implements the Setter interface.
+func (po *Setter) IsNewObject() bool {
 	return po.NewObject
 }
 
@@ -738,12 +738,7 @@ var tableParams = map[string]tableParam{
 			return nil
 		},
 		getResetValue: func(ctx context.Context, evalCtx *eval.Context, key string) (string, error) {
-			schemaLockedDefault := evalCtx.SessionData().CreateTableWithSchemaLocked
-			// Before 25.3 tables were never created with schema_locked by default.
-			if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.V25_3) {
-				schemaLockedDefault = false
-			}
-			return fmt.Sprintf("%t", schemaLockedDefault), nil
+			return fmt.Sprintf("%t", evalCtx.SessionData().CreateTableWithSchemaLocked), nil
 		},
 		onReset: func(ctx context.Context, po *Setter, key string, value string) error {
 			boolVal, err := strconv.ParseBool(value)
@@ -770,6 +765,10 @@ var tableParams = map[string]tableParam{
 	},
 	catpb.CanaryStatsWindowSettingName: {
 		validateSetValue: func(ctx context.Context, semaCtx *tree.SemaContext, evalCtx *eval.Context, key string, datum tree.Datum) (string, error) {
+			if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.V26_2) {
+				return "", pgerror.Newf(pgcode.FeatureNotSupported,
+					"%s cannot be used until the cluster upgrade to v26.2 is finalized", key)
+			}
 			d, err := paramparse.DatumAsDuration(ctx, evalCtx, key, datum)
 			if err != nil {
 				return "", err

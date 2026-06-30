@@ -95,6 +95,17 @@ type normalizedSpanConfig struct {
 	interner *stringInterner
 }
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (conf *normalizedSpanConfig) SafeFormat(w redact.SafePrinter, _ rune) {
+	if conf == nil {
+		w.SafeString("<nil>")
+		return
+	}
+	w.Printf("numVoters=%v numReplicas=%v constraints=%v voterConstraints=%v",
+		redact.SafeInt(conf.numVoters), redact.SafeInt(conf.numReplicas),
+		redact.SafeInt(len(conf.constraints)), redact.SafeInt(len(conf.voterConstraints)))
+}
+
 type internedConstraint struct {
 	// type captures the kind of constraint this is: required or prohibited.
 	typ roachpb.Constraint_Type
@@ -319,15 +330,15 @@ func (cc constraintsConj) relationship(b constraintsConj) conjunctionRelationshi
 func (rel conjunctionRelationship) SafeFormat(w redact.SafePrinter, _ rune) {
 	switch rel {
 	case conjPossiblyIntersecting:
-		w.Print("possiblyIntersecting")
+		w.SafeString("possiblyIntersecting")
 	case conjEqualSet:
-		w.Print("equalSet")
+		w.SafeString("equalSet")
 	case conjStrictSubset:
-		w.Print("strictSubset")
+		w.SafeString("strictSubset")
 	case conjStrictSuperset:
-		w.Print("strictSuperset")
+		w.SafeString("strictSuperset")
 	case conjNonIntersecting:
-		w.Print("nonIntersecting")
+		w.SafeString("nonIntersecting")
 	default:
 		w.Printf("unknown(%d)", rel)
 	}
@@ -1401,22 +1412,22 @@ func (rac *rangeAnalyzedConstraints) String() string {
 // SafeFormat implements the redact.SafeFormatter interface.
 func (rac *rangeAnalyzedConstraints) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("leaseholder=%v", rac.leaseholderID)
-	w.Print(" voters=[")
+	w.SafeString(" voters=[")
 	for i := range rac.replicas[voterIndex] {
 		if i > 0 {
-			w.Print(", ")
+			w.SafeString(", ")
 		}
 		w.Printf("s%v", rac.replicas[voterIndex][i].StoreID)
 	}
-	w.Print("]")
-	w.Print(" non-voters=[")
+	w.SafeRune(']')
+	w.SafeString(" non-voters=[")
 	for i := range rac.replicas[nonVoterIndex] {
 		if i > 0 {
-			w.Print(", ")
+			w.SafeString(", ")
 		}
 		w.Printf("s%v", rac.replicas[nonVoterIndex][i].StoreID)
 	}
-	w.Print("]")
+	w.SafeRune(']')
 	w.Printf(" req_num_voters=%v req_num_non_voters=%v",
 		rac.numNeededReplicas[voterIndex], rac.numNeededReplicas[nonVoterIndex])
 }
@@ -1757,6 +1768,8 @@ func (rac *rangeAnalyzedConstraints) finishInit(
 		}
 	}
 
+	// NB: these slices are captured by makeReplicasLocalityTiers and thus
+	// cannot be pooled.
 	var replicaLocalityTiers, voterLocalityTiers []localityTiers
 	for i := range rac.replicas[voterIndex] {
 		replicaLocalityTiers = append(replicaLocalityTiers, rac.replicas[voterIndex][i].localityTiers)
@@ -2088,10 +2101,11 @@ type storeAndLeasePreference struct {
 //
 // This would require restructuring to pass a health-filtered store set into
 // this function.
-func (rac *rangeAnalyzedConstraints) candidatesToMoveLease() (
-	cands []storeAndLeasePreference,
-	curLeasePreferenceIndex int32,
-) {
+// buf, if non-nil, is reused for the returned slice to avoid allocation.
+func (rac *rangeAnalyzedConstraints) candidatesToMoveLease(
+	buf []storeAndLeasePreference,
+) (cands []storeAndLeasePreference, curLeasePreferenceIndex int32) {
+	cands = buf[:0]
 	curLeasePreferenceIndex = rac.leaseholderPreferenceIndex
 	for i := range rac.leasePreferenceIndices {
 		if rac.leasePreferenceIndices[i] <= curLeasePreferenceIndex &&

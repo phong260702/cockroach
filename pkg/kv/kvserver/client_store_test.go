@@ -93,9 +93,9 @@ func TestStoreRaftReplicaID(t *testing.T) {
 	require.NoError(t, err)
 	repl, err := store.GetReplica(desc.RangeID)
 	require.NoError(t, err)
-	replicaID, err := kvstorage.MakeStateLoader(desc.RangeID).LoadRaftReplicaID(ctx, store.TODOEngine())
+	mark, err := kvstorage.MakeStateLoader(desc.RangeID).LoadReplicaMark(ctx, store.StateEngine())
 	require.NoError(t, err)
-	require.Equal(t, repl.ReplicaID(), replicaID.ReplicaID)
+	require.True(t, mark.Is(repl.ReplicaID()))
 
 	// RHS of a split also has ReplicaID.
 	splitKey := append(scratchKey, '0', '0')
@@ -103,10 +103,10 @@ func TestStoreRaftReplicaID(t *testing.T) {
 	require.NoError(t, err)
 	rhsRepl, err := store.GetReplica(rhsDesc.RangeID)
 	require.NoError(t, err)
-	rhsReplicaID, err :=
-		kvstorage.MakeStateLoader(rhsDesc.RangeID).LoadRaftReplicaID(ctx, store.StateEngine())
+	rhsMark, err := kvstorage.MakeStateLoader(rhsDesc.RangeID).LoadReplicaMark(
+		ctx, store.StateEngine())
 	require.NoError(t, err)
-	require.Equal(t, rhsRepl.ReplicaID(), rhsReplicaID.ReplicaID)
+	require.True(t, rhsMark.Is(rhsRepl.ReplicaID()))
 }
 
 // TestStoreLoadReplicaQuiescent tests whether replicas are initially quiescent
@@ -171,15 +171,26 @@ func TestStoreLoadReplicaQuiescent(t *testing.T) {
 			// and the lease acquisition will trigger an election. Expire that lease
 			// and send a request that'll force a re-acquisition. This time, we should
 			// get a leader lease.
+			//
+			// However, the clock increment also expires store liveness support,
+			// which can cause the Raft leader to step down. If this happens, we may
+			// end up acquiring yet another expiration based lease -- but that's fine,
+			// as eventually, we'll upgrade to a leader lease; the test needs to wait this
+			// out.
 			manualClock.Increment(tc.Server(0).RaftConfig().RangeLeaseDuration.Nanoseconds())
 			incArgs := incrementArgs(key, int64(5))
 
 			testutils.SucceedsSoon(t, func() error {
-				_, err := kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, 0).TestSender(), incArgs)
-				return err.GoError()
+				_, pErr := kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, 0).TestSender(), incArgs)
+				if pErr != nil {
+					return pErr.GoError()
+				}
+				lease, _ = repl.GetLease()
+				if lease.Type() != roachpb.LeaseLeader {
+					return errors.Errorf("expected leader lease, got %s", lease.Type())
+				}
+				return nil
 			})
-			lease, _ = repl.GetLease()
-			require.Equal(t, roachpb.LeaseLeader, lease.Type())
 		}
 
 		switch leaseType {

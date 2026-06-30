@@ -149,7 +149,6 @@ func showBackupTypeCheck(
 		exprutil.Strings{
 			backup.Path,
 			backup.Options.EncryptionPassphrase,
-			backup.Options.EncryptionInfoDir,
 			backup.Options.CheckConnectionTransferSize,
 			backup.Options.CheckConnectionDuration,
 		},
@@ -245,8 +244,9 @@ func collectBackupInfo(
 	collectionURIs []string,
 	backupToken string,
 ) (info backupInfo, memReserved int64, err error) {
+	_, _, err = backupinfo.DecodeBackupID(backupToken)
 	useIDs := p.SessionData().UseBackupsWithIDs
-	if !useIDs {
+	if err != nil && !(useIDs && strings.EqualFold(backupToken, backupbase.LatestFileName)) {
 		return legacyCollectBackupInfo(ctx, p, mem, kmsEnv, stmt, collectionURIs, backupToken)
 	}
 	mkStore := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI
@@ -259,9 +259,7 @@ func collectBackupInfo(
 	if err != nil {
 		return backupInfo{}, 0, errors.Wrapf(err, "make storage")
 	}
-	defer besteffort.Error(ctx, "close-root-store", func(_ context.Context) error {
-		return defaultRootStore.Close()
-	})
+	defer besteffort.Cleanup(ctx, "close-root-store", defaultRootStore.Close)
 
 	var backupIdx backuppb.BackupIndexMetadata
 	var backupID string
@@ -292,9 +290,7 @@ func collectBackupInfo(
 	if err != nil {
 		return backupInfo{}, 0, err
 	}
-	defer besteffort.Error(ctx, "close-enc-store", func(_ context.Context) error {
-		return encStore.Close()
-	})
+	defer besteffort.Cleanup(ctx, "close-enc-store", encStore.Close)
 	encryption, err := backupencryption.ResolveEncryptionOptionsFromExpr(
 		ctx, p, p.ExprEvaluator("SHOW BACKUP"), encStore,
 		stmt.Options.EncryptionPassphrase, tree.Exprs(stmt.Options.DecryptionKMSURI),
@@ -311,9 +307,7 @@ func collectBackupInfo(
 	if err != nil {
 		return backupInfo{}, 0, err
 	}
-	defer besteffort.Error(ctx, "close-backup-store", func(_ context.Context) error {
-		return backupStore.Close()
-	})
+	defer besteffort.Cleanup(ctx, "close-backup-store", backupStore.Close)
 	manifest, memReserved, err := backupinfo.ReadBackupManifestFromStore(
 		ctx, mem, backupStore, mainBackupURI, encryption, kmsEnv,
 	)
@@ -333,9 +327,7 @@ func collectBackupInfo(
 	if err != nil {
 		return backupInfo{}, 0, err
 	}
-	defer besteffort.Error(ctx, "close-root-stores", func(_ context.Context) error {
-		return cleanupStores()
-	})
+	defer besteffort.Cleanup(ctx, "close-root-stores", cleanupStores)
 	localityInfo, err := backupinfo.GetLocalityInfo(
 		ctx, rootStores, collectionURIs, manifest, encryption, kmsEnv, backupIdx.Path,
 	)
@@ -413,25 +405,10 @@ func legacyCollectBackupInfo(
 	if err != nil {
 		return backupInfo{}, 0, err
 	}
-	defer besteffort.Error(ctx, "cleanup-backup-stores", func(_ context.Context) error {
-		return cleanup()
-	})
-
-	encStore := baseStores[0]
-	if stmt.Options.EncryptionInfoDir != nil {
-		encDir, err := exprEval.String(ctx, stmt.Options.EncryptionInfoDir)
-		if err != nil {
-			return backupInfo{}, 0, err
-		}
-		encStore, err = p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, encDir, p.User())
-		if err != nil {
-			return backupInfo{}, 0, errors.Wrap(err, "make storage")
-		}
-		defer encStore.Close()
-	}
+	defer besteffort.Cleanup(ctx, "cleanup-backup-stores", cleanup)
 
 	encryption, err := backupencryption.ResolveEncryptionOptionsFromExpr(
-		ctx, p, exprEval, encStore,
+		ctx, p, exprEval, baseStores[0],
 		stmt.Options.EncryptionPassphrase, tree.Exprs(stmt.Options.DecryptionKMSURI),
 	)
 	if err != nil {
@@ -1402,6 +1379,16 @@ func showBackupsInCollectionTypeCheck(
 	); err != nil {
 		return false, nil, err
 	}
+
+	if p.SessionData().UseBackupsWithIDs {
+		header := showBackupsWithIDsHeader
+		if backup.Options.Debug {
+			header = showBackupsWithIDsDebugHeader
+		} else if backup.Options.RevisionStartTime {
+			header = showBackupsWithIDsRevisionHeader
+		}
+		return true, header, nil
+	}
 	return true, showBackupsInCollectionHeader, nil
 }
 
@@ -1412,7 +1399,21 @@ var showBackupsInCollectionHeader = colinfo.ResultColumns{
 var showBackupsWithIDsHeader = colinfo.ResultColumns{
 	{Name: "id", Typ: types.String},
 	{Name: "backup_time", Typ: types.TimestampTZ},
+}
+
+var showBackupsWithIDsRevisionHeader = colinfo.ResultColumns{
+	{Name: "id", Typ: types.String},
+	{Name: "backup_time", Typ: types.TimestampTZ},
 	{Name: "revision_start_time", Typ: types.TimestampTZ},
+}
+
+var showBackupsWithIDsDebugHeader = colinfo.ResultColumns{
+	{Name: "id", Typ: types.String},
+	{Name: "backup_time", Typ: types.TimestampTZ},
+	{Name: "revision_start_time", Typ: types.TimestampTZ},
+	{Name: "start_time", Typ: types.TimestampTZ},
+	{Name: "full_subdir", Typ: types.String},
+	{Name: "path", Typ: types.String},
 }
 
 // getTimeRangeOrDefaults parses the NEWER THAN and OLDER THAN expressions from
@@ -1472,6 +1473,8 @@ func showBackupsInCollectionPlanHook(
 	}
 
 	useIDs := p.SessionData().UseBackupsWithIDs
+	debug := showStmt.Options.Debug
+	revisionStartTime := showStmt.Options.RevisionStartTime
 	fn := func(ctx context.Context, resultsCh chan<- tree.Datums) error {
 		ctx, span := tracing.ChildSpan(ctx, showStmt.StatementTag())
 		defer span.Finish()
@@ -1480,17 +1483,16 @@ func showBackupsInCollectionPlanHook(
 		if err != nil {
 			return errors.Wrapf(err, "connect to external storage")
 		}
-		defer besteffort.Error(ctx, "show-backups-close-store", func(_ context.Context) error {
-			return store.Close()
-		})
+		defer besteffort.Cleanup(ctx, "show-backups-close-store", store.Close)
 
 		if useIDs {
 			newerThan, olderThan, maxCount, err := getTimeRangeOrDefaults(ctx, p, showStmt.TimeRange)
 			if err != nil {
 				return err
 			}
+			openIndex := revisionStartTime || debug
 			res, exceededMax, err := backupinfo.ListRestorableBackups(
-				ctx, store, newerThan, olderThan, maxCount,
+				ctx, store, newerThan, olderThan, maxCount, openIndex,
 			)
 			if err != nil {
 				return err
@@ -1512,19 +1514,36 @@ func showBackupsInCollectionPlanHook(
 				if err != nil {
 					return err
 				}
-				revStartTime := tree.DNull
-				if i.MVCCFilter == backuppb.MVCCFilter_All {
-					revStartTime, err = tree.MakeDTimestampTZ(
-						timeutil.Unix(0, i.RevisionStartTime.WallTime), time.Second,
-					)
-					if err != nil {
-						return err
+				row := tree.Datums{tree.NewDString(i.ID), backupTime}
+				if revisionStartTime || debug {
+					revStartTime := tree.DNull
+					if i.OpenedIndex() && i.MVCCFilter(ctx, p.ExecCfg().SV()) == backuppb.MVCCFilter_All {
+						revStartTime, err = tree.MakeDTimestampTZ(
+							timeutil.Unix(0, i.RevisionStartTime(ctx, p.ExecCfg().SV()).WallTime), time.Second,
+						)
+						if err != nil {
+							return err
+						}
 					}
+					row = append(row, revStartTime)
 				}
-				resultsCh <- tree.Datums{
-					tree.NewDString(i.ID),
-					backupTime,
-					revStartTime,
+				if debug {
+					sv := p.ExecCfg().SV()
+					startTime := tree.DNull
+					if st := i.StartTime(ctx, sv); !st.IsEmpty() {
+						startTime, err = tree.MakeDTimestampTZ(
+							timeutil.Unix(0, st.WallTime), time.Nanosecond,
+						)
+						if err != nil {
+							return err
+						}
+					}
+					row = append(row, startTime, tree.NewDString(i.FullSubdir), tree.NewDString(i.Path(ctx, sv)))
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case resultsCh <- row:
 				}
 			}
 		} else {
@@ -1533,7 +1552,11 @@ func showBackupsInCollectionPlanHook(
 				return err
 			}
 			for _, i := range res {
-				resultsCh <- tree.Datums{tree.NewDString(i)}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case resultsCh <- tree.Datums{tree.NewDString(i)}:
+				}
 			}
 		}
 		return nil
@@ -1542,6 +1565,11 @@ func showBackupsInCollectionPlanHook(
 	header := showBackupsInCollectionHeader
 	if useIDs {
 		header = showBackupsWithIDsHeader
+		if debug {
+			header = showBackupsWithIDsDebugHeader
+		} else if revisionStartTime {
+			header = showBackupsWithIDsRevisionHeader
+		}
 	}
 	return fn, header, false, nil
 }

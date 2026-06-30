@@ -1366,6 +1366,12 @@ func (twb *txnWriteBuffer) mergeResponseWithRequestRecords(
 // applied by the txnWriteBuffer on a batch request that needs to be accounted
 // for when returning the response.
 type requestRecord struct {
+	// origRequest is the original request that was transformed.
+	origRequest kvpb.Request
+	// index of the request in the original batch to which the requestRecord
+	// applies.
+	index int
+
 	// stripped, if true, indicates that the request was stripped from the batch
 	// and never sent to the KV layer.
 	stripped bool
@@ -1374,11 +1380,6 @@ type requestRecord struct {
 	// transformed is always false; i.e. if the request was completely dropped,
 	// then it's not considered transformed.
 	transformed bool
-	// index of the request in the original batch to which the requestRecord
-	// applies.
-	index int
-	// origRequest is the original request that was transformed.
-	origRequest kvpb.Request
 }
 
 // toResp returns the response that should be added to the batch response as
@@ -1789,7 +1790,13 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 	}
 
 	midTxnFlush := !hasEndTxn
-	splitBatchRequired := separateBatchIsNeeded(ba, endTxnArg)
+	// We'll require a separate batch when flushing in the middle of the txn to
+	// avoid almost all read-write batches, plus it gives us protection against
+	// different edge cases.
+	//
+	// Separately, we might need to have a separate batch even when the EndTxn
+	// request is present.
+	splitBatchRequired := midTxnFlush || separateBatchIsNeeded(ba, endTxnArg)
 
 	// Flush all buffered writes by pre-pending them to the requests being sent
 	// in the batch.
@@ -1892,11 +1899,24 @@ func separateBatchIsNeeded(ba *kvpb.BatchRequest, optEndTxn kvpb.Request) bool {
 		}
 	}
 
-	return ba.MightStopEarly() ||
+	if ba.MightStopEarly() ||
 		ba.ReadConsistency != 0 ||
 		ba.WaitPolicy != 0 ||
 		ba.WriteOptions != nil && (*ba.WriteOptions != kvpb.WriteOptions{}) ||
-		ba.IsReverse
+		ba.IsReverse {
+		return true
+	}
+
+	// If we find any CPuts, then we need a separate batch because these can
+	// fail in a way that both (1) isn't retried at levels below us, and (2)
+	// can be recovered from in the same transaction at higher levels.
+	for _, ru := range ba.Requests {
+		if _, ok := ru.GetInner().(*kvpb.ConditionalPutRequest); ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 // clearBatchRequestOptions clears any options that should not be present on a

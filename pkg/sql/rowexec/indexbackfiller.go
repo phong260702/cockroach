@@ -8,6 +8,7 @@ package rowexec
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -17,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulksst"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -31,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -71,47 +74,26 @@ var backfillerMaxBufferSize = settings.RegisterByteSizeSetting(
 	512<<20,
 )
 
-// indexBackfillIngestConcurrency is the number of goroutines to use for
-// the ingestion step of the index backfiller; these are the goroutines
-// that write the index entries in bulk. Since that is mostly I/O bound,
-// adding concurrency allows some of the computational work to occur in
-// parallel.
+// indexBackfillIngestConcurrency controls the number of goroutines for the
+// ingestion step of the index backfiller. When set to 0 (auto), uses
+// GOMAXPROCS/2 for distributed merge, or 2 for the legacy path.
+// When set to a positive value, uses that explicit value.
 var indexBackfillIngestConcurrency = settings.RegisterIntSetting(
 	settings.ApplicationLevel,
 	"bulkio.index_backfill.ingest_concurrency",
-	"the number of goroutines to use for bulk adding index entries",
-	2,
-	settings.PositiveInt, /* validateFn */
+	"the number of goroutines to use for bulk adding index entries: "+
+		"0 assigns a reasonable default based on CPU count for distributed merge "+
+		"or 2 for the legacy path, >0 assigns the setting value",
+	0, // auto mode by default
+	settings.NonNegativeInt,
 )
 
 var indexBackfillElasticCPUControlEnabled = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
 	"bulkio.index_backfill.elastic_control.enabled",
 	"determines whether index backfill operations integrate with elastic CPU control",
-	false, // TODO(dt): enable this by default after more benchmarking.
+	true,
 )
-
-// indexBackfillSink abstracts the destination for index backfill output so the
-// ingestion pipeline can route built KVs either to the legacy BulkAdder path or
-// to future sinks (e.g. distributed-merge SST writers) without rewriting the
-// DistSQL processor. All sinks share the same Add/Flush/progress contract.
-type indexBackfillSink interface {
-	// Add enqueues a single KV pair for eventual persistence in the sink-specific
-	// backing store.
-	Add(ctx context.Context, key roachpb.Key, value []byte) error
-	// Flush forces any buffered state to be persisted.
-	Flush(ctx context.Context) error
-	// Close releases resources owned by the sink. Implementations should be
-	// idempotent and safe to call even if Flush returns an error.
-	Close(ctx context.Context)
-	// SetOnFlush installs a callback that is invoked after the sink writes a
-	// batch (mirrors kvserverbase.BulkAdder semantics so existing progress
-	// plumbing can be reused).
-	SetOnFlush(func(summary kvpb.BulkOpSummary))
-	// ConsumeFlushManifests returns any SST manifests produced since the last
-	// flush. This is only relevant for sinks that produce SSTs.
-	ConsumeFlushManifests() []jobspb.IndexBackfillSSTManifest
-}
 
 // indexBackfillBulkAdderFactory mirrors kvserverbase.BulkAdderFactory but is
 // injected so tests can swap in fakes and future sinks can reuse the backfiller
@@ -119,20 +101,6 @@ type indexBackfillSink interface {
 type indexBackfillBulkAdderFactory func(
 	ctx context.Context, writeAsOf hlc.Timestamp, opts kvserverbase.BulkAdderOptions,
 ) (kvserverbase.BulkAdder, error)
-
-// bulkAdderIndexBackfillSink is the default sink implementation backed by
-// kvserverbase.BulkAdder.
-type bulkAdderIndexBackfillSink struct {
-	kvserverbase.BulkAdder
-}
-
-var _ indexBackfillSink = (*bulkAdderIndexBackfillSink)(nil)
-
-// ConsumeFlushManifests implements the indexBackfillSink interface.
-func (b *bulkAdderIndexBackfillSink) ConsumeFlushManifests() []jobspb.IndexBackfillSSTManifest {
-	// The BulkAdder does not produce SST manifests.
-	return nil
-}
 
 func newIndexBackfiller(
 	ctx context.Context,
@@ -313,16 +281,26 @@ func (ib *indexBackfiller) maybeReencodeAndWriteVectorIndexEntry(
 // makeIndexBackfillSink materializes whatever sink the current backfill should
 // use (legacy BulkAdder or distributed-merge sink). The choice is driven by
 // execinfrapb.BackfillerSpec.
-func (ib *indexBackfiller) makeIndexBackfillSink(ctx context.Context) (indexBackfillSink, error) {
+func (ib *indexBackfiller) makeIndexBackfillSink(ctx context.Context) (bulksst.BulkSink, error) {
 	if ib.spec.UseDistributedMergeSink {
-		// Construct the full nodelocal URI using this processors's node ID. The spec
+		// Construct the full nodelocal URI using this processor's node ID. The spec
 		// stores just the path portion so that each processor writes to its own
 		// node's local storage.
 		nodeID := ib.flowCtx.NodeID.SQLInstanceID()
 		prefix := fmt.Sprintf("nodelocal://%d/%s", nodeID, ib.spec.DistributedMergeFilePrefix)
 
-		return newSSTIndexBackfillSink(
-			ctx, ib.flowCtx, prefix, ib.spec.WriteAsOf, ib.processorID)
+		checkDuplicates := ib.ContainsUniqueIndex()
+		return bulksst.NewSSTSink(
+			ctx,
+			ib.flowCtx.Cfg.Settings,
+			ib.flowCtx.Cfg.ExternalStorageFromURI,
+			ib.flowCtx.Cfg.DB.KV().Clock(),
+			prefix,
+			nodeID,
+			ib.spec.WriteAsOf,
+			ib.processorID,
+			checkDuplicates,
+		)
 	}
 
 	minBufferSize := backfillerBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV)
@@ -345,7 +323,7 @@ func (ib *indexBackfiller) makeIndexBackfillSink(ctx context.Context) (indexBack
 	if err != nil {
 		return nil, err
 	}
-	return &bulkAdderIndexBackfillSink{BulkAdder: adder}, nil
+	return &bulksst.BulkAdderSink{BulkAdder: adder}, nil
 }
 
 // ingestIndexEntries adds the batches of built index entries to the buffering
@@ -371,7 +349,7 @@ func (ib *indexBackfiller) ingestIndexEntries(
 		syncutil.Mutex
 		completedSpans []roachpb.Span
 		addedSpans     []roachpb.Span
-		manifests      []jobspb.IndexBackfillSSTManifest
+		manifests      []jobspb.BulkSSTManifest
 	}{}
 
 	// When the bulk adder flushes, the spans which were previously marked as
@@ -391,7 +369,7 @@ func (ib *indexBackfiller) ingestIndexEntries(
 		var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
 		prog.CompletedSpans = append(prog.CompletedSpans, mu.completedSpans...)
 		mu.completedSpans = nil
-		manifests := append([]jobspb.IndexBackfillSSTManifest(nil), mu.manifests...)
+		manifests := append([]jobspb.BulkSSTManifest(nil), mu.manifests...)
 		mu.manifests = nil
 		mu.Unlock()
 
@@ -399,7 +377,7 @@ func (ib *indexBackfiller) ingestIndexEntries(
 			return nil
 		}
 		if len(manifests) > 0 {
-			progress := execinfrapb.IndexBackfillMapProgress{
+			progress := execinfrapb.BulkMapProgress{
 				SSTManifests: manifests,
 			}
 			any, err := gogotypes.MarshalAny(&progress)
@@ -532,6 +510,15 @@ func (ib *indexBackfiller) runBackfill(
 ) error {
 	const indexEntriesChBufferSize = 10
 	ingestConcurrency := indexBackfillIngestConcurrency.Get(&ib.flowCtx.Cfg.Settings.SV)
+	if ingestConcurrency == 0 {
+		if ib.spec.UseDistributedMergeSink {
+			// Auto mode for distributed merge: scale with CPU count.
+			ingestConcurrency = max(1, int64(runtime.GOMAXPROCS(0)/2))
+		} else {
+			// Auto mode for legacy path: use historic default.
+			ingestConcurrency = 2
+		}
+	}
 
 	// Used to send index entries to the KV layer.
 	indexEntriesCh := make(chan indexEntryBatch, indexEntriesChBufferSize)
@@ -583,12 +570,21 @@ func (ib *indexBackfiller) Run(ctx context.Context, output execinfra.RowReceiver
 
 	progCh := make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
 	var err error
-	// We don't have to worry about this go routine leaking because next we loop
-	// over progCh which is closed only after the go routine returns.
-	go func() {
+	// Launch via the stopper so that any panic in runBackfill (or a panic
+	// re-thrown from a ctxgroup worker via Wait) is recovered and reported to
+	// Sentry by the stopper's recover wrapper before it tears down the
+	// process. We don't have to worry about the goroutine leaking because next
+	// we loop over progCh, which is closed only after the goroutine returns.
+	if startErr := ib.flowCtx.Stopper().RunAsyncTaskEx(ctx, stop.TaskOpts{
+		TaskName: "indexBackfiller-runBackfill",
+		SpanOpt:  stop.ChildSpan,
+	}, func(ctx context.Context) {
 		defer close(progCh)
 		err = ib.runBackfill(ctx, progCh)
-	}()
+	}); startErr != nil {
+		close(progCh)
+		err = startErr
+	}
 
 	for prog := range progCh {
 		// Take a copy so that we can send the progress address to the output processor.
@@ -609,17 +605,19 @@ func (ib *indexBackfiller) wrapDupError(ctx context.Context, orig error) error {
 	if orig == nil {
 		return nil
 	}
-	var typed *kvserverbase.DuplicateKeyError
-	if !errors.As(orig, &typed) {
-		return orig
+
+	// Handle DuplicateKeyError from within-batch duplicate detection.
+	var dupErr *kvserverbase.DuplicateKeyError
+	if errors.As(orig, &dupErr) {
+		desc, err := ib.desc.MakeFirstMutationPublic()
+		if err != nil {
+			return err
+		}
+		v := &roachpb.Value{RawBytes: dupErr.Value}
+		return row.NewUniquenessConstraintViolationError(ctx, desc, dupErr.Key, v)
 	}
 
-	desc, err := ib.desc.MakeFirstMutationPublic()
-	if err != nil {
-		return err
-	}
-	v := &roachpb.Value{RawBytes: typed.Value}
-	return row.NewUniquenessConstraintViolationError(ctx, desc, typed.Key, v)
+	return orig
 }
 
 const indexBackfillProgressReportInterval = 10 * time.Second

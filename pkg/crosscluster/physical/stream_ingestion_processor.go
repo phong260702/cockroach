@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
+	"github.com/cockroachdb/cockroach/pkg/util/rangescanstats/rangescanstatspb"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -88,7 +89,7 @@ var cutoverSignalPollInterval = settings.RegisterDurationSetting(
 	settings.SystemOnly,
 	"bulkio.stream_ingestion.failover_signal_poll_interval",
 	"the interval at which the stream ingestion job checks if it has been signaled to cutover",
-	10*time.Second,
+	60*time.Second,
 	settings.WithName("physical_replication.consumer.failover_signal_poll_interval"),
 )
 
@@ -289,7 +290,7 @@ type streamIngestionProcessor struct {
 	aggTimer timeutil.Timer
 
 	// Pipelines to report range stats down to frontier processor.
-	rangeStatsCh chan *streampb.StreamEvent_RangeStats
+	rangeStatsCh chan *rangescanstatspb.RangeStats
 }
 
 // PartitionEvent augments a normal event with the partition it came from.
@@ -346,7 +347,7 @@ func newStreamIngestionDataProcessor(
 		flushCh:          make(chan flushableBuffer),
 		checkpointCh:     make(chan *jobspb.ResolvedSpans),
 		errCh:            make(chan error, 1),
-		rangeStatsCh:     make(chan *streampb.StreamEvent_RangeStats),
+		rangeStatsCh:     make(chan *rangescanstatspb.RangeStats),
 		rekeyer:          rekeyer,
 		rewriteToDiffKey: spec.TenantRekey.NewID != spec.TenantRekey.OldID,
 		logBufferEvery:   log.Every(30 * time.Second),
@@ -541,7 +542,7 @@ func (sip *streamIngestionProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pr
 		return nil, bulkutil.ConstructTracingAggregatorProducerMeta(sip.Ctx(),
 			sip.FlowCtx.NodeID.SQLInstanceID(), sip.FlowCtx.ID, sip.agg)
 	case stats := <-sip.rangeStatsCh:
-		meta, err := replicationutils.StreamRangeStatsToProgressMeta(sip.FlowCtx, sip.ProcessorID, stats)
+		meta, err := replicationutils.StreamRangeStatsToProgressMeta(sip.Ctx(), sip.FlowCtx, sip.ProcessorID, stats)
 		if err != nil {
 			sip.MoveToDrainingAndLogError(err)
 			return nil, sip.DrainHelper()

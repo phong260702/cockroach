@@ -14,8 +14,11 @@ import (
 // Warning executes a best-effort operation that logs a warning on failure.
 //
 // Best-effort operations are tasks that should be attempted but are not critical
-// to system correctness. In production builds, failures are logged as warnings.
-// In test builds, failures panic by default to catch regressions.
+// to system correctness.
+// In production builds, failures are logged as warnings.
+// In test builds, failures panic by default to catch regressions and operations
+// are randomly skipped 50% of the time to ensure the system remains correct
+// when those operations don't run.
 //
 // Example usage:
 //
@@ -40,8 +43,11 @@ func Warning(ctx context.Context, name string, do func(ctx context.Context) erro
 // Error executes a best-effort operation that logs an error on failure.
 //
 // Best-effort operations are tasks that should be attempted but are not critical
-// to system correctness. In production builds, failures are logged as errors.
-// In test builds, failures panic by default to catch regressions.
+// to system correctness.
+// In production builds, failures are logged as errors. In test builds, failures
+// panic by default to catch regressions and operations are randomly skipped 50%
+// of the time to ensure the system remains correct when those operations don't
+// run.
 //
 // Example usage:
 //
@@ -60,5 +66,26 @@ func Error(ctx context.Context, name string, do func(ctx context.Context) error)
 			panic(err)
 		}
 		log.Dev.Errorf(ctx, "best effort operation '%s' failed: %+v", name, err)
+	}
+}
+
+// Cleanup executes a cleanup operation that must always run.
+//
+// Unlike Warning and Error, Cleanup never skips execution in test builds.
+// This is appropriate for resource cleanup (closing files, release locks,
+// etc.), where skipping would cause resource leaks. In production builds,
+// errors are logged as warnings. In test builds, errors panic by default to
+// catch regressions.
+//
+// Example usage:
+//
+//	defer besteffort.Cleanup(ctx, "close-store", store.Close)
+func Cleanup(ctx context.Context, name string, do func() error) {
+	err := do()
+	if err != nil {
+		if !isAllowedFailure(name) {
+			panic(err)
+		}
+		log.Dev.Warningf(ctx, "cleanup operation '%s' failed: %+v", name, err)
 	}
 }

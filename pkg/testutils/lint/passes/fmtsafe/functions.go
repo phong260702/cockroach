@@ -119,6 +119,10 @@ var requireConstFmt = map[string]bool{
 	"(*main.operationImpl).Fatalf":                                                            true,
 	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.operationImpl).Fatalf":              true,
 
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/tef/planners.defaultLogger).Infof":    true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/tef/planners.defaultLogger).Warningf": true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/tef/planners.defaultLogger).Errorf":   true,
+
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Debugf":   true,
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Infof":    true,
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Warningf": true,
@@ -127,6 +131,9 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Panicf":   true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver/rafttrace.traceValue).logf": true,
+
+	"(github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/mmaprototype.mmaLogger).logf": true,
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/mmaprototype.assertTruef":      true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2.LogTracker).errorf": true,
 
@@ -176,13 +183,6 @@ var requireConstFmt = map[string]bool{
 	"(github.com/cockroachdb/cockroach/pkg/kv/kvpb.TestPrinter).Printf": true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/cloud/amazon.awsLogAdapter).Logf": true,
-
-	"(github.com/cockroachdb/cockroach/pkg/util/log.Migrator).logfDepth": true,
-	"(github.com/cockroachdb/cockroach/pkg/util/log.Migrator).Infof":     true,
-	"(github.com/cockroachdb/cockroach/pkg/util/log.Migrator).Warningf":  true,
-	"(github.com/cockroachdb/cockroach/pkg/util/log.Migrator).Errorf":    true,
-	"(github.com/cockroachdb/cockroach/pkg/util/log.Migrator).Fatalf":    true,
-	"(github.com/cockroachdb/cockroach/pkg/util/log.Migrator).VEventf":   true,
 
 	// Error things are populated in the init() message.
 }

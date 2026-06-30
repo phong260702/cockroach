@@ -259,6 +259,27 @@ func (c *VecToDatumConverter) GetDatumColumn(colIdx int) tree.Datums {
 	return c.convertedVecs[colIdx]
 }
 
+func countNulls(nulls *coldata.Nulls, length int, sel []int) int {
+	if !nulls.MaybeHasNulls() {
+		return 0
+	}
+	var count int
+	if sel != nil {
+		for _, idx := range sel[:length] {
+			if nulls.NullAt(idx) {
+				count++
+			}
+		}
+	} else {
+		for i := range length {
+			if nulls.NullAt(i) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 // ColVecToDatumAndDeselect converts a vector of coldata-represented values in
 // col into tree.Datum representation while performing a deselection step.
 // length specifies the number of values to be converted and sel is an optional
@@ -273,6 +294,10 @@ func ColVecToDatumAndDeselect(
 	if sel == nil {
 		ColVecToDatum(converted, col, length, sel, da)
 		return
+	}
+	var jsonScratch []json.JSONEncoded
+	if col.Type().Family() == types.JsonFamily {
+		jsonScratch = make([]json.JSONEncoded, length-countNulls(col.Nulls(), length, sel))
 	}
 	if col.MaybeHasNulls() {
 		nulls := col.Nulls()
@@ -291,6 +316,10 @@ func ColVecToDatum(
 ) {
 	if length == 0 {
 		return
+	}
+	var jsonScratch []json.JSONEncoded
+	if col.Type().Family() == types.JsonFamily {
+		jsonScratch = make([]json.JSONEncoded, length-countNulls(col.Nulls(), length, sel))
 	}
 	if col.MaybeHasNulls() {
 		nulls := col.Nulls()
@@ -386,6 +415,30 @@ func vecToDatum(
 					}
 				}
 				v := da.NewDName(tree.DString(bytes.Get(srcIdx)))
+				if !hasSel || deselect {
+					//gcassert:bce
+				}
+				converted[destIdx] = v
+			}
+			return
+		}
+		if ct.Oid() == oid.T_aclitem {
+			for idx = 0; idx < length; idx++ {
+				setDestIdx(destIdx, idx, sel, hasSel, deselect)
+				setSrcIdx(srcIdx, idx, sel, hasSel)
+				if hasNulls {
+					if nulls.NullAt(srcIdx) {
+						if !hasSel || deselect {
+							//gcassert:bce
+						}
+						converted[destIdx] = tree.DNull
+						continue
+					}
+				}
+				v, err := da.NewDACLItem(tree.DString(bytes.Get(srcIdx)))
+				if err != nil {
+					colexecerror.ExpectedError(err)
+				}
 				if !hasSel || deselect {
 					//gcassert:bce
 				}

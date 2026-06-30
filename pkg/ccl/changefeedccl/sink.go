@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -109,6 +110,7 @@ type EventSink interface {
 		ctx context.Context,
 		topic TopicDescriptor,
 		key, value []byte,
+		csvColumnHeader []byte,
 		updated, mvcc hlc.Timestamp,
 		alloc kvevent.Alloc,
 		headers rowHeaders,
@@ -148,7 +150,7 @@ func getEventSink(
 	m metricsRecorder,
 	targets changefeedbase.Targets,
 ) (EventSink, error) {
-	return getAndDialSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m, targets)
+	return getAndDialSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m, targets, false /* initialValidation */)
 }
 
 func getResolvedTimestampSink(
@@ -161,7 +163,7 @@ func getResolvedTimestampSink(
 	m metricsRecorder,
 	targets changefeedbase.Targets,
 ) (ResolvedTimestampSink, error) {
-	return getAndDialSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m, targets)
+	return getAndDialSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m, targets, false /* initialValidation */)
 }
 
 func getAndDialSink(
@@ -173,8 +175,9 @@ func getAndDialSink(
 	jobID jobspb.JobID,
 	m metricsRecorder,
 	targets changefeedbase.Targets,
+	initialValidation bool,
 ) (Sink, error) {
-	sink, err := getSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m, targets)
+	sink, err := getSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m, targets, initialValidation)
 	if err != nil {
 		return nil, err
 	}
@@ -207,10 +210,16 @@ func getSink(
 	jobID jobspb.JobID,
 	m metricsRecorder,
 	targets changefeedbase.Targets,
+	initialValidation bool,
 ) (Sink, error) {
 	u, err := url.Parse(feedCfg.SinkURI)
 	if err != nil {
 		return nil, err
+	}
+	if initialValidation {
+		if err := changefeedbase.ValidateSinkURIParams(u); err != nil {
+			return nil, err
+		}
 	}
 	if scheme, ok := changefeedbase.NoLongerExperimental[u.Scheme]; ok {
 		u.Scheme = scheme
@@ -380,11 +389,12 @@ func (s errorWrapperSink) EmitRow(
 	ctx context.Context,
 	topic TopicDescriptor,
 	key, value []byte,
+	csvColumnHeader []byte,
 	updated, mvcc hlc.Timestamp,
 	alloc kvevent.Alloc,
 	headers rowHeaders,
 ) error {
-	if err := s.wrapped.(EventSink).EmitRow(ctx, topic, key, value, updated, mvcc, alloc, headers); err != nil {
+	if err := s.wrapped.(EventSink).EmitRow(ctx, topic, key, value, csvColumnHeader, updated, mvcc, alloc, headers); err != nil {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
@@ -472,6 +482,7 @@ func (s *bufferSink) EmitRow(
 	ctx context.Context,
 	topic TopicDescriptor,
 	key, value []byte,
+	csvColumnHeader []byte,
 	updated, mvcc hlc.Timestamp,
 	r kvevent.Alloc,
 	_headers rowHeaders,
@@ -584,6 +595,7 @@ func (n *nullSink) EmitRow(
 	ctx context.Context,
 	topic TopicDescriptor,
 	key, value []byte,
+	csvColumnHeader []byte,
 	updated, mvcc hlc.Timestamp,
 	r kvevent.Alloc,
 	_headers rowHeaders,
@@ -663,13 +675,14 @@ func (s *safeSink) EmitRow(
 	ctx context.Context,
 	topic TopicDescriptor,
 	key, value []byte,
+	csvColumnHeader []byte,
 	updated, mvcc hlc.Timestamp,
 	alloc kvevent.Alloc,
 	headers rowHeaders,
 ) error {
 	s.Lock()
 	defer s.Unlock()
-	return s.wrapped.EmitRow(ctx, topic, key, value, updated, mvcc, alloc, headers)
+	return s.wrapped.EmitRow(ctx, topic, key, value, csvColumnHeader, updated, mvcc, alloc, headers)
 }
 
 func (s *safeSink) Flush(ctx context.Context) error {
@@ -836,6 +849,7 @@ func newCPUPacerFactory(ctx context.Context, cfg *execinfra.ServerConfig) func()
 			if !ok {
 				tenantID = roachpb.SystemTenantID
 			}
+			wid, wtype := kv.WorkloadInfoFromContext(ctx)
 
 			pacer = cfg.AdmissionPacerFactory.NewPacer(
 				pacerRequestUnit,
@@ -844,6 +858,8 @@ func newCPUPacerFactory(ctx context.Context, cfg *execinfra.ServerConfig) func()
 					Priority:        admissionpb.BulkNormalPri,
 					CreateTime:      timeutil.Now().UnixNano(),
 					BypassAdmission: false,
+					WorkloadID:      wid,
+					WorkloadType:    wtype,
 				},
 			)
 		}

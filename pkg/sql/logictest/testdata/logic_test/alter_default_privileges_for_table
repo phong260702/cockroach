@@ -266,9 +266,12 @@ d              public       t8          testuser   CREATE             false
 d              public       t8          testuser   DELETE             false
 d              public       t8          testuser   DROP               false
 d              public       t8          testuser   INSERT             false
+d              public       t8          testuser   MAINTAIN           false
+d              public       t8          testuser   REFERENCES         false
 d              public       t8          testuser   REPLICATIONDEST    false
 d              public       t8          testuser   REPLICATIONSOURCE  false
 d              public       t8          testuser   TRIGGER            false
+d              public       t8          testuser   TRUNCATE           false
 d              public       t8          testuser   UPDATE             false
 d              public       t8          testuser   ZONECONFIG         false
 d              public       t8          testuser2  BACKUP             false
@@ -277,9 +280,12 @@ d              public       t8          testuser2  CREATE             false
 d              public       t8          testuser2  DELETE             false
 d              public       t8          testuser2  DROP               false
 d              public       t8          testuser2  INSERT             false
+d              public       t8          testuser2  MAINTAIN           false
+d              public       t8          testuser2  REFERENCES         false
 d              public       t8          testuser2  REPLICATIONDEST    false
 d              public       t8          testuser2  REPLICATIONSOURCE  false
 d              public       t8          testuser2  TRIGGER            false
+d              public       t8          testuser2  TRUNCATE           false
 d              public       t8          testuser2  UPDATE             false
 d              public       t8          testuser2  ZONECONFIG         false
 

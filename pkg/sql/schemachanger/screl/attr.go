@@ -62,6 +62,8 @@ const (
 	// use includes:
 	//   1. comment metadata on descriptors.
 	//   2. string representation of column generated as identity sequence options
+	//   3. region name for TableLocalitySecondaryRegion.
+	//   4. regional by row AS
 	Value
 	// TemporaryIndexID is the index ID of the temporary index being populated
 	// during this index's backfill.
@@ -173,6 +175,9 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.CompositeType)(nil)),
 		rel.EntityAttr(DescID, "TypeID"),
 	),
+	rel.EntityMapping(t((*scpb.DomainType)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+	),
 	rel.EntityMapping(t((*scpb.CompositeTypeAttrName)(nil)),
 		rel.EntityAttr(DescID, "CompositeTypeID"),
 		rel.EntityAttr(Name, "Name"),
@@ -279,9 +284,11 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.TableLocalitySecondaryRegion)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ReferencedDescID, "RegionEnumTypeID"),
+		rel.EntityAttr(Value, "RegionName"),
 	),
 	rel.EntityMapping(t((*scpb.TableLocalityRegionalByRow)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(Value, "As"),
 	),
 	rel.EntityMapping(t((*scpb.TableLocalityRegionalByRowUsingConstraint)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -579,6 +586,48 @@ var elementSchemaOptions = []rel.SchemaOption{
 	),
 	rel.EntityMapping(t((*scpb.FunctionSecurity)(nil)),
 		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionParams)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionComment)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+		rel.EntityAttr(Value, "Comment"),
+	),
+	// Domain constraint elements are placed at the end to avoid introducing
+	// new attribute ordinals before existing ones, which would change the
+	// field order in element string formatting across all golden files.
+	rel.EntityMapping(t((*scpb.DomainDefault)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(Expr, "Expr"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+		rel.EntityAttr(ReferencedFunctionIDs, "UsesFunctionIDs"),
+	),
+	rel.EntityMapping(t((*scpb.DomainNotNull)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+	),
+	rel.EntityMapping(t((*scpb.DomainCheckConstraint)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(Expr, "Expr"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+		rel.EntityAttr(ReferencedFunctionIDs, "UsesFunctionIDs"),
+	),
+	rel.EntityMapping(t((*scpb.DomainCheckConstraintUnvalidated)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(Expr, "Expr"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+		rel.EntityAttr(ReferencedFunctionIDs, "UsesFunctionIDs"),
+	),
+	rel.EntityMapping(t((*scpb.DomainConstraintName)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(Name, "Name"),
 	),
 }
 

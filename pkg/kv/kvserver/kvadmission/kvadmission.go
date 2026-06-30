@@ -9,7 +9,6 @@ package kvadmission
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -17,6 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/replica_rac2"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -25,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
@@ -161,16 +161,12 @@ type Controller interface {
 	) (Handle, error)
 	// AdmittedKVWorkDone is called after the admitted KV work is done
 	// executing.
-	AdmittedKVWorkDone(Handle, *StoreWriteBytes)
+	AdmittedKVWorkDone(Handle, admission.StoreWorkDoneInfo)
 	// AdmitRangefeedRequest must be called before serving rangefeed requests.
 	// If enabled, it returns a non-nil Pacer that's to be used within rangefeed
 	// catchup scans (typically CPU-intensive and affecting scheduling
 	// latencies).
 	AdmitRangefeedRequest(roachpb.TenantID, *kvpb.RangeFeedRequest) *admission.Pacer
-	// SetTenantWeightProvider is used to set the provider that will be
-	// periodically polled for weights. The stopper should be used to terminate
-	// the periodic polling.
-	SetTenantWeightProvider(TenantWeightProvider, *stop.Stopper)
 	// SnapshotIngestedOrWritten informs admission control about a range
 	// snapshot ingestion or a range snapshot written as a normal write.
 	// writeBytes should roughly correspond to the size of the write when
@@ -190,34 +186,13 @@ type Controller interface {
 	GetProvisionedBandwidth(roachpb.StoreID) int64
 }
 
-// TenantWeightProvider can be periodically asked to provide the tenant
-// weights.
-type TenantWeightProvider interface {
-	GetTenantWeights() TenantWeights
-}
-
-// TenantWeights contains the various tenant weights.
-type TenantWeights struct {
-	// Node is the node level tenant ID => weight.
-	Node map[uint64]uint32
-	// Stores contains the per-store tenant weights.
-	Stores []TenantWeightsForStore
-}
-
-// TenantWeightsForStore contains the tenant weights for a store.
-type TenantWeightsForStore struct {
-	roachpb.StoreID
-	// Weights is tenant ID => weight.
-	Weights map[uint64]uint32
-}
-
 // controllerImpl implements Controller interface.
 type controllerImpl struct {
 	nodeID *base.NodeIDContainer
 
 	// Admission control queues and coordinators. All three should be nil or
 	// non-nil.
-	kvAdmissionQ               *admission.WorkQueue
+	cpuGrantCoords             *admission.CPUGrantCoordinators
 	storeGrantCoords           *admission.StoreGrantCoordinators
 	elasticCPUGrantCoordinator *admission.ElasticCPUGrantCoordinator
 	kvflowHandles              kvflowcontrol.ReplicationAdmissionHandles
@@ -239,28 +214,44 @@ type Handle struct {
 	storeWorkHandle      admission.StoreWorkHandle
 	elasticCPUWorkHandle *admission.ElasticCPUWorkHandle
 	raftAdmissionMeta    *kvflowcontrolpb.RaftAdmissionMeta
+	ghToUnpause          *admission.GoroutineCPUHandle
 
 	cpuStart            time.Duration
+	cpuAdmissionQueue   *admission.WorkQueue
 	cpuKVAdmissionQResp admission.AdmitResponse
 }
 
-// AnnotateCtx annotates the given context with request-scoped admission
-// data, plumbed through the KV stack using context.Contexts.
+// AnnotateCtx annotates the given context with the ElasticCPUWorkHandle,
+// which is used deep in the storage layer (e.g., mvccExportToWriter) to pace
+// CPU intensive operations.
 func (h *Handle) AnnotateCtx(ctx context.Context) context.Context {
 	if h.elasticCPUWorkHandle != nil {
 		ctx = admission.ContextWithElasticCPUWorkHandle(ctx, h.elasticCPUWorkHandle)
 	}
-	if h.raftAdmissionMeta != nil {
-		ctx = kvflowcontrol.ContextWithMeta(ctx, h.raftAdmissionMeta)
-	}
 	return ctx
+}
+
+// AdmissionInfo returns admission control state that should be plumbed
+// through the KV layer via explicit function parameters.
+func (h *Handle) AdmissionInfo() AdmissionInfo {
+	return AdmissionInfo{
+		RaftAdmissionMeta: h.raftAdmissionMeta,
+	}
+}
+
+// AdmissionInfo contains admission control state that is plumbed through the
+// KV layer via explicit function parameters rather than context.
+type AdmissionInfo struct {
+	// RaftAdmissionMeta is the metadata used for replication flow control.
+	// It is populated for requests that will be proposed to Raft.
+	RaftAdmissionMeta *kvflowcontrolpb.RaftAdmissionMeta
 }
 
 // MakeController returns a Controller. All three parameters must together be
 // nil or non-nil.
 func MakeController(
 	nodeID *base.NodeIDContainer,
-	kvAdmissionQ *admission.WorkQueue,
+	cpuGrantCoords *admission.CPUGrantCoordinators,
 	elasticCPUGrantCoordinator *admission.ElasticCPUGrantCoordinator,
 	storeGrantCoords *admission.StoreGrantCoordinators,
 	kvflowHandles kvflowcontrol.ReplicationAdmissionHandles,
@@ -268,7 +259,7 @@ func MakeController(
 ) Controller {
 	return &controllerImpl{
 		nodeID:                     nodeID,
-		kvAdmissionQ:               kvAdmissionQ,
+		cpuGrantCoords:             cpuGrantCoords,
 		storeGrantCoords:           storeGrantCoords,
 		elasticCPUGrantCoordinator: elasticCPUGrantCoordinator,
 		kvflowHandles:              kvflowHandles,
@@ -287,7 +278,7 @@ func (n *controllerImpl) AdmitKVWork(
 	rangeTenantID roachpb.TenantID,
 	ba *kvpb.BatchRequest,
 ) (_ Handle, retErr error) {
-	if n.kvAdmissionQ == nil {
+	if n.cpuGrantCoords == nil {
 		return Handle{}, nil
 	}
 	admissionInfo := workInfoForBatch(n.settings, requestTenantID, rangeTenantID, ba)
@@ -309,7 +300,13 @@ func (n *controllerImpl) AdmitKVWork(
 			}
 			var err error
 			admitted, err = kvflowHandle.Admit(
-				ctx, admissionInfo.Priority, timeutil.FromUnixNanos(admissionInfo.CreateTime))
+				ctx, admissionInfo.Priority, timeutil.FromUnixNanos(admissionInfo.CreateTime),
+				ash.WorkloadInfo{
+					WorkloadID:    admissionInfo.WorkloadID,
+					AppNameID:     admissionInfo.AppNameID,
+					GatewayNodeID: admissionInfo.GatewayNodeID,
+					WorkloadType:  admissionInfo.WorkloadType,
+				})
 			if err != nil {
 				return Handle{}, err
 			} else if admitted {
@@ -356,6 +353,7 @@ func (n *controllerImpl) AdmitKVWork(
 			}
 		}
 	}
+	cpuAdmissionQ := n.cpuGrantCoords.GetKVWorkQueue()
 	if admissionEnabled {
 		// Bulk jobs such as backups or row-level TTL issue KV requests with a
 		// priority of admissionpb.BulkNormalPri or lower; these are eligible for
@@ -400,7 +398,7 @@ func (n *controllerImpl) AdmitKVWork(
 			}()
 		} else {
 			// Use the slots-based mechanism for everything else.
-			resp, err := n.kvAdmissionQ.Admit(ctx, admissionInfo)
+			resp, err := cpuAdmissionQ.Admit(ctx, admissionInfo)
 			if err != nil {
 				return Handle{}, err
 			}
@@ -409,14 +407,30 @@ func (n *controllerImpl) AdmitKVWork(
 				// since it is acceptable to charge them to the tenant.
 				ah.cpuStart = grunning.Time()
 			}
+			ah.cpuAdmissionQueue = cpuAdmissionQ
 			ah.cpuKVAdmissionQResp = resp
 		}
+	}
+	// Pause CPU measurement for SQL work if it is happening locally on this
+	// goroutine.
+	//
+	// NB: if we never reach this point in the function, either there is an
+	// error, or some aspect of admission is disabled (which is never the case
+	// in production). In the latter case, we will not pause measurement, which
+	// we deem acceptable.
+	//
+	// TODO(sumeer): improve the structure of AdmitKVWork to make the behavior
+	// easier to understand.
+	sqlHandle := admission.SQLCPUHandleFromContext(ctx)
+	if sqlHandle != nil {
+		ah.ghToUnpause = sqlHandle.RegisterGoroutine()
+		ah.ghToUnpause.PauseMeasuring()
 	}
 	return ah, nil
 }
 
 // AdmittedKVWorkDone implements the Controller interface.
-func (n *controllerImpl) AdmittedKVWorkDone(ah Handle, writeBytes *StoreWriteBytes) {
+func (n *controllerImpl) AdmittedKVWorkDone(ah Handle, doneInfo admission.StoreWorkDoneInfo) {
 	n.elasticCPUGrantCoordinator.ElasticCPUWorkQueue.AdmittedWorkDone(ah.elasticCPUWorkHandle)
 	if ah.cpuKVAdmissionQResp.Enabled {
 		cpuTime := grunning.Time() - ah.cpuStart
@@ -429,13 +443,9 @@ func (n *controllerImpl) AdmittedKVWorkDone(ah Handle, writeBytes *StoreWriteByt
 			}
 			cpuTime = 1
 		}
-		n.kvAdmissionQ.AdmittedWorkDone(ah.cpuKVAdmissionQResp, cpuTime)
+		ah.cpuAdmissionQueue.AdmittedWorkDone(ah.cpuKVAdmissionQResp, cpuTime)
 	}
 	if ah.storeAdmissionQ != nil {
-		var doneInfo admission.StoreWorkDoneInfo
-		if writeBytes != nil {
-			doneInfo = admission.StoreWorkDoneInfo(*writeBytes)
-		}
 		err := ah.storeAdmissionQ.AdmittedWorkDone(ah.storeWorkHandle, doneInfo)
 		if err != nil {
 			// This shouldn't be happening.
@@ -446,6 +456,9 @@ func (n *controllerImpl) AdmittedKVWorkDone(ah Handle, writeBytes *StoreWriteByt
 				log.KvDistribution.Errorf(context.Background(), "%s", err)
 			}
 		}
+	}
+	if ah.ghToUnpause != nil {
+		ah.ghToUnpause.UnpauseMeasuring()
 	}
 }
 
@@ -464,52 +477,9 @@ func (n *controllerImpl) AdmitRangefeedRequest(
 			Priority:        admissionpb.WorkPriority(request.AdmissionHeader.Priority),
 			CreateTime:      request.AdmissionHeader.CreateTime,
 			BypassAdmission: false,
+			WorkloadID:      uint64(workloadid.WORKLOAD_ID_RANGEFEED),
+			WorkloadType:    workloadid.WorkloadTypeSystem,
 		})
-}
-
-// SetTenantWeightProvider implements the Controller interface.
-func (n *controllerImpl) SetTenantWeightProvider(
-	provider TenantWeightProvider, stopper *stop.Stopper,
-) {
-	// TODO(irfansharif): Use a stopper here instead.
-	go func() {
-		const weightCalculationPeriod = 10 * time.Minute
-		ticker := time.NewTicker(weightCalculationPeriod)
-		// Used for short-circuiting the weights calculation if all weights are
-		// disabled.
-		allWeightsDisabled := false
-		for {
-			select {
-			case <-ticker.C:
-				kvDisabled := !admission.KVTenantWeightsEnabled.Get(&n.settings.SV)
-				kvStoresDisabled := !admission.KVStoresTenantWeightsEnabled.Get(&n.settings.SV)
-				if allWeightsDisabled && kvDisabled && kvStoresDisabled {
-					// Have already transitioned to disabled, so noop.
-					continue
-				}
-				weights := provider.GetTenantWeights()
-				if kvDisabled {
-					weights.Node = nil
-				}
-				n.kvAdmissionQ.SetTenantWeights(weights.Node)
-				n.elasticCPUGrantCoordinator.ElasticCPUWorkQueue.SetTenantWeights(weights.Node)
-
-				for _, storeWeights := range weights.Stores {
-					q := n.storeGrantCoords.TryGetQueueForStore(storeWeights.StoreID)
-					if q != nil {
-						if kvStoresDisabled {
-							storeWeights.Weights = nil
-						}
-						q.SetTenantWeights(storeWeights.Weights)
-					}
-				}
-				allWeightsDisabled = kvDisabled && kvStoresDisabled
-			case <-stopper.ShouldQuiesce():
-				ticker.Stop()
-				return
-			}
-		}
-	}()
 }
 
 // SnapshotIngestedOrWritten implements the Controller interface.
@@ -540,11 +510,17 @@ func (n *controllerImpl) FollowerStoreWriteBytes(
 
 var _ replica_rac2.ACWorkQueue = &controllerImpl{}
 
+var logUnableToFindQueueForStore = log.Every(time.Second)
+
 // Admit implements replica_rac2.ACWorkQueue. It is only used for the RACv2 protocol.
 func (n *controllerImpl) Admit(ctx context.Context, entry replica_rac2.EntryForAdmission) bool {
 	storeAdmissionQ := n.storeGrantCoords.TryGetQueueForStore(entry.StoreID)
 	if storeAdmissionQ == nil {
-		log.KvDistribution.Errorf(ctx, "unable to find queue for store: %s", entry.StoreID)
+		// This can happen during node startup before
+		// StoreGrantCoordinators.SetPebbleMetricsProvider has run.
+		if logUnableToFindQueueForStore.ShouldLog() {
+			log.KvDistribution.VInfof(ctx, 1, "unable to find queue for store: %s", entry.StoreID)
+		}
 		return false // nothing to do
 	}
 
@@ -610,30 +586,6 @@ func (f *FollowerStoreWriteBytes) Merge(from FollowerStoreWriteBytes) {
 	f.IngestedBytes += from.IngestedBytes
 }
 
-// StoreWriteBytes aliases admission.StoreWorkDoneInfo, since the notion of
-// "work is done" is specific to admission control and doesn't need to leak
-// everywhere.
-type StoreWriteBytes admission.StoreWorkDoneInfo
-
-var storeWriteBytesPool = sync.Pool{
-	New: func() interface{} { return &StoreWriteBytes{} },
-}
-
-// NewStoreWriteBytes constructs a new StoreWriteBytes.
-func NewStoreWriteBytes() *StoreWriteBytes {
-	wb := storeWriteBytesPool.Get().(*StoreWriteBytes)
-	*wb = StoreWriteBytes{}
-	return wb
-}
-
-// Release returns the *StoreWriteBytes to the pool.
-func (wb *StoreWriteBytes) Release() {
-	if wb == nil {
-		return
-	}
-	storeWriteBytesPool.Put(wb)
-}
-
 func workInfoForBatch(
 	st *cluster.Settings,
 	requestTenantID roachpb.TenantID,
@@ -684,6 +636,11 @@ func workInfoForBatch(
 		Priority:        admissionpb.WorkPriority(ba.AdmissionHeader.Priority),
 		CreateTime:      createTime,
 		BypassAdmission: bypassAdmission,
+		WorkloadID:      ba.Header.WorkloadID,
+		AppNameID:       ba.Header.AppNameID,
+		GatewayNodeID:   ba.Header.GatewayNodeID,
+		WorkloadType:    workloadid.WorkloadType(ba.Header.WorkloadType),
+		ResourceGroupID: admissionpb.ResourceGroupID(ba.AdmissionHeader.ResourceGroupID),
 	}
 	return admissionInfo
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -86,6 +87,7 @@ func PlanCDCExpression(
 		}, clusterunique.ID{}, /* queryID */
 		tree.FmtFlags(tree.QueryFormattingForFingerprintsMask.Get(&p.execCfg.Settings.SV)),
 		nil, /* statementHintsCache */
+		"",  /* currentDB */
 	)
 
 	p.curPlan.init(&p.stmt, &p.instrumentation)
@@ -479,7 +481,7 @@ func (c *cdcOptCatalog) newCDCDataSource(
 	if err != nil {
 		return nil, err
 	}
-	return newOptTable(ctx, d, c.codec(), nil /* stats */, emptyZoneConfig)
+	return newOptTable(ctx, d, c.codec(), nil /* stats */, emptyZoneConfig, false /* canaryAndStableStatsDiffer */, hlc.Timestamp{} /* canaryExpiration */)
 }
 
 // familyTableDescriptor wraps underlying catalog.TableDescriptor,

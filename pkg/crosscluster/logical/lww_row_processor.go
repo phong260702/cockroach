@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/sqlwriter"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -88,6 +89,17 @@ type querier interface {
 func isLwwLoser(err error) bool {
 	if condErr := (*kvpb.ConditionFailedError)(nil); errors.As(err, &condErr) {
 		return condErr.OriginTimestampOlderThan.IsSet()
+	}
+	return false
+}
+
+// isInsertWinnerWithConflict returns true if the error is a
+// ConditionFailedError with HadNewerOriginTimestamp set, meaning the insert
+// won the LWW comparison but conflicts with an existing row. The caller
+// should fall through to the upsert path.
+func isInsertWinnerWithConflict(err error) bool {
+	if condErr := (*kvpb.ConditionFailedError)(nil); errors.As(err, &condErr) {
+		return condErr.HadNewerOriginTimestamp
 	}
 	return false
 }
@@ -352,10 +364,14 @@ func (srp *sqlRowProcessor) ProcessRow(
 		return batchStats{}, errors.Wrap(err, "stripping tenant prefix")
 	}
 
-	row, err := srp.decoder.DecodeKV(ctx, kv, cdcevent.CurrentRow, kv.Value.Timestamp, false)
+	row, status, err := srp.decoder.DecodeKV(ctx, kv, cdcevent.CurrentRow, kv.Value.Timestamp, false)
 	if err != nil {
 		srp.lastRow = cdcevent.Row{}
 		return batchStats{}, errors.Wrap(err, "decoding KeyValue")
+	}
+	if status != cdcevent.DecodeOK {
+		srp.lastRow = cdcevent.Row{}
+		return batchStats{}, errors.Newf("unexpected decode status: %v", status)
 	}
 	srp.lastRow = row
 
@@ -367,12 +383,15 @@ func (srp *sqlRowProcessor) processParsedRow(
 ) (batchStats, error) {
 	var parsedBeforeRow *cdcevent.Row
 	if srp.querier.RequiresParsedBeforeRow(row.TableID) {
-		before, err := srp.decoder.DecodeKV(ctx, roachpb.KeyValue{
+		before, beforeStatus, err := srp.decoder.DecodeKV(ctx, roachpb.KeyValue{
 			Key:   key,
 			Value: prevValue,
 		}, cdcevent.PrevRow, prevValue.Timestamp, false)
 		if err != nil {
 			return batchStats{}, err
+		}
+		if beforeStatus != cdcevent.DecodeOK {
+			return batchStats{}, errors.Newf("unexpected decode status: %v", beforeStatus)
 		}
 		parsedBeforeRow = &before
 	}
@@ -485,7 +504,7 @@ func makeSQLProcessor(
 			deleteQueries: make(map[catid.DescID]queryBuilder, len(tableConfigByDestID)),
 			insertQueries: make(map[catid.DescID]map[catid.FamilyID]queryBuilder, len(tableConfigByDestID)),
 		},
-		tombstoneUpdaters:          make(map[descpb.ID]*tombstoneUpdater, len(tableConfigByDestID)),
+		tombstoneUpdaters:          make(map[descpb.ID]*sqlwriter.TombstoneUpdater, len(tableConfigByDestID)),
 		ieOverrideOptimisticInsert: getIEOverride(replicatedOptimisticInsertOpName, jobID),
 		ieOverrideInsert:           getIEOverride(replicatedInsertOpName, jobID),
 		ieOverrideDelete:           getIEOverride(replicatedDeleteOpName, jobID),
@@ -567,7 +586,7 @@ type lwwQuerier struct {
 	codec             keys.SQLCodec
 	db                descs.DB
 	queryBuffer       queryBuffer
-	tombstoneUpdaters map[descpb.ID]*tombstoneUpdater
+	tombstoneUpdaters map[descpb.ID]*sqlwriter.TombstoneUpdater
 
 	ieOverrideOptimisticInsert sessiondata.InternalExecutorOverride
 	ieOverrideInsert           sessiondata.InternalExecutorOverride
@@ -587,9 +606,8 @@ func (lww *lwwQuerier) AddTable(targetDescID int32, tc sqlProcessorTableConfig) 
 		return err
 	}
 
-	lww.tombstoneUpdaters[td.GetID()] = newTombstoneUpdater(
+	lww.tombstoneUpdaters[td.GetID()] = sqlwriter.NewTombstoneUpdater(
 		lww.codec,
-		lww.db.KV(),
 		lww.leaseMgr,
 		catid.DescID(targetDescID),
 		lww.sd,
@@ -644,10 +662,10 @@ func (lww *lwwQuerier) InsertRow(
 			if isLwwLoser(err) {
 				return batchStats{}, nil
 			}
-			// If the optimistic insert failed with unique violation, we have to
-			// fall back to the pessimistic path. If we got a different error,
-			// then we bail completely.
-			if pgerror.GetPGCode(err) != pgcode.UniqueViolation {
+			// If the optimistic insert failed with a unique violation or because
+			// the insert won LWW but conflicts with an existing row, fall back
+			// to the pessimistic upsert path. For any other error, bail.
+			if pgerror.GetPGCode(err) != pgcode.UniqueViolation && !isInsertWinnerWithConflict(err) {
 				log.Dev.Warningf(ctx, "replicated optimistic insert failed (query: %s): %s", stmt.SQL, err.Error())
 				return batchStats{}, err
 			}
@@ -713,10 +731,28 @@ func (lww *lwwQuerier) DeleteRow(
 		return batchStats{}, err
 	}
 	if rowCount != 1 {
-		// NOTE: at this point we don't know if we are updating a tombstone or if
-		// we are losing LWW. As long as it is a LWW loss or a tombstone update,
-		// updateTombstone will return okay.
-		return lww.tombstoneUpdaters[row.TableID].updateTombstoneAny(ctx, txn, row.MvccTimestamp, datums)
+		// NOTE: at this point we don't know if we are updating a tombstone or
+		// if we are losing LWW. UpdateTombstoneAny returns (true, nil) for a
+		// LWW loss, (false, nil) for a successful tombstone update, or
+		// (false, ErrStalePreviousValue) if a live row exists at the key.
+		tu := lww.tombstoneUpdaters[row.TableID]
+		var lwwLoss bool
+		if kvTxn != nil {
+			lwwLoss, err = tu.UpdateTombstoneAny(ctx, kvTxn, row.MvccTimestamp, datums)
+		} else {
+			err = lww.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				var txnErr error
+				lwwLoss, txnErr = tu.UpdateTombstoneAny(ctx, txn, row.MvccTimestamp, datums)
+				return txnErr
+			})
+		}
+		if err != nil {
+			return batchStats{}, err
+		}
+		if lwwLoss {
+			return batchStats{kvWriteTooOld: 1}, nil
+		}
+		return batchStats{}, nil
 	}
 	return batchStats{}, nil
 }

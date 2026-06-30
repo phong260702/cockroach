@@ -61,7 +61,7 @@
 // The interfaces involved:
 // - requester: handles all requests for a particular WorkKind. Implemented by
 //   WorkQueue. The requester implementation is responsible for controlling
-//   the admission order within a WorkKind based on tenant fairness,
+//   the admission order within a WorkKind based on group fairness,
 //   importance of work etc.
 // - granter: the counterpart to requester which grants admission tokens or
 //   slots. The implementations are slotGranter, tokenGranter,
@@ -121,37 +121,45 @@
 package admission
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/schedulerlatency"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/redact"
 )
 
 // burstQualification is an optional behavior of certain WorkQueues (which
-// implement requester), that differentiate between tenants that are qualified
+// implement requester), that differentiate between groups that are qualified
 // to burst (in their token consumption) and those that are not. This is a
-// dynamic attribute of a tenant, based on token consumption history
-// maintained in the WorkQueue. The ordering of tenants is also affected in
-// that burstable tenants are ordered before non-burstable tenants.
+// dynamic attribute of a group, based on token consumption history
+// maintained in the WorkQueue. The ordering of groups is also affected in
+// that burstable groups are ordered before non-burstable groups.
 type burstQualification uint8
 
 const (
+	// Order matters here. A higher priority burstQualification must use a
+	// lower ordinal than a lower priority burstQualification (see
+	// groupHeap.Less for a place where this invariant is relied on).
 	canBurst burstQualification = iota
 	noBurst
 	numBurstQualifications
 )
 
 func (bq burstQualification) String() string {
+	return redact.StringWithoutMarkers(bq)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (bq burstQualification) SafeFormat(s redact.SafePrinter, _ rune) {
 	switch bq {
 	case canBurst:
-		return "canBurst"
+		s.SafeString("can_burst")
 	case noBurst:
-		return "noBurst"
+		s.SafeString("no_burst")
 	default:
-		return fmt.Sprintf("burstQualification(%d)", bq)
+		s.Printf("burstQualification(%d)", bq)
 	}
 }
 
@@ -322,8 +330,14 @@ type granterWithIOTokens interface {
 		lastTick bool,
 	) (ioTokensUsed int64, ioTokensUsedByElasticWork int64)
 	// getDiskTokensUsedAndReset returns the disk bandwidth tokens used since the
-	// last such call.
-	getDiskTokensUsedAndReset() ([admissionpb.NumStoreWorkTypes]diskTokens, diskErrorStats)
+	// last such call, along with the remaining disk write tokens at the end of
+	// the previous interval. A negative value for remainingDiskWriteTokens
+	// indicates overadmission.
+	getDiskTokensUsedAndReset() (
+		usedTokens [admissionpb.NumStoreWorkTypes]diskTokens,
+		errStats diskErrorStats,
+		remainingDiskWriteTokens int64,
+	)
 	// setLinearModels supplies the models to use when storeWriteDone or
 	// storeReplicatedWorkAdmittedLocked is called, to adjust token consumption.
 	// Note that these models are not used for token adjustment at admission

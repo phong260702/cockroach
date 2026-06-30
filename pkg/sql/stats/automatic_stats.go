@@ -16,12 +16,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -189,6 +195,8 @@ var DefaultAsOfTime = 30 * time.Second
 // "buffered channel is full" errors.
 var bufferedChanFullLogLimiter = log.Every(time.Second)
 
+var fixMisestimatesChanFullLogLimiter = log.Every(10 * time.Second)
+
 // Constants for automatic statistics collection.
 // TODO(rytaft): Should these constants be configurable?
 const (
@@ -197,12 +205,36 @@ const (
 	// table.
 	defaultAverageTimeBetweenRefreshes = 12 * time.Hour
 
-	// refreshChanBufferLen is the length of the buffered channel used by the
-	// automatic statistics refresher. If the channel overflows, all SQL mutations
-	// will be ignored by the refresher until it processes some existing mutations
-	// in the buffer and makes space for new ones. SQL mutations will never block
-	// waiting on the refresher.
-	refreshChanBufferLen = 256
+	// mutationsChanBufferLen is the length of the buffered channel used by the
+	// automatic statistics refresher. If the channel overflows, all SQL
+	// mutations will be ignored by the refresher until it processes some
+	// existing mutations in the buffer and makes space for new ones. SQL
+	// mutations will never block waiting on the refresher.
+	mutationsChanBufferLen = 1 << 15
+
+	// misestimatesChanBufferLen is the same as mutationsChanBufferLen but for
+	// the stats misestimates buffered channel.
+	// TODO(#168078): maybe we should increase this value, perhaps after
+	// adding the memory accounting for the spans buffered in the channel.
+	// TODO(yuzefovich): consider introducing metrics counters to track how
+	// frequently the buffered channel fills up.
+	misestimatesChanBufferLen = 1 << 10
+
+	// maxMisestimateSpanCountPerTable is a loose upper-bound on the number of
+	// misestimate spans that we keep for a single table.
+	// TODO(#168078): consider making this configurable by a cluster setting,
+	// probably after adding the memory accounting.
+	maxMisestimateSpanCountPerTable = 256
+
+	// maxTablesForMisestimates controls the maximum number of tables for which
+	// we track the misestimates.
+	// TODO(#168078): consider making this configurable by a cluster setting,
+	// probably after adding the memory accounting.
+	maxTablesForMisestimates = 250
+
+	// settingsChanBufferLen is the same as mutationsChanBufferLen but for the
+	// settings' overrides buffered channel.
+	settingsChanBufferLen = 1 << 8
 )
 
 // Refresher is responsible for automatically refreshing the table statistics
@@ -282,6 +314,11 @@ type Refresher struct {
 	// metadata about SQL mutations to the background Refresher thread.
 	mutations chan mutation
 
+	// misestimates is the buffered channel used to pass messages from the
+	// execution engine after it encountered a "stats misestimate" to the
+	// background MisestimatesRefresher thread.
+	misestimates chan misestimate
+
 	// settings is the buffered channel used to pass messages containing
 	// autostats setting override information to the background Refresher thread.
 	settings chan settingOverride
@@ -299,6 +336,12 @@ type Refresher struct {
 	// mutationCounts contains aggregated mutation counts for each table that
 	// have yet to be processed by the refresher.
 	mutationCounts map[descpb.ID]int64
+
+	// misesimateSpans contains all the stats misestimates accumulated so far
+	// that have yet to be processed by the refresher.
+	// TODO(#168078): we should add memory accounting for spans stored in
+	// this map.
+	misestimateSpans map[indexInfo]roachpb.Spans
 
 	// settingOverrides holds any autostats cluster setting overrides for each
 	// table.
@@ -328,6 +371,19 @@ type mutation struct {
 	removeSettingOverrides bool
 }
 
+type indexInfo struct {
+	tableID       descpb.ID
+	indexID       descpb.IndexID
+	keyColumnName string
+	keyColumnDir  catenumpb.IndexColumn_Direction
+	keyColumnType *types.T
+}
+
+type misestimate struct {
+	indexInfo
+	roachpb.Spans
+}
+
 // settingOverride specifies the autostats setting override values to use in
 // place of the cluster settings.
 type settingOverride struct {
@@ -340,13 +396,13 @@ type TableStatsTestingKnobs struct {
 	// DisableInitialTableCollection, if set, indicates that the "initial table
 	// collection" performed by the Refresher should be skipped.
 	DisableInitialTableCollection bool
-	// DisableFullStatsRefresh, if set, indicates that the Refresher should not
-	// perform full statistics refreshes. Useful for testing the partial stats
-	// refresh logic.
-	DisableFullStatsRefresh bool
 	// StubTimeNow allows tests to override the current time, used by
 	// EstimateStaleness to get the latest stats' age.
 	StubTimeNow func() time.Time
+	// RescheduleAttempt, if non-nil, will be used to non-blockingly send the
+	// tableID on which the refresh is rescheduled due to
+	// ConcurrentCreateStatsError.
+	RescheduleAttempt chan descpb.ID
 }
 
 var _ base.ModuleTestingKnobs = &TableStatsTestingKnobs{}
@@ -371,11 +427,13 @@ func MakeRefresher(
 		knobs:            knobs,
 		readOnlyTenant:   readOnlyTenant,
 		rng:              rand.New(rand.NewSource(rand.Int63())),
-		mutations:        make(chan mutation, refreshChanBufferLen),
-		settings:         make(chan settingOverride, refreshChanBufferLen),
+		mutations:        make(chan mutation, mutationsChanBufferLen),
+		misestimates:     make(chan misestimate, misestimatesChanBufferLen),
+		settings:         make(chan settingOverride, settingsChanBufferLen),
 		asOfTime:         asOfTime,
 		extraTime:        time.Duration(rand.Int63n(int64(time.Hour))),
 		mutationCounts:   make(map[descpb.ID]int64, 16),
+		misestimateSpans: make(map[indexInfo]roachpb.Spans, 16),
 		settingOverrides: make(map[descpb.ID]catpb.AutoStatsSettings),
 		drainAutoStats:   make(chan struct{}),
 	}
@@ -406,17 +464,13 @@ func (r *Refresher) autoStatsEnabled(desc catalog.TableDescriptor) bool {
 
 // autoPartialStatsEnabled returns true if the
 // sql_stats_automatic_partial_collection_enabled setting of the table
-// descriptor set to true. If the table descriptor is nil or the table-level
-// setting is not set, the function returns true if the automatic partial stats
-// cluster setting is enabled.
-func (r *Refresher) autoPartialStatsEnabled(desc catalog.TableDescriptor) bool {
-	if desc == nil {
-		// If the descriptor could not be accessed, defer to the cluster setting.
+// descriptor set to true. If the table-level setting is not set, the function
+// returns true if the automatic partial stats cluster setting is enabled.
+func (r *Refresher) autoPartialStatsEnabled(explicitSettings *catpb.AutoStatsSettings) bool {
+	if explicitSettings == nil {
 		return AutomaticPartialStatisticsClusterMode.Get(&r.st.SV)
 	}
-	enabledForTable := desc.AutoPartialStatsCollectionEnabled()
-	// The table-level setting of sql_stats_automatic_partial_collection_enabled
-	// takes precedence over the cluster setting.
+	enabledForTable := explicitSettings.AutoPartialStatsCollectionEnabled()
 	if enabledForTable == catpb.AutoPartialStatsCollectionNotSet {
 		return AutomaticPartialStatisticsClusterMode.Get(&r.st.SV)
 	}
@@ -424,18 +478,14 @@ func (r *Refresher) autoPartialStatsEnabled(desc catalog.TableDescriptor) bool {
 }
 
 // autoFullStatsEnabled returns true if the
-// sql_stats_automatic_full_collection_enabled setting of the table
-// descriptor set to true. If the table descriptor is nil or the table-level
-// setting is not set, the function returns true if the automatic full stats
-// cluster setting is enabled.
-func (r *Refresher) autoFullStatsEnabled(desc catalog.TableDescriptor) bool {
-	if desc == nil {
-		// If the descriptor could not be accessed, defer to the cluster setting.
+// sql_stats_automatic_full_collection_enabled setting of the table descriptor
+// set to true. If the table-level setting is not set, the function returns true
+// if the automatic full stats cluster setting is enabled.
+func (r *Refresher) autoFullStatsEnabled(explicitSettings *catpb.AutoStatsSettings) bool {
+	if explicitSettings == nil {
 		return AutomaticFullStatisticsClusterMode.Get(&r.st.SV)
 	}
-	enabledForTable := desc.AutoFullStatsCollectionEnabled()
-	// The table-level setting of sql_stats_automatic_full_collection_enabled
-	// takes precedence over the cluster setting.
+	enabledForTable := explicitSettings.AutoFullStatsCollectionEnabled()
 	if enabledForTable == catpb.AutoFullStatsCollectionNotSet {
 		return AutomaticFullStatisticsClusterMode.Get(&r.st.SV)
 	}
@@ -539,7 +589,8 @@ func (r *Refresher) SetDraining() {
 
 // Start starts the stats refresher thread, which polls for messages about
 // new SQL mutations and refreshes the table statistics with probability
-// proportional to the percentage of rows affected.
+// proportional to the percentage of rows affected. It also starts the
+// "misestimates refresher" as well as the stats garbage collector threads.
 func (r *Refresher) Start(
 	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
@@ -549,6 +600,13 @@ func (r *Refresher) Start(
 		return nil
 	}
 
+	// We always sleep for r.asOfTime at the beginning of each refresh, so
+	// subtract it from the refreshInterval.
+	refreshInterval -= r.asOfTime
+	if refreshInterval < 0 {
+		refreshInterval = 0
+	}
+
 	// The refresher has the same lifetime as the server, so the cancellation
 	// function can be ignored and it'll be called by the stopper.
 	stoppingCtx, _ := stopper.WithCancelOnQuiesce(context.Background()) // nolint:quiesce
@@ -556,13 +614,6 @@ func (r *Refresher) Start(
 	r.startedTasksWG.Add(1)
 	if err := stopper.RunAsyncTask(bgCtx, "refresher", func(ctx context.Context) {
 		defer r.startedTasksWG.Done()
-
-		// We always sleep for r.asOfTime at the beginning of each refresh, so
-		// subtract it from the refreshInterval.
-		refreshInterval -= r.asOfTime
-		if refreshInterval < 0 {
-			refreshInterval = 0
-		}
 
 		timer := time.NewTimer(refreshInterval)
 		defer timer.Stop()
@@ -667,20 +718,18 @@ func (r *Refresher) Start(
 							}
 							r.maybeRefreshStats(
 								ctx,
-								stopper,
 								tableID,
 								explicitSettings,
 								rowsAffected,
 								r.asOfTime,
-								r.autoPartialStatsEnabled(desc),
-								r.autoFullStatsEnabled(desc),
+								r.autoPartialStatsEnabled(explicitSettings),
+								r.autoFullStatsEnabled(explicitSettings),
 							)
 
 							select {
 							case <-ctx.Done():
 								return
 							case <-r.drainAutoStats:
-								// Ditto.
 								return
 							default:
 							}
@@ -712,7 +761,9 @@ func (r *Refresher) Start(
 			case <-r.drainAutoStats:
 				log.Dev.Infof(ctx, "draining auto stats refresher")
 				return
+
 			case <-ctx.Done():
+				log.Dev.Infof(ctx, "quiescing auto stats refresher")
 				return
 			}
 		}
@@ -720,8 +771,47 @@ func (r *Refresher) Start(
 		r.startedTasksWG.Done()
 		log.Dev.Warningf(ctx, "refresher task failed to start: %v", err)
 	}
-	// Start another task that will periodically run an internal query to delete
-	// stats for dropped tables.
+
+	// Start another task to process "stats misestimates".
+	//
+	// The main reason for separating it out from the 'refresher' thread is that
+	// on each 'misestimate' object from r.misestimates we might need to do
+	// non-trivial amount of work, so we could delay consuming mutations from
+	// r.mutations.
+	r.startedTasksWG.Add(1)
+	if err := stopper.RunAsyncTask(bgCtx, "misestimates refresher", func(ctx context.Context) {
+		defer r.startedTasksWG.Done()
+
+		timer := time.NewTimer(refreshInterval)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-timer.C:
+				misestimateSpans := r.misestimateSpans
+				_ = misestimateSpans
+				r.misestimateSpans = make(map[indexInfo]roachpb.Spans, len(r.misestimateSpans))
+				timer.Reset(refreshInterval)
+
+			case mis := <-r.misestimates:
+				r.addMisestimate(mis)
+
+			case <-r.drainAutoStats:
+				log.Dev.Infof(ctx, "draining auto stats misestimates refresher")
+				return
+
+			case <-ctx.Done():
+				log.Dev.Infof(ctx, "quiescing auto stats misestimates refresher")
+				return
+			}
+		}
+	}); err != nil {
+		r.startedTasksWG.Done()
+		log.Dev.Warningf(ctx, "misestimates refresher task failed to start: %v", err)
+	}
+
+	// Start yet another task that will periodically run an internal query to
+	// delete stats for dropped tables.
 	r.startedTasksWG.Add(1)
 	if err := stopper.RunAsyncTask(bgCtx, "stats-garbage-collector", func(ctx context.Context) {
 		defer r.startedTasksWG.Done()
@@ -894,15 +984,65 @@ func (r *Refresher) NotifyMutation(
 	}
 }
 
+// RescheduleRefresh should be called by an auto full stats job whenever it hits
+// ConcurrentCreateStatsError to attempt to reschedule the stats refresh. Note
+// that it might block (for at most DefaultRefreshInterval) but will
+// short-circuit on the node shutdown.
+func (r *Refresher) RescheduleRefresh(ctx context.Context, tableID descpb.ID) {
+	mustRefresh, _, err := r.mustDoFullRefresh(ctx, tableID)
+	if err != nil {
+		mustRefresh = true
+		log.Dev.Warningf(ctx, "failed to get table statistics for rescheduling the refresh: %v", err)
+	}
+	var newEvent mutation
+	if mustRefresh {
+		// For the cases where mustRefresh=true (stats don't yet exist or it
+		// has been 2x the average time since a refresh), we want to make sure
+		// that maybeRefreshStats is called on this table during the next
+		// cycle so that we have another chance to trigger a refresh. We pass
+		// rowsAffected=0 so that we don't force a refresh if another node has
+		// already done it.
+		newEvent = mutation{tableID: tableID, rowsAffected: 0}
+	} else {
+		// If this refresh was caused by a "dice roll", we want to make sure
+		// that the refresh is rescheduled so that we adhere to the
+		// AutomaticStatisticsFractionStaleRows statistical ideal. We
+		// ensure that the refresh is triggered during the next cycle by
+		// passing a very large number for rowsAffected.
+		newEvent = mutation{tableID: tableID, rowsAffected: math.MaxInt32}
+	}
+	if r.knobs != nil && r.knobs.RescheduleAttempt != nil {
+		select {
+		case r.knobs.RescheduleAttempt <- tableID:
+		default:
+		}
+	}
+	select {
+	case r.mutations <- newEvent:
+		return
+	case <-r.drainAutoStats:
+		// Shutting down due to a graceful drain.
+		// We don't want to force a write to the mutations here
+		// otherwise we could block the graceful shutdown.
+		err = errors.New("server is shutting down")
+	case <-r.cache.stopper.ShouldQuiesce():
+		// Shutting down due to direct stopper Stop call.
+		// This is not strictly required for correctness but
+		// helps avoiding log spam.
+		err = errors.New("server is shutting down")
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	log.Dev.Warningf(ctx, "failed to create statistics on table %d: %v", tableID, err)
+}
+
 // EstimateStaleness returns an estimate fraction of stale rows in the given
 // table based on how long it has been since the last full statistics refresh,
 // and the average time between refreshes.
-func (r *Refresher) EstimateStaleness(ctx context.Context, tableID descpb.ID) (float64, error) {
-	desc := r.getTableDescriptor(ctx, tableID)
-	if desc == nil {
-		return 0, errors.New("could not access the table descriptor")
-	}
-	if !r.cache.autostatsCollectionAllowed(desc) {
+func (r *Refresher) EstimateStaleness(
+	ctx context.Context, tableDesc catalog.TableDescriptor,
+) (float64, error) {
+	if !r.cache.autostatsCollectionAllowed(tableDesc) {
 		return 0, errors.New("automatic stats collection is not allowed for this table")
 	}
 
@@ -910,7 +1050,7 @@ func (r *Refresher) EstimateStaleness(ctx context.Context, tableID descpb.ID) (f
 	// NB: we pass nil boolean as 'forecast' argument in order to not invalidate
 	// the stats cache entry since we don't care whether there is a forecast or
 	// not in the stats.
-	tableStats, err := r.cache.getTableStatsFromCache(ctx, tableID, forecast, nil /* udtCols */, nil /* typeResolver */)
+	tableStats, _, _, err := r.cache.getTableStatsFromCache(ctx, tableDesc.GetID(), forecast, nil /* udtCols */, nil /* typeResolver */, false /* stable */, 0 /* canaryWindowSize */, hlc.Timestamp{} /* statsAsOf */)
 	if err != nil {
 		return 0, err
 	}
@@ -928,7 +1068,7 @@ func (r *Refresher) EstimateStaleness(ctx context.Context, tableID descpb.ID) (f
 	}
 
 	var explicitSettings *catpb.AutoStatsSettings
-	if s, ok := r.settingOverrides[tableID]; ok {
+	if s, ok := r.settingOverrides[tableDesc.GetID()]; ok {
 		explicitSettings = &s
 	}
 	staleTargetFraction := r.autoStatsFractionStaleRows(explicitSettings)
@@ -946,33 +1086,85 @@ func (r *Refresher) EstimateStaleness(ctx context.Context, tableID descpb.ID) (f
 	return staleFraction, nil
 }
 
-// maybeRefreshStats implements the core logic described in the comment for
-// Refresher. It is called by the background Refresher thread.
-// explicitSettings, if non-nil, holds any autostats cluster setting overrides
-// for this table.
-func (r *Refresher) maybeRefreshStats(
+// FixMisestimate is called by the execution engine after having executed a SQL
+// statement where we had an inaccurate estimated row count for the rows scanned
+// by the TableReader. It is an ask to collect partial stats on the given spans
+// on the table on which the partial fixup stats are enabled.
+//
+// UDTs as the first index column aren't supported.
+//
+// Spans must be ordered and non-overlapping.
+func (r *Refresher) FixMisestimate(
 	ctx context.Context,
-	stopper *stop.Stopper,
-	tableID descpb.ID,
-	explicitSettings *catpb.AutoStatsSettings,
-	rowsAffected int64,
-	asOf time.Duration,
-	partialStatsEnabled bool,
-	fullStatsEnabled bool,
+	tableDesc catalog.TableDescriptor,
+	indexID descpb.IndexID,
+	spans []roachpb.Span,
 ) {
+	if !r.autoStatsEnabled(tableDesc) {
+		// Collecting stats in general is disabled on this table, so we cannot
+		// start the "fix misestimates" stats job. (Partial fixup stats are
+		// enabled though.)
+		return
+	}
+	if !r.cache.autostatsCollectionAllowed(tableDesc) {
+		// Unexpected - we shouldn't have tracked the estimate for this table in
+		// the first place.
+		if buildutil.CrdbTestBuild {
+			panic(errors.AssertionFailedf("table ID %d should've been exempted from fixing misestimates", tableDesc.GetID()))
+		}
+		return
+	}
+	idx, err := catalog.MustFindIndexByID(tableDesc, indexID)
+	if err != nil {
+		return
+	}
+	col, err := catalog.MustFindColumnByID(tableDesc, idx.GetKeyColumnID(0 /* columnOrdinal */))
+	if err != nil {
+		return
+	}
+	typ := col.GetType()
+	if typ.UserDefined() {
+		// Not supporting UDTs comes from two angles:
+		// - if we have an enum, then every fixup stats collection could result
+		// in a very large scan
+		// - if we have a UDT, we need to keep track of the type descriptor
+		// version before we can use *types.T.
+		// TODO(yuzefovich): consider lifting this limitation.
+		return
+	}
+	select {
+	case r.misestimates <- misestimate{
+		indexInfo: indexInfo{
+			tableID:       tableDesc.GetID(),
+			indexID:       indexID,
+			keyColumnName: tree.NameString(col.GetName()),
+			keyColumnDir:  idx.GetKeyColumnDirection(0 /* columnOrdinal */),
+			keyColumnType: typ,
+		},
+		// TODO(#168078): we could consider stripping TableID/IndexID prefix
+		// given that we track that separately.
+		Spans: spans,
+	}:
+	default:
+		// Don't block if there is no room in the buffered channel.
+		if fixMisestimatesChanFullLogLimiter.ShouldLog() {
+			log.Dev.Warningf(ctx, "buffered channel is full. Unable to fix misestimates for table ID %d", tableDesc.GetID())
+		}
+	}
+}
+
+func (r *Refresher) mustDoFullRefresh(
+	ctx context.Context, tableID descpb.ID,
+) (mustRefresh bool, rowCount float64, _ error) {
 	// NB: we pass nil boolean as 'forecast' argument in order to not invalidate
 	// the stats cache entry since we don't care whether there is a forecast or
 	// not in the stats.
 	var forecast *bool
-	tableStats, err := r.cache.getTableStatsFromCache(ctx, tableID, forecast, nil /* udtCols */, nil /* typeResolver */)
+	tableStats, _, _, err := r.cache.getTableStatsFromCache(ctx, tableID, forecast, nil /* udtCols */, nil /* typeResolver */, false /* stable */, 0 /* canaryWindowSize */, hlc.Timestamp{} /* statsAsOf */)
 	if err != nil {
-		log.Dev.Errorf(ctx, "failed to get table statistics: %v", err)
-		return
+		return false, 0, err
 	}
 
-	var rowCount float64
-	mustRefresh := false
-	isPartial := false
 	stat := mostRecentAutomaticFullStat(tableStats)
 	if stat != nil {
 		// Check if too much time has passed since the last refresh.
@@ -1001,24 +1193,45 @@ func (r *Refresher) maybeRefreshStats(
 		// a refresh.
 		mustRefresh = true
 	}
+	return mustRefresh, rowCount, nil
+}
 
-	// We will always do a full stats refresh if we must or if the maximum
-	// rowsAffected value was specified.
-	doFullRefresh := mustRefresh || rowsAffected >= math.MaxInt32
-	if !doFullRefresh {
-		// Perform the "dice roll".
-		statsFractionStaleRows := r.autoStatsFractionStaleRows(explicitSettings)
-		statsMinStaleRows := r.autoStatsMinStaleRows(explicitSettings)
-		targetRows := int64(rowCount*statsFractionStaleRows) + statsMinStaleRows
-		randomTargetRows := int64(0)
-		if targetRows > 0 {
-			randomTargetRows = r.rng.Int63n(targetRows)
-		}
-		doFullRefresh = randomTargetRows < rowsAffected
+// maybeRefreshStats implements the core logic described in the comment for
+// Refresher. It is called by the background Refresher thread.
+// explicitSettings, if non-nil, holds any autostats cluster setting overrides
+// for this table.
+func (r *Refresher) maybeRefreshStats(
+	ctx context.Context,
+	tableID descpb.ID,
+	explicitSettings *catpb.AutoStatsSettings,
+	rowsAffected int64,
+	asOf time.Duration,
+	partialStatsEnabled bool,
+	fullStatsEnabled bool,
+) {
+	mustRefresh, rowCount, err := r.mustDoFullRefresh(ctx, tableID)
+	if err != nil {
+		log.Dev.Errorf(ctx, "failed to get table statistics: %v", err)
+		return
 	}
-	if (r.knobs != nil && r.knobs.DisableFullStatsRefresh) || !fullStatsEnabled {
-		// We cannot do the full stats refresh.
-		doFullRefresh = false
+
+	isPartial := false
+	var doFullRefresh bool
+	if fullStatsEnabled {
+		// We will always do a full stats refresh if we must or if the maximum
+		// rowsAffected value was specified.
+		doFullRefresh = mustRefresh || rowsAffected >= math.MaxInt32
+		if !doFullRefresh {
+			// Perform the "dice roll".
+			statsFractionStaleRows := r.autoStatsFractionStaleRows(explicitSettings)
+			statsMinStaleRows := r.autoStatsMinStaleRows(explicitSettings)
+			targetRows := int64(rowCount*statsFractionStaleRows) + statsMinStaleRows
+			randomTargetRows := int64(0)
+			if targetRows > 0 {
+				randomTargetRows = r.rng.Int63n(targetRows)
+			}
+			doFullRefresh = randomTargetRows < rowsAffected
+		}
 	}
 
 	if !doFullRefresh {
@@ -1046,46 +1259,13 @@ func (r *Refresher) maybeRefreshStats(
 	}
 
 	if err := r.refreshStats(ctx, tableID, asOf, isPartial); err != nil {
+		// ConcurrentCreateStatsError is expected, so simply ignore it (it's
+		// handled by RescheduleRefresh called by the stats job). Log all
+		// others.
 		if errors.Is(err, ConcurrentCreateStatsError) {
-			// Another stats job was already running. Attempt to reschedule this
-			// refresh.
-			var newEvent mutation
-			if mustRefresh {
-				// For the cases where mustRefresh=true (stats don't yet exist or it
-				// has been 2x the average time since a refresh), we want to make sure
-				// that maybeRefreshStats is called on this table during the next
-				// cycle so that we have another chance to trigger a refresh. We pass
-				// rowsAffected=0 so that we don't force a refresh if another node has
-				// already done it.
-				newEvent = mutation{tableID: tableID, rowsAffected: 0}
-			} else {
-				// If this refresh was caused by a "dice roll", we want to make sure
-				// that the refresh is rescheduled so that we adhere to the
-				// AutomaticStatisticsFractionStaleRows statistical ideal. We
-				// ensure that the refresh is triggered during the next cycle by
-				// passing a very large number for rowsAffected.
-				newEvent = mutation{tableID: tableID, rowsAffected: math.MaxInt32}
-			}
-			select {
-			case r.mutations <- newEvent:
-				return
-			case <-r.drainAutoStats:
-				// Shutting down due to a graceful drain.
-				// We don't want to force a write to the mutations here
-				// otherwise we could block the graceful shutdown.
-				err = errors.New("server is shutting down")
-			case <-stopper.ShouldQuiesce():
-				// Shutting down due to direct stopper Stop call.
-				// This is not strictly required for correctness but
-				// helps avoiding log spam.
-				err = errors.New("server is shutting down")
-			}
+			return
 		}
-
-		// Log other errors but don't automatically reschedule the refresh, since
-		// that could lead to endless retries.
 		log.Dev.Warningf(ctx, "failed to create statistics on table %d: %v", tableID, err)
-		return
 	}
 }
 
@@ -1118,6 +1298,114 @@ func (r *Refresher) refreshStats(
 		stmt,
 	)
 	return err
+}
+
+// addMisestimate includes the given misestimate into the "queue" of
+// misestimates. It de-duplicates and merges spans.
+//
+// Spans without EndKey (which represent Get requests for the execution engine)
+// are accepted, but they are handled by converting to equivalent spans (where
+// EndKey is Key.Next()).
+func (r *Refresher) addMisestimate(mis misestimate) {
+	for i := range mis.Spans {
+		// In order to simplify the logic, if we have an unset EndKey, we'll
+		// transform the "point" span into an equivalent "range" span.
+		if len(mis.Spans[i].EndKey) == 0 {
+			mis.Spans[i].EndKey = mis.Spans[i].Key.Next()
+		}
+	}
+	id := mis.indexInfo
+	oldSpans := r.misestimateSpans[id]
+	if len(oldSpans) == 0 {
+		if len(r.misestimateSpans) >= maxTablesForMisestimates {
+			return
+		}
+		r.misestimateSpans[id] = mis.Spans
+		return
+	}
+	if len(oldSpans) >= maxMisestimateSpanCountPerTable {
+		return
+	}
+
+	// Quick check whether all new spans are fully contained within old ones.
+	allDups := true
+	var oldIdx, newIdx int
+	for oldIdx < len(oldSpans) && newIdx < len(mis.Spans) {
+		if oldSpans[oldIdx].Contains(mis.Spans[newIdx]) {
+			// Fully contained. Only advance newIdx in case the current old span
+			// contains more than one new.
+			newIdx++
+			continue
+		}
+		if oldSpans[oldIdx].EndKey.Compare(mis.Spans[newIdx].Key) < 0 {
+			// The old span ends before the new span starts.
+			oldIdx++
+			continue
+		}
+		// Either the old span starts after the new span ends (in which case the
+		// new span doesn't overlap with any old ones), or there is a partial
+		// overlap with the old one. In both cases we'll need to update the
+		// "queue".
+		allDups = false
+		break
+	}
+	allDups = allDups && newIdx == len(mis.Spans)
+	if allDups {
+		return
+	}
+
+	// Merge two ordered non-overlapping lists of spans. We also de-duplicate
+	// them and merge adjacent spans together.
+	updatedSpans := make(roachpb.Spans, 0, len(oldSpans)+len(mis.Spans))
+	// addSpan is a helper that includes the given span into the updated result.
+	// It additionally checks whether the span can be merged into the "previous"
+	// span.
+	addSpan := func(span roachpb.Span) {
+		if len(updatedSpans) > 0 {
+			prevSpan := updatedSpans[len(updatedSpans)-1]
+			if prevSpan.Contains(span) {
+				// Already fully contained - nothing to do.
+				return
+			}
+			if prevSpan.EndKey.Compare(span.Key) >= 0 {
+				// The "previous" span can be extended to include the span.
+				updatedSpans[len(updatedSpans)-1].EndKey = span.EndKey
+				return
+			}
+		}
+		updatedSpans = append(updatedSpans, span)
+	}
+	oldIdx, newIdx = 0, 0
+	for oldIdx < len(oldSpans) && newIdx < len(mis.Spans) {
+		// Decide which span must be included into the result next (whichever
+		// starts earlier).
+		var span roachpb.Span
+		if cmp := oldSpans[oldIdx].Key.Compare(mis.Spans[newIdx].Key); cmp == 0 {
+			// Both share the start key - pick the larger of the two.
+			span = oldSpans[oldIdx]
+			if oldSpans[oldIdx].EndKey.Compare(mis.Spans[newIdx].EndKey) < 0 {
+				span = mis.Spans[newIdx]
+			}
+			oldIdx++
+			newIdx++
+		} else if cmp < 0 {
+			span = oldSpans[oldIdx]
+			oldIdx++
+		} else {
+			span = mis.Spans[newIdx]
+			newIdx++
+		}
+		addSpan(span)
+	}
+	for oldIdx < len(oldSpans) {
+		addSpan(oldSpans[oldIdx])
+		oldIdx++
+	}
+	for newIdx < len(mis.Spans) {
+		addSpan(mis.Spans[newIdx])
+		newIdx++
+	}
+	r.misestimateSpans[id] = updatedSpans
 }
 
 // mostRecentAutomaticFullStat finds the most recent automatic statistic

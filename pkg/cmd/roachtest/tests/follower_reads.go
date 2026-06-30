@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
@@ -26,10 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
@@ -67,15 +64,12 @@ func registerFollowerReads(r registry.Registry) {
 				6, /* nodeCount */
 				spec.CPU(4),
 				spec.Geo(),
-				spec.GCEZones("us-east1-b,us-east1-b,us-east1-b,us-west1-b,europe-west2-b,europe-west2-b"),
+				spec.GCEZones("us-east1-b,us-east1-b,us-east1-b,us-west1-c,europe-west2-b,europe-west2-b"),
 			),
 			CompatibleClouds: registry.OnlyGCE,
 			Suites:           registry.Suites(registry.Nightly),
 			Leases:           registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				if c.Cloud() == spec.GCE && c.Architecture() == vm.ArchARM64 {
-					t.Skip("arm64 in GCE is available only in us-central1")
-				}
 				c.Start(ctx, t.L(), followerReadsVerboseRaftStartOpts(), install.MakeClusterSettings())
 				topology := topologySpec{
 					multiRegion:       true,
@@ -108,7 +102,7 @@ func registerFollowerReads(r registry.Registry) {
 				}()
 
 				rng, _ := randutil.NewPseudoRand()
-				data := initFollowerReadsDB(ctx, t, t.L(), c, connFunc, connFunc, rng, topology, clusterversion.Latest.Version())
+				data := initFollowerReadsDB(ctx, t, t.L(), c, connFunc, connFunc, rng, topology)
 				runFollowerReadsTest(ctx, t, t.L(), c, connFunc, connFunc, rng, topology, rc, data)
 			},
 		})
@@ -150,7 +144,7 @@ func registerFollowerReads(r registry.Registry) {
 			6, /* nodeCount */
 			spec.CPU(4),
 			spec.Geo(),
-			spec.GCEZones("us-east1-b,us-east1-b,us-east1-b,us-west1-b,us-west1-b,europe-west2-b"),
+			spec.GCEZones("us-east1-b,us-east1-b,us-east1-b,us-west1-c,us-west1-c,europe-west2-b"),
 		),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.MixedVersion, registry.Nightly),
@@ -253,6 +247,15 @@ func runFollowerReadsTest(
 		}
 		return err
 	}())
+
+	// Bump the login timeout to 60s (from the default 10s) to avoid
+	// authentication timeouts when new SQL connections are opened after possibly
+	// causing failover for system ranges. See #166376.
+	{
+		_, err := systemConnectFunc(1).ExecContext(ctx,
+			"SET CLUSTER SETTING server.user_login.timeout = '60s'")
+		require.NoError(t, err)
+	}
 
 	var conns []*gosql.DB
 	for i := 0; i < c.Spec().NodeCount; i++ {
@@ -412,17 +415,16 @@ func runFollowerReadsTest(
 
 	l.Printf("starting read load")
 	const loadDuration = 4 * time.Minute
-	timeoutCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	time.AfterFunc(loadDuration, func() {
-		l.Printf("stopping load")
-		cancel()
-	})
-	g = t.NewGroup(task.WithContext(timeoutCtx), task.ErrorHandler(
+	g = t.NewGroup(task.ErrorHandler(
 		func(_ context.Context, name string, l *logger.Logger, err error) error {
 			return errors.Wrapf(err, "error reading data")
 		},
 	))
+	defer g.Cancel()
+	time.AfterFunc(loadDuration, func() {
+		l.Printf("stopping load")
+		g.Cancel()
+	})
 	const concurrency = 32
 	var cur int
 	for i := 0; cur < concurrency; i++ {
@@ -499,7 +501,6 @@ func initFollowerReadsDB(
 	connectFunc, systemConnectFunc func(int) *gosql.DB,
 	rng *rand.Rand,
 	topology topologySpec,
-	clusterVersion roachpb.Version,
 ) (data map[int]int64) {
 	systemDB := systemConnectFunc(1)
 	db := connectFunc(1)
@@ -528,7 +529,7 @@ func initFollowerReadsDB(
 			expMatrix := [][]string{
 				{"europe-west2", "europe-west2-b"},
 				{"us-east1", "us-east1-b"},
-				{"us-west1", "us-west1-b"},
+				{"us-west1", "us-west1-c"},
 			}
 			if !reflect.DeepEqual(matrix, expMatrix) {
 				return errors.Errorf("unexpected cluster regions: want %+v, got %+v", expMatrix, matrix)
@@ -539,16 +540,9 @@ func initFollowerReadsDB(
 		}
 	}
 
-	// Disable schema_locked within this since it will modify locality on
-	// tables.
-	if clusterVersion.AtLeast(clusterversion.V25_3.Version()) {
-		_, err = db.ExecContext(ctx, "SET create_table_with_schema_locked=false")
-		require.NoError(t, err)
-		_, err = db.ExecContext(ctx, "ALTER ROLE ALL SET create_table_with_schema_locked=false")
-		require.NoError(t, err)
-	}
-
-	// Create a multi-region database and table.
+	// Create a multi-region database and table. Use schema_locked = false
+	// since the test will modify locality on the table, which at the time
+	// of this writing requires the legacy schema changer.
 	_, err = db.ExecContext(ctx, `CREATE DATABASE mr_db`)
 	require.NoError(t, err)
 	if topology.multiRegion {
@@ -561,7 +555,7 @@ func initFollowerReadsDB(
 		_, err = db.ExecContext(ctx, fmt.Sprintf(`ALTER DATABASE mr_db SURVIVE %s FAILURE`, topology.survival))
 		require.NoError(t, err)
 	}
-	_, err = db.ExecContext(ctx, `CREATE TABLE mr_db.test ( k INT8, v INT8, PRIMARY KEY (k) )`)
+	_, err = db.ExecContext(ctx, `CREATE TABLE mr_db.test ( k INT8, v INT8, PRIMARY KEY (k) ) WITH (schema_locked = false)`)
 	require.NoError(t, err)
 	if topology.multiRegion {
 		_, err = db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE mr_db.test SET LOCALITY %s`, topology.locality))
@@ -774,7 +768,7 @@ func verifySQLLatency(
 			SourceAggregator: tspb.TimeSeriesQueryAggregator_MAX.Enum(),
 		}},
 	}
-	client := roachtestutil.DefaultHTTPClient(c, l)
+	client := roachtestutil.DefaultHTTPClient(c, l, roachtestutil.HTTPTimeout(15*time.Second))
 	var response tspb.TimeSeriesQueryResponse
 	if err := client.PostProtobuf(ctx, url, &request, &response); err != nil {
 		t.Fatal(err)
@@ -854,6 +848,7 @@ func verifyHighFollowerReadRatios(
 	// is running on a multitenant deployment.
 	client := roachtestutil.DefaultHTTPClient(
 		c, l, roachtestutil.VirtualCluster(install.SystemInterfaceName),
+		roachtestutil.HTTPTimeout(15*time.Second),
 	)
 	var response tspb.TimeSeriesQueryResponse
 	if err := client.PostProtobuf(ctx, url, &request, &response); err != nil {
@@ -949,6 +944,7 @@ func getFollowerReadCounts(ctx context.Context, t test.Test, c cluster.Cluster) 
 			// is running on a multitenant deployment.
 			client := roachtestutil.DefaultHTTPClient(
 				c, l, roachtestutil.VirtualCluster(install.SystemInterfaceName),
+				roachtestutil.HTTPTimeout(15*time.Second),
 			)
 			resp, err := client.Get(ctx, url)
 			if err != nil {
@@ -1092,9 +1088,7 @@ func runFollowerReadsMixedVersionTest(
 			}
 		}
 
-		version, err := h.ClusterVersion(r)
-		require.NoError(t, err)
-		data = initFollowerReadsDB(ctx, t, l, c, h.Connect, h.System.Connect, r, topology, version)
+		data = initFollowerReadsDB(ctx, t, l, c, h.Connect, h.System.Connect, r, topology)
 		return nil
 	}
 

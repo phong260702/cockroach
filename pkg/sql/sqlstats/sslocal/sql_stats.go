@@ -82,6 +82,12 @@ func newSQLStats(
 	s.mu.apps = make(map[string]*ssmemstorage.Container)
 	s.mu.mon = monitor
 	s.mu.mon.StartNoReserved(context.Background(), parentMon)
+	// Initialize lastReset to the current time. This ensures that if an instance
+	// is never explicitly reset, its lastReset will be a reasonable timestamp
+	// rather than the zero value. This is important for multi-node clusters where
+	// the Statements() API returns the minimum lastReset across all nodes - if any
+	// node has a zero lastReset, it would incorrectly pull down the overall value.
+	s.mu.lastReset = timeutil.Now()
 	return s
 }
 
@@ -119,6 +125,13 @@ func (s *SQLStats) getStatsForApplication(appName string) *ssmemstorage.Containe
 	)
 	s.mu.apps[appName] = a
 	return a
+}
+
+func (s *SQLStats) getTimeNow() time.Time {
+	if s.knobs != nil && s.knobs.StubTimeNow != nil {
+		return s.knobs.StubTimeNow()
+	}
+	return timeutil.Now()
 }
 
 // resetAndMaybeDumpStats clears all the stored per-app, per-statement and
@@ -197,6 +210,12 @@ func (s *SQLStats) ObserveTransaction(
 		return
 	}
 
+	// Compute the aggregation timestamp once for the entire batch so that
+	// all statements and their enclosing transaction land in the same
+	// aggregation window.
+	interval := sqlstats.SQLStatsAggregationInterval.Get(&s.st.SV)
+	aggTs := s.getTimeNow().Truncate(interval)
+
 	// Retrieve application container.
 	var application string
 	if transaction != nil {
@@ -209,6 +228,8 @@ func (s *SQLStats) ObserveTransaction(
 	// Record statements.
 	var discardedCount int64
 	for _, stmt := range statements {
+		stmt.AggregatedTs = aggTs
+		stmt.AggInterval = interval
 		if stmt.App != application {
 			application = stmt.App
 			appStats = s.getStatsForApplication(application)
@@ -223,7 +244,8 @@ func (s *SQLStats) ObserveTransaction(
 	// executed in connections with an outer transaction are not
 	// recorded with their transaction.
 	if transaction != nil {
-		// Write statements.
+		transaction.AggregatedTs = aggTs
+		transaction.AggInterval = interval
 		err := appStats.RecordTransaction(ctx, transaction)
 		if err != nil {
 			discardedCount++

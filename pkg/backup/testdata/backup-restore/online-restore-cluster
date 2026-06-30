@@ -1,4 +1,4 @@
-# This test ensures that cluster online restore publishes only one download job. 
+# This test ensures that cluster online restore publishes only one download job.
 
 reset test-nodelocal
 ----
@@ -32,4 +32,9 @@ SELECT count(*) FROM [SHOW JOBS] WHERE description LIKE '%Background Data Downlo
 ----
 1
 
+# Wait for download job to complete
+query-sql retry
+SELECT count(*) FROM [SHOW JOBS] WHERE job_type='RESTORE' and status='succeeded';
+----
+2
 

@@ -2267,6 +2267,15 @@ var (
 		Measurement: "Log Entries",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRaftLogTruncatorBusyNanos = metric.Metadata{
+		Name: "raftlog.truncator.busy_nanos",
+		Help: crstrings.UnwrapText(`
+			Cumulative wall-clock nanoseconds the per-store loosely-coupled raft
+			log truncator goroutine has spent running.
+		`),
+		Measurement: "Processing Time",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
 
 	metaRaftLogTotalSize = metric.Metadata{
 		Name:        "raftlog.size.total",
@@ -2483,6 +2492,13 @@ var (
 	metaReplicaGCQueuePending = metric.Metadata{
 		Name:        "queue.replicagc.pending",
 		Help:        "Number of pending replicas in the replica GC queue",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+		Visibility:  metric.Metadata_SUPPORT,
+	}
+	metaReplicaGCQueuePurgatory = metric.Metadata{
+		Name:        "queue.replicagc.purgatory",
+		Help:        "Number of replicas in the replica GC queue's purgatory, waiting for a prerequisite (e.g. left neighbor GC) before they can be GC'd",
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 		Visibility:  metric.Metadata_SUPPORT,
@@ -2893,10 +2909,10 @@ var (
 		Visibility:  metric.Metadata_SUPPORT,
 	}
 
-	// Export request counter.
-	metaExportEvalTotalDelay = metric.Metadata{
-		Name:        "exportrequest.delay.total",
-		Help:        "Amount by which evaluation of Export requests was delayed",
+	// Bulk low-priority read request metrics.
+	metaBulkReadEvalTotalDelay = metric.Metadata{
+		Name:        "kv.bulk_low_pri_read.delay.total",
+		Help:        "Amount by which evaluation of bulk low-priority read requests was delayed",
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -3197,6 +3213,24 @@ var (
 			Only populated when WAL failover is configured. Without WAL failover, the
 			relevant metric is storage.wal.fsync.latency.
 		`),
+	}
+	metaStorageWALFailoverSecondaryDiskCapacity = metric.Metadata{
+		Name:        "storage.wal.failover.secondary.disk.capacity",
+		Help:        "Total disk capacity of the secondary WAL failover volume.",
+		Measurement: "Storage",
+		Unit:        metric.Unit_BYTES,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_STORAGE,
+		HowToUse:    "Only populated when WAL failover is configured.",
+	}
+	metaStorageWALFailoverSecondaryDiskAvailable = metric.Metadata{
+		Name:        "storage.wal.failover.secondary.disk.available",
+		Help:        "Available disk space on the secondary WAL failover volume.",
+		Measurement: "Storage",
+		Unit:        metric.Unit_BYTES,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_STORAGE,
+		HowToUse:    "Only populated when WAL failover is configured.",
 	}
 	metaReplicaReadBatchDroppedLatchesBeforeEval = metric.Metadata{
 		Name:        "kv.replica_read_batch_evaluate.dropped_latches_before_eval",
@@ -3519,6 +3553,8 @@ type StoreMetrics struct {
 	WALFailoverPrimaryDuration         *metric.Counter
 	WALFailoverSecondaryDuration       *metric.Counter
 	WALFailoverWriteAndSyncLatency     *metric.ManualWindowHistogram
+	WALFailoverSecondaryDiskCapacity   *metric.Gauge
+	WALFailoverSecondaryDiskAvailable  *metric.Gauge
 
 	RdbCheckpoints *metric.Gauge
 
@@ -3620,6 +3656,7 @@ type StoreMetrics struct {
 	// Raft log metrics.
 	RaftLogFollowerBehindCount *metric.Gauge
 	RaftLogTruncated           *metric.Counter
+	RaftLogTruncatorBusyNanos  *metric.Counter
 	RaftLogTotalSize           *metric.Gauge
 	RaftLogMaxSize             *metric.Gauge
 
@@ -3659,6 +3696,7 @@ type StoreMetrics struct {
 	ReplicaGCQueueSuccesses                   *metric.Counter
 	ReplicaGCQueueFailures                    *metric.Counter
 	ReplicaGCQueuePending                     *metric.Gauge
+	ReplicaGCQueuePurgatory                   *metric.Gauge
 	ReplicaGCQueueProcessingNanos             *metric.Counter
 	ReplicateQueueEnqueueAdd                  *metric.Counter
 	ReplicateQueueEnqueueFailedPrecondition   *metric.Counter
@@ -3721,8 +3759,8 @@ type StoreMetrics struct {
 	AddSSTableAsWrites           *metric.Counter
 	AddSSTableProposalTotalDelay *metric.Counter
 
-	// Export request stats.
-	ExportRequestProposalTotalDelay *metric.Counter
+	// Records how much low-priority bulk read request throttling was performed.
+	BulkLowPriReadRequestTotalDelay *metric.Counter
 
 	// Encryption-at-rest stats.
 	// EncryptionAlgorithm is an enum representing the cipher in use, so we use a gauge.
@@ -3742,6 +3780,12 @@ type StoreMetrics struct {
 	MaxLockWaitQueueWaitersForLock    *metric.Gauge
 	LocksShedDueToMemoryLimit         *metric.Counter
 	NumLockShedDueToMemoryLimitEvents *metric.Counter
+	VirtualResolveCondenseCount       *metric.Counter
+	VirtualResolveDisabledCount       *metric.Counter
+	VirtualResolveIntentCount         *metric.Counter
+	VirtualResolveIntentRangeCount    *metric.Counter
+	VirtualResolveBatches             *metric.Counter
+	VirtualResolveBatchErrors         *metric.Counter
 	LatchWaitDurations                metric.IHistogram
 
 	// Ingestion metrics
@@ -4295,6 +4339,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 			pebble.FsyncLatencyBuckets,
 			false, /* withRotate */
 		),
+		WALFailoverSecondaryDiskCapacity:  metric.NewGauge(metaStorageWALFailoverSecondaryDiskCapacity),
+		WALFailoverSecondaryDiskAvailable: metric.NewGauge(metaStorageWALFailoverSecondaryDiskAvailable),
 
 		// Ingestion metrics
 		IngestCount: metric.NewGauge(metaIngestCount),
@@ -4438,6 +4484,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		// Raft log metrics.
 		RaftLogFollowerBehindCount: metric.NewGauge(metaRaftLogFollowerBehindCount),
 		RaftLogTruncated:           metric.NewCounter(metaRaftLogTruncated),
+		RaftLogTruncatorBusyNanos:  metric.NewCounter(metaRaftLogTruncatorBusyNanos),
 		RaftLogTotalSize:           metric.NewGauge(metaRaftLogTotalSize),
 		RaftLogMaxSize:             metric.NewGauge(metaRaftLogMaxSize),
 
@@ -4479,6 +4526,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		ReplicaGCQueueSuccesses:                   metric.NewCounter(metaReplicaGCQueueSuccesses),
 		ReplicaGCQueueFailures:                    metric.NewCounter(metaReplicaGCQueueFailures),
 		ReplicaGCQueuePending:                     metric.NewGauge(metaReplicaGCQueuePending),
+		ReplicaGCQueuePurgatory:                   metric.NewGauge(metaReplicaGCQueuePurgatory),
 		ReplicaGCQueueProcessingNanos:             metric.NewCounter(metaReplicaGCQueueProcessingNanos),
 		ReplicateQueueEnqueueAdd:                  metric.NewCounter(metaReplicateQueueEnqueueAdd),
 		ReplicateQueueEnqueueFailedPrecondition:   metric.NewCounter(metaReplicateQueueEnqueueFailedPrecondition),
@@ -4538,8 +4586,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		AddSSTableApplicationCopies:  metric.NewCounter(metaAddSSTableApplicationCopies),
 		AddSSTableProposalTotalDelay: metric.NewCounter(metaAddSSTableEvalTotalDelay),
 
-		// ExportRequest proposal.
-		ExportRequestProposalTotalDelay: metric.NewCounter(metaExportEvalTotalDelay),
+		// Low-priority bulk read request delay counter.
+		BulkLowPriReadRequestTotalDelay: metric.NewCounter(metaBulkReadEvalTotalDelay),
 
 		// Encryption-at-rest.
 		EncryptionAlgorithm: metric.NewGauge(metaEncryptionAlgorithm),
@@ -4558,6 +4606,12 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		MaxLockWaitQueueWaitersForLock:    metric.NewGauge(metaConcurrencyMaxLockWaitQueueWaitersForLock),
 		LocksShedDueToMemoryLimit:         metric.NewCounter(concurrency.MetaConcurrencyLocksShedDueToMemoryLimit),
 		NumLockShedDueToMemoryLimitEvents: metric.NewCounter(concurrency.MetaConcurrencyNumLockShedDueToMemoryLimitEvents),
+		VirtualResolveCondenseCount:       metric.NewCounter(concurrency.MetaVirtualResolveCondense),
+		VirtualResolveDisabledCount:       metric.NewCounter(concurrency.MetaVirtualResolveDisabled),
+		VirtualResolveIntentCount:         metric.NewCounter(concurrency.MetaVirtualResolveIntent),
+		VirtualResolveIntentRangeCount:    metric.NewCounter(concurrency.MetaVirtualResolveIntentRange),
+		VirtualResolveBatches:             metric.NewCounter(concurrency.MetaVirtualResolveBatches),
+		VirtualResolveBatchErrors:         metric.NewCounter(concurrency.MetaVirtualResolveBatchErrors),
 		LatchWaitDurations: metric.NewHistogram(metric.HistogramOptions{
 			Mode:         metric.HistogramModePreferHdrLatency,
 			Metadata:     metaLatchConflictWaitDurations,
@@ -4623,6 +4677,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 	}
 
 	sm.categoryIterMetrics.init(storeRegistry)
+	sm.categoryDiskWriteMetrics.init(storeRegistry)
 
 	storeRegistry.AddMetricStruct(sm)
 	storeRegistry.AddMetricStruct(sm.LoadSplitterMetrics)
@@ -4778,12 +4833,12 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.CompressionUnknownBytes.Update(int64(c.CompressedBytesWithoutStats))
 
 	overall := pebble.CompressionStatsForSetting{
-		CompressedBytes:   m.Table.Compression.NoCompressionBytes,
-		UncompressedBytes: m.Table.Compression.NoCompressionBytes,
+		CompressedBytes:   c.NoCompressionBytes,
+		UncompressedBytes: c.NoCompressionBytes,
 	}
-	overall.Add(m.Table.Compression.Snappy)
-	overall.Add(m.Table.Compression.MinLZ)
-	overall.Add(m.Table.Compression.Zstd)
+	overall.Add(c.Snappy)
+	overall.Add(c.MinLZ)
+	overall.Add(c.Zstd)
 	// We cannot use CompressedBytesWithoutStats for the overall compression
 	// ratio; we estimate it from the data we do have.
 	sm.CompressionOverallCR.Update(overall.CompressionRatio())
@@ -4897,6 +4952,20 @@ func (sm *StoreMetrics) updateEnvStats(stats fs.EnvStats) {
 	sm.EncryptionAlgorithm.Update(int64(stats.EncryptionType))
 }
 
+// updateDiskCounter updates a disk stat counter with a cumulative value from
+// the OS. On s390x, /proc/diskstats counters are 32-bit unsigned and wrap
+// after ~2^32. If the new value is lower than the current counter value
+// (indicating a wrap), the counter is cleared before updating to avoid a
+// panic in test builds.
+func updateDiskCounter(ctx context.Context, counter *metric.Counter, val int64) {
+	if counter.Count() > val {
+		log.Ops.Infof(ctx,
+			"disk stats counter wrap detected for %s, resetting", counter.GetMetadata().Name)
+		counter.Clear()
+	}
+	counter.Update(val)
+}
+
 func (sm *StoreMetrics) updateDiskStats(
 	ctx context.Context,
 	rollingStats disk.StatsWindow,
@@ -4904,14 +4973,14 @@ func (sm *StoreMetrics) updateDiskStats(
 	cumulativeStatsErr error,
 ) {
 	if cumulativeStatsErr == nil {
-		sm.DiskReadCount.Update(int64(cumulativeStats.ReadsCount))
-		sm.DiskReadBytes.Update(int64(cumulativeStats.BytesRead()))
-		sm.DiskReadTime.Update(int64(cumulativeStats.ReadsDuration))
-		sm.DiskWriteCount.Update(int64(cumulativeStats.WritesCount))
-		sm.DiskWriteBytes.Update(int64(cumulativeStats.BytesWritten()))
-		sm.DiskWriteTime.Update(int64(cumulativeStats.WritesDuration))
-		sm.DiskIOTime.Update(int64(cumulativeStats.CumulativeDuration))
-		sm.DiskWeightedIOTime.Update(int64(cumulativeStats.WeightedIODuration))
+		updateDiskCounter(ctx, sm.DiskReadCount, int64(cumulativeStats.ReadsCount))
+		updateDiskCounter(ctx, sm.DiskReadBytes, int64(cumulativeStats.BytesRead()))
+		updateDiskCounter(ctx, sm.DiskReadTime, int64(cumulativeStats.ReadsDuration))
+		updateDiskCounter(ctx, sm.DiskWriteCount, int64(cumulativeStats.WritesCount))
+		updateDiskCounter(ctx, sm.DiskWriteBytes, int64(cumulativeStats.BytesWritten()))
+		updateDiskCounter(ctx, sm.DiskWriteTime, int64(cumulativeStats.WritesDuration))
+		updateDiskCounter(ctx, sm.DiskIOTime, int64(cumulativeStats.CumulativeDuration))
+		updateDiskCounter(ctx, sm.DiskWeightedIOTime, int64(cumulativeStats.WeightedIODuration))
 		sm.DiskIopsInProgress.Update(int64(cumulativeStats.InProgressCount))
 	} else {
 		// Don't update cumulative stats to the useless zero value.
@@ -5141,6 +5210,36 @@ func (m *pebbleCategoryDiskWriteMetrics) update(stats vfs.DiskWriteStatsAggregat
 type pebbleCategoryDiskWriteMetricsContainer struct {
 	registry   *metric.Registry
 	metricsMap syncutil.Map[vfs.DiskWriteCategory, pebbleCategoryDiskWriteMetrics]
+}
+
+// knownDiskWriteCategories contains all known disk write categories that should
+// be eagerly initialized. This includes both Pebble internal categories and
+// CockroachDB-defined categories.
+var knownDiskWriteCategories = []vfs.DiskWriteCategory{
+	// Pebble internal categories
+	"pebble-wal",
+	"pebble-memtable-flush",
+	"pebble-compaction",
+	"pebble-manifest",
+	// CockroachDB categories (from pkg/storage/fs/category.go)
+	vfs.WriteCategoryUnspecified,
+	fs.RaftSnapshotWriteCategory,
+	fs.SQLColumnSpillWriteCategory,
+	fs.PebbleIngestionWriteCategory,
+	fs.CRDBLogWriteCategory,
+	fs.EncryptionRegistryWriteCategory,
+}
+
+func (m *pebbleCategoryDiskWriteMetricsContainer) init(registry *metric.Registry) {
+	m.registry = registry
+	// Eagerly initialize metrics for all known disk write categories to ensure
+	// consistent metric visibility across all stores from startup.
+	for _, category := range knownDiskWriteCategories {
+		cm, ok := m.metricsMap.LoadOrStore(category, makePebbleCategorizedWriteMetrics(category))
+		if !ok {
+			m.registry.AddMetricStruct(cm)
+		}
+	}
 }
 
 func (m *pebbleCategoryDiskWriteMetricsContainer) update(stats []vfs.DiskWriteStatsAggregate) {

@@ -11,7 +11,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -24,11 +23,11 @@ func TestMain(m *testing.M) {
 	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
-	serverutils.InitTestServerFactory(server.TestServerFactory)
+	// TODO(kev-cao): DRPC is currently flaky in backup tests; disable it
+	// package-wide while it is investigated. See #170394.
+	serverutils.InitTestServerFactory(server.TestServerFactory,
+		serverutils.WithDRPCOption(base.TestDRPCDisabled))
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
-	defer serverutils.TestingGlobalDRPCOption(
-		base.TestDRPCEnabledRandomly,
-	)()
 	os.Exit(m.Run())
 }
 

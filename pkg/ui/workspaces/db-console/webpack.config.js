@@ -103,7 +103,7 @@ module.exports = (env, argv) => {
         "buffer": require.resolve("buffer/"),
         "stream": require.resolve("stream-browserify"),
         "assert": require.resolve("assert/"),
-        "crypto": require.resolve("crypto-browserify"),
+        "crypto": false,
         "util": require.resolve("util/"),
         "events": require.resolve("events/"),
         "process": require.resolve("process/browser"),
@@ -261,6 +261,9 @@ module.exports = (env, argv) => {
       static: {
         directory: path.join(__dirname, `dist${env.dist}`),
       },
+      client: {
+        overlay: false,
+      },
       devMiddleware: {
         index: false,
       },
@@ -302,7 +305,7 @@ module.exports = (env, argv) => {
       loader: StringReplacePlugin.replace({
         replacements: [
           {
-            pattern: /import rootSaga from ".\/sagas";/gi, // match last 'import' expression in module.
+            pattern: /import { DataFromServer } from "src\/util\/dataFromServer";/gi, // match last 'import' expression in module.
             replacement: function(match, p) {
               return `${match}\nimport { fakeMetricsDataGenerationMiddleware } from "src/test-utils/fakeMetricsDataGenerationMiddleware";`;
             },

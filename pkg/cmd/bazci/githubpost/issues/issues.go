@@ -157,11 +157,13 @@ type Options struct {
 	Token            string // GitHub API token
 	Org              string
 	Repo             string
-	SHA              string
+	SHA              string // optional; if empty, commit info is omitted from issue body
 	Branch           string
 	GetBinaryVersion func() string
-	// One of the following sub-structs is expected to be populated. Post()
-	// will fail if one is not.
+	// At most one of the following sub-structs is expected to be populated.
+	// When neither is set, no build URL is included in the issue. The
+	// IssueFormatter is responsible for providing any necessary links in
+	// this case.
 	TeamCityOptions *TeamCityOptions
 	EngFlowOptions  *EngFlowOptions
 }
@@ -185,6 +187,7 @@ func DefaultOptionsFromEnv() *Options {
 		goFlagsEnv             = "GOFLAGS"
 	)
 
+	branch := strings.TrimPrefix(maybeEnv(teamcityBuildBranchEnv, "branch-not-found-in-env"), "refs/heads/")
 	return &Options{
 		Token: maybeEnv(githubAPITokenEnv, ""),
 		Org:   maybeEnv(githubOrgEnv, "cockroachdb"),
@@ -194,7 +197,7 @@ func DefaultOptionsFromEnv() *Options {
 		// at least it'll be obvious that something went wrong (as an
 		// issue will be posted pointing at that SHA).
 		SHA:              maybeEnv(teamcityVCSNumberEnv, "8548987813ff9e1b8a9878023d3abfc6911c16db"),
-		Branch:           maybeEnv(teamcityBuildBranchEnv, "branch-not-found-in-env"),
+		Branch:           branch,
 		GetBinaryVersion: build.BinaryVersion,
 		TeamCityOptions: &TeamCityOptions{
 			BuildTypeID: maybeEnv(teamcityBuildTypeIDEnv, "BUILDTYPE_ID-not-found-in-env"),
@@ -215,9 +218,15 @@ func maybeEnv(envKey, defaultValue string) string {
 }
 
 // CanPost returns true if the github API token environment variable is set to
-// a nontrivial value.
+// a nontrivial value and if the GITHUB_REPOSITORY environment variable is set
+// to an appropriate value.
 func (o *Options) CanPost() bool {
-	return o.Token != ""
+	const cockroach = "cockroachdb/cockroach"
+	// NB: GitHub Actions sets the GITHUB_REPOSITORY environment variable.
+	// We don't want issue posting to run on forks, so this will keep that
+	// from happening. Note we check the GITHUB_REPO env var below, which is
+	// different. It's manually set in TeamCity in various places.
+	return maybeEnv("GITHUB_REPOSITORY", cockroach) == cockroach && o.Token != ""
 }
 
 // IsReleaseBranch returns true for branches that we want to treat as
@@ -263,16 +272,24 @@ func (p *poster) templateData(
 	if req.Artifacts != "" {
 		artifactsURL = p.teamcityArtifactsURL(req.Artifacts).String()
 	}
+	var commitURL string
+	if p.SHA != "" {
+		commitURL = fmt.Sprintf("https://github.com/%s/%s/commits/%s", p.Org, p.Repo, p.SHA)
+	}
+	var buildURL string
+	if u := p.buildURL(); u != nil {
+		buildURL = u.String()
+	}
 	return TemplateData{
 		PostRequest:      req,
 		PackageNameShort: strings.TrimPrefix(req.PackageName, CockroachPkgPrefix),
 		Parameters:       p.parameters(req.ExtraParams),
 		CondensedMessage: CondensedMessage(req.Message),
 		Commit:           p.SHA,
-		CommitURL:        fmt.Sprintf("https://github.com/%s/%s/commits/%s", p.Org, p.Repo, p.SHA),
+		CommitURL:        commitURL,
 		Branch:           p.Branch,
 		ArtifactsURL:     artifactsURL,
-		URL:              p.buildURL().String(),
+		URL:              buildURL,
 		RelatedIssues:    relatedIssues,
 	}
 }
@@ -354,6 +371,15 @@ func (tfi TestFailureIssue) String() string {
 	}
 }
 
+// branchTitlePrefix returns a prefix for issue titles on non-master branches
+// so that issues are visually distinguishable when scanning issue lists.
+func branchTitlePrefix(branch string) string {
+	if branch == "master" || branch == "" {
+		return ""
+	}
+	return branch + ": "
+}
+
 func (p *poster) post(
 	origCtx context.Context, formatter IssueFormatter, req PostRequest,
 ) (*TestFailureIssue, error) {
@@ -366,7 +392,7 @@ func (p *poster) post(
 
 	// We just want the title this time around, as we're going to use
 	// it to figure out if an issue already exists.
-	title := formatter.Title(data)
+	title := branchTitlePrefix(p.Branch) + formatter.Title(data)
 
 	// We carry out two searches below, one attempting to find an issue that we
 	// adopt (i.e. add a comment to) and one finding "related issues", i.e. those

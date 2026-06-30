@@ -156,7 +156,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -183,7 +182,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -210,7 +208,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 32
     typeName: INT4
   Status: PUBLIC
@@ -237,7 +234,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: OID
   Status: PUBLIC
@@ -264,7 +260,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -308,6 +303,7 @@ ElementState:
     isNotVisible: false
     isUnique: true
     sharding: null
+    skipUniqueChecks: false
     sourceIndexId: 0
     tableId: 104
     temporaryIndexId: 0
@@ -627,7 +623,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -654,7 +649,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: STRING
   Status: PUBLIC
@@ -681,7 +675,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 2
     typeName: DECIMAL(8,2)
   Status: PUBLIC
@@ -708,7 +701,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -735,7 +727,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -762,7 +753,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 32
     typeName: INT4
   Status: PUBLIC
@@ -789,7 +779,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: OID
   Status: PUBLIC
@@ -816,7 +805,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -843,7 +831,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -870,7 +857,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -1078,6 +1064,7 @@ ElementState:
     isNotVisible: false
     isUnique: true
     sharding: null
+    skipUniqueChecks: false
     sourceIndexId: 0
     tableId: 105
     temporaryIndexId: 0
@@ -1105,6 +1092,7 @@ ElementState:
     referencedColumnIds:
     - 1
     sharding: null
+    skipUniqueChecks: false
     sourceIndexId: 0
     tableId: 105
     temporaryIndexId: 0
@@ -1331,7 +1319,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -1358,7 +1345,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -1385,7 +1371,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -1412,7 +1397,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 32
     typeName: INT4
   Status: PUBLIC
@@ -1439,7 +1423,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: OID
   Status: PUBLIC
@@ -1466,7 +1449,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -1520,6 +1502,7 @@ ElementState:
     isNotVisible: false
     isUnique: true
     sharding: null
+    skipUniqueChecks: false
     sourceIndexId: 0
     tableId: 104
     temporaryIndexId: 0
@@ -1728,7 +1711,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: STRING
   Status: PUBLIC
@@ -1755,7 +1737,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 64
     typeName: INT8
   Status: PUBLIC
@@ -1782,7 +1763,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -1809,7 +1789,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 32
     typeName: INT4
   Status: PUBLIC
@@ -1836,7 +1815,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: OID
   Status: PUBLIC
@@ -1863,7 +1841,6 @@ ElementState:
       tupleContents: []
       tupleLabels: []
       udtMetadata: null
-      visibleType: 0
       width: 0
     typeName: DECIMAL
   Status: PUBLIC
@@ -1917,6 +1894,7 @@ ElementState:
     isNotVisible: false
     isUnique: true
     sharding: null
+    skipUniqueChecks: false
     sourceIndexId: 0
     tableId: 109
     temporaryIndexId: 0

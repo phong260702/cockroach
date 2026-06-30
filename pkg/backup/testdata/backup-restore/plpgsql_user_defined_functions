@@ -117,15 +117,15 @@ CREATE FUNCTION sc1.f1(a sc1.enum1)
 	LANGUAGE plpgsql
 	SECURITY INVOKER
 	AS $$
-	DECLARE
-	x INT8 := 0;
-	foobar sc1.enum1;
-	BEGIN
-	SELECT a FROM sc1.tbl1;
-	SELECT 'Good':::sc1.enum1;
-	RETURN nextval('sc1.sq1'::REGCLASS);
-	END;
-$$
+		DECLARE
+			x INT8 := 0;
+			foobar sc1.enum1;
+		BEGIN
+			SELECT a FROM sc1.tbl1;
+			SELECT 'Good':::sc1.enum1;
+			RETURN nextval('sc1.sq1'::REGCLASS);
+		END;
+	$$
 
 query-sql
 SELECT sc1.f1('Good'::sc1.enum1)
@@ -143,15 +143,15 @@ CREATE FUNCTION sc2.f2()
 	LANGUAGE plpgsql
 	SECURITY INVOKER
 	AS $$
-	DECLARE
-	x INT8;
-	BEGIN
-	SELECT a FROM sc2.tbl2 LIMIT 1 INTO x;
-	SELECT sc1.f1('Good':::sc1.enum1);
-	CALL public.p_nested('Good':::sc1.enum1);
-	RETURN x;
-	END;
-$$
+		DECLARE
+			x INT8;
+		BEGIN
+			SELECT a FROM sc2.tbl2 LIMIT 1 INTO x;
+			SELECT sc1.f1('Good':::sc1.enum1);
+			CALL public.p_nested('Good':::sc1.enum1);
+			RETURN x;
+		END;
+	$$
 
 exec-sql
 DROP DATABASE db1
@@ -180,15 +180,15 @@ CREATE FUNCTION sc1.f1(a sc1.enum1)
 	LANGUAGE plpgsql
 	SECURITY INVOKER
 	AS $$
-	DECLARE
-	x INT8 := 0;
-	foobar sc1.enum1;
-	BEGIN
-	SELECT a FROM sc1.tbl1;
-	SELECT 'Good':::sc1.enum1;
-	RETURN nextval('sc1.sq1'::REGCLASS);
-	END;
-$$
+		DECLARE
+			x INT8 := 0;
+			foobar sc1.enum1;
+		BEGIN
+			SELECT a FROM sc1.tbl1;
+			SELECT 'Good':::sc1.enum1;
+			RETURN nextval('sc1.sq1'::REGCLASS);
+		END;
+	$$
 
 query-sql
 SELECT create_statement FROM [SHOW CREATE FUNCTION sc2.f2]
@@ -201,15 +201,15 @@ CREATE FUNCTION sc2.f2()
 	LANGUAGE plpgsql
 	SECURITY INVOKER
 	AS $$
-	DECLARE
-	x INT8;
-	BEGIN
-	SELECT a FROM sc2.tbl2 LIMIT 1 INTO x;
-	SELECT sc1.f1('Good':::sc1.enum1);
-	CALL public.p_nested('Good':::sc1.enum1);
-	RETURN x;
-	END;
-$$
+		DECLARE
+			x INT8;
+		BEGIN
+			SELECT a FROM sc2.tbl2 LIMIT 1 INTO x;
+			SELECT sc1.f1('Good':::sc1.enum1);
+			CALL public.p_nested('Good':::sc1.enum1);
+			RETURN x;
+		END;
+	$$
 
 # Make sure function signature is rewritten in schema descriptor so that
 # function can be resolved and executed.
@@ -372,16 +372,16 @@ CREATE FUNCTION sc1.f1(a sc1.enum1)
 	LANGUAGE plpgsql
 	SECURITY INVOKER
 	AS $$
-	DECLARE
-	x INT8;
-	foobar sc1.enum1;
-	BEGIN
-	SELECT a FROM sc1.tbl1;
-	SELECT 'Good':::sc1.enum1;
-	SELECT nextval('sc1.sq1'::REGCLASS) INTO x;
-	RETURN x;
-	END;
-$$
+		DECLARE
+			x INT8;
+			foobar sc1.enum1;
+		BEGIN
+			SELECT a FROM sc1.tbl1;
+			SELECT 'Good':::sc1.enum1;
+			SELECT nextval('sc1.sq1'::REGCLASS) INTO x;
+			RETURN x;
+		END;
+	$$
 
 query-sql
 SELECT sc1.f1('Good'::sc1.enum1)
@@ -416,16 +416,16 @@ CREATE FUNCTION sc1.f1(a sc1.enum1)
 	LANGUAGE plpgsql
 	SECURITY INVOKER
 	AS $$
-	DECLARE
-	x INT8;
-	foobar sc1.enum1;
-	BEGIN
-	SELECT a FROM sc1.tbl1;
-	SELECT 'Good':::sc1.enum1;
-	SELECT nextval('sc1.sq1'::REGCLASS) INTO x;
-	RETURN x;
-	END;
-$$
+		DECLARE
+			x INT8;
+			foobar sc1.enum1;
+		BEGIN
+			SELECT a FROM sc1.tbl1;
+			SELECT 'Good':::sc1.enum1;
+			SELECT nextval('sc1.sq1'::REGCLASS) INTO x;
+			RETURN x;
+		END;
+	$$
 
 # Make sure function signature is rewritten in schema descriptor so that
 # function can be resolved and executed.
@@ -618,8 +618,8 @@ query-sql
 SELECT database_name, schema_name, routine_signature, grantee, privilege_type, is_grantable
 FROM [SHOW GRANTS ON FUNCTION add]
 ----
-db1 public add(int8, int8) admin ALL true
-db1 public add(int8, int8) root ALL true
+db1 public add(x int8, y int8) admin ALL true
+db1 public add(x int8, y int8) root ALL true
 
 exec-sql
 SET ROLE = root
@@ -652,8 +652,8 @@ query-sql cluster=s5
 SELECT database_name, schema_name, routine_signature, grantee, privilege_type, is_grantable
 FROM [SHOW GRANTS ON FUNCTION add]
 ----
-db1 public add(int8, int8) admin ALL true
-db1 public add(int8, int8) root ALL true
+db1 public add(x int8, y int8) admin ALL true
+db1 public add(x int8, y int8) root ALL true
 
 # Backing up and restoring a database with a function resets privileges on
 # functions to the default privileges because we cannot be sure if the same
@@ -694,8 +694,8 @@ query-sql
 SELECT database_name, schema_name, routine_signature, grantee, privilege_type, is_grantable
 FROM [SHOW GRANTS ON FUNCTION add]
 ----
-db1 public add(int8, int8) admin ALL true
-db1 public add(int8, int8) root ALL true
+db1 public add(x int8, y int8) admin ALL true
+db1 public add(x int8, y int8) root ALL true
 
 exec-sql
 SET ROLE = root
@@ -725,6 +725,6 @@ query-sql cluster=s6
 SELECT database_name, schema_name, routine_signature, grantee, privilege_type, is_grantable
 FROM [SHOW GRANTS ON FUNCTION add]
 ----
-db1_new public add(int8, int8) admin ALL true
-db1_new public add(int8, int8) public EXECUTE false
-db1_new public add(int8, int8) root ALL true
+db1_new public add(x int8, y int8) admin ALL true
+db1_new public add(x int8, y int8) public EXECUTE false
+db1_new public add(x int8, y int8) root ALL true

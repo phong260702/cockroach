@@ -335,7 +335,7 @@ func (p *inspectProcessor) processSpan(
 	}
 	for _, check := range checks {
 		if check, ok := check.(inspectSpanCheck); ok {
-			err := check.CheckSpan(ctx, checks, p.loggerBundle, progressMsg.SpanCheckData)
+			err := check.CheckSpan(ctx, checks, span, p.loggerBundle, progressMsg.SpanCheckData)
 			if err != nil {
 				return err
 			}
@@ -540,6 +540,18 @@ func buildInspectCheckFactories(
 					asOf:         asOf,
 
 					expected: specCheck.RowCount,
+				}
+			})
+		case jobspb.InspectCheckUniqueness:
+			checkFactories = append(checkFactories, func(asOf hlc.Timestamp) inspectCheck {
+				return &uniquenessCheck{
+					uniquenessCheckApplicability: uniquenessCheckApplicability{
+						tableID: tableID,
+					},
+					execCfg:      execCfg,
+					indexID:      indexID,
+					tableVersion: tableVersion,
+					asOf:         asOf,
 				}
 			})
 		default:

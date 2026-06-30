@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
@@ -878,6 +879,16 @@ func (tv *View) Trigger(i int) cat.Trigger {
 	return &tv.Triggers[i]
 }
 
+// IsSecurityInvoker is part of the cat.View interface.
+func (tv *View) IsSecurityInvoker() bool {
+	return false
+}
+
+// Owner is part of the cat.View interface.
+func (tv *View) Owner() username.SQLUsername {
+	return username.MakeSQLUsernameFromPreNormalizedString("root")
+}
+
 // Table implements the cat.Table interface for testing purposes.
 type Table struct {
 	TabID      cat.StableID
@@ -1237,6 +1248,15 @@ func (tt *Table) Policies() *cat.Policies {
 	return &tt.policies
 }
 
+// CanaryAndStableStatsDiffer is part of the cat.Table interface.
+func (tt *Table) CanaryAndStableStatsDiffer() bool { return false }
+
+// StatsCanaryWindow is part of the cat.Table interface.
+func (tt *Table) StatsCanaryWindow() time.Duration { return 0 }
+
+// CanaryExpiration is part of the cat.Table interface.
+func (tt *Table) CanaryExpiration() hlc.Timestamp { return hlc.Timestamp{} }
+
 // findPolicyByName will lookup the policy by its name. It returns it's policy
 // type and index within that policy type slice so that callers can do removal
 // if needed.
@@ -1353,6 +1373,11 @@ type Index struct {
 	// numImplicitPartitioningColumns is the number of implicit partitioning
 	// columns defined in this index.
 	numImplicitPartitioningColumns int
+
+	// isTemporaryIndexForBackfill indicates that this is a temporary index
+	// used during an in-progress index backfill (UseDeletePreservingEncoding
+	// in the real catalog).
+	isTemporaryIndexForBackfill bool
 }
 
 // ID is part of the cat.Index interface.
@@ -1495,8 +1520,9 @@ func (ti *Index) Partition(i int) cat.Partition {
 	return &ti.partitions[i]
 }
 
+// IsTemporaryIndexForBackfill is part of the cat.Index interface.
 func (ti *Index) IsTemporaryIndexForBackfill() bool {
-	return false
+	return ti.isTemporaryIndexForBackfill
 }
 
 // SetPartitions manually sets the partitions.
@@ -1873,9 +1899,8 @@ func (u *UniqueConstraint) Validated() bool {
 	return u.validated
 }
 
-// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
-// interface.
-func (u *UniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
+// CanElideUniqueCheck is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) CanElideUniqueCheck() bool {
 	return false
 }
 

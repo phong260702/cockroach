@@ -88,9 +88,9 @@ func TestReplicaRankings(t *testing.T) {
 				continue
 			}
 			for i := range want {
-				if repls[i].RangeUsageInfo().Load().Dim(dimension) != want[i] {
+				if repls[i].RangeUsageInfo().LoadDim(dimension) != want[i] {
 					t.Errorf("got %f for %d'th element; want %f (input: %v)",
-						repls[i].RangeUsageInfo().Load().Dim(dimension), i, want, rLoad)
+						repls[i].RangeUsageInfo().LoadDim(dimension), i, want, rLoad)
 					break
 				}
 			}
@@ -218,7 +218,7 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 
 	// This test is known to flake. E.g. in #160265, a request raced in after
 	// clearing the load stats and before asserting they are 0.
-	skip.UnderDeadlock(t, "timing sensitive")
+	skip.UnderDuress(t, "timing sensitive")
 
 	ctx := context.Background()
 	args := base.TestClusterArgs{
@@ -309,6 +309,13 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 			lhRepl.Desc().Replicas().Descriptors(),
 			lhRepl.GetLeaseAppliedIndex(),
 		))
+		// Wait for raftMu on the followers to ensure that handleRaftReady has
+		// finished, including the load stats recording that happens after the
+		// applied index bump. See #161600.
+		followerRepl1.raftMu.Lock()
+		followerRepl1.raftMu.Unlock() //lint:ignore SA2001 empty critical section
+		followerRepl2.raftMu.Lock()
+		followerRepl2.raftMu.Unlock() //lint:ignore SA2001 empty critical section
 
 		requestsAfter := lhRepl.loadStats.TestingGetSum(load.Requests)
 		lhWritesAfter := lhRepl.loadStats.TestingGetSum(load.WriteKeys)
@@ -647,5 +654,32 @@ func TestNewReplicaRankingsMap(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func BenchmarkReplicaAccumulator(b *testing.B) {
+	for _, numReplicas := range []int{128, 1000, 10000, 30000} {
+		b.Run(fmt.Sprintf("replicas=%d", numReplicas), func(b *testing.B) {
+			// Pre-build the candidate replicas.
+			candidates := make([]candidateReplica, numReplicas)
+			for i := range candidates {
+				candidates[i] = candidateReplica{
+					Replica: &Replica{RangeID: roachpb.RangeID(i)},
+					usage: allocator.RangeUsageInfo{
+						QueriesPerSecond:         rand.Float64() * 1000,
+						RequestCPUNanosPerSecond: rand.Float64() * 1e9,
+						RaftCPUNanosPerSecond:    rand.Float64() * 1e8,
+					},
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				acc := NewReplicaAccumulator(aload.CPU, aload.Queries)
+				for i := range candidates {
+					acc.AddReplica(candidates[i])
+				}
+			}
+		})
 	}
 }

@@ -42,7 +42,7 @@ type Cluster interface {
 	Get(ctx context.Context, l *logger.Logger, src, dest string, opts ...option.Option) error
 	Put(ctx context.Context, src, dest string, opts ...option.Option)
 	PutE(ctx context.Context, l *logger.Logger, src, dest string, opts ...option.Option) error
-	PutLibraries(ctx context.Context, libraryDir string, libraries []string) error
+	PutLibraries(ctx context.Context, l *logger.Logger, libraryDir string, libraries []string) error
 	Stage(
 		ctx context.Context, l *logger.Logger, application, versionOrSHA, dir string, opts ...option.Option,
 	) error
@@ -181,6 +181,7 @@ type Cluster interface {
 	FetchTimeseriesData(ctx context.Context, l *logger.Logger) error
 	FetchDebugZip(ctx context.Context, l *logger.Logger, dest string, opts ...option.Option) error
 	RefetchCertsFromNode(ctx context.Context, node int) error
+	LocalCertsDir() string
 
 	StartGrafana(ctx context.Context, l *logger.Logger, promCfg *prometheus.Config) error
 	StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error

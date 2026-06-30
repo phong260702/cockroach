@@ -76,6 +76,32 @@ var slowQueryLogFullTableScans = settings.RegisterBoolSetting(
 	false,
 	settings.WithPublic)
 
+// failedQueryLogEnabled, when set, causes every non-internal SQL statement
+// that ends in error to be emitted on the SQL_EXEC log channel as a
+// `failed_query` event. It is intended as an "errors-only" counterpart to
+// `sql.log.all_statements.enabled`: operators get reliable per-failure
+// visibility (and can derive a custom metric from the log stream) without
+// paying the cost of logging every successful statement.
+var failedQueryLogEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.log.failed_query.enabled",
+	"when set to true, every SQL statement that ends in an error is logged "+
+		"to a secondary logger on each node as a `failed_query` event",
+	false,
+	settings.WithPublic)
+
+// failedQueryLogInternalEnabled gates the same logging for the internal
+// executor. It mirrors `sql.log.slow_query.internal_queries.enabled` and has
+// no effect unless `sql.log.failed_query.enabled` is also set.
+var failedQueryLogInternalEnabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.log.failed_query.internal_queries.enabled",
+	"when set to true, internal queries that end in an error are logged to a "+
+		"separate `failed_query_internal` event. Must have "+
+		"`sql.log.failed_query.enabled` set for this setting to have any effect.",
+	false,
+	settings.WithPublic)
+
 var adminAuditLogEnabled = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
 	"sql.log.admin_audit.enabled",
@@ -168,6 +194,8 @@ func (p *planner) maybeLogStatementInternal(
 	slowLogFullTableScans := slowQueryLogFullTableScans.Get(&p.execCfg.Settings.SV)
 	slowQueryLogEnabled := slowLogThreshold != 0
 	slowInternalQueryLogEnabled := slowInternalQueryLogEnabled.Get(&p.execCfg.Settings.SV)
+	failedQueryLogEnabled := failedQueryLogEnabled.Get(&p.execCfg.Settings.SV)
+	failedQueryLogInternalEnabled := failedQueryLogInternalEnabled.Get(&p.execCfg.Settings.SV)
 	auditEventsDetected := len(p.curPlan.auditEventBuilders) != 0
 	logConsoleQuery := telemetryInternalConsoleQueriesEnabled.Get(&p.execCfg.Settings.SV) &&
 		strings.HasPrefix(p.SessionData().ApplicationName, internalConsoleAppName)
@@ -184,8 +212,19 @@ func (p *planner) maybeLogStatementInternal(
 	// a user and the user has admin privilege (is directly or indirectly a
 	// member of the admin role).
 
+	// Zone config changes are always audit-logged on the SENSITIVE_ACCESS
+	// channel because they control data placement (CRDB-1180).
+	_, isZoneConfigChange := p.stmt.AST.(tree.ZoneConfigStatement)
+	shouldLogZoneConfigAudit := isZoneConfigChange && execType != executorTypeInternal
+
+	// failedQueryLogActive captures whether we may need to emit a failed_query
+	// event for this statement. The setting can be on without an error, in
+	// which case this evaluates to false and we still short-circuit below.
+	failedQueryLogActive := failedQueryLogEnabled && err != nil
+
 	if !logV && !logExecuteEnabled && !auditEventsDetected && !slowQueryLogEnabled &&
-		!shouldLogToAdminAuditLog && !telemetryLoggingEnabled {
+		!shouldLogToAdminAuditLog && !telemetryLoggingEnabled && !shouldLogZoneConfigAudit &&
+		!failedQueryLogActive {
 		// Shortcut: avoid the expense of computing anything log-related
 		// if logging is not enabled by configuration.
 		return
@@ -259,10 +298,7 @@ func (p *planner) maybeLogStatementInternal(
 				CommonSQLEventDetails: commonSQLEventDetails,
 				CommonSQLExecDetails:  execDetails,
 			}
-			migrator := log.NewStructuredEventMigrator(func() bool {
-				return log.ShouldMigrateEvent(p.ExecCfg().SV())
-			}, logpb.Channel_SQL_PERF)
-			migrator.StructuredEvent(ctx, severity.INFO, event)
+			log.StructuredEvent(ctx, severity.INFO, event)
 		case execType == executorTypeInternal && slowInternalQueryLogEnabled:
 			// Internal queries that surpass the slow query log threshold should only
 			// be logged to the slow-internal-only log if the cluster setting dictates.
@@ -270,11 +306,25 @@ func (p *planner) maybeLogStatementInternal(
 				CommonSQLEventDetails: commonSQLEventDetails,
 				CommonSQLExecDetails:  execDetails,
 			}
-			migrator := log.NewStructuredEventMigrator(func() bool {
-				return log.ShouldMigrateEvent(p.ExecCfg().SV())
-			}, logpb.Channel_SQL_INTERNAL_PERF)
-			migrator.StructuredEvent(ctx, severity.INFO,
-				event)
+			log.StructuredEvent(ctx, severity.INFO, event)
+		}
+	}
+
+	if failedQueryLogActive {
+		commonSQLEventDetails := p.getCommonSQLEventDetails()
+		switch {
+		case execType == executorTypeExec:
+			event := &eventpb.FailedQuery{
+				CommonSQLEventDetails: commonSQLEventDetails,
+				CommonSQLExecDetails:  execDetails,
+			}
+			log.StructuredEvent(ctx, severity.INFO, event)
+		case execType == executorTypeInternal && failedQueryLogInternalEnabled:
+			event := &eventpb.FailedQueryInternal{
+				CommonSQLEventDetails: commonSQLEventDetails,
+				CommonSQLExecDetails:  execDetails,
+			}
+			log.StructuredEvent(ctx, severity.INFO, event)
 		}
 	}
 
@@ -295,6 +345,14 @@ func (p *planner) maybeLogStatementInternal(
 
 	if shouldLogToAdminAuditLog {
 		p.logEventsOnlyExternally(ctx, &eventpb.AdminQuery{CommonSQLExecDetails: execDetails})
+	}
+
+	// Note: for admin users, both admin_query (above) and zone_config_audit
+	// (below) are emitted. This is intentional — admin_query captures all
+	// admin activity, while zone_config_audit enables filtering specifically
+	// for zone config changes across all users.
+	if shouldLogZoneConfigAudit {
+		p.logEventsOnlyExternally(ctx, &eventpb.ZoneConfigAudit{CommonSQLExecDetails: execDetails})
 	}
 
 	if telemetryLoggingEnabled && !p.SessionData().TroubleshootingMode {
@@ -436,11 +494,7 @@ func (p *planner) maybeLogStatementInternal(
 			SchemaChangerMode:                     p.curPlan.instrumentation.schemaChangerMode.String(),
 		}
 
-		migrator := log.NewStructuredEventMigrator(func() bool {
-			return log.ShouldMigrateEvent(p.ExecCfg().SV())
-		}, logpb.Channel_TELEMETRY)
-
-		migrator.StructuredEvent(ctx, severity.INFO, sampledQuery)
+		log.StructuredEvent(ctx, severity.INFO, sampledQuery)
 	}
 }
 
@@ -525,11 +579,7 @@ func (p *planner) logTransaction(
 		}
 	}
 
-	migrator := log.NewStructuredEventMigrator(func() bool {
-		return log.ShouldMigrateEvent(p.ExecCfg().SV())
-	}, logpb.Channel_TELEMETRY)
-
-	migrator.StructuredEvent(ctx, severity.INFO, sampledTxn)
+	log.StructuredEvent(ctx, severity.INFO, sampledTxn)
 }
 
 func (p *planner) logEventsOnlyExternally(ctx context.Context, entries ...logpb.EventPayload) {

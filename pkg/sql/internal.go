@@ -9,6 +9,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -19,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/advisorylock"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -38,12 +40,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -404,6 +409,15 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 			ex.extraTxnState.jobs = ie.extraTxnState.jobs
 			ex.extraTxnState.schemaChangerState = ie.extraTxnState.schemaChangerState
 			ex.extraTxnState.shouldResetSyntheticDescriptors = shouldResetSyntheticDescriptors
+			// We inherit the parent's advisory lock manager here. This is safe
+			// because internal executors on this path do not issue SQL
+			// SAVEPOINT/RELEASE statements; savepoint hooks still fire from the
+			// parent's conn_executor_savepoints. If that changes, using this
+			// inherited manager could desynchronize advisory-lock savepoint markers
+			// from the parent's savepoint stack.
+			if ie.extraTxnState.advisoryLockManager != nil {
+				ex.extraTxnState.advisoryLockManager = ie.extraTxnState.advisoryLockManager
+			}
 		}
 	}
 
@@ -468,6 +482,7 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 		txn,
 		ex.transitionCtx,
 		ex.QualityOfService(),
+		0, /* resourceGroupID: unused, the bound txn is adopted, not created */
 		isolation.Serializable,
 		txn.GetOmitInRangefeeds(),
 		// TODO(yuzefovich): re-evaluate whether we want to allow buffered
@@ -898,9 +913,17 @@ func (ie *InternalExecutor) QueryIteratorEx(
 	stmt string,
 	qargs ...interface{},
 ) (isql.Rows, error) {
-	return ie.execInternal(
+	r, err := ie.execInternal(
 		ctx, opName, newSyncIEResultChannel(), defaultIEExecutionMode, txn, session, ieStmt{stmt: stmt}, qargs...,
 	)
+	// Avoid returning a typed nil *rowsIterator wrapped in a non-nil
+	// isql.Rows interface. Callers check "if it != nil" before calling
+	// methods, but a non-nil interface holding a nil pointer passes that
+	// check and panics on method dispatch (e.g. Close, HasResults).
+	if r == nil {
+		return nil, err
+	}
+	return r, err
 }
 
 // applyInternalExecutorSessionExceptions overrides values from
@@ -965,12 +988,23 @@ func applyOverrides(o sessiondata.InternalExecutorOverride, sd *sessiondata.Sess
 	if o.PreventPartitioningSoftLimitedScans != nil {
 		sd.DistSQLPreventPartitioningSoftLimitedScans = *o.PreventPartitioningSoftLimitedScans
 	}
+	if o.DistSQLMode != nil {
+		sd.DistSQLMode = *o.DistSQLMode
+	}
+	if o.NewSchemaChangerMode != nil {
+		sd.NewSchemaChangerMode = *o.NewSchemaChangerMode
+	}
 	// For 25.2, we're being conservative and explicitly disabling buffered
 	// writes for the internal executor.
 	// TODO(yuzefovich): remove this for 25.3.
 	sd.BufferedWritesEnabled = false
 
 	if o.MultiOverride != "" {
+		if buildutil.CrdbTestBuild {
+			if err := sessiondata.ValidateMultiOverride(o.MultiOverride); err != nil {
+				panic(errors.Wrap(err, "invalid MultiOverride"))
+			}
+		}
 		overrides := strings.Split(o.MultiOverride, ",")
 		for _, override := range overrides {
 			parts := strings.Split(override, "=")
@@ -989,17 +1023,7 @@ var ieMultiOverride = settings.RegisterStringSetting(
 		"session variables used by the InternalExecutor (performed on a best-effort basis)",
 	"",
 	settings.WithValidateString(func(_ *settings.Values, val string) error {
-		if val == "" {
-			return nil
-		}
-		overrides := strings.Split(val, ",")
-		for _, override := range overrides {
-			parts := strings.Split(override, "=")
-			if len(parts) != 2 {
-				return errors.Newf("invalid override format: expected 'variable=value', found %q", override)
-			}
-		}
-		return nil
+		return sessiondata.ValidateMultiOverride(val)
 	}),
 )
 
@@ -1741,10 +1765,11 @@ func (icc *internalClientComm) RTrim(_ context.Context, pos CmdPos) {
 // executor in that it may lead to surprising bugs whereby we forget to add
 // fields here and keep them in sync.
 type extraTxnState struct {
-	txn                *kv.Txn
-	descCollection     *descs.Collection
-	jobs               *txnJobsCollection
-	schemaChangerState *SchemaChangerState
+	txn                 *kv.Txn
+	descCollection      *descs.Collection
+	jobs                *txnJobsCollection
+	schemaChangerState  *SchemaChangerState
+	advisoryLockManager *atomic.Pointer[advisorylock.Manager]
 
 	// regionsProvider is populated lazily.
 	regionsProvider *regions.Provider
@@ -1987,6 +2012,11 @@ func (ief *InternalDB) txn(
 		if len(modifiedDescriptors) == 0 && deletedDescs.Len() == 0 {
 			return nil
 		}
+		ctx, span := tracing.ChildSpan(ctx, "wait-for-descriptors")
+		defer span.Finish()
+		start := timeutil.Now()
+		log.Dev.Infof(ctx, "waiting for %d modified and %d deleted descriptors",
+			len(modifiedDescriptors), deletedDescs.Len())
 		retryOpts := retry.Options{
 			InitialBackoff: time.Millisecond,
 			Multiplier:     1.5,
@@ -2015,6 +2045,7 @@ func (ief *InternalDB) txn(
 				return err
 			}
 		}
+		log.Dev.Infof(ctx, "waiting for descriptors done, took %v", timeutil.Since(start))
 		return nil
 	}
 

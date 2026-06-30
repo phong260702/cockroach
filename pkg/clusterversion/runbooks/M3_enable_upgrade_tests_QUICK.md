@@ -23,6 +23,34 @@ Enable upgrade tests after the first RC is published using a **2-PR approach** (
 
 ---
 
+## Check: Has PR 1 Already Been Done?
+
+Before generating fixtures, verify whether someone already merged the fixtures PR:
+
+```bash
+RC_VERSION="v25.4.0-rc.1"    # Set to actual RC version
+MINOR="25.4"                  # Set to minor version (e.g., 25.4)
+
+# 1. Releases file updated?
+grep "${MINOR}" pkg/testutils/release/cockroach_releases.yaml
+
+# 2. REPOSITORIES.bzl updated?
+grep "${RC_VERSION}" pkg/sql/logictest/REPOSITORIES.bzl
+
+# 3. Fixtures present?
+ls -lh pkg/cmd/roachtest/fixtures/*/checkpoint-v${MINOR}.tgz
+```
+
+**If all three return results → PR 1 is done. Skip to PR 2.**
+
+To find the PR that did it:
+```bash
+git log origin/master --oneline -- "pkg/cmd/roachtest/fixtures/1/checkpoint-v${MINOR}.tgz"
+# Then: gh api repos/cockroachdb/cockroach/commits/<hash>/pulls --jq '.[].number'
+```
+
+---
+
 ## PR 1: Fixtures (~6 files)
 
 ### Step 1: Update Releases File (on Mac)
@@ -306,7 +334,7 @@ const PreviousRelease Key = V25_4
 cockroach_predecessor_version(
     name = "cockroach_predecessor_version",
     visibility = [
-        "//pkg/ccl/logictestccl:__subpackages__",
+        "//pkg/sql/logictest:__subpackages__",
         "//pkg/sql/logictest/tests/cockroach-go-testserver-25.2:__pkg__",
         "//pkg/sql/logictest/tests/cockroach-go-testserver-25.3:__pkg__",
         "//pkg/sql/logictest/tests/cockroach-go-testserver-25.4:__pkg__",  # Add
@@ -338,9 +366,61 @@ func supportsSkipUpgradeTo(v *version.Version) bool {
 ```
 
 **Generates:**
-- `pkg/sql/logictest/tests/cockroach-go-testserver-25.4/BUILD.bazel`
-- `pkg/sql/logictest/tests/cockroach-go-testserver-25.4/generated_test.go`
+- `pkg/sql/logictest/tests/cockroach-go-testserver-X.Y/BUILD.bazel`
+- `pkg/sql/logictest/tests/cockroach-go-testserver-X.Y/generated_test.go`
 - Updates to various BUILD.bazel files
+
+**Stage and commit only the right files:**
+
+```bash
+git status --porcelain | grep -v "^??"
+```
+
+Stage new/modified generated files, then **check for BUILD.bazel files in packages
+whose only Go files are gitignored** (e.g., `upgradeinterlockccl/`). Locally, gazelle
+sees the gitignored `generated_test.go` and writes a BUILD.bazel with a `go_test`
+target. CI does not have that file, so CI's gazelle empties/omits the BUILD.bazel.
+Committing the local version causes `check_generated_code` CI to fail.
+
+**Fix:** Do not commit BUILD.bazel for packages with only gitignored Go files:
+
+```bash
+# Check if a suspicious BUILD.bazel belongs to a package with only gitignored Go files
+git check-ignore -v <path>/generated_test.go  # If this prints a rule, the file is gitignored
+
+# If gitignored: remove the BUILD.bazel from the commit
+git rm --cached <path>/BUILD.bazel
+# Also remove the corresponding entry from pkg/BUILD.bazel if present
+grep -n "upgradeinterlockccl\|<package_name>" pkg/BUILD.bazel
+# Edit pkg/BUILD.bazel to remove those lines, then re-stage it
+```
+
+**Verify CI compatibility before pushing:**
+
+The CI runs generate with `COCKROACH_BAZEL_FORCE_GENERATE=1`. You cannot fully replicate
+this locally if gitignored files exist, but you can spot-check:
+
+```bash
+git stash   # stash local gitignored-file side-effects
+# workspace should now be clean (no modified tracked files)
+git status --porcelain | grep -v "^??"
+git stash pop
+```
+
+If `./dev gen bazel` fails locally, see `failures/m3_failures.md` for the manual fallback.
+
+---
+
+### Step 6.5: Regenerate Declarative Rules Corpus
+
+Bumping `PreviousRelease` changes which schema changer rules are active, so the
+declarative rules test corpus must be regenerated:
+
+```bash
+./dev test pkg/cli -f=TestDeclarativeRules --rewrite
+```
+
+**Updates:** `pkg/cli/testdata/declarative-rules/deprules`
 
 ---
 
@@ -400,14 +480,15 @@ Epic: None"
 2. `pkg/sql/logictest/REPOSITORIES.bzl`
 3-6. `pkg/cmd/roachtest/fixtures/{1,2,3,4}/checkpoint-v25.4.tgz`
 
-### PR 2 (Code): ~9 files
+### PR 2 (Code): ~10 files
 1. `pkg/clusterversion/cockroach_versions.go`
 2. `pkg/sql/logictest/logictestbase/logictestbase.go`
 3. `pkg/sql/logictest/BUILD.bazel`
 4. `pkg/cmd/roachtest/roachtestutil/mixedversion/mixedversion.go` (verify only)
-5. `pkg/sql/logictest/tests/cockroach-go-testserver-25.4/BUILD.bazel` (generated)
-6. `pkg/sql/logictest/tests/cockroach-go-testserver-25.4/generated_test.go` (generated)
-7-9. Various BUILD.bazel updates from `./dev gen bazel`
+5. `pkg/cli/testdata/declarative-rules/deprules` (regenerated via `--rewrite`)
+6. `pkg/sql/logictest/tests/cockroach-go-testserver-25.4/BUILD.bazel` (generated)
+7. `pkg/sql/logictest/tests/cockroach-go-testserver-25.4/generated_test.go` (generated)
+8-10. Various BUILD.bazel updates from `./dev gen bazel`
 
 ---
 
@@ -434,6 +515,12 @@ grep "const PreviousRelease" pkg/clusterversion/cockroach_versions.go
 
 # Verify testserver config added
 grep "cockroach-go-testserver-25.4" pkg/sql/logictest/logictestbase/logictestbase.go
+
+# Run unit tests
+./dev test pkg/clusterversion -v
+./dev test pkg/roachpb -v
+./dev test pkg/sql/logictest/logictestbase -v
+./dev test pkg/cli -f=TestDeclarativeRules -v
 
 # Build succeeds
 ./dev build short
@@ -469,6 +556,14 @@ grep "cockroach-go-testserver-25.4" pkg/sql/logictest/logictestbase/logictestbas
 | "license required" | Verify: `echo $COCKROACH_DEV_LICENSE` |
 | "roachprod cluster exists" | `./bin/roachprod destroy local` |
 | Fixtures 0 bytes or >10MB | Compare with previous version sizes, regenerate if needed |
+
+### CI Failures After PR 2
+
+| Error | Fix |
+|-------|-----|
+| `TestLogic_mixed_version_bootstrap_tenant` fails with descriptor diffs | System table descriptors evolve between versions. Exclude differing keys in the test's WHERE clause (see full runbook for details) |
+| `TestDeclarativeRules` fails with version mismatch | Forgot Step 6.5: run `./dev test pkg/cli -f=TestDeclarativeRules --rewrite` |
+| `check_generated_code` fails: "Some automatically generated code is not up to date" | Forgot to run `./dev gen bazel` before pushing, or committed a BUILD.bazel for a package whose only Go files are gitignored (see Step 6). Fix: remove that BUILD.bazel with `git rm --cached`, remove its entry from `pkg/BUILD.bazel`, amend, and force-push. |
 
 ### REPOSITORIES.bzl
 

@@ -10,6 +10,7 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,8 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/schemafeed"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/timers"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/obs/clustermetrics/cmmetrics"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -31,10 +35,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
+	"github.com/cockroachdb/cockroach/pkg/util/rangescanstats/rangescanstatspb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/crlib/crtime"
+	prometheusgo "github.com/prometheus/client_model/go"
 	"github.com/rcrowley/go-metrics"
 )
 
@@ -55,6 +61,14 @@ const maxSLIScopeNameLen = 128
 // defaultSLIScope is the name of the default SLI scope -- i.e. the set of metrics
 // keeping track of all changefeeds which did not have explicit sli scope specified.
 const defaultSLIScope = "default"
+
+func normalizeSLIScope(scope string) string {
+	scope = strings.TrimSpace(strings.ToLower(scope))
+	if scope == "" {
+		return defaultSLIScope
+	}
+	return scope
+}
 
 // AggMetrics are aggregated metrics keeping track of aggregated changefeed performance
 // indicators, combined with a limited number of per-changefeed indicators.
@@ -86,16 +100,16 @@ type AggMetrics struct {
 	InternalRetryMessageCount   *aggmetric.AggGauge
 	SchemaRegistrations         *aggmetric.AggCounter
 	SchemaRegistryRetries       *aggmetric.AggCounter
-	AggregatorProgress          *aggmetric.AggGauge
-	CheckpointProgress          *aggmetric.AggGauge
+	AggregatorProgress          *aggmetric.AggFunctionalGauge
+	CheckpointProgress          *aggmetric.AggFunctionalGauge
 	LaggingRanges               *aggmetric.AggGauge
 	TotalRanges                 *aggmetric.AggGauge
 	CloudstorageBufferedBytes   *aggmetric.AggGauge
 	KafkaThrottlingNanos        *aggmetric.AggHistogram
 	SinkErrors                  *aggmetric.AggCounter
-	MaxBehindNanos              *aggmetric.AggGauge
-	SpanProgressSkew            *aggmetric.AggGauge
-	TableProgressSkew           *aggmetric.AggGauge
+	MaxBehindNanos              *aggmetric.AggFunctionalGauge
+	SpanProgressSkew            *aggmetric.AggFunctionalGauge
+	TableProgressSkew           *aggmetric.AggFunctionalGauge
 
 	Timers *timers.Timers
 
@@ -177,16 +191,16 @@ type sliMetrics struct {
 	InternalRetryMessageCount   *aggmetric.Gauge
 	SchemaRegistrations         *aggmetric.Counter
 	SchemaRegistryRetries       *aggmetric.Counter
-	AggregatorProgress          *aggmetric.Gauge
-	CheckpointProgress          *aggmetric.Gauge
+	AggregatorProgress          *aggmetric.FunctionalGauge
+	CheckpointProgress          *aggmetric.FunctionalGauge
 	LaggingRanges               *aggmetric.Gauge
 	TotalRanges                 *aggmetric.Gauge
 	CloudstorageBufferedBytes   *aggmetric.Gauge
 	KafkaThrottlingNanos        *aggmetric.Histogram
 	SinkErrors                  *aggmetric.Counter
-	MaxBehindNanos              *aggmetric.Gauge
-	SpanProgressSkew            *aggmetric.Gauge
-	TableProgressSkew           *aggmetric.Gauge
+	MaxBehindNanos              *aggmetric.FunctionalGauge
+	SpanProgressSkew            *aggmetric.FunctionalGauge
+	TableProgressSkew           *aggmetric.FunctionalGauge
 
 	Timers *timers.ScopedTimers
 
@@ -416,7 +430,7 @@ func (m *sliMetrics) timers() *timers.ScopedTimers {
 // components because they don't support reliable deregistration, which is
 // desirable in this use-case.
 type JobScopedUsageMetrics struct {
-	UsageTableBytes    *metric.Gauge
+	UsageTableBytes    *metric.FunctionalGauge
 	UsageErrorCount    *metric.Counter
 	UsageQueryDuration metric.IHistogram
 
@@ -870,7 +884,49 @@ var (
 		Unit:        metric.Unit_COUNT,
 		Category:    metric.Metadata_CHANGEFEEDS,
 	}
+	metaCheckpointLag = metric.Metadata{
+		Name:        "changefeed.checkpoint_lag",
+		Help:        "Time elapsed since a changefeed's most recently persisted checkpoint.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
+		Category:    metric.Metadata_CHANGEFEEDS,
+		MetricType:  prometheusgo.MetricType_GAUGE,
+	}
 )
+
+// ClusterMetrics groups all per-job cluster metrics emitted by the
+// changefeed package. New cluster metrics should be added by extending
+// this struct.
+type ClusterMetrics struct {
+	CheckpointLag *cmmetrics.WriteStopwatchVec
+}
+
+// RegisterWith attaches all cluster metrics to the given writer.
+func (cm *ClusterMetrics) RegisterClusterMetric(writer sql.ClusterMetricAdder) {
+	if writer == nil {
+		return
+	}
+	writer.AddMetricStruct(cm)
+}
+
+// SetCheckpointLag records the resolved-frontier nanos of the most
+// recent persisted checkpoint for the given job.
+func (cm *ClusterMetrics) SetCheckpointLag(jobID jobspb.JobID, scope string, frontierNanos int64) {
+	cm.CheckpointLag.UpdateStartTime(jobIDAndScopeLabels(jobID, scope), frontierNanos)
+}
+
+// DeleteJob drops all cluster metric entries belonging to the given
+// job.
+func (cm *ClusterMetrics) DeleteJob(jobID jobspb.JobID, scope string) {
+	cm.CheckpointLag.Delete(jobIDAndScopeLabels(jobID, scope))
+}
+
+func jobIDAndScopeLabels(jobID jobspb.JobID, scope string) map[string]string {
+	return map[string]string{
+		"job_id": strconv.FormatInt(int64(jobID), 10),
+		"scope":  normalizeSLIScope(scope),
+	}
+}
 
 func newAggregateMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) *AggMetrics {
 	metaChangefeedEmittedMessages := metric.Metadata{
@@ -1315,11 +1371,7 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	scope = strings.TrimSpace(strings.ToLower(scope))
-
-	if scope == "" {
-		scope = defaultSLIScope
-	}
+	scope = normalizeSLIScope(scope)
 
 	if len(scope) > maxSLIScopeNameLen {
 		return nil, pgerror.Newf(pgcode.ConfigurationLimitExceeded,
@@ -1423,22 +1475,21 @@ func (a *AggMetrics) getOrCreateScope(scope string) (*sliMetrics, error) {
 		}
 	}
 
-	sm.AggregatorProgress = a.AggregatorProgress.AddFunctionalChild(minTimestampGetter(sm.mu.resolved), scope)
-	sm.CheckpointProgress = a.CheckpointProgress.AddFunctionalChild(minTimestampGetter(sm.mu.checkpoint), scope)
-	sm.MaxBehindNanos = a.MaxBehindNanos.AddFunctionalChild(maxBehindNanosGetter(sm.mu.resolved), scope)
-	sm.SpanProgressSkew = a.SpanProgressSkew.AddFunctionalChild(
+	sm.AggregatorProgress = a.AggregatorProgress.AddChild(minTimestampGetter(sm.mu.resolved), scope)
+	sm.CheckpointProgress = a.CheckpointProgress.AddChild(minTimestampGetter(sm.mu.checkpoint), scope)
+	sm.MaxBehindNanos = a.MaxBehindNanos.AddChild(maxBehindNanosGetter(sm.mu.resolved), scope)
+	sm.SpanProgressSkew = a.SpanProgressSkew.AddChild(
 		maxTimestampSkewGetter(sm.mu.spanSkew), scope)
-	sm.TableProgressSkew = a.TableProgressSkew.AddFunctionalChild(
+	sm.TableProgressSkew = a.TableProgressSkew.AddChild(
 		maxTimestampSkewGetter(sm.mu.tableSkew), scope)
 
 	a.mu.sliMetrics[scope] = sm
 	return sm, nil
 }
 
-// getLaggingRangesCallback returns a function which can be called to update the
-// lagging ranges metric. It should be called with the current number of lagging
-// ranges.
-func (m *sliMetrics) getLaggingRangesCallback() func(lagging int64, total int64) {
+// getRangeStatsCallback returns a function which can be called to update our
+// range stats metrics: lagging ranges, scanning ranges, and total ranges.
+func (m *sliMetrics) getRangeStatsCallback() func(stats *rangescanstatspb.RangeStats) {
 	// Because this gauge is shared between changefeeds in the same metrics scope,
 	// we must instead modify it using `Inc` and `Dec` (as opposed to `Update`) to
 	// ensure values written by others are not overwritten. The code below is used
@@ -1458,7 +1509,13 @@ func (m *sliMetrics) getLaggingRangesCallback() func(lagging int64, total int64)
 		lagging int64
 		total   int64
 	}{}
-	return func(lagging int64, total int64) {
+	return func(stats *rangescanstatspb.RangeStats) {
+		total, scanning, lagging := stats.RangeCount, stats.ScanningRangeCount, stats.LaggingRangeCount
+		// We don't want to report lagging ranges during an initial scan.
+		if scanning > 0 {
+			lagging = 0
+		}
+
 		last.Lock()
 		defer last.Unlock()
 
@@ -1485,6 +1542,7 @@ type Metrics struct {
 	ParallelConsumerFlushNanos     metric.IHistogram
 	ParallelConsumerConsumeNanos   metric.IHistogram
 	ParallelConsumerInFlightEvents *metric.Gauge
+	ClusterMetrics                 *ClusterMetrics
 
 	mu struct {
 		syncutil.Mutex
@@ -1534,6 +1592,11 @@ func MakeMetrics(histogramWindow time.Duration, lookup *cidr.Lookup) metric.Stru
 			Mode:         metric.HistogramModePrometheus,
 		}),
 		ParallelConsumerInFlightEvents: metric.NewGauge(metaChangefeedEventConsumerInFlightEvents),
+		ClusterMetrics: &ClusterMetrics{
+			CheckpointLag: cmmetrics.NewWriteStopwatchVec(
+				metaCheckpointLag, timeutil.DefaultTimeSource{}, "job_id", "scope",
+			),
+		},
 	}
 
 	m.mu.id = 1 // start the first id at 1 so we can detect initialization
@@ -1577,6 +1640,11 @@ func MakeMemoryMetrics(
 }
 
 func init() {
+	// Register metric so cmreader on other nodes knows this metric exists
+	// before any node constructs it.
+	cmmetrics.RegisterLabeledClusterMetric(
+		metaCheckpointLag.Name, metaCheckpointLag, []string{"job_id", "scope"},
+	)
 	jobs.MakeChangefeedMetricsHook = MakeMetrics
 	jobs.MakeChangefeedMemoryMetricsHook = MakeMemoryMetrics
 }

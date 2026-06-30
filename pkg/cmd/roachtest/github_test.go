@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
@@ -36,7 +35,9 @@ var (
 cockroachdb/test-eng:
  label: T-testeng
 cockroachdb/dev-inf:
- label: T-dev-inf`
+ label: T-dev-inf
+cockroachdb/sql-foundations:
+ label: T-sql-foundations`
 
 	validTeamsFn   = func() (team.Map, error) { return loadYamlTeams(teamsYaml) }
 	invalidTeamsFn = func() (team.Map, error) { return loadYamlTeams("invalid yaml") }
@@ -101,14 +102,17 @@ func TestGenerateHelpCommand(t *testing.T) {
 	end := time.Date(2023, time.July, 21, 16, 42, 13, 137, time.UTC)
 
 	r := &issues.Renderer{}
-	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", spec.GCE, start, end)(r)
+	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", start, end)(r)
 
 	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command.txt"))
 
+	// With TC_BUILD_BRANCH=master, Datadog log upload is enabled and the
+	// help command should include a Datadog Logs link.
+	t.Setenv("TC_BUILD_BRANCH", "master")
 	r = &issues.Renderer{}
-	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", spec.AWS, start, end)(r)
+	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", start, end)(r)
 
-	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command_non_gce.txt"))
+	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command_with_dd.txt"))
 }
 
 func TestCreatePostRequest(t *testing.T) {
@@ -143,7 +147,7 @@ func TestCreatePostRequest(t *testing.T) {
 		}
 		ti.ReplaceL(nilLogger())
 
-		testClusterImpl := &clusterImpl{spec: clusterSpec, arch: vm.ArchAMD64, name: "foo"}
+		var testClusterImpl testCluster = &roachprodCluster{spec: clusterSpec, arch: vm.ArchAMD64, name: "foo"}
 		vo := vm.DefaultCreateOpts()
 		vmOpts := &vo
 		teamLoadFn := validTeamsFn
@@ -215,6 +219,11 @@ func TestCreatePostRequest(t *testing.T) {
 							refError = liveMigrationError("my_VM")
 						case "error-with-owner-sql-foundations":
 							refError = registry.ErrorWithOwner(registry.OwnerSQLFoundations, refError)
+						case "error-with-owner-sql-foundations-title-override":
+							refError = registry.ErrorWithOwner(
+								registry.OwnerSQLFoundations, refError,
+								registry.WithTitleOverride("schema_change_workload_failure"),
+							)
 						case "error-with-owner-test-eng":
 							refError = registry.ErrorWithOwner(registry.OwnerTestEng, refError)
 						case "require-no-error-failed":
@@ -249,6 +258,8 @@ func TestCreatePostRequest(t *testing.T) {
 				ti.spec.CockroachBinary = registry.RuntimeAssertionsCockroach
 			case "set-coverage-enabled-build":
 				ti.goCoverEnabled = true
+			case "set-branch":
+				t.Setenv("TC_BUILD_BRANCH", d.CmdArgs[0].Vals[0])
 			case "add-additional-info":
 				msg_type := d.CmdArgs[0].Vals[0]
 				switch msg_type {

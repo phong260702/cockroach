@@ -23,9 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -311,6 +313,16 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, _ context.C
 	wg.Add(len(rb.outputs))
 	for i := range rb.outputs {
 		go func(ctx context.Context, rb *routerBase, ro *routerOutput) {
+			if cpuHandle := admission.SQLCPUHandleFromContext(ctx); cpuHandle != nil {
+				gh := cpuHandle.RegisterGoroutine()
+				defer gh.Close(ctx)
+			}
+			// Measure this goroutine's grunning so that the buffer-pop and
+			// stream-push work it performs is attributed to the query's SQL CPU
+			// time. The value is emitted as Metrics.RawSQLCPUTime alongside the
+			// trace metadata when the producer signals done.
+			var cpuStopWatch timeutil.CPUStopWatch
+			cpuStopWatch.Start()
 			defer wg.Done()
 			var span *tracing.Span
 			if rb.statsCollectionEnabled {
@@ -389,6 +401,17 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, _ context.C
 							<-rb.semaphore
 							ro.mu.Lock()
 						}
+					}
+					if delta := cpuStopWatch.Stop(); delta > 0 {
+						grunningMeta := &execinfrapb.ProducerMetadata{}
+						grunningMeta.Metrics = execinfrapb.GetMetricsMeta()
+						grunningMeta.Metrics.RawSQLCPUTime = int64(delta)
+						ro.mu.Unlock()
+						rb.semaphore <- struct{}{}
+						status := ro.stream.Push(nil /* row */, grunningMeta)
+						rb.updateStreamState(&streamStatus, status)
+						<-rb.semaphore
+						ro.mu.Lock()
 					}
 					ro.stream.ProducerDone()
 					break

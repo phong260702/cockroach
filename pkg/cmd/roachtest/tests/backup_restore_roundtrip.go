@@ -10,7 +10,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -18,15 +17,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/failureinjection/failures"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -45,15 +46,19 @@ var (
 	}
 )
 
-func handleSchemaChangeWorkloadError(err error) error {
-	// If the UNEXPECTED ERROR detail appears, the workload likely flaked.
-	// Otherwise, the workload could have failed due to other reasons like a node
-	// crash.
+func handleSchemaChangeWorkloadError(ctx context.Context, err error) error {
+	// If the parent context is canceled, the schema change workload did not cause the test to fail.
 	if err != nil {
-		flattenedErr := errors.FlattenDetails(err)
-		if strings.Contains(flattenedErr, "workload run error: ***") || strings.Contains(flattenedErr, "UNEXPECTED ERROR") || strings.Contains(flattenedErr, "UNEXPECTED COMMIT ERROR") {
-			return registry.ErrorWithOwner(registry.OwnerSQLFoundations, errors.Wrapf(err, "schema change workload failed"))
+		if ctx.Err() != nil {
+			// Context was cancelled - return unwrapped error.
+			return err
 		}
+		// Context was not cancelled - genuine workload failure.
+		return registry.ErrorWithOwner(
+			registry.OwnerSQLFoundations,
+			errors.Wrapf(err, "schema change workload failed"),
+			registry.WithTitleOverride("schema_change_workload_failure"),
+		)
 	}
 	return err
 }
@@ -109,23 +114,21 @@ func registerBackupRestoreRoundTrip(r registry.Registry) {
 			},
 		})
 	}
-}
 
-func registerOnlineRestoreRecovery(r registry.Registry) {
 	r.Add(registry.TestSpec{
-		Name:                       "backup-restore/online-restore-recovery",
-		Timeout:                    4 * time.Hour,
-		Owner:                      registry.OwnerDisasterRecovery,
-		Cluster:                    r.MakeClusterSpec(4, spec.WorkloadNode()),
-		EncryptionSupport:          registry.EncryptionMetamorphic,
-		NativeLibs:                 registry.LibGEOS,
-		CompatibleClouds:           registry.Clouds(spec.GCE, spec.Local),
-		Suites:                     registry.Suites(registry.Nightly),
-		TestSelectionOptOutSuites:  registry.Suites(registry.Nightly),
-		Randomized:                 true,
-		RequiresDeprecatedWorkload: true, // uses schemachange
+		Name:                      "backup-restore/chaos",
+		Monitor:                   true,
+		Timeout:                   4 * time.Hour,
+		Owner:                     registry.OwnerDisasterRecovery,
+		Cluster:                   r.MakeClusterSpec(4, spec.WorkloadNode()),
+		EncryptionSupport:         registry.EncryptionMetamorphic,
+		NativeLibs:                registry.LibGEOS,
+		CompatibleClouds:          registry.Clouds(spec.GCE, spec.Local),
+		Suites:                    registry.Suites(registry.Nightly),
+		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
+		Randomized:                true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			testOnlineRestoreRecovery(ctx, t, c)
+			backupRestoreChaos(ctx, t, c)
 		},
 	})
 }
@@ -154,8 +157,9 @@ func backupRestoreRoundTrip(
 
 	m.Go(func(ctx context.Context) error {
 		testUtils, err := setupBackupRestoreTestUtils(
-			ctx, t, c, m, testRNG,
-			withMock(sp.mock), withOnlineRestore(sp.onlineRestore), withCompaction(!sp.onlineRestore),
+			ctx, t, c, testRNG,
+			withMock(sp.mock), withOnlineRestore(sp.onlineRestore),
+			withCompaction(!sp.onlineRestore), withClusterSettings(envOption),
 		)
 		if err != nil {
 			return err
@@ -164,7 +168,7 @@ func backupRestoreRoundTrip(
 
 		dbs := []string{"bank", "tpcc", schemaChangeDB}
 		d, runBackgroundWorkload, _, err := createDriversForBackupRestore(
-			ctx, t, c, m, testRNG, workloadSeed, testUtils, dbs,
+			ctx, t, c, testRNG, workloadSeed, testUtils, dbs, nil, /* excludedWorkloads */
 		)
 		if err != nil {
 			return err
@@ -251,18 +255,231 @@ func backupRestoreRoundTrip(
 	m.Wait()
 }
 
-// startBackgroundWorkloads returns a function that starts a TPCC, bank, and a
-// system table workload in the background.
-func startBackgroundWorkloads(
+func backupRestoreChaos(ctx context.Context, t test.Test, c cluster.Cluster) {
+	testRNG, seed := randutil.NewLockedPseudoRand()
+	t.L().Printf("random seed: %d", seed)
+
+	workloadSeed := testRNG.Int63()
+	t.L().Printf("workload seed: %d", workloadSeed)
+
+	onlineRestore := testRNG.Intn(2) == 0
+	t.L().Printf("online restore: %t", onlineRestore)
+	t.AddParam("onlineRestore", fmt.Sprintf("%t", onlineRestore))
+
+	startOpts := roachtestutil.MaybeUseMemoryBudget(t, 50)
+	startOpts.RoachprodOpts.ExtraArgs = []string{"--vmodule=split_queue=3,cloud_logging_transport=1"}
+	c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.CRDBNodes())
+
+	const numToKill = 1
+	failureNodes := c.CRDBNodes()[:numToKill]
+	liveNodes := c.CRDBNodes()[numToKill:] // The set of nodes that will not be failure injected
+	isGraceful := testRNG.Intn(2) == 0
+	t.Monitor().ExpectProcessDead(failureNodes)
+	t.L().Printf("process kill failure isGraceful: %t", isGraceful)
+	// To clarify, the grace period refers to the amount of time we wait when
+	// draining gracefully before sending a SIGKILL and is unrelated to the wait
+	// in injectAndRecoverFailure.
+	failer, args, err := roachtestutil.MakeProcessKillFailer(
+		t.L(), c, failureNodes, isGraceful, 5*time.Minute, /* gracePeriod */
+	)
+	require.NoError(t, err)
+	require.NoError(t, failer.Setup(ctx, t.L(), args))
+	defer func() {
+		if err := failer.Cleanup(ctx, t.L()); err != nil {
+			t.L().Printf("failed to clean up failure: %v", err)
+		}
+	}()
+
+	// TODO (kev-cao): Running this test with withMock(true) causes the
+	// backups to complete too quickly, but the default workload sizes also take
+	// quite a while to backup. Considering the goal of this test, it'd be good
+	// to add some options to provide the caller with more flexibility over the
+	// workload.
+	testUtils, err := setupBackupRestoreTestUtils(
+		ctx, t, c, testRNG, withCompaction(true), withOnlineRestore(onlineRestore),
+	)
+	require.NoError(t, err)
+	defer testUtils.CloseConnections()
+
+	dbs := []string{"bank", "tpcc"}
+	// TODO (kev-cao): The schemachange workload currently run without tolerating
+	// errors so that we can catch schemachange errors, which means it is not
+	// resilient to node failures. We could update our helpers to give us more
+	// granular control over error tolerance, but for now we skip it.
+	excludedWorkloads := []string{"schemachange"}
+	d, runWorkloads, _, err := createDriversForBackupRestore(
+		ctx, t, c, testRNG, workloadSeed, testUtils, dbs, excludedWorkloads,
+	)
+	require.NoError(t, err)
+	stopWorkloads, err := runWorkloads()
+	require.NoError(t, err)
+	defer stopWorkloads()
+
+	bspec := backupSpec{
+		// We query for job progress via plannodes, so we don't want to use nodes
+		// subject to failure injection in the Plan spec.
+		Plan:    labeledNodes{Nodes: liveNodes, Version: clusterupgrade.CurrentVersion().String()},
+		Execute: labeledNodes{Nodes: c.CRDBNodes(), Version: clusterupgrade.CurrentVersion().String()},
+	}
+	builder := d.NewCollectionBuilder(
+		t.L(), t, testRNG, "backup-restore-chaos", bspec, bspec, true /* internalSystemsJobs */, false, /* isMultitenant */
+		WithClusterScope(),
+	)
+	jobID, err := builder.TakeFull(ctx)
+	require.NoError(t, err)
+	injectAndRecoverFailure(
+		ctx, t, t.L(), testUtils, testUtils.RandomNode(testRNG, liveNodes), jobID, failer, args,
+		randFloatBetween(testRNG, 0.15, 0.65),
+		// We use a number greater than 1.0 so that there is a chance of a node
+		// failing until the backup is complete.
+		min(randFloatBetween(testRNG, 0.65, 1.1), 1),
+	)
+	require.NoError(t, builder.WaitForLastJob(ctx))
+
+	for i := 0; i < 3; i++ {
+		jobID, err = builder.TakeInc(ctx)
+		require.NoError(t, err)
+		injectAndRecoverFailure(
+			ctx, t, t.L(), testUtils, testUtils.RandomNode(testRNG, liveNodes), jobID, failer, args,
+			randFloatBetween(testRNG, 0.15, 0.65),
+			min(randFloatBetween(testRNG, 0.65, 1.1), 1),
+		)
+		require.NoError(t, builder.WaitForLastJob(ctx))
+	}
+
+	jobID, err = builder.TakeCompacted(ctx, 1, 3)
+	require.NoError(t, err)
+	injectAndRecoverFailure(
+		ctx, t, t.L(), testUtils, testUtils.RandomNode(testRNG, liveNodes), jobID, failer, args,
+		randFloatBetween(testRNG, 0.15, 0.65),
+		min(randFloatBetween(testRNG, 0.65, 1.1), 1),
+	)
+	require.NoError(t, builder.WaitForLastJob(ctx))
+	collection, err := builder.Finalize(ctx)
+	require.NoError(t, err)
+
+	stopWorkloads()
+	testUtils.takeDebugZip(ctx, t.L())
+	err = testUtils.resetCluster(ctx, t.L(), clusterupgrade.CurrentVersion(), nil, nil)
+	require.NoError(t, err)
+
+	// Resetting the cluster resets expected deaths, so set them again for
+	// restore failure injection.
+	t.Monitor().ExpectProcessDead(failureNodes)
+
+	restoreJob, err := d.Restore(
+		ctx, t.L(), testRNG, collection,
+		false /* checkFiles */, true /* internalSystemJobs */, nil, /* mvHelper */
+	)
+	require.NoError(t, err)
+	injectAndRecoverFailure(
+		ctx, t, t.L(), testUtils, testUtils.RandomNode(testRNG, liveNodes), restoreJob.ID(), failer, args,
+		randFloatBetween(testRNG, 0.15, 0.65),
+		min(randFloatBetween(testRNG, 0.65, 1.1), 1),
+	)
+	require.NoError(t, restoreJob.WaitForJobSuccess(ctx))
+	// If running online restore, inject an additional failure during the download phase.
+	if onlineRestore {
+		downloadJobID, err := d.getORDownloadJobID(ctx, t.L(), testRNG)
+		require.NoError(t, err)
+		injectAndRecoverFailure(
+			ctx, t, t.L(), testUtils, testUtils.RandomNode(testRNG, liveNodes), downloadJobID, failer, args,
+			randFloatBetween(testRNG, 0.15, 0.50),
+			randFloatBetween(testRNG, 0.50, 0.66),
+		)
+		require.NoError(t, testUtils.waitForJobSuccess(
+			ctx, t.L(), testRNG, downloadJobID, true, /* internalSystemJobs */
+		))
+	}
+	require.NoError(t, restoreJob.ValidateRestore(ctx))
+}
+
+// injectAndRecoverFailure waits for the job to progress past
+// failFractionCompleted, then injects the specified failure, waits for the
+// failure to propagate, waits for the job to progress past
+// recoverFractionCompleted, and then recovers from the failure. It
+// synchronously waits until the job succeeds before returning.
+// queryNode is the node used to poll for job status and should not be the
+// node that is subject to failure injection.
+func injectAndRecoverFailure(
 	ctx context.Context,
+	t test.Test,
+	l *logger.Logger,
+	testUtils *CommonTestUtils,
+	queryNode int,
+	jobID int,
+	failer *failures.Failer,
+	args failures.FailureArgs,
+	failFractionCompleted float64,
+	recoverFractionCompleted float64,
+) {
+	require.LessOrEqual(t, failFractionCompleted, 1.0, "failFractionCompleted should be <= 1.0")
+	require.LessOrEqual(t, recoverFractionCompleted, 1.0, "recoverFractionCompleted should be <= 1.0")
+
+	grp := t.NewErrorGroup(task.WithContext(ctx))
+	cancelFailer := grp.GoWithCancel(func(ctx context.Context, l *logger.Logger) error {
+		l.Printf(
+			"waiting for job %d to progress past %.2f%% before injecting failure",
+			jobID, failFractionCompleted*100,
+		)
+		if err := testUtils.waitForJobFractionCompletedWithNode(
+			ctx, l, queryNode, jobID, failFractionCompleted,
+		); err != nil {
+			return err
+		}
+		l.Printf("injecting failure")
+		if err := failer.Inject(ctx, l, args); err != nil {
+			return err
+		}
+		if err := failer.WaitForFailureToPropagate(ctx, l); err != nil {
+			return err
+		}
+		l.Printf(
+			"failure propagated, waiting for job %d to progress past %.2f%% before recovering",
+			jobID, recoverFractionCompleted*100,
+		)
+		if err := testUtils.waitForJobFractionCompletedWithNode(
+			ctx, l, queryNode, jobID, recoverFractionCompleted,
+		); err != nil {
+			return err
+		}
+		l.Printf("job %d progressed past %.2f%%, recovering from failure", jobID, recoverFractionCompleted*100)
+
+		if err := failer.Recover(ctx, l); err != nil {
+			return err
+		}
+		return failer.WaitForFailureToRecover(ctx, l)
+	}, task.Name(fmt.Sprintf("inject-failure-and-recovery-job-%d", jobID)))
+
+	grp.Go(func(ctx context.Context, l *logger.Logger) error {
+		l.Printf("waiting for job %d to succeed", jobID)
+		if err := testUtils.waitForJobSuccessWithNode(
+			ctx, l, queryNode, jobID, true, /* internalSystemJobs */
+		); err != nil {
+			// If the job fails, the test fails, so no need to attempt to recover.
+			cancelFailer()
+			return err
+		}
+		return nil
+	}, task.Name(fmt.Sprintf("wait-for-job-%d-success", jobID)))
+
+	require.NoError(t, grp.WaitE())
+}
+
+// initBackgroundWorkloads returns a function that starts a TPCC, bank, and a
+// system table workload in the background. Workloads in excludedWorkloads will
+// not be started.
+func initBackgroundWorkloads(
+	ctx context.Context,
+	t test.Test,
 	l *logger.Logger,
 	c cluster.Cluster,
-	m cluster.Monitor,
 	testRNG *rand.Rand,
 	seed int64,
 	roachNodes, workloadNode option.NodeListOption,
 	testUtils *CommonTestUtils,
 	dbs []string,
+	excludedWorkloads []string,
 ) (func() (func(), error), error) {
 	// numWarehouses is picked as a number that provides enough work
 	// for the cluster used in this test without overloading it,
@@ -271,67 +488,82 @@ func startBackgroundWorkloads(
 	if testUtils.mock {
 		numWarehouses = 10
 	}
+	excluded := make(map[string]bool, len(excludedWorkloads))
+	for _, w := range excludedWorkloads {
+		excluded[w] = true
+	}
+
 	tpccInit, tpccRun := tpccWorkloadCmd(l, testRNG, seed, numWarehouses, roachNodes)
 	bankInit, bankRun := bankWorkloadCmd(l, testRNG, seed, roachNodes, testUtils.mock)
 	scInit, scRun := schemaChangeWorkloadCmd(l, testRNG, seed, roachNodes, testUtils.mock)
-	if err := prepSchemaChangeWorkload(ctx, workloadNode, testUtils, testRNG); err != nil {
+
+	initGroup := t.NewErrorGroup(task.WithContext(ctx))
+	if !excluded["bank"] {
+		initGroup.Go(func(ctx context.Context, l *logger.Logger) error {
+			return c.RunE(ctx, option.WithNodes(workloadNode), bankInit.String())
+		}, task.Name("init-bank"))
+	}
+	if !excluded["tpcc"] {
+		initGroup.Go(func(ctx context.Context, l *logger.Logger) error {
+			return c.RunE(ctx, option.WithNodes(workloadNode), tpccInit.String())
+		}, task.Name("init-tpcc"))
+	}
+	if !excluded["schemachange"] {
+		initGroup.Go(func(ctx context.Context, l *logger.Logger) (err error) {
+			defer func() {
+				if err != nil {
+					err = handleSchemaChangeWorkloadError(ctx, err)
+				}
+			}()
+			if err := prepSchemaChangeWorkload(ctx, workloadNode, testUtils, testRNG); err != nil {
+				return err
+			}
+			return c.RunE(ctx, option.WithNodes(workloadNode), scInit.String())
+		}, task.Name("init-schemachange"))
+	}
+	if err := initGroup.WaitE(); err != nil {
 		return nil, err
 	}
 
-	err := c.RunE(ctx, option.WithNodes(workloadNode), bankInit.String())
-	if err != nil {
-		return nil, err
-	}
-
-	err = c.RunE(ctx, option.WithNodes(workloadNode), tpccInit.String())
-	if err != nil {
-		return nil, err
-	}
-
-	err = c.RunE(ctx, option.WithNodes(workloadNode), scInit.String())
-	if err != nil {
-		return nil, handleSchemaChangeWorkloadError(err)
-	}
-
-	run := func() (func(), error) {
+	runWorkloadTasks := func() (func(), error) {
 		tables, err := testUtils.loadTablesForDBs(ctx, l, testRNG, dbs...)
 		if err != nil {
 			return nil, err
 		}
-		stopBank := workloadWithCancel(m, func(ctx context.Context) error {
-			return c.RunE(ctx, option.WithNodes(workloadNode), bankRun.String())
-		})
 
-		stopTPCC := workloadWithCancel(m, func(ctx context.Context) error {
-			return c.RunE(ctx, option.WithNodes(workloadNode), tpccRun.String())
-		})
-		stopSC := workloadWithCancel(m, func(ctx context.Context) error {
-			if err := c.RunE(ctx, option.WithNodes(workloadNode), scRun.String()); err != nil {
-				return handleSchemaChangeWorkloadError(err)
-			}
-			return nil
-		})
-
-		stopSystemWriter := workloadWithCancel(m, func(ctx context.Context) error {
-			// We use a separate RNG for the system table writer to avoid
-			// non-determinism of the RNG usage due to the time-based nature of
-			// the system writer workload. See
-			// https://github.com/cockroachdb/cockroach/blob/master/pkg/cmd/roachtest/roachtestutil/mixedversion/README.md#note-non-deterministic-use-of-the-randrand-instance
-			systemTableRNG := rand.New(rand.NewSource(testRNG.Int63()))
-			return testUtils.systemTableWriter(ctx, l, systemTableRNG, dbs, tables)
-		})
-
-		stopBackgroundCommands := func() {
-			stopBank()
-			stopTPCC()
-			stopSC()
-			stopSystemWriter()
+		runGroup := t.NewGroup()
+		if !excluded["bank"] {
+			runGroup.Go(func(ctx context.Context, l *logger.Logger) error {
+				return c.RunE(ctx, option.WithNodes(workloadNode), bankRun.String())
+			}, task.Name("run-bank"))
+		}
+		if !excluded["tpcc"] {
+			runGroup.Go(func(ctx context.Context, l *logger.Logger) error {
+				return c.RunE(ctx, option.WithNodes(workloadNode), tpccRun.String())
+			}, task.Name("run-tpcc"))
+		}
+		if !excluded["schemachange"] {
+			runGroup.Go(func(ctx context.Context, l *logger.Logger) error {
+				return handleSchemaChangeWorkloadError(ctx,
+					c.RunE(ctx, option.WithNodes(workloadNode), scRun.String()),
+				)
+			}, task.Name("run-schemachange"))
+		}
+		if !excluded["systemTableWriter"] {
+			runGroup.Go(func(ctx context.Context, l *logger.Logger) error {
+				// We use a separate RNG for the system table writer to avoid
+				// non-determinism of the RNG usage due to the time-based nature of
+				// the system writer workload. See
+				// https://github.com/cockroachdb/cockroach/blob/master/pkg/cmd/roachtest/roachtestutil/mixedversion/README.md#note-non-deterministic-use-of-the-randrand-instance
+				systemTableRNG := rand.New(rand.NewSource(testRNG.Int63()))
+				return testUtils.systemTableWriter(ctx, l, systemTableRNG, dbs, tables)
+			}, task.Name("run-system-table-writer"))
 		}
 
-		return stopBackgroundCommands, nil
+		return runGroup.Cancel, nil
 	}
 
-	return run, nil
+	return runWorkloadTasks, nil
 }
 
 // Connect makes a database handle to the node.
@@ -383,27 +615,10 @@ func (u *CommonTestUtils) CloseConnections() {
 	}
 }
 
-func workloadWithCancel(m cluster.Monitor, fn func(ctx context.Context) error) func() {
-	cancelWorkload := m.GoWithCancel(func(ctx context.Context) error {
-		err := fn(ctx)
-		if ctx.Err() != nil {
-			// Workload context was cancelled as a normal part of test shutdown.
-			return nil
-		}
-		return err
-	})
-	return cancelWorkload
-}
-
 // setupBackupRestoreTestUtils sets up a CommonTestUtils instance for backup and
 // restore tests and initializes some useful settings.
 func setupBackupRestoreTestUtils(
-	ctx context.Context,
-	t test.Test,
-	c cluster.Cluster,
-	m cluster.Monitor,
-	rng *rand.Rand,
-	testOpts ...commonTestOption,
+	ctx context.Context, t test.Test, c cluster.Cluster, rng *rand.Rand, testOpts ...commonTestOption,
 ) (*CommonTestUtils, error) {
 	connectFunc := func(node int) (*gosql.DB, error) {
 		conn, err := c.ConnE(ctx, t.L(), node)
@@ -435,14 +650,15 @@ func createDriversForBackupRestore(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
-	m cluster.Monitor,
 	rng *rand.Rand,
 	workloadSeed int64,
 	testUtils *CommonTestUtils,
 	dbs []string,
+	excludedWorkloads []string,
 ) (*BackupRestoreTestDriver, func() (func(), error), [][]string, error) {
-	runBackgroundWorkload, err := startBackgroundWorkloads(
-		ctx, t.L(), c, m, rng, workloadSeed, c.CRDBNodes(), c.WorkloadNode(), testUtils, dbs,
+	runBackgroundWorkload, err := initBackgroundWorkloads(
+		ctx, t, t.L(), c, rng, workloadSeed, c.CRDBNodes(), c.WorkloadNode(), testUtils, dbs,
+		excludedWorkloads,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -456,146 +672,4 @@ func createDriversForBackupRestore(
 		return nil, nil, nil, err
 	}
 	return d, runBackgroundWorkload, tables, nil
-}
-
-func testOnlineRestoreRecovery(ctx context.Context, t test.Test, c cluster.Cluster) {
-	testRNG, seed := randutil.NewLockedPseudoRand()
-	workloadSeed := testRNG.Int63()
-	t.L().Printf("random seed: %d", seed)
-
-	c.Start(ctx, t.L(), roachtestutil.MaybeUseMemoryBudget(t, 50), install.MakeClusterSettings(), c.CRDBNodes())
-	m := c.NewDeprecatedMonitor(ctx, c.CRDBNodes())
-	const jobStatusWait = time.Minute * 5
-
-	m.Go(func(ctx context.Context) error {
-		testUtils, err := setupBackupRestoreTestUtils(
-			ctx, t, c, m, testRNG,
-			withOnlineRestore(true), withCompaction(true),
-		)
-		if err != nil {
-			return err
-		}
-		defer testUtils.CloseConnections()
-
-		dbs := []string{"bank", "tpcc", schemaChangeDB}
-		d, runBackgroundWorkload, _, err := createDriversForBackupRestore(
-			ctx, t, c, m, testRNG, workloadSeed, testUtils, dbs,
-		)
-		if err != nil {
-			return err
-		}
-
-		stopBackgroundCommands, err := runBackgroundWorkload()
-		if err != nil {
-			return err
-		}
-		defer stopBackgroundCommands()
-
-		dbConn := c.Conn(ctx, t.L(), c.CRDBNodes().RandNode()[0])
-		defer dbConn.Close()
-
-		allNodes := labeledNodes{Nodes: c.CRDBNodes(), Version: clusterupgrade.CurrentVersion().String()}
-		bspec := backupSpec{
-			Plan:    allNodes,
-			Execute: allNodes,
-		}
-
-		// We set this pausepoint so that the download job is paused before it
-		// begins downloading external files. This allows us to guarantee that when
-		// we delete an SST file, it won't have already been downloaded by the
-		// download phase and therefore not trigger a failure.
-		// We also must set this BEFORE taking backups. In the event of a full
-		// cluster backup, the link phase of OR will reset the pausepoints back to
-		// the point of the backup, which means this pausepoint will be wiped if it
-		// is set after the backups.
-		if _, err := dbConn.ExecContext(
-			ctx, "SET CLUSTER SETTING jobs.debug.pausepoints = 'restore.before_download'",
-		); err != nil {
-			return errors.Wrap(err, "failed to set pausepoint for online restore")
-		}
-
-		t.L().Printf("starting backup")
-		collection, err := d.createBackupCollection(
-			ctx, t.L(), t, testRNG, bspec, bspec, "online-restore-recovery-backup",
-			true /* internalSystemsJobs */, false, /* isMultitenant */
-		)
-		if err != nil {
-			return err
-		}
-
-		// If we're running a cluster backup, we need to reset the cluster
-		// to restore it. We also intentionally stop background commands so
-		// the workloads don't report errors.
-		if _, ok := collection.btype.(*clusterBackup); ok {
-			t.L().Printf("resetting cluster before restoring full cluster backup")
-			stopBackgroundCommands()
-			expectDeathsFn := func(n int) {
-				m.ExpectDeaths(int32(n))
-			}
-
-			// Between each reset grab a debug zip from the cluster.
-			zipPath := fmt.Sprintf("debug-%d.zip", timeutil.Now().Unix())
-			if err := testUtils.cluster.FetchDebugZip(ctx, t.L(), zipPath); err != nil {
-				t.L().Printf("failed to fetch a debug zip: %v", err)
-			}
-			if err := testUtils.resetCluster(
-				ctx, t.L(), clusterupgrade.CurrentVersion(), expectDeathsFn, []install.ClusterSettingOption{},
-			); err != nil {
-				return err
-			}
-		}
-
-		t.L().Printf("performing online restore of backup")
-		if _, _, err := d.runRestore(
-			ctx, t.L(), testRNG, collection,
-			false /* checkFiles */, true /* internalSystemJobs */, nil, /* mvHelper */
-		); err != nil {
-			return err
-		}
-		downloadJobID, err := d.getORDownloadJobID(ctx, t.L(), testRNG)
-		if err != nil {
-			return err
-		}
-		if err := WaitForPaused(ctx, dbConn, jobspb.JobID(downloadJobID), jobStatusWait); err != nil {
-			return errors.Wrapf(
-				err, "waiting for download job %v to reach paused state", downloadJobID,
-			)
-		}
-
-		// defaultdb is going to be set offline by the failed download job, so we
-		// need to switch to the system database first to avoid any errors.
-		if _, err := dbConn.ExecContext(ctx, "USE system"); err != nil {
-			return err
-		}
-
-		if _, err := dbConn.ExecContext(
-			ctx, "SET CLUSTER SETTING jobs.debug.pausepoints = ''",
-		); err != nil {
-			return errors.Wrap(err, "failed to remove pausepoint for online restore")
-		}
-
-		if err := d.deleteSSTFromBackupLayers(ctx, t.L(), dbConn, collection); err != nil {
-			return err
-		}
-		if _, err := dbConn.ExecContext(ctx, "RESUME JOB $1", downloadJobID); err != nil {
-			return errors.Wrapf(
-				err, "failed to resume download job %v after deleting sst", downloadJobID,
-			)
-		}
-		if err := WaitForResume(ctx, dbConn, jobspb.JobID(downloadJobID), jobStatusWait); err != nil {
-			return errors.Wrapf(
-				err, "waiting for download job %v to reach resumed state", downloadJobID,
-			)
-		}
-		if err := WaitForFailed(ctx, dbConn, jobspb.JobID(downloadJobID), 10*time.Minute); err != nil {
-			return errors.Wrapf(
-				err, "waiting for download job %v to reach failed state", downloadJobID,
-			)
-		}
-		return errors.Wrapf(
-			checkNoExternalBytesRemaining(ctx, dbConn),
-			"cluster did not cleanup all external files after download phase failure",
-		)
-	})
-	m.Wait()
 }

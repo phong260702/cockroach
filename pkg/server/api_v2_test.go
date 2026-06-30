@@ -40,11 +40,7 @@ func TestListSessionsV2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			DefaultDRPCOption: base.TestDRPCDisabled,
-		},
-	})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
@@ -369,6 +365,7 @@ func TestCheckRestartSafe_Criticality(t *testing.T) {
 
 	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(ctx)
+	require.NoError(t, testCluster.WaitForFullReplication())
 
 	ts1 := testCluster.Server(0)
 
@@ -380,7 +377,6 @@ func TestCheckRestartSafe_Criticality(t *testing.T) {
 	require.Greater(t, res.RaftLeadershipOnNodeCount, int32(0))
 	require.Equal(t, int32(1), res.StoreNotDrainingCount)
 
-	require.Equal(t, int32(0), res.UnderreplicatedRangeCount)
 	require.Equal(t, int32(0), res.UnderreplicatedRangeCount)
 
 	err = drain(ctx, ts1, t)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -42,15 +43,12 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
+	defer ccl.TestingEnableEnterprise()()
 	securityassets.SetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
-	serverutils.InitTestServerFactory(server.TestServerFactory)
+	serverutils.InitTestServerFactory(server.TestServerFactory,
+		serverutils.WithTenantOption(base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(156124)))
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
-
-	defer serverutils.TestingSetDefaultTenantSelectionOverride(
-		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(156124),
-	)()
-
 	os.Exit(m.Run())
 }
 
@@ -108,6 +106,13 @@ func TestLogic_distsql_builtin(
 	runLogicTest(t, "distsql_builtin")
 }
 
+func TestLogic_distsql_collated_string(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "distsql_collated_string")
+}
+
 func TestLogic_distsql_crdb_internal(
 	t *testing.T,
 ) {
@@ -150,6 +155,13 @@ func TestLogic_distsql_numtables(
 	runLogicTest(t, "distsql_numtables")
 }
 
+func TestLogic_distsql_partitioning(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "distsql_partitioning")
+}
+
 func TestLogic_distsql_stats(
 	t *testing.T,
 ) {
@@ -169,6 +181,13 @@ func TestLogic_distsql_union(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "distsql_union")
+}
+
+func TestLogic_drop_index_ccl(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "drop_index_ccl")
 }
 
 func TestLogic_experimental_distsql_planning_5node(
@@ -213,6 +232,20 @@ func TestLogic_merge_join_dist(
 	runLogicTest(t, "merge_join_dist")
 }
 
+func TestLogic_partitioning_hash_sharded_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "partitioning_hash_sharded_index")
+}
+
+func TestLogic_partitioning_hash_sharded_index_query_plan(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "partitioning_hash_sharded_index_query_plan")
+}
+
 func TestLogic_ranges(
 	t *testing.T,
 ) {
@@ -225,4 +258,18 @@ func TestLogic_tenant_slow_repro(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "tenant_slow_repro")
+}
+
+func TestLogic_zone(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "zone")
+}
+
+func TestLogic_zone_config_inheritance(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "zone_config_inheritance")
 }

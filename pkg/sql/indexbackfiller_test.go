@@ -10,6 +10,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkmerge"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -34,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -55,13 +59,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/taskset"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
 )
 
-// TestIndexBackfiller tests the scenarios described in docs/tech-notes/index-backfill.md
+// TestIndexBackfiller tests the MVCC-compatible index backfill with temporary indexes.
 func TestIndexBackfiller(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -116,9 +121,9 @@ func TestIndexBackfiller(t *testing.T) {
 		return nil
 	}
 
-	// The sequence of events here exactly matches the test cases in
-	// docs/tech-notes/index-backfill.md. If you update this, please remember to
-	// update the tech note as well.
+	// The sequence of events here exercises the MVCC-compatible index
+	// backfill protocol: concurrent DML during backfill is captured by
+	// the temporary index, then merged into the final index.
 	execOrFail("SET create_table_with_schema_locked=false")
 	execOrFail("SET use_declarative_schema_changer='off'")
 	execOrFail("CREATE DATABASE t")
@@ -303,7 +308,7 @@ INSERT INTO foo VALUES (1), (10), (100);
 					ID:             mut.NextColumnID,
 					Type:           types.Int,
 					Nullable:       false,
-					DefaultExpr:    proto.String("42"),
+					DefaultExpr:    new(descpb.Expression("42")),
 					Hidden:         false,
 					PGAttributeNum: descpb.PGAttributeNum(mut.NextColumnID),
 				}
@@ -316,7 +321,7 @@ INSERT INTO foo VALUES (1), (10), (100);
 					ID:             mut.NextColumnID,
 					Type:           types.Int,
 					Nullable:       false,
-					ComputeExpr:    proto.String("i + def"),
+					ComputeExpr:    new(descpb.Expression("i + def")),
 					Hidden:         false,
 					PGAttributeNum: descpb.PGAttributeNum(mut.NextColumnID),
 				}
@@ -587,9 +592,27 @@ func TestIndexBackfillerResumePreservesProgress(t *testing.T) {
 	skip.UnderRace(t, "slow timing sensitive test")
 
 	ctx := context.Background()
+
+	// progressUpdate wraps completed spans with a generation tag to detect
+	// stale messages from previous backfill runs.
+	type progressUpdate struct {
+		generation uint64
+		spans      []roachpb.Span
+	}
+
 	// backfillProgressCompletedCh will be used to communicate completed spans
 	// with the tenant prefix removed, if applicable.
-	backfillProgressCompletedCh := make(chan []roachpb.Span)
+	backfillProgressCompletedCh := make(chan progressUpdate)
+	// backfillGeneration tracks the current backfill run. It increments each
+	// time RunBeforeBackfill is called, allowing us to discard stale progress
+	// updates from previous runs.
+	var backfillGeneration atomic.Uint64
+	// backfillStartedCh signals when RunBeforeBackfill is called, indicating
+	// a new backfill run has started. receiveProgressUpdate waits on this to
+	// ensure it doesn't accept stale updates from the previous run.
+	// Buffered to allow RunBeforeBackfill to signal even if receiveProgressUpdate
+	// isn't waiting yet.
+	backfillStartedCh := make(chan struct{}, 1)
 	const numRows = 100
 	const numSpans = 20
 	var isBlockingBackfillProgress atomic.Bool
@@ -617,18 +640,42 @@ func TestIndexBackfillerResumePreservesProgress(t *testing.T) {
 							}
 							completed = updated
 						}
+
+						// Capture current generation to tag this progress update.
+						currentGen := backfillGeneration.Load()
+						update := progressUpdate{
+							generation: currentGen,
+							spans:      completed,
+						}
+
 						select {
 						case <-ctx.Done():
-						case backfillProgressCompletedCh <- completed:
-							t.Logf("before index backfill progress update, completed spans: %v", completed)
+							t.Logf("before index backfill progress update, got context done")
+						case backfillProgressCompletedCh <- update:
+							t.Logf("before index backfill progress update, generation=%d, completed spans: %v",
+								currentGen, completed)
 						}
 					}
 				},
 			},
 			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				RunBeforeBackfill: func(progresses []scexec.BackfillProgress) error {
+					// Increment generation to mark start of new backfill run.
+					// First run is generation 1, subsequent resumes increment further.
+					newGen := backfillGeneration.Add(1)
+					t.Logf("starting backfill generation %d (new run=%v)", newGen, progresses == nil)
 					if progresses != nil {
 						t.Logf("before resuming backfill, checkpointed spans: %v", progresses[0].CompletedSpans)
+					}
+					// Signal that the backfill has started so receiveProgressUpdate
+					// can begin accepting updates from this generation.
+					select {
+					case backfillStartedCh <- struct{}{}:
+					default:
+						// Channel may already have a value if this is not the first call.
+						// It is safe to skip because the receiver synchronizes using
+						// backfillGeneration to filter stale updates, not the number of
+						// signals in this channel.
 					}
 					return nil
 				},
@@ -711,8 +758,30 @@ func TestIndexBackfillerResumePreservesProgress(t *testing.T) {
 	var observedSpans []roachpb.Span
 	receiveProgressUpdate := func() {
 		updateCount := 2
+		// Wait for the backfill to actually start (or resume) before we start
+		// accepting progress updates. This ensures we don't accept stale updates
+		// from a previous backfill run.
+		<-backfillStartedCh
+		// Capture the minimum acceptable generation at the start of receiving.
+		// We'll accept updates from this generation or later, but discard
+		// updates from earlier generations (which are stale from previous runs).
+		minAcceptableGen := backfillGeneration.Load()
+		t.Logf("receiveProgressUpdate: accepting generation %d or later", minAcceptableGen)
+
 		for isBlockingBackfillProgress.Load() && updateCount > 0 {
-			progressUpdate := <-backfillProgressCompletedCh
+			update := <-backfillProgressCompletedCh
+
+			// Discard stale updates from previous backfill runs.
+			// Updates with generation >= minAcceptableGen are from the current or
+			// subsequent runs and should be processed.
+			if update.generation < minAcceptableGen {
+				t.Logf("discarding stale progress update from generation %d (min acceptable: %d), spans: %v",
+					update.generation, minAcceptableGen, update.spans)
+				continue
+			}
+
+			progressUpdate := update.spans
+
 			// Make sure the progress update does not contain overlapping spans.
 			for i, span1 := range progressUpdate {
 				for j, span2 := range progressUpdate {
@@ -818,7 +887,7 @@ func TestDistributedMergeStoragePrefixTracking(t *testing.T) {
 	testingKnobs := base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		DistSQL: &execinfra.TestingKnobs{
-			AfterDistributedMergeMapPhase: func(_ context.Context, manifests []jobspb.IndexBackfillSSTManifest) {
+			AfterDistributedMergeMapPhase: func(_ context.Context, manifests []jobspb.BulkSSTManifest) {
 				// Extract node IDs from manifest URIs (format: nodelocal://<nodeID>/...).
 				nodeIDRegex := regexp.MustCompile(`^nodelocal://(\d+)/`)
 				for _, m := range manifests {
@@ -932,7 +1001,7 @@ func TestDistributedMergeStoragePrefixPreservedAcrossPauseResume(t *testing.T) {
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			DistSQL: &execinfra.TestingKnobs{
 				BulkAdderFlushesEveryBatch: true,
-				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.IndexBackfillSSTManifest) {
+				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.BulkSSTManifest) {
 					iterationCompleted.Store(int32(iteration))
 					// Block after iteration 1 to allow test to pause the job.
 					// Only block if there are manifests (not the final KV ingest iteration).
@@ -951,7 +1020,6 @@ func TestDistributedMergeStoragePrefixPreservedAcrossPauseResume(t *testing.T) {
 	tdb := sqlutils.MakeSQLRunner(db)
 
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
-	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.iterations = 4`)
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.checkpoint_interval = '10ms'`)
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
 
@@ -1004,9 +1072,18 @@ func TestDistributedMergeStoragePrefixPreservedAcrossPauseResume(t *testing.T) {
 		return errors.New("waiting for iteration 1")
 	}, 30*time.Second)
 
-	// Capture storage prefixes before pause.
-	prefixesBeforePause := getStoragePrefixes(jobID)
-	require.NotEmpty(t, prefixesBeforePause, "expected storage prefixes to be recorded before pause")
+	// Wait for storage prefixes to be flushed to the job payload. The tracker
+	// marks progress as dirty in memory; the actual persist happens on the
+	// periodic checkpoint interval, so under stress the flush may lag behind the
+	// iteration-completed signal.
+	var prefixesBeforePause []string
+	testutils.SucceedsWithin(t, func() error {
+		prefixesBeforePause = getStoragePrefixes(jobID)
+		if len(prefixesBeforePause) == 0 {
+			return errors.New("waiting for storage prefixes to be checkpointed")
+		}
+		return nil
+	}, 30*time.Second)
 	t.Logf("storage prefixes before pause: %v", prefixesBeforePause)
 
 	ensureJobState := func(targetState string) {
@@ -1076,7 +1153,7 @@ func TestMultiMergeIndexBackfill(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			DistSQL: &execinfra.TestingKnobs{
-				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.IndexBackfillSSTManifest) {
+				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.BulkSSTManifest) {
 					manifestCountByIteration[iteration] = len(manifests)
 				},
 			},
@@ -1087,7 +1164,6 @@ func TestMultiMergeIndexBackfill(t *testing.T) {
 	tdb := sqlutils.MakeSQLRunner(db)
 
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
-	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.iterations = 4`)
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
 
 	tdb.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, v TEXT)`)
@@ -1099,11 +1175,203 @@ func TestMultiMergeIndexBackfill(t *testing.T) {
 	// created and recorded in job progress for each iteration.
 	tdb.Exec(t, `CREATE INDEX idx ON t (v)`)
 
-	// Verify that we saw all intermediate iterations (1, 2, 3) via the testing knob.
-	// Iteration 4 is the final one that ingests to KV, so it doesn't generate manifests.
+	// Verify that we saw iteration 1 (local-only merge) via the testing knob.
+	// Iteration 2 is the final one that ingests to KV, so it doesn't generate manifests.
 	require.GreaterOrEqual(t, manifestCountByIteration[1], 12)
-	require.GreaterOrEqual(t, manifestCountByIteration[2], 12)
-	require.GreaterOrEqual(t, manifestCountByIteration[3], 12)
+}
+
+// TestDistributedMergePhasedProgress verifies the 3-phase progress model for
+// distributed merge backfills. The model divides progress as:
+//   - Phase 0 (map): 0-33% (span-based progress during backfill)
+//   - Phase 1 (merge iteration 1): 34-66%
+//   - Phase 2 (merge iteration 2): 67-100%
+//
+// This test verifies that after each phase completes, the DistributedMergePhase
+// and task tracking fields are correctly set in the job payload, and that the
+// fraction_completed reported by SHOW JOBS reflects the expected progress.
+func TestDistributedMergePhasedProgress(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "slow timing sensitive test")
+
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	// Coordination channels for controlling test flow.
+	mapPhaseCh := make(chan struct{})
+	iterationCh := make(chan struct{})
+	var mapPhaseComplete atomic.Bool
+	var currentIteration atomic.Int32
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		ExternalIODir: tempDir,
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			DistSQL: &execinfra.TestingKnobs{
+				BulkAdderFlushesEveryBatch: true,
+				AfterDistributedMergeMapPhase: func(ctx context.Context, manifests []jobspb.BulkSSTManifest) {
+					t.Logf("map phase complete, manifests=%d", len(manifests))
+					mapPhaseComplete.Store(true)
+					// Block to allow test to check progress after map phase.
+					select {
+					case <-mapPhaseCh:
+					case <-ctx.Done():
+					}
+				},
+				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.BulkSSTManifest) {
+					currentIteration.Store(int32(iteration))
+					t.Logf("iteration %d complete, manifests=%d", iteration, len(manifests))
+					// Block after iteration 1 (which has manifests) to check progress.
+					if iteration == 1 && len(manifests) > 0 {
+						select {
+						case <-iterationCh:
+						case <-ctx.Done():
+						}
+					}
+				},
+			},
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
+	tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
+	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.checkpoint_interval = '10ms'`)
+	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.progress_interval = '100ms'`)
+
+	tdb.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, v TEXT)`)
+	tdb.Exec(t, `INSERT INTO t SELECT i, repeat('x', 100) || i::text FROM generate_series(1, 5000) AS g(i)`)
+
+	// Run CREATE INDEX in background.
+	var jobID int64
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		_, err := db.ExecContext(ctx, `CREATE INDEX idx ON t (v)`)
+		return err
+	})
+
+	// Wait for the job to be created.
+	testutils.SucceedsWithin(t, func() error {
+		row := db.QueryRow(`
+			SELECT job_id FROM crdb_internal.jobs
+			WHERE job_type = 'NEW SCHEMA CHANGE'
+			AND description LIKE '%CREATE INDEX idx%'
+			ORDER BY created DESC LIMIT 1
+		`)
+		return row.Scan(&jobID)
+	}, 30*time.Second)
+
+	// Helper to get fraction_completed from SHOW JOBS.
+	getFractionCompleted := func() float32 {
+		var fraction float32
+		err := db.QueryRow(
+			`SELECT fraction_completed FROM [SHOW JOBS] WHERE job_id = $1`, jobID,
+		).Scan(&fraction)
+		require.NoError(t, err)
+		return fraction
+	}
+
+	// === Verify progress after map phase (~33%) ===
+	testutils.SucceedsWithin(t, func() error {
+		if mapPhaseComplete.Load() {
+			return nil
+		}
+		return errors.New("waiting for map phase")
+	}, 60*time.Second)
+
+	// Helper to check the fraction is within epsilon of expected.
+	fractionInEpsilon := func(fraction, expected float32) bool {
+		const epsilon float32 = 0.01
+		return fraction >= expected-epsilon && fraction <= expected+epsilon
+	}
+
+	// Wait for progress to be flushed and verify it's ~33% (after map phase = 1/3).
+	var fractionAfterMap float32
+	testutils.SucceedsWithin(t, func() error {
+		fractionAfterMap = getFractionCompleted()
+		if fractionInEpsilon(fractionAfterMap, 0.33) {
+			return nil
+		}
+		return errors.Errorf("waiting for fraction ~0.33, got %.4f", fractionAfterMap)
+	}, 10*time.Second)
+	t.Logf("fraction_completed after map phase: %.4f", fractionAfterMap)
+
+	// Unblock map phase.
+	close(mapPhaseCh)
+
+	// === Verify progress after iteration 1 (~66%) ===
+	// Wait for iteration 1 to complete and block.
+	testutils.SucceedsWithin(t, func() error {
+		if currentIteration.Load() >= 1 {
+			return nil
+		}
+		return errors.New("waiting for iteration 1")
+	}, 60*time.Second)
+
+	// Wait for checkpoint to reflect iteration 1 completion.
+	testutils.SucceedsWithin(t, func() error {
+		phase, _, _ := getMergeIterationProgress(t, db, int(jobID))
+		if phase >= 1 {
+			return nil
+		}
+		return errors.New("waiting for iteration 1 checkpoint")
+	}, 10*time.Second)
+
+	// Verify the phased progress fields after iteration 1.
+	// After an iteration completes, task tracking fields are cleared to ensure
+	// accurate progress calculation for the next iteration.
+	phase, tasksTotal, completedTasks := getMergeIterationProgress(t, db, int(jobID))
+	t.Logf("after iteration 1: phase=%d, tasksTotal=%d, completedTasks=%v", phase, tasksTotal, completedTasks)
+
+	require.Equal(t, int32(1), phase,
+		"DistributedMergePhase should be 1 after iteration 1")
+	require.Equal(t, int64(0), tasksTotal,
+		"MergeIterationTasksTotal should be cleared after iteration completion")
+	require.Equal(t, 0, len(completedTasks),
+		"MergeIterationCompletedTasks should be cleared after iteration completion")
+
+	// Verify fraction_completed from SHOW JOBS reflects iteration 1 progress (~66%).
+	// Wait for the progress flusher to update the job's fraction_completed.
+	var fractionAfterIter1 float32
+	testutils.SucceedsWithin(t, func() error {
+		fractionAfterIter1 = getFractionCompleted()
+		// After iteration 1, progress should be ~66% (phase 1 complete = 2/3).
+		if fractionInEpsilon(fractionAfterIter1, 0.66) {
+			return nil
+		}
+		return errors.Errorf("waiting for fraction >= 0.60, got %.4f", fractionAfterIter1)
+	}, 10*time.Second)
+	t.Logf("fraction_completed after iteration 1: %.4f", fractionAfterIter1)
+	require.GreaterOrEqual(t, fractionAfterIter1, float32(0.60),
+		"fraction_completed after iteration 1 should be >= 60%%")
+	require.LessOrEqual(t, fractionAfterIter1, float32(0.72),
+		"fraction_completed after iteration 1 should be <= 72%%")
+
+	// Unblock iteration 1 and let job complete.
+	close(iterationCh)
+
+	require.NoError(t, g.Wait())
+
+	// Verify the final state after completion.
+	phaseFinal, tasksTotalFinal, completedTasksFinal := getMergeIterationProgress(t, db, int(jobID))
+	t.Logf("after completion: phase=%d, tasksTotal=%d, completedTasks=%v",
+		phaseFinal, tasksTotalFinal, completedTasksFinal)
+
+	// After final iteration, phase should be 2, tasks fields cleared (since completion resets them).
+	require.Equal(t, int32(2), phaseFinal,
+		"DistributedMergePhase should be 2 after completion")
+	// Final iteration clears task tracking fields.
+	require.Equal(t, int64(0), tasksTotalFinal,
+		"MergeIterationTasksTotal should be 0 after completion")
+	require.Empty(t, completedTasksFinal,
+		"MergeIterationCompletedTasks should be empty after completion")
+
+	// Verify final fraction_completed is ~100%.
+	fractionFinal := getFractionCompleted()
+	require.InEpsilon(t, float32(1.0), fractionFinal, 0.01,
+		"fraction_completed should be ~100%% after completion")
 }
 
 // TestDistributedMergeAcrossNodes verifies that the distributed merge pipeline
@@ -1135,7 +1403,7 @@ func TestDistributedMergeAcrossNodes(t *testing.T) {
 	testingKnobs := base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		DistSQL: &execinfra.TestingKnobs{
-			AfterDistributedMergeIteration: func(_ context.Context, iteration int, manifests []jobspb.IndexBackfillSSTManifest) {
+			AfterDistributedMergeIteration: func(_ context.Context, iteration int, manifests []jobspb.BulkSSTManifest) {
 				// Extract node IDs from manifest URIs (format: nodelocal://<nodeID>/...).
 				nodeIDRegex := regexp.MustCompile(`^nodelocal://(\d+)/`)
 				mu.Lock()
@@ -1170,7 +1438,6 @@ func TestDistributedMergeAcrossNodes(t *testing.T) {
 	tdb := sqlutils.MakeSQLRunner(db)
 
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
-	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.iterations = 25`)
 	tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
 
 	tdb.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, v TEXT)`)
@@ -1281,10 +1548,17 @@ func (s *pauseResumeTestState) reset(
 
 // waitForCheckpointPersisted waits for checkpoint data to be persisted to the job payload.
 // For map phase pauses, it verifies that expectedSpans are checkpointed.
-// For iteration pauses, it verifies that SST manifests are checkpointed.
+// For iteration pauses, it verifies that SST manifests are checkpointed and
+// that DistributedMergePhase matches expectedPhase (when non-zero).
 func waitForCheckpointPersisted(
-	t *testing.T, ctx context.Context, db *gosql.DB, jobID int, expectedSpans []roachpb.Span,
+	t *testing.T,
+	ctx context.Context,
+	db *gosql.DB,
+	jobID int,
+	expectedSpans []roachpb.Span,
+	expectedPhase int32,
 ) {
+	t.Helper()
 	testutils.SucceedsWithin(t, func() error {
 		stmt := `SELECT payload FROM crdb_internal.system_jobs WHERE id = $1`
 		var payloadBytes []byte
@@ -1318,13 +1592,43 @@ func waitForCheckpointPersisted(
 		}
 
 		// Otherwise, verify SST manifests are checkpointed (iteration pause case).
-		ssts := schemaChangeDetails.BackfillProgress[0].SSTManifests
-		if len(ssts) == 0 {
-			return errors.Errorf("no SST manifests checkpointed yet")
+		// Manifests are now stored in job info keys, not in the proto payload.
+		bp := schemaChangeDetails.BackfillProgress[0]
+		manifestKey := fmt.Sprintf("~backfill/sst-manifests/%d-%d.binpb", bp.TableID, bp.SourceIndexID)
+		var manifestData []byte
+		manifestQuery := `SELECT value FROM system.job_info WHERE job_id = $1 AND info_key LIKE $2 ORDER BY info_key LIMIT 1`
+		if err := db.QueryRowContext(ctx, manifestQuery, jobID, manifestKey+"%").Scan(&manifestData); err != nil {
+			return errors.Wrap(err, "no SST manifests checkpointed yet")
 		}
-		t.Logf("checkpoint contains %d SST manifests", len(ssts))
+		if expectedPhase > 0 && bp.DistributedMergePhase != expectedPhase {
+			return errors.Errorf("waiting for phase %d, current: %d",
+				expectedPhase, bp.DistributedMergePhase)
+		}
+		t.Logf("checkpoint contains SST manifests (key=%s), phase=%d", manifestKey, bp.DistributedMergePhase)
 		return nil
 	}, 5*time.Second)
+}
+
+// getMergeIterationProgress extracts merge iteration progress fields from
+// the job payload. Returns the distributed merge phase, total tasks count,
+// and completed task IDs.
+func getMergeIterationProgress(
+	t *testing.T, db *gosql.DB, jobID int,
+) (phase int32, tasksTotal int64, completedTasks []int64) {
+	t.Helper()
+	var payloadBytes []byte
+	err := db.QueryRow(`SELECT payload FROM crdb_internal.system_jobs WHERE id = $1`, jobID).Scan(&payloadBytes)
+	require.NoError(t, err, "failed to query job payload")
+
+	payload := &jobspb.Payload{}
+	require.NoError(t, protoutil.Unmarshal(payloadBytes, payload), "failed to unmarshal job payload")
+
+	details := payload.Details.(*jobspb.Payload_NewSchemaChange).NewSchemaChange
+	if len(details.BackfillProgress) == 0 {
+		return 0, 0, nil
+	}
+	bp := details.BackfillProgress[0]
+	return bp.DistributedMergePhase, bp.MergeIterationTasksTotal, bp.MergeIterationCompletedTasks
 }
 
 // TestDistributedMergeResumePreservesProgress tests that spans completed during
@@ -1370,7 +1674,7 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 						}
 					}
 				},
-				AfterDistributedMergeMapPhase: func(ctx context.Context, manifests []jobspb.IndexBackfillSSTManifest) {
+				AfterDistributedMergeMapPhase: func(ctx context.Context, manifests []jobspb.BulkSSTManifest) {
 					state.mapPhaseManifestCount.Store(int32(len(manifests)))
 					t.Logf("[%s] after distributed merge map phase, manifests count: %d", state.currentTestName, len(manifests))
 
@@ -1380,10 +1684,19 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 						t.Logf("[%s] unblocked by test, continuing with merge iterations", state.currentTestName)
 					}
 				},
-				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.IndexBackfillSSTManifest) {
+				AfterDistributedMergeIteration: func(ctx context.Context, iteration int, manifests []jobspb.BulkSSTManifest) {
 					state.currentIteration.Store(int32(iteration))
 					state.manifestCountByIteration[iteration] = len(manifests)
 					t.Logf("[%s] after distributed merge iteration %d, manifests count: %d", state.currentTestName, iteration, len(manifests))
+
+					if len(manifests) > 0 {
+						for i, m := range manifests {
+							if len(m.RowSample) == 0 {
+								t.Errorf("[%s] iteration %d: manifest %d has empty RowSample",
+									state.currentTestName, iteration, i)
+							}
+						}
+					}
 
 					if len(manifests) == 0 {
 						t.Logf("[%s] final iteration %d completed (direct KV ingest)", state.currentTestName, iteration)
@@ -1426,7 +1739,6 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.iterations = 4`)
 	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
 
 	// Create a table and splits that we can use for all subtests.
@@ -1469,18 +1781,6 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 			checkpointInterval:  "10ms",
 			waitForCheckpoint:   true,
 		},
-		{
-			name:                "pause after iteration 2 with checkpoint",
-			pauseAfterIteration: 2,
-			checkpointInterval:  "10ms",
-			waitForCheckpoint:   true,
-		},
-		{
-			name:                "pause after iteration 3 with checkpoint",
-			pauseAfterIteration: 3,
-			checkpointInterval:  "10ms",
-			waitForCheckpoint:   true,
-		},
 	} {
 		// Use unique index name per subtest to avoid job ID confusion.
 		testIdx++
@@ -1492,6 +1792,7 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 
 			// Set checkpoint interval based on test variant.
 			sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.checkpoint_interval = $1`, tc.checkpointInterval)
+			sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.progress_interval = '10ms'`)
 			t.Logf("checkpoint interval set to %s, waitForCheckpoint=%v", tc.checkpointInterval, tc.waitForCheckpoint)
 
 			var jobID int
@@ -1550,7 +1851,7 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 				}
 
 				if tc.waitForCheckpoint {
-					waitForCheckpointPersisted(t, ctx, db, jobID, observedSpansBeforePause)
+					waitForCheckpointPersisted(t, ctx, db, jobID, observedSpansBeforePause, 0)
 				}
 
 				pauseAndResumeJob()
@@ -1583,7 +1884,7 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 				}, 30*time.Second)
 
 				if tc.waitForCheckpoint {
-					waitForCheckpointPersisted(t, ctx, db, jobID, nil)
+					waitForCheckpointPersisted(t, ctx, db, jobID, nil, 0)
 				}
 
 				// Pause the job while it's blocked in the AfterDistributedMergeMapPhase hook.
@@ -1609,7 +1910,38 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 				}, 30*time.Second)
 
 				if tc.waitForCheckpoint {
-					waitForCheckpointPersisted(t, ctx, db, jobID, nil)
+					waitForCheckpointPersisted(t, ctx, db, jobID, nil, int32(tc.pauseAfterIteration))
+
+					// Verify merge iteration progress is checkpointed before pause.
+					// After an iteration completes, task tracking fields are cleared.
+					phase, tasksTotal, completedTasks := getMergeIterationProgress(t, db, jobID)
+					require.Equal(t, int32(tc.pauseAfterIteration), phase,
+						"DistributedMergePhase should match pause iteration")
+					require.Equal(t, int64(0), tasksTotal,
+						"MergeIterationTasksTotal should be cleared after iteration completion")
+					require.Equal(t, 0, len(completedTasks),
+						"MergeIterationCompletedTasks should be cleared after iteration completion")
+					t.Logf("before pause: phase=%d, tasksTotal=%d, completedTasks=%v",
+						phase, tasksTotal, completedTasks)
+
+					// Verify that the progress fraction shows that we are in the final merge iteration (> 60%)
+					testutils.SucceedsWithin(t, func() error {
+						var fractionCompleted float64
+						if err := db.QueryRow(
+							`SELECT fraction_completed FROM crdb_internal.jobs WHERE job_id = $1`,
+							jobID,
+						).Scan(&fractionCompleted); err != nil {
+							return err
+						}
+						if fractionCompleted < 0.6 {
+							return errors.Errorf(
+								"fraction_completed %.3f < 0.6, waiting for progress flush",
+								fractionCompleted)
+						}
+						t.Logf("fraction_completed after iteration %d: %.3f",
+							tc.pauseAfterIteration, fractionCompleted)
+						return nil
+					}, 5*time.Second)
 				}
 
 				// Pause the job while it's blocked in the hook.
@@ -1651,6 +1983,16 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 				require.True(t, state.finalIterationCompleted.Load(),
 					"expected final iteration (KV ingest) to complete after pause/resume at iteration %d",
 					tc.pauseAfterIteration)
+
+				// Verify that the paused iteration produced multiple manifests. Combined
+				// with the RowSample assertion in AfterDistributedMergeIteration, this
+				// guarantees that CombineFileInfo can split work into multiple merge spans
+				// on resume, preserving parallelism.
+				manifestCount := state.manifestCountByIteration[tc.pauseAfterIteration]
+				require.Greater(t, manifestCount, 1,
+					"expected multiple manifests from iteration %d for parallelism on resume",
+					tc.pauseAfterIteration)
+
 				t.Logf("resumption from iteration %d completed with final KV ingest (total iterations: %d)",
 					tc.pauseAfterIteration, state.currentIteration.Load())
 			}
@@ -1658,4 +2000,374 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 			t.Logf("manifest counts by iteration: %v", state.manifestCountByIteration)
 		})
 	}
+}
+
+// TestMergeSameSSTDuplicateDetection verifies that duplicate keys within the
+// same SST are detected during merge iterations.
+func TestMergeSameSSTDuplicateDetection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t)
+
+	const maxMergeIterations int32 = 2
+
+	testCases := []struct {
+		name            string
+		injectIteration int32 // which iteration to inject
+		injectAfterRows int64 // inject dup after processing this many rows
+		expErrRegex     string
+	}{
+		{
+			name:            "non-final iteration duplicate at start",
+			injectIteration: 1,
+			injectAfterRows: 0,
+			expErrRegex:     `duplicate key value violates unique constraint`,
+		},
+		{
+			name:            "non-final iteration duplicate after few rows",
+			injectIteration: 1,
+			injectAfterRows: 80,
+			expErrRegex:     `duplicate key value violates unique constraint`,
+		},
+		{
+			name:            "final iteration duplicate at start",
+			injectIteration: maxMergeIterations,
+			injectAfterRows: 0,
+			expErrRegex:     `duplicate key value violates unique constraint`,
+		},
+		{
+			name:            "final iteration duplicate after few rows",
+			injectIteration: maxMergeIterations,
+			injectAfterRows: 57,
+			expErrRegex:     `duplicate key value violates unique constraint`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			const numNodes = 3
+			const numRows = 500
+
+			var duplicateInjected atomic.Bool
+			var rowCounter atomic.Int64
+
+			bulkMergeKnobs := &bulkmerge.TestingKnobs{
+				InjectDuplicateKey: func(iteration, maxIteration int32) []byte {
+					// Only count rows during the target iteration.
+					if iteration != tc.injectIteration {
+						return nil
+					}
+
+					// Only inject if we haven't already done so.
+					if duplicateInjected.Load() {
+						return nil
+					}
+
+					currentRow := rowCounter.Add(1) - 1 // Get and increment, 0-indexed.
+
+					// Check if we've reached the target row count.
+					if tc.injectAfterRows == 0 || currentRow >= tc.injectAfterRows {
+						duplicateInjected.Store(true)
+						return []byte("injected-duplicate-value")
+					}
+					return nil
+				},
+			}
+
+			testingKnobs := base.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+				DistSQL: &execinfra.TestingKnobs{
+					BulkAdderFlushesEveryBatch: true,
+					BulkMergeTestingKnobs:      bulkMergeKnobs,
+				},
+			}
+
+			// Create separate temp directories for each node.
+			tempDirs := make([]string, numNodes)
+			for i := 0; i < numNodes; i++ {
+				tempDirs[i] = t.TempDir()
+			}
+
+			// Multi-node cluster setup.
+			serverArgsPerNode := make(map[int]base.TestServerArgs)
+			for i := 0; i < numNodes; i++ {
+				serverArgsPerNode[i] = base.TestServerArgs{
+					ExternalIODir: tempDirs[i],
+					Knobs:         testingKnobs,
+				}
+			}
+
+			cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
+				ServerArgsPerNode: serverArgsPerNode,
+			})
+			defer cluster.Stopper().Stop(ctx)
+
+			tdb := sqlutils.MakeSQLRunner(cluster.ServerConn(0))
+
+			// Configure merge settings.
+			tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
+			tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
+
+			// Create table with data.
+			tdb.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, v INT)`)
+			tdb.Exec(t, fmt.Sprintf(`INSERT INTO t SELECT i, i*10 FROM generate_series(1, %d) AS g(i)`, numRows))
+
+			// Split and scatter ranges across nodes.
+			const numRanges = 10
+			for i := 1; i < numRanges; i++ {
+				splitPoint := (numRows / numRanges) * i
+				tdb.Exec(t, fmt.Sprintf(`ALTER TABLE t SPLIT AT VALUES (%d)`, splitPoint))
+			}
+			tdb.Exec(t, `ALTER TABLE t SCATTER`)
+
+			// Create unique index - this should trigger duplicate detection.
+			_, err := tdb.DB.ExecContext(ctx, `CREATE UNIQUE INDEX idx ON t(v)`)
+
+			// Verify injection happened.
+			require.Truef(t, duplicateInjected.Load(), "duplicate key was not injected for %s", tc.name)
+
+			require.Errorf(t, err, "expected error for %s", tc.name)
+			require.Regexp(t, tc.expErrRegex, err.Error(),
+				"error should match expected pattern for %s", tc.name)
+		})
+	}
+}
+
+// TestKVWriteCrossSSTDuplicateDetection verifies that duplicate keys spanning
+// different SST files are detected during KV write. With very small SST file
+// sizes, each index entry lands in its own SST file, forcing cross-SST
+// duplicate detection.
+func TestKVWriteCrossSSTDuplicateDetection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t)
+
+	testCases := []struct {
+		name string
+		ddl  string
+	}{
+		{
+			name: "unique secondary index",
+			ddl:  `CREATE UNIQUE INDEX idx ON t(v)`,
+		},
+		{
+			name: "alter primary key",
+			ddl:  `ALTER TABLE t ALTER PRIMARY KEY USING COLUMNS (v)`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			const numNodes = 3
+
+			testingKnobs := base.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			}
+
+			tempDirs := make([]string, numNodes)
+			for i := 0; i < numNodes; i++ {
+				tempDirs[i] = t.TempDir()
+			}
+
+			serverArgsPerNode := make(map[int]base.TestServerArgs)
+			for i := 0; i < numNodes; i++ {
+				serverArgsPerNode[i] = base.TestServerArgs{
+					ExternalIODir: tempDirs[i],
+					Knobs:         testingKnobs,
+				}
+			}
+
+			cluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
+				ServerArgsPerNode: serverArgsPerNode,
+			})
+			defer cluster.Stopper().Stop(ctx)
+
+			tdb := sqlutils.MakeSQLRunner(cluster.ServerConn(0))
+
+			tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
+
+			// Configure distributed merge with very small SST file size. Each index entry
+			// goes to its own SST file.
+			tdb.Exec(t, `SET CLUSTER SETTING bulkio.sst_writer.batch_size = '1B'`)
+			tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '1B'`)
+			tdb.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.batch_size = '1B'`)
+
+			// Create table with duplicate value in column v. When we attempt DDL that
+			// requires v to be unique, it should fail.
+			tdb.Exec(t, `CREATE TABLE t (k INT PRIMARY KEY, v INT NOT NULL)`)
+			tdb.Exec(t, `INSERT INTO t VALUES (1, 100), (2, 200), (3, 100)`) // v=100 appears twice
+
+			// Execute DDL - should fail due to duplicate key.
+			_, err := tdb.DB.ExecContext(ctx, tc.ddl)
+
+			require.Error(t, err, "expected duplicate key error for cross-SST duplicates")
+
+			// Verify the error is a proper uniqueness constraint violation. The
+			// DuplicateKeyError from the merge processor crosses the DistSQL
+			// boundary and is converted to a user-facing PG error with
+			// constraint name and key details.
+			require.Regexp(t, `duplicate key value violates unique constraint`, err.Error(),
+				"expected uniqueness constraint violation, got: %v", err)
+			var pgErr *pq.Error
+			require.True(t, errors.As(err, &pgErr), "expected pq.Error, got: %T", err)
+			require.Contains(t, pgErr.Detail, "100",
+				"expected error detail to reference the duplicate value, got: %s", pgErr.Detail)
+		})
+	}
+}
+
+// TestDistributedMergeRedoCleanupSSTs verifies that cleanupRedoIterationSSTs
+// removes orphan SST files from a merge iteration's output directory before
+// starting that iteration. This prevents leftover files from a previous
+// (interrupted) attempt from accumulating.
+func TestDistributedMergeRedoCleanupSSTs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	// orphanPlanted tracks whether we've planted the orphan file.
+	var orphanPlanted atomic.Bool
+	// orphanPath stores the full filesystem path to the orphan file.
+	var orphanPath atomic.Value
+	// orphanCleanedBeforeJobEnd tracks that the orphan was confirmed missing
+	// during the iteration hook, before the job's final cleanup runs.
+	var orphanCleanedBeforeJobEnd atomic.Bool
+
+	// dbPtr is set after StartServer returns so that the hook closure can
+	// query for the job ID.
+	var dbPtr atomic.Pointer[gosql.DB]
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		ExternalIODir: tempDir,
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			DistSQL: &execinfra.TestingKnobs{
+				BulkAdderFlushesEveryBatch: true,
+				AfterDistributedMergeMapPhase: func(ctx context.Context, manifests []jobspb.BulkSSTManifest) {
+					sqlDB := dbPtr.Load()
+					if sqlDB == nil {
+						t.Logf("db not yet initialized in hook")
+						return
+					}
+
+					// Find the job ID by querying crdb_internal.jobs. We need the
+					// job ID to construct the correct path for the orphan file.
+					var jobID int64
+					row := sqlDB.QueryRow(`
+						SELECT job_id FROM crdb_internal.jobs
+						WHERE job_type = 'NEW SCHEMA CHANGE'
+						AND description LIKE '%CREATE INDEX idx_cleanup%'
+						ORDER BY created DESC LIMIT 1
+					`)
+					if err := row.Scan(&jobID); err != nil {
+						t.Logf("failed to find job ID in hook: %v", err)
+						return
+					}
+
+					// Construct the path where iteration 1's output files would
+					// live. The nodelocal storage maps directly to tempDir/.
+					mergePaths := bulkutil.NewDistMergePaths(jobspb.JobID(jobID))
+					dir := filepath.Join(tempDir, mergePaths.MergePath(1))
+					path := filepath.Join(dir, "orphan.sst")
+
+					if err := os.MkdirAll(dir, 0755); err != nil {
+						t.Logf("failed to create orphan dir: %v", err)
+						return
+					}
+					if err := os.WriteFile(path, []byte("orphan-data"), 0644); err != nil {
+						t.Logf("failed to write orphan file: %v", err)
+						return
+					}
+					orphanPath.Store(path)
+					orphanPlanted.Store(true)
+					t.Logf("planted orphan SST at %s", path)
+				},
+				BulkMergeTestingKnobs: &bulkmerge.TestingKnobs{
+					RunBeforeMergeTask: func(
+						_ context.Context, _ *execinfra.FlowCtx, _ taskset.TaskID, _ execinfrapb.BulkMergeSpec,
+					) error {
+						if !orphanPlanted.Load() {
+							return nil
+						}
+						path, ok := orphanPath.Load().(string)
+						if !ok {
+							return nil
+						}
+						// cleanupRedoIterationSSTs runs before the merge processors
+						// are created, so by the time this hook fires the orphan
+						// must already be gone.
+						if _, err := os.Stat(path); oserror.IsNotExist(err) {
+							orphanCleanedBeforeJobEnd.Store(true)
+							t.Logf("confirmed orphan cleaned before merge task started")
+						} else {
+							t.Errorf("orphan file %s still exists when merge task started; cleanup did not run before merge", path)
+						}
+						return nil
+					},
+				},
+			},
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+	dbPtr.Store(db)
+
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
+	tdb.Exec(t, `SET CLUSTER SETTING bulkio.merge.file_size = '50KiB'`)
+
+	tdb.Exec(t, `CREATE TABLE t_cleanup (k INT PRIMARY KEY, v TEXT)`)
+	tdb.Exec(t, `INSERT INTO t_cleanup SELECT i, repeat('x', 100) || i::text FROM generate_series(1, 500) AS g(i)`)
+
+	// Run the index backfill. The AfterDistributedMergeMapPhase hook plants
+	// an orphan file before merge iterations begin. cleanupRedoIterationSSTs
+	// should remove it before the merge processors run, and the
+	// RunBeforeMergeTask hook confirms this.
+	tdb.Exec(t, `CREATE INDEX idx_cleanup ON t_cleanup (v)`)
+
+	require.True(t, orphanPlanted.Load(), "expected orphan file to be planted during map phase")
+	require.True(t, orphanCleanedBeforeJobEnd.Load(),
+		"expected orphan to be cleaned up before merge task, not by final job cleanup")
+}
+
+// TestDistributedMergeNoExternalIODir verifies behavior when ExternalIODir is
+// not configured and distributed merge is requested. Without ExternalIODir,
+// nodelocal storage is unavailable, so the distributed merge pipeline cannot
+// write temporary SSTs.
+func TestDistributedMergeNoExternalIODir(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// Intentionally omit ExternalIODir.
+		DefaultTestTenant: base.ExternalTestTenantAlwaysEnabled,
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	// 'declarative' forces distributed merge unconditionally (Force mode),
+	// which should fail because nodelocal storage is unavailable.
+	t.Run("force-fails", func(t *testing.T) {
+		tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
+		tdb.Exec(t, `CREATE TABLE t_force (k INT PRIMARY KEY, v INT)`)
+		tdb.Exec(t, `INSERT INTO t_force SELECT i, i*10 FROM generate_series(1, 100) AS g(i)`)
+		_, err := db.ExecContext(ctx, `CREATE INDEX idx_force ON t_force (v)`)
+		require.Error(t, err)
+	})
+
+	// 'enabled' allows fallback when nodelocal is unavailable. The backfill
+	// should succeed via the non-distributed-merge code path.
+	t.Run("enabled-falls-back", func(t *testing.T) {
+		tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'enabled'`)
+		tdb.Exec(t, `CREATE TABLE t_fallback (k INT PRIMARY KEY, v INT)`)
+		tdb.Exec(t, `INSERT INTO t_fallback SELECT i, i*10 FROM generate_series(1, 100) AS g(i)`)
+
+		tdb.Exec(t, `CREATE INDEX idx_fallback ON t_fallback (v)`)
+	})
 }

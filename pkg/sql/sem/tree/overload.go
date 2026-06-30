@@ -24,22 +24,18 @@ import (
 	"github.com/lib/pq/oid"
 )
 
-// SpecializedVectorizedBuiltin is used to map overloads
-// to the vectorized operator that is specific to
-// that implementation of the builtin function.
+// SpecializedVectorizedBuiltin is used to map overloads to the vectorized
+// operator that is specific to that implementation of the builtin function.
 type SpecializedVectorizedBuiltin int
 
-// TODO (rohany): What is the best place to put this list?
-// I want to put it in builtins or exec, but those create an import
-// cycle with exec. tree is imported by both of them, so
-// this package seems like a good place to do it.
-
-// Keep this list alphabetized so that it is easy to manage.
 const (
 	_ SpecializedVectorizedBuiltin = iota
 	SubstringStringIntInt
 	CrdbInternalRangeStats
 	CrdbInternalRangeStatsWithErrors
+	FNV64
+	FNV64a
+	DatumsToBytes
 )
 
 // AggregateOverload is an opaque type which is used to box an eval.AggregateOverload.
@@ -1210,8 +1206,11 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 	}
 
 	// The first heuristic is to prefer candidates that return the desired type,
-	// if a desired type was provided.
+	// if a desired type was provided. If the filter eliminates all candidates
+	// (e.g., int division has no overload returning int), we roll back so that
+	// subsequent heuristics still have candidates to work with.
 	if desired.Family() != types.AnyFamily {
+		before := s.overloadIdxs
 		s.overloadIdxs = filterOverloads(s.overloadIdxs, s.overloads, func(
 			o overloadImpl,
 		) bool {
@@ -1224,6 +1223,9 @@ func (s *overloadTypeChecker) typeCheckOverloadedExprs(
 			}
 			return true
 		})
+		if len(s.overloadIdxs) == 0 {
+			s.overloadIdxs = before
+		}
 		if ok, err := checkReturn(ctx, semaCtx, s); ok {
 			return err
 		}

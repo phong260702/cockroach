@@ -2003,7 +2003,7 @@ distribution: local
     └── • error if rows
         │
         └── • lookup join (anti)
-            │ estimated row count: 0
+            │ estimated row count: 1
             │ table: small_parent@small_parent_pkey
             │ equality: (?column?) = (p)
             │ equality cols are key
@@ -2095,6 +2095,303 @@ distribution: local
                 │     label: buffer 1
                 │
                 └── • scan buffer
+                      label: buffer 1
+
+subtest end
+
+# Foreign keys backed by a unique constraint covering only a subset of the
+# referenced columns (CockroachDB extension; see require_fk_unique_constraint_on_all_columns).
+# The optimizer plans the FK check as a lookup-anti-join with a residual
+# equality filter on the columns not covered by the unique backing. This
+# disqualifies the insert fast path because the lookup is no longer a clean
+# point-get on a unique-index entry.
+subtest subset_unique_fk
+
+statement disable-cf-mutator ok
+CREATE TABLE subset_p (a INT PRIMARY KEY, b INT, c INT)
+
+# FK cols are NOT NULL so the optimizer doesn't add an IS-NOT-NULL filter,
+# which would disqualify the fast path for unrelated reasons. With NOT NULL,
+# the only thing keeping subset_c off the fast path is the residual equality
+# filter on the non-unique-backed (b, c) columns.
+statement disable-cf-mutator ok
+CREATE TABLE subset_c (
+  c INT PRIMARY KEY,
+  a INT NOT NULL, b INT NOT NULL, sc INT NOT NULL,
+  FOREIGN KEY (a, b, sc) REFERENCES subset_p (a, b, c)
+)
+
+# Subset FK insert should NOT use the insert fast path because the FK check
+# requires a residual equality filter on the non-unique-backed columns.
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN INSERT INTO subset_c VALUES (1, 1, 10, 100)
+] WHERE info LIKE '%insert fast path%'
+----
+false
+
+# Verify the plan shape is a lookup-anti-join with a residual filter on the
+# non-unique-backed columns (b, c). The lookup is keyed on the unique col (a).
+query T
+EXPLAIN (VERBOSE) INSERT INTO subset_c VALUES (1, 1, 10, 100)
+----
+distribution: local
+vectorized: true
+·
+• root
+│ columns: ()
+│
+├── • insert
+│   │ columns: ()
+│   │ estimated row count: 0 (missing stats)
+│   │ into: subset_c(c, a, b, sc)
+│   │
+│   └── • buffer
+│       │ columns: (column1, column2, column3, column4)
+│       │ label: buffer 1
+│       │
+│       └── • values
+│             columns: (column1, column2, column3, column4)
+│             size: 4 columns, 1 row
+│             row 0, expr 0: 1
+│             row 0, expr 1: 1
+│             row 0, expr 2: 10
+│             row 0, expr 3: 100
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │ columns: ()
+        │
+        └── • lookup join (anti)
+            │ columns: (column2, column3, column4)
+            │ estimated row count: 1 (missing stats)
+            │ table: subset_p@subset_p_pkey
+            │ equality: (column2) = (a)
+            │ equality cols are key
+            │ pred: (column3 = b) AND (column4 = c)
+            │ parallel
+            │
+            └── • project
+                │ columns: (column2, column3, column4)
+                │
+                └── • scan buffer
+                      columns: (column1, column2, column3, column4)
+                      estimated row count: 1
+                      label: buffer 1
+
+# Exact-match FKs should still use the insert fast path (regression check). The
+# FK columns are NOT NULL to avoid the IS-NOT-NULL filter that the optimizer
+# inserts for nullable FK cols, which would otherwise disqualify the fast path
+# for unrelated reasons.
+statement disable-cf-mutator ok
+CREATE TABLE exact_p (a INT, b INT, c INT, PRIMARY KEY (a, b, c))
+
+statement disable-cf-mutator ok
+CREATE TABLE exact_c (
+  c INT PRIMARY KEY,
+  a INT NOT NULL, b INT NOT NULL, ec INT NOT NULL,
+  FOREIGN KEY (a, b, ec) REFERENCES exact_p (a, b, c)
+)
+
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN INSERT INTO exact_c VALUES (1, 1, 10, 100)
+] WHERE info LIKE '%insert fast path%'
+----
+true
+
+# Verify the plan uses the insert fast path with FK checks inlined as a
+# uniqueness scan on the parent's PK (no separate lookup-anti-join).
+query T
+EXPLAIN (VERBOSE) INSERT INTO exact_c VALUES (1, 1, 10, 100)
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  columns: ()
+  estimated row count: 0 (missing stats)
+  into: exact_c(c, a, b, ec)
+  auto commit
+  FK check: exact_p@exact_p_pkey
+  size: 4 columns, 1 row
+  row 0, expr 0: 1
+  row 0, expr 1: 1
+  row 0, expr 2: 10
+  row 0, expr 3: 100
+
+# Subset backed by a secondary unique index without STORING. The FK
+# enforcement plan must do a lookup on the unique index AND an additional
+# index-join back to the PK to fetch the un-stored col for the residual
+# equality check. Two KV ops per FK check; still no fast path.
+statement disable-cf-mutator ok
+CREATE TABLE sub_secidx_p (id INT PRIMARY KEY, b INT, c INT, UNIQUE (c))
+
+statement disable-cf-mutator ok
+CREATE TABLE sub_secidx_c (
+  cid INT PRIMARY KEY,
+  b INT NOT NULL, c INT NOT NULL,
+  FOREIGN KEY (b, c) REFERENCES sub_secidx_p (b, c)
+)
+
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN INSERT INTO sub_secidx_c VALUES (1, 10, 100)
+] WHERE info LIKE '%insert fast path%'
+----
+false
+
+# Verify the plan does a lookup on the unique index followed by an index-join
+# to the PK (to fetch b for the residual equality check). The two-stage
+# lookup is the cost STORING(b) would eliminate.
+query T
+EXPLAIN INSERT INTO sub_secidx_c VALUES (1, 10, 100)
+----
+distribution: local
+·
+• root
+│
+├── • insert
+│   │ into: sub_secidx_c(cid, b, c)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • values
+│             size: 3 columns, 1 row
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (anti)
+            │ table: sub_secidx_p@sub_secidx_p_pkey
+            │ equality: (id) = (id)
+            │ equality cols are key
+            │ pred: column2 = b
+            │
+            └── • lookup join (left outer)
+                │ table: sub_secidx_p@sub_secidx_p_c_key
+                │ equality: (column3) = (c)
+                │ equality cols are key
+                │
+                └── • scan buffer
+                      estimated row count: 1
+                      label: buffer 1
+
+# Subset backed by a secondary unique index WITH STORING of the missing FK
+# col. The FK lookup is a single op (the stored b is available from the
+# index entry directly), avoiding the index-join. Still no fast path because
+# the residual filter remains.
+statement disable-cf-mutator ok
+CREATE TABLE sub_storing_p (id INT PRIMARY KEY, b INT, c INT, UNIQUE (c) STORING (b))
+
+statement disable-cf-mutator ok
+CREATE TABLE sub_storing_c (
+  cid INT PRIMARY KEY,
+  b INT NOT NULL, c INT NOT NULL,
+  FOREIGN KEY (b, c) REFERENCES sub_storing_p (b, c)
+)
+
+query B
+SELECT count(*) > 0 FROM [
+  EXPLAIN INSERT INTO sub_storing_c VALUES (1, 10, 100)
+] WHERE info LIKE '%insert fast path%'
+----
+false
+
+# Verify the plan is a single-stage lookup on the unique index (with b
+# available from STORING) with no index-join back to the PK.
+query T
+EXPLAIN INSERT INTO sub_storing_c VALUES (1, 10, 100)
+----
+distribution: local
+·
+• root
+│
+├── • insert
+│   │ into: sub_storing_c(cid, b, c)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • values
+│             size: 3 columns, 1 row
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (anti)
+            │ table: sub_storing_p@sub_storing_p_c_key
+            │ equality: (column3) = (c)
+            │ equality cols are key
+            │ pred: column2 = b
+            │
+            └── • scan buffer
+                  estimated row count: 1
+                  label: buffer 1
+
+# UPDATE on child setting an FK column also triggers FK enforcement, planned
+# as a lookup-anti-join with residual equality on the non-unique-backed
+# columns. UPDATE has no fast-path equivalent (only INSERT does), so there's
+# no fast-path check to assert; this just documents the plan shape for
+# regression purposes.
+query T
+EXPLAIN (VERBOSE) UPDATE subset_c SET a = 2 WHERE c = 0
+----
+distribution: local
+vectorized: true
+·
+• root
+│ columns: ()
+│
+├── • update
+│   │ columns: ()
+│   │ estimated row count: 0 (missing stats)
+│   │ table: subset_c
+│   │ set: a
+│   │
+│   └── • buffer
+│       │ columns: (c, a, b, sc, a_new)
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │ columns: (c, a, b, sc, a_new)
+│           │ render a_new: 2
+│           │ render c: c
+│           │ render a: a
+│           │ render b: b
+│           │ render sc: sc
+│           │
+│           └── • scan
+│                 columns: (c, a, b, sc)
+│                 estimated row count: 1 (missing stats)
+│                 table: subset_c@subset_c_pkey
+│                 spans: /0/0
+│                 locking strength: for update
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │ columns: ()
+        │
+        └── • lookup join (anti)
+            │ columns: (a_new, b, sc)
+            │ estimated row count: 1 (missing stats)
+            │ table: subset_p@subset_p_pkey
+            │ equality: (a_new) = (a)
+            │ equality cols are key
+            │ pred: (b = b) AND (sc = c)
+            │ parallel
+            │
+            └── • project
+                │ columns: (a_new, b, sc)
+                │
+                └── • scan buffer
+                      columns: (c, a, b, sc, a_new)
+                      estimated row count: 1 (missing stats)
                       label: buffer 1
 
 subtest end

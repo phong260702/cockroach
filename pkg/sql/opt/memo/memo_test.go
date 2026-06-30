@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -152,10 +153,6 @@ func TestMemoIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Revoke access to the underlying table. The user should retain indirect
-	// access via the view.
-	catalog.Table(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abc")).Revoked = true
 
 	// Initialize context with starting values.
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
@@ -498,6 +495,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptSplitScanLimit = 0
 	notStale()
 
+	// Stale optimizer_span_limit.
+	evalCtx.SessionData().OptimizerSpanLimit = 100
+	stale()
+	evalCtx.SessionData().OptimizerSpanLimit = 0
+	notStale()
+
 	// Stale optimizer_use_improved_zigzag_join_costing.
 	evalCtx.SessionData().OptimizerUseImprovedZigzagJoinCosting = true
 	stale()
@@ -623,6 +626,36 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().UseImprovedRoutineDepsTriggersAndComputedCols = false
 	notStale()
 
+	// Stale optimizer_inline_any_unnest_subquery.
+	evalCtx.SessionData().OptimizerInlineAnyUnnestSubquery = true
+	stale()
+	evalCtx.SessionData().OptimizerInlineAnyUnnestSubquery = false
+	notStale()
+
+	// Stale optimizer_inline_placeholder_equalities.
+	evalCtx.SessionData().OptimizerInlinePlaceholderEqualities = true
+	stale()
+	evalCtx.SessionData().OptimizerInlinePlaceholderEqualities = false
+	notStale()
+
+	// Stale optimizer_use_min_row_count_anti_join_fix.
+	evalCtx.SessionData().OptimizerUseMinRowCountAntiJoinFix = true
+	stale()
+	evalCtx.SessionData().OptimizerUseMinRowCountAntiJoinFix = false
+	notStale()
+
+	// Stale skip_underlying_view_privilege_checks.
+	sqlclustersettings.SkipUnderlyingViewPrivilegeChecks.Override(ctx, &evalCtx.Settings.SV, true)
+	stale()
+	sqlclustersettings.SkipUnderlyingViewPrivilegeChecks.Override(ctx, &evalCtx.Settings.SV, false)
+	notStale()
+
+	// Stale pg_dump_compatibility.
+	evalCtx.SessionData().PgDumpCompatibility = "postgres"
+	stale()
+	evalCtx.SessionData().PgDumpCompatibility = ""
+	notStale()
+
 	// User no longer has access to view.
 	catalog.View(tree.NewTableNameWithSchema("t", catconstants.PublicSchemaName, "abcview")).Revoked = true
 	_, err = o.Memo().IsStale(ctx, &evalCtx, catalog)
@@ -713,6 +746,47 @@ func TestMemoIsStale(t *testing.T) {
 	stale()
 	evalCtx.SessionData().RowSecurity = false
 	notStale()
+
+	// Stale stats rollout mode: Default → Stable.
+	evalCtx.StatsRollout = eval.StatsRolloutStable
+	stale()
+	evalCtx.StatsRollout = eval.StatsRolloutDefault
+	notStale()
+
+	// Default→Canary: not stale (both use newest stats).
+	evalCtx.StatsRollout = eval.StatsRolloutCanary
+	notStale()
+	evalCtx.StatsRollout = eval.StatsRolloutDefault
+	notStale()
+
+	// A canary-built memo can legitimately be cached when the query
+	// doesn't reference canary-window tables (canary and default use
+	// the same stats). Verify IsStale handles this correctly.
+	evalCtx.StatsRollout = eval.StatsRolloutCanary
+	var o2 xform.Optimizer
+	opttestutils.BuildQuery(t, &o2, catalog, &evalCtx, query)
+	// Canary→Canary: not stale.
+	if isStale, err := o2.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+		t.Fatal(err)
+	} else if isStale {
+		t.Errorf("canary-built memo should not be stale for canary execution")
+	}
+	// Canary→Stable: not stale. A canary-built memo is only cached when
+	// canary and stable stats are identical (write-side guard prevents
+	// caching otherwise), so reuse is safe.
+	evalCtx.StatsRollout = eval.StatsRolloutStable
+	if isStale, err := o2.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+		t.Fatal(err)
+	} else if isStale {
+		t.Errorf("canary-built memo should not be stale for stable execution")
+	}
+	// Canary→Default: not stale (canary and default use the same stats).
+	evalCtx.StatsRollout = eval.StatsRolloutDefault
+	if isStale, err := o2.Memo().IsStale(ctx, &evalCtx, catalog); err != nil {
+		t.Fatal(err)
+	} else if isStale {
+		t.Errorf("canary-built memo should not be stale for default execution")
+	}
 }
 
 // TestStatsAvailable tests that the statisticsBuilder correctly identifies

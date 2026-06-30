@@ -7,6 +7,7 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"google.golang.org/grpc"
+	"storj.io/drpc/drpcserver"
 )
 
 func init() {
@@ -122,9 +124,13 @@ var sourceAddr = func() net.Addr {
 }()
 
 type serverOpts struct {
-	interceptor                   func(fullMethod string) error
-	metricsInterceptor            RequestMetricsInterceptor
-	drpcRequestMetricsInterceptor DRPCRequestMetricsInterceptor
+	interceptor                         func(fullMethod string) error
+	metricsInterceptor                  RequestMetricsInterceptor
+	tlsConfig                           *tls.Config
+	tlsCipherRestrict                   func(conn net.Conn) error
+	drpcUnaryRequestMetricsInterceptor  DRPCUnaryServerRequestMetricsInterceptor
+	drpcStreamRequestMetricsInterceptor DRPCStreamServerRequestMetricsInterceptor
+	drpcServerMetrics                   drpcserver.ServerMetrics
 }
 
 // ServerOption is a configuration option passed to NewServer.
@@ -155,9 +161,46 @@ func WithMetricsServerInterceptor(interceptor RequestMetricsInterceptor) ServerO
 	}
 }
 
-// WithDRPCMetricsServerInterceptor adds a DRPCRequestMetricsInterceptor to the DRPC server.
-func WithDRPCMetricsServerInterceptor(interceptor DRPCRequestMetricsInterceptor) ServerOption {
+// WithDRPCMetricsUnaryServerInterceptor adds a DRPCUnaryServerRequestMetricsInterceptor to the DRPC server.
+func WithDRPCMetricsUnaryServerInterceptor(
+	interceptor DRPCUnaryServerRequestMetricsInterceptor,
+) ServerOption {
 	return func(opts *serverOpts) {
-		opts.drpcRequestMetricsInterceptor = interceptor
+		opts.drpcUnaryRequestMetricsInterceptor = interceptor
+	}
+}
+
+// WithDRPCMetricsStreamServerInterceptor adds a DRPCMetricsStreamServerInterceptor to the DRPC server.
+func WithDRPCMetricsStreamServerInterceptor(
+	interceptor DRPCStreamServerRequestMetricsInterceptor,
+) ServerOption {
+	return func(opts *serverOpts) {
+		opts.drpcStreamRequestMetricsInterceptor = interceptor
+	}
+}
+
+// WithTLSConfig sets the TLS configuration for the DRPC server. When set, the
+// server wraps its listener with tls.NewListener in Serve() and performs the
+// TLS handshake explicitly in ServeOne before processing requests.
+func WithTLSConfig(cfg *tls.Config) ServerOption {
+	return func(opts *serverOpts) {
+		opts.tlsConfig = cfg
+	}
+}
+
+// WithTLSCipherRestrict sets a callback that is invoked immediately after
+// a successful TLS handshake in the DRPC server. The callback receives the
+// net.Conn (a *tls.Conn) and may inspect ConnectionState to enforce cipher
+// suite restrictions. If it returns a non-nil error, the connection is rejected.
+func WithTLSCipherRestrict(f func(conn net.Conn) error) ServerOption {
+	return func(opts *serverOpts) {
+		opts.tlsCipherRestrict = f
+	}
+}
+
+// WithDRPCServerMetrics sets the server-level metrics that the DRPC server reports into.
+func WithDRPCServerMetrics(m drpcserver.ServerMetrics) ServerOption {
+	return func(opts *serverOpts) {
+		opts.drpcServerMetrics = m
 	}
 }

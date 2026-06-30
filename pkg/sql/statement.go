@@ -70,6 +70,7 @@ func makeStatement(
 	queryID clusterunique.ID,
 	fmtFlags tree.FmtFlags,
 	statementHintsCache *hints.StatementHintsCache,
+	currentDB string,
 ) Statement {
 	comments := parserStmt.Comments
 	cl := len(comments)
@@ -88,7 +89,7 @@ func makeStatement(
 		QueryTags:       tags,
 		HintsGeneration: -1,
 	}
-	s.ReloadHintsIfStale(ctx, fmtFlags, statementHintsCache)
+	s.ReloadHintsIfStale(ctx, fmtFlags, statementHintsCache, currentDB)
 	return s
 }
 
@@ -100,6 +101,7 @@ func makeStatementFromPrepared(
 	queryID clusterunique.ID,
 	fmtFlags tree.FmtFlags,
 	statementHintsCache *hints.StatementHintsCache,
+	currentDB string,
 ) Statement {
 	comments := prepared.Comments
 	cl := len(comments)
@@ -123,7 +125,7 @@ func makeStatementFromPrepared(
 		HintsGeneration:      prepared.HintsGeneration,
 		ASTWithInjectedHints: prepared.ASTWithInjectedHints,
 	}
-	s.ReloadHintsIfStale(ctx, fmtFlags, statementHintsCache)
+	s.ReloadHintsIfStale(ctx, fmtFlags, statementHintsCache, currentDB)
 	return s
 }
 
@@ -134,9 +136,13 @@ func (s Statement) String() string {
 }
 
 // ReloadHintsIfStale reloads the external statement hints from the statement
-// hints cache if they are stale.
+// hints cache if they are stale. currentDB is the current database, used to
+// filter out hints scoped to a different database.
 func (s *Statement) ReloadHintsIfStale(
-	ctx context.Context, fmtFlags tree.FmtFlags, statementHintsCache *hints.StatementHintsCache,
+	ctx context.Context,
+	fmtFlags tree.FmtFlags,
+	statementHintsCache *hints.StatementHintsCache,
+	currentDB string,
 ) bool {
 	var hints []hints.Hint
 	var hintIDs []int64
@@ -167,7 +173,7 @@ func (s *Statement) ReloadHintsIfStale(
 			ast = e.Statement
 			hintStmtFingerprint = tree.FormatStatementHideConstants(ast, fmtFlags)
 		}
-		hints, hintIDs = statementHintsCache.MaybeGetStatementHints(ctx, hintStmtFingerprint, fmtFlags)
+		hints, hintIDs = statementHintsCache.MaybeGetStatementHints(ctx, hintStmtFingerprint, fmtFlags, currentDB)
 	}
 	if slices.Equal(hintIDs, s.HintIDs) {
 		return false
@@ -182,8 +188,9 @@ func (s *Statement) ReloadHintsIfStale(
 		len(s.Hints), s.HintIDs,
 	)
 
-	for i, hint := range s.Hints {
-		if !hint.Enabled || hint.Err != nil {
+	for i := range s.Hints {
+		hint := &s.Hints[i]
+		if !hint.Enabled() {
 			continue
 		}
 		if hd := hint.HintInjectionDonor; hd != nil && s.ASTWithInjectedHints == nil {
@@ -192,8 +199,10 @@ func (s *Statement) ReloadHintsIfStale(
 					ctx, "failed to validate hint injection donor from external statement hint %v: %v",
 					s.HintIDs[i], err,
 				)
-				// Do not return the error. Instead we'll simply execute the query
-				// without this hint.
+				// Do not return the error. Instead, we'll simply execute the query
+				// without this hint. Note that it's OK to modify hint.Err here, since
+				// hints are stored by value in the Hints slice.
+				hint.Err = err
 				continue
 			}
 			injectedAST, injected, err := hd.InjectHints(ast)
@@ -201,8 +210,10 @@ func (s *Statement) ReloadHintsIfStale(
 				log.Eventf(
 					ctx, "failed to inject hints from external statement hint %v: %v", s.HintIDs[i], err,
 				)
-				// Do not return the error. Instead we'll simply execute the query
-				// without this hint.
+				// Do not return the error. Instead, we'll simply execute the query
+				// without this hint. Note that it's OK to modify hint.Err here, since
+				// hints are stored by value in the Hints slice.
+				hint.Err = err
 				continue
 			}
 			if injected {

@@ -106,10 +106,10 @@ type FunctionProperties struct {
 	Private bool
 
 	// DistsqlBlocklist is set to true when a function depends on members of the
-	// EvalContext that are not marshaled by DistSQL (e.g. anything inside Planner
-	// other than Mon() which is implemented by DummyEvalPlanner). Currently used
-	// for DistSQL to determine if expressions can be evaluated on a different
-	// node without sending over the EvalContext.
+	// EvalContext that are not marshaled by DistSQL (e.g. anything inside
+	// Planner other than ExecMon() which is implemented by DummyEvalPlanner).
+	// Currently used for DistSQL to determine if expressions can be evaluated
+	// on a different node without sending over the EvalContext.
 	DistsqlBlocklist bool
 
 	// Category is used to generate documentation strings.
@@ -174,22 +174,24 @@ func NewFunctionDefinition(
 ) *FunctionDefinition {
 	overloads := make([]*Overload, len(def))
 
+	// Copy props to avoid mutating the caller's pointer.
+	propsCopy := *props
 	for i := range def {
 		if def[i].OverloadPreference == OverloadPreferencePreferred {
 			// Builtins with a preferred overload are always ambiguous.
-			props.AmbiguousReturnType = true
+			propsCopy.AmbiguousReturnType = true
 			break
 		}
 	}
 
 	for i := range def {
-		def[i].FunctionProperties = *props
+		def[i].FunctionProperties = propsCopy
 		overloads[i] = &def[i]
 	}
 	return &FunctionDefinition{
 		Name:               name,
 		Definition:         overloads,
-		FunctionProperties: *props,
+		FunctionProperties: propsCopy,
 	}
 }
 

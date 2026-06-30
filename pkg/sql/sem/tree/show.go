@@ -112,6 +112,11 @@ func (node *ShowBackup) Format(ctx *FmtCtx) {
 			ctx.WriteString(" ")
 			ctx.FormatNode(&node.TimeRange)
 		}
+		if !node.Options.IsDefault() {
+			ctx.WriteString(" WITH OPTIONS (")
+			ctx.FormatNode(&node.Options)
+			ctx.WriteString(")")
+		}
 		return
 	}
 	ctx.WriteString("SHOW BACKUP ")
@@ -177,19 +182,12 @@ type ShowBackupOptions struct {
 	Privileges           bool
 	SkipSize             bool
 
-	// EncryptionInfoDir is a hidden option used when the user wants to run the deprecated
-	//
-	// SHOW BACKUP <incremental_dir>
-	//
-	// on an encrypted incremental backup will need to pass their full backup's
-	// directory to the encryption_info_dir parameter because the
-	// `ENCRYPTION-INFO` file necessary to decode the incremental backup lives in
-	// the full backup dir.
-	EncryptionInfoDir Expr
-
 	CheckConnectionTransferSize Expr
 	CheckConnectionDuration     Expr
 	CheckConnectionConcurrency  Expr
+
+	RevisionStartTime bool
+	Debug             bool
 }
 
 var _ NodeFormatter = &ShowBackupOptions{}
@@ -230,11 +228,6 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("privileges")
 	}
 
-	if o.EncryptionInfoDir != nil {
-		maybeAddSep()
-		ctx.WriteString("encryption_info_dir = ")
-		ctx.FormatNode(o.EncryptionInfoDir)
-	}
 	if o.DecryptionKMSURI != nil {
 		maybeAddSep()
 		ctx.WriteString("kms = ")
@@ -261,6 +254,16 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("TIME = ")
 		ctx.FormatNode(o.CheckConnectionDuration)
 	}
+
+	// The following are only used in SHOW BACKUPS.
+	if o.RevisionStartTime {
+		maybeAddSep()
+		ctx.WriteString("REVISION START TIME")
+	}
+	if o.Debug {
+		maybeAddSep()
+		ctx.WriteString("DEBUG")
+	}
 }
 
 func (o ShowBackupOptions) IsDefault() bool {
@@ -272,10 +275,11 @@ func (o ShowBackupOptions) IsDefault() bool {
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
 		o.Privileges == options.Privileges &&
 		o.SkipSize == options.SkipSize &&
-		o.EncryptionInfoDir == options.EncryptionInfoDir &&
 		o.CheckConnectionTransferSize == options.CheckConnectionTransferSize &&
 		o.CheckConnectionDuration == options.CheckConnectionDuration &&
-		o.CheckConnectionConcurrency == options.CheckConnectionConcurrency
+		o.CheckConnectionConcurrency == options.CheckConnectionConcurrency &&
+		o.RevisionStartTime == options.RevisionStartTime &&
+		o.Debug == options.Debug
 }
 
 func combineBools(v1 bool, v2 bool, label string) (bool, error) {
@@ -287,7 +291,7 @@ func combineBools(v1 bool, v2 bool, label string) (bool, error) {
 func combineExpr(v1 Expr, v2 Expr, label string) (Expr, error) {
 	if v1 != nil {
 		if v2 != nil {
-			return v1, errors.Newf("% option specified multiple times", label)
+			return v1, errors.Newf("%s option specified multiple times", label)
 		}
 		return v1, nil
 	}
@@ -298,7 +302,7 @@ func combineStringOrPlaceholderOptList(
 ) (StringOrPlaceholderOptList, error) {
 	if v1 != nil {
 		if v2 != nil {
-			return v1, errors.Newf("% option specified multiple times", label)
+			return v1, errors.Newf("%s option specified multiple times", label)
 		}
 		return v1, nil
 	}
@@ -339,11 +343,6 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 	if err != nil {
 		return err
 	}
-	o.EncryptionInfoDir, err = combineExpr(o.EncryptionInfoDir, other.EncryptionInfoDir,
-		"encryption_info_dir")
-	if err != nil {
-		return err
-	}
 
 	o.CheckConnectionTransferSize, err = combineExpr(o.CheckConnectionTransferSize, other.CheckConnectionTransferSize,
 		"transfer")
@@ -359,6 +358,18 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 
 	o.CheckConnectionConcurrency, err = combineExpr(o.CheckConnectionConcurrency, other.CheckConnectionConcurrency,
 		"concurrently")
+	if err != nil {
+		return err
+	}
+
+	o.RevisionStartTime, err = combineBools(
+		o.RevisionStartTime, other.RevisionStartTime, "revision start time",
+	)
+	if err != nil {
+		return err
+	}
+
+	o.Debug, err = combineBools(o.Debug, other.Debug, "debug")
 	if err != nil {
 		return err
 	}
@@ -1008,13 +1019,79 @@ func (node *ShowSavepointStatus) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW SAVEPOINT STATUS")
 }
 
+// ShowUsersOptions describes options for the SHOW USERS statement.
+type ShowUsersOptions struct {
+	// Source filters users by their PROVISIONSRC role option value.
+	Source Expr
+	// LastLoginBefore filters users whose estimated last login is before
+	// this timestamp.
+	LastLoginBefore Expr
+}
+
+// Format implements the NodeFormatter interface.
+func (s *ShowUsersOptions) Format(ctx *FmtCtx) {
+	var addSep bool
+	maybeAddSep := func() {
+		if addSep {
+			ctx.WriteString(", ")
+		}
+		addSep = true
+	}
+
+	if s.Source != nil {
+		maybeAddSep()
+		ctx.WriteString("SOURCE = ")
+		ctx.FormatNode(s.Source)
+	}
+	if s.LastLoginBefore != nil {
+		maybeAddSep()
+		ctx.WriteString("LAST LOGIN BEFORE ")
+		ctx.FormatNode(s.LastLoginBefore)
+	}
+}
+
+// CombineWith merges other ShowUsersOptions into this struct.
+// An error is returned if the same option is specified multiple times.
+func (s *ShowUsersOptions) CombineWith(other *ShowUsersOptions) error {
+	var err error
+	s.Source, err = combineExpr(s.Source, other.Source, "SOURCE")
+	if err != nil {
+		return err
+	}
+	s.LastLoginBefore, err = combineExpr(
+		s.LastLoginBefore, other.LastLoginBefore,
+		"LAST LOGIN BEFORE",
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// IsDefault returns true if this options struct has the default (zero) value.
+func (s ShowUsersOptions) IsDefault() bool {
+	return s.Source == nil && s.LastLoginBefore == nil
+}
+
+var _ NodeFormatter = &ShowUsersOptions{}
+
 // ShowUsers represents a SHOW USERS statement.
 type ShowUsers struct {
+	Options *ShowUsersOptions
+	Limit   *Limit
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowUsers) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW USERS")
+	if node.Options != nil && !node.Options.IsDefault() {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(node.Options)
+	}
+	if node.Limit != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Limit)
+	}
 }
 
 // ShowDefaultSessionVariablesForRole represents a SHOW DEFAULT SESSION VARIABLES FOR ROLE <name> statement.
@@ -1041,11 +1118,21 @@ func (node *ShowDefaultSessionVariablesForRole) Format(ctx *FmtCtx) {
 
 // ShowRoles represents a SHOW ROLES statement.
 type ShowRoles struct {
+	Options *ShowUsersOptions
+	Limit   *Limit
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowRoles) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ROLES")
+	if node.Options != nil && !node.Options.IsDefault() {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(node.Options)
+	}
+	if node.Limit != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(node.Limit)
+	}
 }
 
 // ShowRanges represents a SHOW RANGES statement.
@@ -1077,6 +1164,7 @@ type ShowRangesOptions struct {
 	Details bool
 	Explain bool
 	Keys    bool
+	Zone    bool
 	Mode    ShowRangesMode
 }
 
@@ -1141,6 +1229,11 @@ func (node *ShowRangesOptions) Format(ctx *FmtCtx) {
 	if node.Explain {
 		ctx.WriteString(comma)
 		ctx.WriteString("EXPLAIN")
+		comma = ", "
+	}
+	if node.Zone {
+		ctx.WriteString(comma)
+		ctx.WriteString("ZONE")
 		comma = ", "
 	}
 	if node.Mode != UniqueRanges {

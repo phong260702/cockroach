@@ -71,6 +71,13 @@ var IdleTimeout = settings.RegisterDurationSetting(
 
 // SpanCheckpointInterval controls how often span-level checkpoints
 // can be written.
+//
+// NB: This setting also controls how often a change aggregator will
+// send its frontier to the coordinator when its local frontier's
+// min timestamp is not advancing (because it's doing a backfill or
+// has lagging spans).
+//
+// TODO(#163256): We may want to rename or retire this setting.
 var SpanCheckpointInterval = settings.RegisterDurationSetting(
 	settings.ApplicationLevel,
 	"changefeed.frontier_checkpoint_frequency",
@@ -83,6 +90,13 @@ var SpanCheckpointInterval = settings.RegisterDurationSetting(
 // SpanCheckpointLagThreshold controls the amount of time a changefeed's
 // lagging spans must lag behind its leading spans before a span-level
 // checkpoint is written.
+//
+// NB: This threshold is also checked locally by each change aggregator to
+// determine if it should send its frontier to the coordinator when its
+// local frontier's min timestamp is not advancing and it's not currently
+// doing a backfill.
+//
+// TODO(#163256): We may want to rename or retire this setting.
 var SpanCheckpointLagThreshold = settings.RegisterDurationSetting(
 	settings.ApplicationLevel,
 	"changefeed.frontier_highwater_lag_checkpoint_threshold",
@@ -109,6 +123,8 @@ var SpanCheckpointLagThreshold = settings.RegisterDurationSetting(
 //
 // Therefore, we should write at most 6 MB of checkpoint/hour; OR, based on the default
 // SpanCheckpointInterval setting, 1 MB per checkpoint.
+//
+// TODO(#163256): Retire this setting.
 var SpanCheckpointMaxBytes = settings.RegisterByteSizeSetting(
 	settings.ApplicationLevel,
 	"changefeed.frontier_checkpoint_max_bytes",
@@ -369,8 +385,18 @@ var MaxRetryBackoff = settings.RegisterDurationSettingWithExplicitUnit(
 	settings.ApplicationLevel,
 	"changefeed.max_retry_backoff",
 	"the maximum time a changefeed will backoff when retrying after a restart and how long between retries before backoff resets",
-	10*time.Minute, /* defaultValue */
+	30*time.Second, /* defaultValue */
 	settings.DurationInRange(1*time.Second, 1*time.Hour),
+)
+
+// ResetBackoffOnHighwaterAdvance controls whether the changefeed retry
+// backoff resets when the highwater mark advances between retries.
+var ResetBackoffOnHighwaterAdvance = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"changefeed.reset_backoff_on_highwater_advance.enabled",
+	"if true, the changefeed retry backoff resets when the resolved "+
+		"timestamp advances between retries",
+	true,
 )
 
 // RetryBackoffReset is the time between changefeed retries before the
@@ -391,6 +417,33 @@ var KafkaV2ErrorDetailsEnabled = settings.RegisterBoolSetting(
 	"changefeed.kafka_v2_error_details.enabled",
 	"if enabled, Kafka v2 sinks will include the message key, size, and MVCC timestamp in message too large errors",
 	true,
+	settings.WithPublic,
+)
+
+const (
+	// KafkaMaxRequestSizeMin is the minimum value accepted by
+	// kgo.ProducerBatchMaxBytes (defined by franz-go).
+	KafkaMaxRequestSizeMin = 512
+	// KafkaMaxRequestSizeLimit is the maximum value accepted by
+	// kgo.ProducerBatchMaxBytes (defined by franz-go).
+	KafkaMaxRequestSizeLimit = 256 << 20 // 256 MiB
+)
+
+// KafkaMaxRequestSize controls ProducerBatchMaxBytes for the v2 sink.
+// This mirrors the Kafka Java client's max.request.size producer parameter.
+// franz-go coalesces multiple in-flight batches into a single broker request,
+// so a large value can trigger spurious MessageTooLarge errors. See #165387.
+var KafkaMaxRequestSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
+	"changefeed.kafka.max_request_size",
+	"the maximum number of uncompressed bytes sent in a single request to a "+
+		"Kafka broker; lowering this value helps avoid spurious \"message too large\" "+
+		"errors that can occur when multiple messages are combined into a single "+
+		"batch; this setting is overridden by the per-changefeed "+
+		"Flush { MaxBytes: <int> } option",
+	KafkaMaxRequestSizeLimit,
+	settings.ByteSizeWithMinimum(KafkaMaxRequestSizeMin),
+	settings.ByteSizeWithMaximum(KafkaMaxRequestSizeLimit),
 	settings.WithPublic,
 )
 
@@ -427,6 +480,19 @@ var TrackPerTableProgress = settings.RegisterBoolSetting(
 		"granular saving/restoring of progress, which will reduce duplicates during restarts, "+
 		"but doing so may incur additional overhead during ordinary changefeed execution",
 	metamorphic.ConstantWithTestBool("changefeed.progress.per_table_tracking.enabled", true),
+)
+
+// PeriodicAggregatorFlush controls whether aggregators periodically flush
+// their frontier to the coordinator, even when the frontier has not advanced.
+// This is disabled for cloud storage sinks due to #155174.
+var PeriodicAggregatorFlush = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"changefeed.aggregator.periodic_flushing.enabled",
+	"if true, aggregators periodically flush their frontier to the "+
+		"coordinator even when the frontier has not advanced; this "+
+		"improves checkpoint freshness. Ignored and disabled for cloud "+
+		"storage sinks which are incompatible.",
+	true,
 )
 
 // FrontierPersistenceInterval configures the minimum amount of time that must

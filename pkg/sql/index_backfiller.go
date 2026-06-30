@@ -14,21 +14,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
 	"github.com/cockroachdb/cockroach/pkg/sql/bulksst"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	gogotypes "github.com/gogo/protobuf/types"
@@ -90,7 +94,7 @@ func (ib *IndexBackfillPlanner) BackfillIndexes(
 	addCompleted(progress.CompletedSpans...)
 	sstManifestBuf := backfill.NewSSTManifestBuffer(progress.SSTManifests)
 	progress.SSTManifests = sstManifestBuf.Snapshot()
-	updateSSTManifests := func(newManifests []jobspb.IndexBackfillSSTManifest) {
+	updateSSTManifests := func(newManifests []jobspb.BulkSSTManifest) {
 		progress.SSTManifests = sstManifestBuf.Append(newManifests)
 	}
 	mode, err := getIndexBackfillDistributedMergeMode(job)
@@ -104,7 +108,7 @@ func (ib *IndexBackfillPlanner) BackfillIndexes(
 			return nil
 		}
 		progress.CompletedSpans = addCompleted(meta.BulkProcessorProgress.CompletedSpans...)
-		var mapProgress execinfrapb.IndexBackfillMapProgress
+		var mapProgress execinfrapb.BulkMapProgress
 		if gogotypes.Is(&meta.BulkProcessorProgress.ProgressDetails, &mapProgress) {
 			if err := gogotypes.UnmarshalAny(&meta.BulkProcessorProgress.ProgressDetails, &mapProgress); err != nil {
 				return err
@@ -133,7 +137,10 @@ func (ib *IndexBackfillPlanner) BackfillIndexes(
 		}
 		return tracker.SetBackfillProgress(ctx, progress)
 	}
-	useDistributedMerge := mode == jobspb.IndexBackfillDistributedMergeMode_Enabled
+	useDistributedMerge, err := shouldUseDistributedMerge(ctx, mode, descriptor, progress, ib.execCfg.ExternalIODir)
+	if err != nil {
+		return err
+	}
 
 	// addStoragePrefix records storage prefixes before any SST is written to those
 	// locations, ensuring cleanup can occur even if the job fails mid-backfill or
@@ -224,20 +231,15 @@ func (ib *IndexBackfillPlanner) BackfillIndexes(
 	//   - phase = 0: Map phase complete, no merge iterations completed yet.
 	//   - phase = N (N >= 1): Merge iteration N completed.
 	//
-	// On resume after a completed iteration, for simplicity in tracking we do a
-	// single final iteration to KV rather than continuing with the original
-	// iteration count.
-	maxIterations := int(backfill.DistributedMergeIterations.Get(&ib.execCfg.Settings.SV))
-	startIteration := 1
-
-	if progress.DistributedMergePhase >= 1 {
-		// Resume case: we've completed at least one merge iteration.
-		// Complete the merge in a single final iteration directly to KV.
-		startIteration = int(progress.DistributedMergePhase) + 1
-		maxIterations = startIteration
-	}
-	// If phase = 0, this is either a fresh merge or resume before any iteration
-	// completed. In both cases, run the full merge iterations from the start.
+	// We always run 2 merge iterations: a local merge (iteration 1) followed by
+	// a final cross-node merge (iteration 2). The local merge reduces network
+	// traffic by having each node merge its local SSTs first.
+	//
+	// WARNING: The phased progress tracking in calculatePhasedProgress assumes
+	// exactly 2 iterations. Changing this value requires updating the progress
+	// calculation in that function.
+	const maxIterations = 2
+	startIteration := int(progress.DistributedMergePhase) + 1
 
 	return ib.runDistributedMerge(
 		ctx, job, descriptor, &progress, tracker, manifests, startIteration, maxIterations, addStoragePrefix,
@@ -368,6 +370,52 @@ func getIndexBackfillDistributedMergeMode(
 	return details.DistributedMergeMode, nil
 }
 
+// shouldUseDistributedMerge decides whether the backfill should run through
+// the distributed merge pipeline. Force mode always enables it. Enabled mode
+// falls back to the regular path when every destination index shares leading
+// key columns with the source, since the SSTs are already non-overlapping,
+// or when nodelocal storage is unavailable (ExternalIODir is not configured).
+func shouldUseDistributedMerge(
+	ctx context.Context,
+	mode jobspb.IndexBackfillDistributedMergeMode,
+	descriptor catalog.TableDescriptor,
+	progress scexec.BackfillProgress,
+	externalIODir string,
+) (bool, error) {
+	if mode == jobspb.IndexBackfillDistributedMergeMode_Force {
+		return true, nil
+	}
+	if mode != jobspb.IndexBackfillDistributedMergeMode_Enabled {
+		return false, nil
+	}
+	// The distributed merge pipeline writes temporary SSTs to nodelocal
+	// storage, which requires ExternalIODir to be configured. When it is
+	// not available, fall back to the regular backfill path.
+	if externalIODir == "" {
+		return false, nil
+	}
+	// Mode is Enabled: check whether the backfill data is already sorted
+	// relative to the PK. If every destination index shares leading key
+	// columns with the source index, the SSTs from different PK ranges are
+	// non-overlapping and distributed merge adds only overhead.
+	sourceIndex, err := catalog.MustFindIndexByID(descriptor, progress.SourceIndexID)
+	if err != nil {
+		return false, err
+	}
+	for _, destIndexID := range progress.DestIndexIDs {
+		destIndex, err := catalog.MustFindIndexByID(descriptor, destIndexID)
+		if err != nil {
+			return false, err
+		}
+		if !backfill.IsBackfillDataSorted(sourceIndex, destIndex) {
+			return true, nil
+		}
+	}
+	log.Dev.Infof(ctx, "index backfill data is sorted relative to source index %d; "+
+		"falling back to non-distributed merge", progress.SourceIndexID)
+	return false, nil
+}
+
 // runDistributedMerge runs a multi-pass distributed merge of the provided SSTs.
 // Intermediate iterations emit merged SSTs to nodelocal storage and update the
 // progress with the new manifests; the final iteration ingests the files directly
@@ -381,13 +429,18 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 	descriptor catalog.TableDescriptor,
 	progress *scexec.BackfillProgress,
 	tracker scexec.BackfillerProgressWriter,
-	manifests []jobspb.IndexBackfillSSTManifest,
+	manifests []jobspb.BulkSSTManifest,
 	startIteration int,
 	maxIterations int,
 	addStoragePrefix func(ctx context.Context, prefixes []string) error,
 ) error {
 	if len(manifests) == 0 {
 		return nil
+	}
+
+	if metrics := ib.execCfg.DistSQLSrv.BulkMergeMetrics; metrics != nil {
+		metrics.IndexBackfillCount.Inc(1)
+		metrics.MapPhaseSSTs.RecordValue(int64(len(manifests)))
 	}
 
 	// Convert manifests to SSTFiles format for CombineFileInfo. We create a
@@ -444,6 +497,13 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 		default:
 		}
 
+		// Reset task tracking for this iteration and set progress so that we
+		// persist it.
+		progress.MergeIterationCompletedTasks = nil
+		if err := tracker.SetBackfillProgress(ctx, *progress); err != nil {
+			return err
+		}
+
 		genOutputURIAndRecordPrefix := func(instanceID base.SQLInstanceID) (string, error) {
 			// Use nodelocal for temporary storage of merged SSTs. These SSTs are
 			// only needed during the lifetime of the job. Record the storage prefix
@@ -454,7 +514,7 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			}
 			// The '/job/<jobID>' prefix allows for easy cleanup in the event of job
 			// cancellation or failure.
-			return fmt.Sprintf("%sjob/%d/merge/iter-%d/", prefix, job.ID(), iteration), nil
+			return prefix + bulkutil.NewDistMergePaths(job.ID()).MergePath(iteration), nil
 		}
 
 		var writeTS *hlc.Timestamp
@@ -463,6 +523,42 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			ts := progress.MinimumWriteTimestamp
 			writeTS = &ts
 		}
+
+		// Determine if any destination indexes are unique. If so, we need to
+		// enforce uniqueness checking during the final merge iteration.
+		enforceUniqueness := false
+		for _, idxID := range progress.DestIndexIDs {
+			idx, err := catalog.MustFindIndexByID(descriptor, idxID)
+			if err != nil {
+				return err
+			}
+			if idx.IsUnique() {
+				enforceUniqueness = true
+				break
+			}
+		}
+
+		// Create a progress callback to track task completion during this iteration.
+		onProgress := func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error {
+			if meta.BulkProcessorProgress == nil {
+				return nil
+			}
+			var mergeProgress execinfrapb.MergeIterationProgress
+			if gogotypes.Is(&meta.BulkProcessorProgress.ProgressDetails, &mergeProgress) {
+				if err := gogotypes.UnmarshalAny(
+					&meta.BulkProcessorProgress.ProgressDetails, &mergeProgress,
+				); err != nil {
+					return err
+				}
+				progress.MergeIterationTasksTotal = mergeProgress.TasksTotal
+				progress.MergeIterationCompletedTasks = append(
+					progress.MergeIterationCompletedTasks, mergeProgress.CompletedTaskID)
+				return tracker.SetBackfillProgress(ctx, *progress)
+			}
+			return nil
+		}
+
+		ib.cleanupRedoIterationSSTs(ctx, job.ID(), iteration, maxIterations, progress.SSTStoragePrefixes)
 
 		merged, err := invokeBulkMerge(
 			ctx,
@@ -473,15 +569,33 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			iteration,
 			maxIterations,
 			writeTS,
+			enforceUniqueness,
+			onProgress,
+			execinfrapb.BulkMergeSpec_BACKFILL_MONITOR,
 		)
 		if err != nil {
+			// Convert DuplicateKeyError into a user-facing uniqueness
+			// constraint violation, matching the non-distributed backfill
+			// path (see indexBackfiller.wrapDupError).
+			var dupErr *kvserverbase.DuplicateKeyError
+			if errors.As(err, &dupErr) {
+				desc, descErr := descriptor.MakeFirstMutationPublic()
+				if descErr != nil {
+					return descErr
+				}
+				v := &roachpb.Value{RawBytes: dupErr.Value}
+				return row.NewUniquenessConstraintViolationError(ctx, desc, dupErr.Key, v)
+			}
 			return err
 		}
 
 		// Final iteration: data is ingested into KV, we're done.
 		if iteration == maxIterations {
-			// Clear manifests to indicate completion.
+			// Clear manifests and merge iteration tracking to indicate completion.
 			progress.SSTManifests = nil
+			progress.DistributedMergePhase = int32(iteration)
+			progress.MergeIterationTasksTotal = 0
+			progress.MergeIterationCompletedTasks = nil
 			if err := tracker.SetBackfillProgress(ctx, *progress); err != nil {
 				return err
 			}
@@ -497,25 +611,23 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			return errors.AssertionFailedf("expected merged sst output: iteration %d", iteration)
 		}
 
+		if iteration == 1 {
+			if metrics := ib.execCfg.DistSQLSrv.BulkMergeMetrics; metrics != nil {
+				metrics.FirstIterationOutputSSTs.RecordValue(int64(len(merged)))
+			}
+		}
+
 		// Convert merged SSTs to manifests for checkpointing. On resume, these
 		// manifests will be used as input to complete the merge in a single
 		// iteration directly to KV.
-		newManifests := make([]jobspb.IndexBackfillSSTManifest, 0, len(merged))
-		for _, sst := range merged {
-			span := roachpb.Span{
-				Key:    append([]byte(nil), sst.StartKey...),
-				EndKey: append([]byte(nil), sst.EndKey...),
-			}
-			newManifests = append(newManifests, jobspb.IndexBackfillSSTManifest{
-				URI:      sst.URI,
-				Span:     &span,
-				KeyCount: sst.KeyCount,
-			})
-		}
-		progress.SSTManifests = newManifests
+		progress.SSTManifests = bulksst.MergeOutputToManifests(merged)
 		// Update the merge phase to track which iteration we completed.
 		// This allows resume logic to know we're in the middle of merge iterations.
+		// Clear task tracking fields so progress calculation doesn't incorrectly
+		// use stale task counts from the just-completed iteration.
 		progress.DistributedMergePhase = int32(iteration)
+		progress.MergeIterationTasksTotal = 0
+		progress.MergeIterationCompletedTasks = nil
 		if err := tracker.SetBackfillProgress(ctx, *progress); err != nil {
 			return err
 		}
@@ -530,4 +642,38 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 	}
 
 	return nil
+}
+
+// cleanupRedoIterationSSTs removes leftover output SSTs from a previous attempt
+// of a non-final merge iteration. When an iteration is interrupted (e.g., job
+// paused/crashed) and restarted from scratch, the new attempt writes to the
+// same output directory. This cleanup prevents orphaned files from the previous
+// attempt from wasting storage.
+//
+// Cleanup is best-effort: errors are logged as warnings rather than failing the
+// job, consistent with the existing cleanup pattern in backfiller/cleanup.go.
+func (ib *IndexBackfillPlanner) cleanupRedoIterationSSTs(
+	ctx context.Context,
+	jobID jobspb.JobID,
+	iteration int,
+	maxIterations int,
+	storagePrefixes []string,
+) {
+	if iteration >= maxIterations || len(storagePrefixes) == 0 {
+		return
+	}
+	outputSubdir := bulkutil.NewDistMergePaths(jobID).MergeSubdir(iteration)
+	cleaner := bulkutil.NewBulkJobCleaner(
+		ib.execCfg.DistSQLSrv.ExternalStorageFromURI, username.NodeUserName(),
+	)
+	defer func() {
+		if err := cleaner.Close(); err != nil {
+			log.Dev.Warningf(ctx, "error closing cleaner after SST cleanup: %v", err)
+		}
+	}()
+	if err := cleaner.CleanupJobSubdirectory(
+		ctx, jobID, storagePrefixes, outputSubdir,
+	); err != nil {
+		log.Dev.Warningf(ctx, "failed to clean up SSTs in %s before redo: %v", outputSubdir, err)
+	}
 }

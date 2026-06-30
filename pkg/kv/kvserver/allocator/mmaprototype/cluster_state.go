@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -58,18 +59,18 @@ type ReplicaIDAndType struct {
 
 // SafeFormat implements the redact.SafeFormatter interface.
 func (rit ReplicaIDAndType) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Print("replica-id=")
+	w.SafeString("replica-id=")
 	switch rit.ReplicaID {
 	case unknownReplicaID:
-		w.Print("unknown")
+		w.SafeString("unknown")
 	case noReplicaID:
-		w.Print("none")
+		w.SafeString("none")
 	default:
 		w.Print(rit.ReplicaID)
 	}
 	w.Printf(" type=%v", rit.ReplicaType.ReplicaType)
 	if rit.IsLeaseholder {
-		w.Print(" leaseholder=true")
+		w.SafeString(" leaseholder=true")
 	}
 }
 
@@ -123,10 +124,20 @@ type ReplicaState struct {
 	LeaseDisposition LeaseDisposition
 }
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (rs ReplicaState) SafeFormat(w redact.SafePrinter, c rune) {
+	rs.ReplicaIDAndType.SafeFormat(w, c)
+	if rs.LeaseDisposition != LeaseDispositionOK {
+		w.Printf(" lease-disposition=%v", rs.LeaseDisposition)
+	}
+}
+
 // changeID is a unique ID, in the context of this data-structure and when
 // receiving updates about enactment having happened or having been rejected
 // (by the component responsible for change enactment).
 type changeID uint64
+
+func (changeID) SafeValue() {}
 
 type ReplicaChangeType int
 
@@ -143,20 +154,25 @@ const (
 	ChangeReplica
 )
 
-func (s ReplicaChangeType) String() string {
-	switch s {
+func (rct ReplicaChangeType) String() string {
+	return redact.StringWithoutMarkers(rct)
+}
+
+// SafeFormat implements the redact.SafeFromatter interface.
+func (rct ReplicaChangeType) SafeFormat(w redact.SafePrinter, _ rune) {
+	switch rct {
 	case Unknown:
-		return "Unknown"
+		w.SafeString("Unknown")
 	case AddLease:
-		return "AddLease"
+		w.SafeString("AddLease")
 	case RemoveLease:
-		return "RemoveLease"
+		w.SafeString("RemoveLease")
 	case AddReplica:
-		return "AddReplica"
+		w.SafeString("AddReplica")
 	case RemoveReplica:
-		return "RemoveReplica"
+		w.SafeString("RemoveReplica")
 	case ChangeReplica:
-		return "ChangeReplica"
+		w.SafeString("ChangeReplica")
 	default:
 		panic("unknown ReplicaChangeType")
 	}
@@ -539,7 +555,7 @@ func (prc PendingRangeChange) String() string {
 // previous state and next state.
 func (prc PendingRangeChange) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("r%v=[", prc.RangeID)
-	nextAddOrChangeReplicaStr := func(next ReplicaType) string {
+	nextAddOrChangeReplicaStr := func(next ReplicaType) redact.SafeString {
 		if next.ReplicaType == roachpb.NON_VOTER {
 			return "non-voter"
 		}
@@ -550,7 +566,7 @@ func (prc PendingRangeChange) SafeFormat(w redact.SafePrinter, _ rune) {
 	}
 	for i, c := range prc.pendingReplicaChanges {
 		if i > 0 {
-			w.Print(" ")
+			w.SafeRune(' ')
 		}
 		w.Printf("id:%d", c.changeID)
 		switch c.replicaChangeType() {
@@ -569,7 +585,7 @@ func (prc PendingRangeChange) SafeFormat(w redact.SafePrinter, _ rune) {
 				c.target.StoreID)
 		}
 	}
-	w.Print("]")
+	w.SafeRune(']')
 }
 
 // StringForTesting prints the untransformed internal state for testing.
@@ -703,13 +719,32 @@ type storeState struct {
 		// one resource dimension, that is the dimension chosen when picking the
 		// top-k.
 		//
+		// The key in this map is a local store-id; the value enumerates ranges
+		// for which (a) that local store is the leaseholder and (b) the storeState
+		// owning this entry has a replica.
+		//
+		// Lifecycle and staleness: topKRanges is rebuilt only by
+		// processStoreLeaseholderMsgInternal — a StoreLeaseholderMsg from local
+		// store L recomputes topKRanges[L] across every storeState from scratch.
+		// Pending mutations to rs.replicas and ss.adjusted.replicas (via
+		// applyReplicaChange / undoReplicaChange) and enactment / GC of pending
+		// changes do NOT update topK. So between consecutive msgs from L,
+		// topKRanges[L] entries can become stale in two ways:
+		//   - phantom entry: r is listed for store ss, but ss is no longer in
+		//     rs.replicas (replica removed via a pending change that has since
+		//     enacted); or
+		//   - leaseholder mismatch: r is listed under L, but rs.replicas[L] no
+		//     longer marks L as leaseholder (lease transferred away).
+		// Skip-on-pending in the rebalance loops masks the in-progress window;
+		// the post-enact window relies on readers (rebalanceLeasesFromLocalStoreID,
+		// rebalanceReplicas) tolerating mismatches by skipping affected entries.
+		// Self-corrects on L's next leaseholder msg.
+		//
 		// It includes ranges whose replicas are being removed via pending
 		// changes, or lease transfers. That is, it does not account for
 		// pending or enacted changes made since the last time top-k was
 		// computed. It does account for pending changes that were pending
 		// when the top-k was computed.
-		//
-		// The key in this map is a local store-id.
 		//
 		// NB: this only includes replicas that satisfy the isVoter() or
 		// isNonVoter() methods, i.e., {VOTER_FULL, VOTER_INCOMING, NON_VOTER,
@@ -717,9 +752,6 @@ type storeState struct {
 		// only replica types where the allocator wants to explicitly consider
 		// shedding, since the other states are transient states, that are
 		// either going away, or will soon transition to a full-fledged state.
-		//
-		// We may decide to keep this top-k up-to-date incrementally instead of
-		// recomputing it from scratch on each StoreLeaseholderMsg.
 		//
 		// Example:
 		// Assume the local node has two stores, s1 and s2.
@@ -793,6 +825,17 @@ type storeState struct {
 	overloadStartTime time.Time
 	// When overloaded this is equal to time.Time{}.
 	overloadEndTime time.Time
+	// lastDetailedLogTimes tracks the last time detailed (Infof-level) logging
+	// was emitted for this shedding store, keyed by the local store ID that
+	// triggered the log burst. Each local store may evaluate different lease
+	// transfer candidates for the same shedding store, so they get independent
+	// rate-limiting. Lazily allocated by rebalanceStores; nil-map indexing
+	// returns the zero time, which the read path treats as "never logged".
+	// `clear`-ed when a fresh overload interval starts (after the previous
+	// interval ended and the grace period expired); not reset on transient
+	// drops below overloadSlow. Only updated when the persistent-overload
+	// branch fires - vmodule=3 promotions do not consume the throttle.
+	lastDetailedLogTimes map[roachpb.StoreID]time.Time
 }
 
 // The time duration between a change happening at a store, and when the
@@ -888,7 +931,20 @@ func newStoreState() *storeState {
 type nodeState struct {
 	stores []roachpb.StoreID
 	NodeLoad
-	// NB: adjustedCPU can be negative.
+	// adjustedCPU starts at NodeCPULoad (physical node CPU) and is
+	// adjusted by pending change deltas, mirroring how storeState.adjusted.load
+	// tracks pending changes on top of reportedLoad. The deltas are in
+	// store-level modeled CPU units while NodeCPULoad is physical — a known
+	// imprecision accepted because the delta is small and transient.
+	// TODO(wenyihu6): fix this by introducing physical load modeling.
+	//
+	// Only CPU is tracked at the node level because CPU is a shared physical
+	// resource across all stores on a node: if any store saturates the CPU,
+	// the whole node is affected. Other dimensions (WriteBandwidth, ByteSize)
+	// are per-store (each store has its own disk) and only need store-level
+	// overload detection.
+	//
+	// NB: can be negative.
 	adjustedCPU LoadValue
 }
 
@@ -1216,8 +1272,15 @@ func (rs *rangeState) removePendingChangeTracking(changeID changeID) {
 	}
 }
 
-// clearAnalyzedConstraints clears the analyzed constraints for the range state.
-// This should be used when rs is deleted or rs.constraints needs to be reset.
+// clearAnalyzedConstraints clears the cached analyzed constraints for the
+// range state.
+//
+// Invalidation contract: rs.constraints is a per-rangeState cache derived
+// from rs.replicas (the IsLeaseholder flags and the per-replica
+// StoreIDs/types). It is consulted in the rebalance loops both to choose
+// candidate stores and to assert internal invariants (see
+// rebalanceLeasesFromLocalStoreID and rebalanceReplicas). Any code path that
+// mutates rs.replicas must call this method to keep the cache consistent.
 func (rs *rangeState) clearAnalyzedConstraints() {
 	if rs.constraints == nil {
 		return
@@ -1294,6 +1357,14 @@ type clusterState struct {
 
 	mmaid int // a counter for rebalanceStores calls, for logging
 
+	// outerLogEvery throttles the rebalanceStores outer-loop narrative
+	// (rebalanceStores begins, cluster means, evaluating sN, etc.) to one
+	// Infof emission per outerLogInterval. Only consumed when passObs != nil
+	// (the first iteration of the production rebalance loop), so test and
+	// non-periodic invocations leave the throttle untouched. See
+	// rebalanceStores.
+	outerLogEvery util.EveryN[time.Time]
+
 	// Disk utilization thresholds from cluster settings. These are set via
 	// SetDiskUtilThresholds.
 	//
@@ -1327,6 +1398,7 @@ func newClusterState(ts timeutil.TimeSource, interner *stringInterner) *clusterS
 		pendingChanges:       map[changeID]*pendingReplicaChange{},
 		constraintMatcher:    newConstraintMatcher(interner),
 		localityTierInterner: newLocalityTierInterner(interner),
+		outerLogEvery:        util.Every(outerLogInterval),
 		// Disk utilization thresholds default to 0. We don't plumb cluster
 		// settings here to avoid coupling MMA to settings at construction.
 		// Callers (e.g., newMMAStoreRebalancer) call SetDiskUtilThresholds
@@ -1336,7 +1408,9 @@ func newClusterState(ts timeutil.TimeSource, interner *stringInterner) *clusterS
 	return cs
 }
 
-func (cs *clusterState) processStoreLoadMsg(ctx context.Context, storeMsg *StoreLoadMsg) {
+func (cs *clusterState) processStoreLoadMsg(
+	ctx context.Context, storeMsg *StoreLoadMsg, metrics *loadAndCapacityMetrics,
+) {
 	now := cs.ts.Now()
 	cs.gcPendingChanges(ctx, now)
 
@@ -1351,11 +1425,21 @@ func (cs *clusterState) processStoreLoadMsg(ctx context.Context, storeMsg *Store
 	if ss == nil {
 		panic(fmt.Sprintf("store %d not found", storeMsg.StoreID))
 	}
-	ns.ReportedCPU += storeMsg.Load[CPURate] - ss.reportedLoad[CPURate]
-	ns.CapacityCPU += storeMsg.Capacity[CPURate] - ss.capacity[CPURate]
-	// Undo the adjustment for the store. We will apply the adjustment again
-	// below.
-	ns.adjustedCPU += storeMsg.Load[CPURate] - ss.adjusted.load[CPURate]
+	// Update adjustedCPU (= NodeCPULoad + sum of pending deltas across all
+	// stores on this node). NodeCPULoad is a node-level physical value carried
+	// in every store's message; each store generates its descriptor
+	// independently, so the values may differ slightly across stores on the
+	// same node. For simplicity, we overwrite with the latest one received.
+	//
+	// For a single-store node we could simply set adjustedCPU =
+	// storeMsg.NodeCPULoad and let the loop below re-apply pending deltas.
+	// With multiple stores we must preserve other stores' pending deltas,
+	// so we incrementally adjust for the baseline shift and strip only this
+	// store's pending delta.
+	storePendingDelta := ss.adjusted.load[CPURate] - ss.reportedLoad[CPURate]
+	ns.adjustedCPU += (storeMsg.NodeCPULoad - ns.NodeCPULoad) - storePendingDelta
+	ns.NodeCPULoad = storeMsg.NodeCPULoad
+	ns.NodeCPUCapacity = storeMsg.NodeCPUCapacity
 
 	// The store's load sequence number is incremented on each load change. The
 	// store's load is updated below.
@@ -1369,6 +1453,26 @@ func (cs *clusterState) processStoreLoadMsg(ctx context.Context, storeMsg *Store
 	ss.adjusted.load = storeMsg.Load
 	ss.adjusted.secondaryLoad = storeMsg.SecondaryLoad
 	ss.maxFractionPendingIncrease, ss.maxFractionPendingDecrease = 0, 0
+
+	// Report the load and capacity that was just applied if we have a valid
+	// metrics handle.
+	if metrics != nil {
+		cpuLoad := int64(storeMsg.Load[CPURate])
+		cpuCapacity := int64(storeMsg.Capacity[CPURate])
+		cpuUtil := float64(cpuLoad) / float64(cpuCapacity)
+		writeBandwidth := int64(storeMsg.Load[WriteBandwidth])
+		diskLoad := int64(storeMsg.Load[ByteSize])
+		diskCapacity := int64(storeMsg.Capacity[ByteSize])
+		diskUtil := float64(diskLoad) / float64(diskCapacity)
+
+		metrics.CPULoad.Update(cpuLoad)
+		metrics.CPUCapacity.Update(cpuCapacity)
+		metrics.CPUUtilization.Update(cpuUtil)
+		metrics.WriteBandwidth.Update(writeBandwidth)
+		metrics.DiskLoad.Update(diskLoad)
+		metrics.DiskCapacity.Update(diskCapacity)
+		metrics.DiskUtilization.Update(diskUtil)
+	}
 
 	// Find any load pending changes for ranges which involve this store, that
 	// can now be removed from the loadPendingChanges. We don't need to undo the
@@ -1675,7 +1779,12 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 	}
 	localss := cs.stores[msg.StoreID]
 	cs.meansMemo.clear()
-	clusterMeans := cs.meansMemo.getMeans(nil)
+	clusterMeans, ok := cs.meansMemo.getMeans(nil)
+	if !ok {
+		// No stores are known to the allocator yet (e.g. the local store
+		// descriptor has not been gossiped at startup). Nothing to do.
+		return
+	}
 	// Sort by store ID for deterministic log output in tests.
 	storeIDs := make([]roachpb.StoreID, 0, len(cs.stores))
 	for storeID := range cs.stores {
@@ -1690,7 +1799,7 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 			ss.adjusted.topKRanges[msg.StoreID] = topk
 		}
 		topk.startInit()
-		sls := cs.computeLoadSummary(ctx, ss.StoreID, &clusterMeans.storeLoad, &clusterMeans.nodeLoad)
+		sls := cs.computeLoadSummary(ctx, ss.StoreID, &clusterMeans.storeLoad, &clusterMeans.nodeLoad, makeMMALogger(false /* verboseToInfof */))
 		if ss.StoreID == localss.StoreID {
 			topk.dim = CPURate
 		} else {
@@ -1788,8 +1897,10 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 	// transferring its replica for range r1 to remote store s2, then
 	// localss.adjusted.replicas will not have r1. This is fine in that s1
 	// should not be making more decisions about r1. If the change is undone
-	// later, we will again compute the top-k, which will consider r1, before
-	// computing new changes (due to REQUIREMENT(change-computation)).
+	// later, the top-k will be recomputed here on the next leaseholder msg
+	// from localss; rebalance passes that interleave between the undo and
+	// that next msg see a stale topK and tolerate it (see the topKRanges
+	// invariant on storeState).
 	for rangeID, state := range localss.adjusted.replicas {
 		if !state.IsLeaseholder {
 			// We may have transferred the lease away previously but still have a
@@ -1810,9 +1921,10 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 		// transferred to another store s11, s10 will not see r1 below. We
 		// make this choice to avoid cluttering the top-k for s10 with
 		// replicas that are going away. If it is undone, r1 will not be in
-		// the top-k for s10, but due to REQUIREMENT(change-computation), a
-		// new authoritative state will be provided and the top-k recomputed,
-		// before computing any new changes.
+		// the top-k for s10 until the next leaseholder msg from msg.StoreID
+		// rebuilds it; rebalance passes that interleave between the undo and
+		// that msg see a stale topK and tolerate it (see the topKRanges
+		// invariant on storeState).
 		for _, replica := range rs.replicas {
 			typ := replica.ReplicaState.ReplicaType.ReplicaType
 			if isVoter(typ) || isNonVoter(typ) {
@@ -1996,6 +2108,9 @@ func (cs *clusterState) addPendingRangeChange(ctx context.Context, change Pendin
 			"addPendingRangeChange: change_id=%v, range_id=%v, change=%v",
 			cid, rangeID, pendingChange.ReplicaChange)
 	}
+	// applyReplicaChange above mutated rs.replicas; invalidate per the
+	// contract on clearAnalyzedConstraints.
+	cs.ranges[rangeID].clearAnalyzedConstraints()
 }
 
 // preCheckOnApplyReplicaChanges does some validation of the changes being
@@ -2294,6 +2409,22 @@ func (cs *clusterState) getStoreReportedLoad(storeID roachpb.StoreID) (roachpb.N
 	return 0, nil
 }
 
+// hasStore reports whether storeID is known to mma's clusterState.
+// Used by BuildMMARebalanceAdvisor to filter candidate slices that come
+// from the legacy allocator's StorePool view, which can include stores
+// that gossip has not yet announced to MMA.
+func (cs *clusterState) hasStore(storeID roachpb.StoreID) bool {
+	_, ok := cs.stores[storeID]
+	return ok
+}
+
+// notHasStore is the negation of hasStore, exposed so callers can pass
+// it as a method value to slices.IndexFunc / slices.DeleteFunc without
+// an inline closure.
+func (cs *clusterState) notHasStore(storeID roachpb.StoreID) bool {
+	return !cs.hasStore(storeID)
+}
+
 func (cs *clusterState) getNodeReportedLoad(nodeID roachpb.NodeID) *NodeLoad {
 	if nodeState, ok := cs.nodes[nodeID]; ok {
 		return &nodeState.NodeLoad
@@ -2341,10 +2472,12 @@ func (cs *clusterState) canShedAndAddLoad(
 	ctx context.Context,
 	srcSS *storeState,
 	targetSS *storeState,
+	rangeID roachpb.RangeID,
 	delta LoadVector,
 	means *meansLoad,
 	onlyConsiderTargetCPUSummary bool,
 	overloadedDim LoadDimension,
+	ml mmaLogger,
 ) (canAddLoad bool) {
 	if overloadedDim == NumLoadDimensions {
 		panic("overloadedDim must not be NumLoadDimensions")
@@ -2362,13 +2495,8 @@ func (cs *clusterState) canShedAndAddLoad(
 	// Add the delta.
 	deltaToAdd := loadVectorToAdd(delta)
 	targetSS.adjusted.load.add(deltaToAdd)
-	// TODO(tbg): why does NodeLoad have an adjustedCPU field but not fields for
-	// the other load dimensions? We just added deltaToAdd to targetSS.adjusted,
-	// shouldn't this be wholly reflected in targetNS as well, not just for CPU?
-	// Or maybe CPU is the only dimension that matters at the node level. It feels
-	// sloppy/confusing though.
 	targetNS.adjustedCPU += deltaToAdd[CPURate]
-	targetSLS := computeLoadSummary(ctx, targetSS, targetNS, &means.storeLoad, &means.nodeLoad)
+	targetSLS := computeLoadSummary(ctx, targetSS, targetNS, &means.storeLoad, &means.nodeLoad, ml)
 	postTransferHighDiskSpaceUtil := highDiskSpaceUtilization(targetSS.adjusted.load[ByteSize],
 		targetSS.capacity[ByteSize], cs.diskUtilRefuseThreshold)
 
@@ -2380,27 +2508,28 @@ func (cs *clusterState) canShedAndAddLoad(
 	srcNS := cs.nodes[srcSS.NodeID]
 	srcSS.adjusted.load.subtract(delta)
 	srcNS.adjustedCPU -= delta[CPURate]
-	srcSLS := computeLoadSummary(ctx, srcSS, srcNS, &means.storeLoad, &means.nodeLoad)
+	srcSLS := computeLoadSummary(ctx, srcSS, srcNS, &means.storeLoad, &means.nodeLoad, ml)
 	// Undo the removal.
 	srcSS.adjusted.load.add(delta)
 	srcNS.adjustedCPU += delta[CPURate]
 
-	var failureReason strings.Builder
-	populateFailureReason := log.ExpensiveLogEnabled(ctx, 2)
+	var failureReason redact.StringBuilder
 	defer func() {
 		if canAddLoad {
-			log.KvDistribution.VEventf(ctx, 3, "can add load to n%vs%v: %v targetSLS[%v] srcSLS[%v]",
+			ml.logf(ctx, 3, "can add load to n%vs%v: %v targetSLS[%v] srcSLS[%v]",
 				targetNS.NodeID, targetSS.StoreID, canAddLoad, targetSLS, srcSLS)
-		} else if populateFailureReason {
-			log.KvDistribution.VEventf(ctx, 2, "cannot add load to n%vs%v: due to %s", targetNS.NodeID, targetSS.StoreID, failureReason.String())
-			log.KvDistribution.VEventf(ctx, 2, "[target_sls:%v,src_sls:%v]", targetSLS, srcSLS)
+		} else if ml.V(ctx, 3) {
+			ml.logf(ctx, 3,
+				"cannot add load from n%vs%v to n%vs%v for r%v due to %v: delta(%v) targetSLS[%v] srcSLS[%v]",
+				srcNS.NodeID, srcSS.StoreID, targetNS.NodeID, targetSS.StoreID, rangeID,
+				&failureReason, delta, targetSLS, srcSLS)
 		}
 	}()
 	// Check if the target would have high disk utilization after the transfer.
 	// We compute this using the post-transfer load (current + delta).
 	if postTransferHighDiskSpaceUtil {
-		if populateFailureReason {
-			failureReason.WriteString("(post-transfer) targetSLS.highDiskSpaceUtilization")
+		if ml.V(ctx, 3) {
+			failureReason.SafeString("(post-transfer) targetSLS.highDiskSpaceUtilization")
 		}
 		return false
 	}
@@ -2419,8 +2548,8 @@ func (cs *clusterState) canShedAndAddLoad(
 		return true
 	}
 	if targetSummary >= overloadUrgent {
-		if populateFailureReason {
-			failureReason.WriteString("overloadUrgent")
+		if ml.V(ctx, 3) {
+			failureReason.SafeString("overloadUrgent")
 		}
 		return false
 	}
@@ -2478,7 +2607,7 @@ func (cs *clusterState) canShedAndAddLoad(
 			dimFractionIncrease := float64(deltaToAdd[dim]) / float64(targetSS.adjusted.load[dim])
 			// The use of 33% is arbitrary.
 			if dimFractionIncrease > overloadedDimFractionIncrease/3 {
-				log.KvDistribution.VEventf(ctx, 2, "%v: %f > %f/3", dim, dimFractionIncrease, overloadedDimFractionIncrease)
+				ml.logf(ctx, 3, "%v: %f > %f/3", dim, dimFractionIncrease, overloadedDimFractionIncrease)
 				otherDimensionsBecameWorseInTarget = true
 				break
 			}
@@ -2528,88 +2657,104 @@ func (cs *clusterState) canShedAndAddLoad(
 	if canAddLoad {
 		return true
 	}
-	if populateFailureReason {
-		if !overloadedDimPermitsChange {
+	if ml.V(ctx, 3) {
+		appendSep := func() {
 			if failureReason.Len() != 0 {
-				failureReason.WriteRune(',')
+				failureReason.SafeRune(',')
 			}
-			failureReason.WriteString("!overloadedDimPermitsChange")
+		}
+		if !overloadedDimPermitsChange {
+			appendSep()
+			failureReason.SafeString("!overloadedDimPermitsChange")
 		}
 		if otherDimensionsBecameWorseInTarget {
-			if failureReason.Len() != 0 {
-				failureReason.WriteRune(',')
-			}
-			failureReason.WriteString("otherDimensionsBecameWorseInTarget")
+			appendSep()
+			failureReason.SafeString("otherDimensionsBecameWorseInTarget")
 		}
 		if targetSummary >= loadNoChange {
-			if failureReason.Len() != 0 {
-				failureReason.WriteRune(',')
-			}
-			failureReason.WriteString(fmt.Sprintf("target_summary(%s)>=loadNoChange", targetSummary))
+			appendSep()
+			failureReason.Printf("target_summary(%v)>=loadNoChange", targetSummary)
 		}
 		if targetSLS.maxFractionPendingIncrease >= epsilon || targetSLS.maxFractionPendingDecrease >= epsilon {
-			if failureReason.Len() != 0 {
-				failureReason.WriteRune(',')
-			}
-			failureReason.WriteString(fmt.Sprintf("targetSLS.frac_pending(%.2for%.2f>=epsilon)",
-				targetSLS.maxFractionPendingIncrease, targetSLS.maxFractionPendingDecrease))
+			appendSep()
+			failureReason.Printf("targetSLS.frac_pending(%.2for%.2f>=epsilon)",
+				redact.SafeFloat(targetSLS.maxFractionPendingIncrease),
+				redact.SafeFloat(targetSLS.maxFractionPendingDecrease))
 		}
 		if targetSLS.sls > srcSLS.sls {
-			if failureReason.Len() != 0 {
-				failureReason.WriteRune(',')
-			}
-			failureReason.WriteString(fmt.Sprintf("target-store(%s)>src-store(%s)", targetSLS.sls, srcSLS.sls))
+			appendSep()
+			failureReason.Printf("target-store(%v)>src-store(%v)", targetSLS.sls, srcSLS.sls)
 		}
 		if targetSLS.nls > targetSLS.sls {
-			if failureReason.Len() != 0 {
-				failureReason.WriteRune(',')
-			}
-			failureReason.WriteString(fmt.Sprintf("target-node(%s)>target-store(%s)",
-				targetSLS.nls, targetSLS.sls))
+			appendSep()
+			failureReason.Printf("target-node(%v)>target-store(%v)",
+				targetSLS.nls, targetSLS.sls)
 		}
 	}
 	return false
 }
 
 func (cs *clusterState) computeLoadSummary(
-	ctx context.Context, storeID roachpb.StoreID, msl *meanStoreLoad, mnl *meanNodeLoad,
+	ctx context.Context, storeID roachpb.StoreID, msl *meanStoreLoad, mnl *meanNodeLoad, ml mmaLogger,
 ) storeLoadSummary {
 	ss := cs.stores[storeID]
 	ns := cs.nodes[ss.NodeID]
-	return computeLoadSummary(ctx, ss, ns, msl, mnl)
+	return computeLoadSummary(ctx, ss, ns, msl, mnl, ml)
 }
 
 // TODO(wenyihu6): check to make sure obs here is correct
 func (cs *clusterState) loadSummaryForAllStores(ctx context.Context) string {
-	var b strings.Builder
-	clusterMeans := cs.meansMemo.getMeans(nil)
-	b.WriteString(fmt.Sprintf("cluster means: (stores-load %s) (stores-capacity %s)\n",
-		clusterMeans.storeLoad.load, clusterMeans.storeLoad.capacity))
-	b.WriteString(fmt.Sprintf("(nodes-cpu-load %d) (nodes-cpu-capacity %d)\n",
-		clusterMeans.nodeLoad.loadCPU, clusterMeans.nodeLoad.capacityCPU))
-	for storeID, ss := range cs.stores {
-		sls := cs.meansMemo.getStoreLoadSummary(ctx, clusterMeans, storeID, ss.loadSeqNum)
-		b.WriteString(fmt.Sprintf("evaluating store s%d for shedding: load summary %v", storeID, sls))
+	var buf redact.StringBuilder
+	clusterMeans, ok := cs.meansMemo.getMeans(nil)
+	if !ok {
+		return "no stores known to allocator"
 	}
-	return b.String()
+	buf.Printf("cluster means: (stores-load %v) (stores-capacity %v)\n",
+		clusterMeans.storeLoad.load, clusterMeans.storeLoad.capacity)
+	buf.Printf("(nodes-cpu-load %v) (nodes-cpu-capacity %v)\n",
+		clusterMeans.nodeLoad.loadCPU, clusterMeans.nodeLoad.capacityCPU)
+	storeIDs := make([]roachpb.StoreID, 0, len(cs.stores))
+	for storeID := range cs.stores {
+		storeIDs = append(storeIDs, storeID)
+	}
+	slices.Sort(storeIDs)
+	for _, storeID := range storeIDs {
+		ss := cs.stores[storeID]
+		sls := cs.meansMemo.getStoreLoadSummary(ctx, clusterMeans, storeID, ss.loadSeqNum)
+		buf.Printf("evaluating store s%v for shedding: load summary %v", storeID, sls)
+	}
+	return string(buf.RedactableString())
 }
 
 func computeLoadSummary(
-	ctx context.Context, ss *storeState, ns *nodeState, msl *meanStoreLoad, mnl *meanNodeLoad,
+	ctx context.Context,
+	ss *storeState,
+	ns *nodeState,
+	msl *meanStoreLoad,
+	mnl *meanNodeLoad,
+	ml mmaLogger,
 ) storeLoadSummary {
 	sls := loadLow
 	var dimSummary [NumLoadDimensions]loadSummary
 	var worstDim LoadDimension
 	for i := range msl.load {
 		ls := loadSummaryForDimension(ctx, ss.StoreID, nodeIDForLogging, LoadDimension(i), ss.adjusted.load[i], ss.capacity[i],
-			msl.load[i], msl.util[i])
+			msl.load[i], msl.util[i], ml)
 		if ls > sls {
 			sls = ls
 			worstDim = LoadDimension(i)
 		}
 		dimSummary[i] = ls
 	}
-	nls := loadSummaryForDimension(ctx, storeIDForLogging, ns.NodeID, CPURate, ns.adjustedCPU, ns.CapacityCPU, mnl.loadCPU, mnl.utilCPU)
+	// Use adjustedCPU for node-level overload detection. It starts at
+	// NodeCPULoad (physical) and is adjusted by pending change deltas (in
+	// store-level modeled CPU units — a known imprecision accepted because the
+	// delta is small and transient).
+	//
+	// TODO(wenyihu6): the unit mismatch between physical NodeCPULoad and
+	// store-level pending deltas will be resolved with the introduction of
+	// physical load modeling.
+	nls := loadSummaryForDimension(ctx, storeIDForLogging, ns.NodeID, CPURate, ns.adjustedCPU, ns.NodeCPUCapacity, mnl.loadCPU, mnl.utilCPU, ml)
 	return storeLoadSummary{
 		worstDim:                   worstDim,
 		sls:                        sls,

@@ -168,7 +168,9 @@ type TestServerArgs struct {
 
 	// DefaultDRPCOption specifies the DRPC enablement mode for a test
 	// server. This controls whether inter-node connectivity uses DRPC, just
-	// gRPC, or is chosen randomly.
+	// gRPC, or is chosen randomly. It is resolved by the test framework
+	// (via ShouldEnableDRPC) into a concrete TestDRPCEnabled or
+	// TestDRPCDisabled value before the server starts.
 	DefaultDRPCOption DefaultTestDRPCOption
 
 	// DefaultTenantName is the name of the tenant created implicitly according
@@ -324,6 +326,13 @@ type TestClusterArgs struct {
 	// that field, RestartServer will return an error to guide the developer
 	// towards a non-flaky pattern.
 	ReusableListenerReg *listenerutil.ListenerRegistry
+
+	// EnablePartitioner, when true, installs RPC interceptors on each node that
+	// allow injecting network partitions via TestCluster.Partitioner(). This is
+	// required for CrashNode and tests that use the Partitioner directly. Because
+	// the interceptors overwrite RPC ContextTestingKnobs' client interceptors,
+	// this should only be enabled by tests that need it.
+	EnablePartitioner bool
 }
 
 // DefaultTestTenantOptions specifies the conditions under which a
@@ -434,6 +443,11 @@ var (
 	// worth the cost of never running that test with the virtualization
 	// layer active.
 	TestNeedsTightIntegrationBetweenAPIsAndTestingKnobs = TestIsSpecificToStorageLayerAndNeedsASystemTenant
+
+	// TestSkipSecondaryTenantsUnderDuress should be used whenever we want to
+	// disable test tenant randomization under heavy configs (e.g. under race)
+	// due to overload.
+	TestSkipSecondaryTenantsUnderDuress = TestIsSpecificToStorageLayerAndNeedsASystemTenant
 )
 
 func (do DefaultTestTenantOptions) AllowAdditionalTenants() bool {

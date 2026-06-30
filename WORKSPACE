@@ -17,12 +17,48 @@ http_archive(
     ],
 )
 
+# bazel_lib is a dependency of aspect_rules_js v2.8+
+# NB: The name of the `aspect_bazel_lib` library changed to `bazel_lib` in v3.0.0.
+# In the future as these libraries get updated we should be able to consolidate on
+# `bazel_lib` for everything. For now, we need two versions of the library installed
+# at different versions for both names.
+http_archive(
+    name = "bazel_lib",
+    sha256 = "6fd3b1e1a38ca744f9664be4627ced80895c7d2ee353891c172f1ab61309c933",
+    strip_prefix = "bazel-lib-3.0.0",
+    url = "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazel-lib-v3.0.0.tar.gz",
+)
+
+# tar.bzl is a dependency of aspect_bazel_lib v2.22.5
+http_archive(
+    name = "tar.bzl",
+    sha256 = "8bac5a2b43f9988e4e69bb03a242b9cbed2c53f9cd4c989f879aaa441bda03f4",
+    strip_prefix = "tar.bzl-0.8.1",
+    url = "https://storage.googleapis.com/public-bazel-artifacts/tar/tar.bzl-v0.8.1.tar.gz",
+)
+
+# jq.bzl is a dependency of aspect_bazel_lib v2.22.5
+http_archive(
+    name = "jq.bzl",
+    sha256 = "ec80ea87132eada066fe6efe838b68feebc578626ba8fef7d620a8fc5a1279be",
+    strip_prefix = "jq.bzl-0.5.1",
+    url = "https://storage.googleapis.com/public-bazel-artifacts/bazel/jq.bzl-v0.5.1.tar.gz",
+)
+
+# aspect_tools_telemetry_report is a dependency of aspect_rules_js v2.8+
+http_archive(
+    name = "aspect_tools_telemetry_report",
+    sha256 = "fea3bc2f9b7896ab222756c27147b1f1b8f489df8114e03d252ffff475f8bce6",
+    strip_prefix = "tools_telemetry-0.2.8",
+    url = "https://storage.googleapis.com/public-bazel-artifacts/bazel/tools_telemetry-v0.2.8.tar.gz",
+)
+
 # Like the above, but for JS.
 http_archive(
     name = "aspect_rules_js",
-    sha256 = "83e5af4d17385d1c3268c31ae217dbfc8525aa7bcf52508dc6864baffc8b9501",
-    strip_prefix = "rules_js-2.3.7",
-    url = "https://storage.googleapis.com/public-bazel-artifacts/js/rules_js-v2.3.7.tar.gz",
+    sha256 = "1774702556e1d0b83b7f5eb58ec95676afe6481c62596b53f5b96575bacccf73",
+    strip_prefix = "rules_js-2.9.2",
+    url = "https://storage.googleapis.com/public-bazel-artifacts/js/rules_js-v2.9.2.tar.gz",
 )
 
 http_archive(
@@ -110,6 +146,22 @@ http_archive(
 # com_github_pmezard_go_difflib handled in DEPS.bzl.
 # org_golang_x_xerrors handled in DEPS.bzl.
 
+# rules_shell is a transitive dependency of rules_go, declared in
+# go/private/repositories.bzl via _maybe(). We pin it here so that
+# go_rules_dependencies() finds it already defined and skips its own
+# declaration, which points at GitHub rather than our GCS mirror.
+# When upgrading rules_go, check whether the version or sha256 of
+# rules_shell changed in go/private/repositories.bzl and update this
+# block (and the mirrored artifact) accordingly.
+http_archive(
+    name = "rules_shell",
+    sha256 = "d8cd4a3a91fc1dc68d4c7d6b655f09def109f7186437e3f50a9b60ab436a0c53",
+    strip_prefix = "rules_shell-0.3.0",
+    urls = [
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_shell-v0.3.0.tar.gz",
+    ],
+)
+
 http_archive(
     name = "rules_cc",
     sha256 = "92a89a2bbe6c6db2a8b87da4ce723aff6253656e8417f37e50d362817c39b98b",
@@ -190,14 +242,14 @@ load(
 go_download_sdk(
     name = "go_sdk",
     sdks = {
-        "darwin_arm64": ("go1.25.5.darwin-arm64.tar.gz", "98786ff279bc13d96a0a0a582f8a0e50f552edfb948effc9171c8fc0116c5b82"),
-        "linux_amd64": ("go1.25.5.linux-amd64.tar.gz", "a7681f6aa008a78fa0351a4560eac382fa594a1469cc99e78e803a5b53bd0b8d"),
-        "linux_arm64": ("go1.25.5.linux-arm64.tar.gz", "974b9e0a8825e62c735f5be008ae53f7a347aa08d76630c0d82dcc40329c92db"),
-        "linux_s390x": ("go1.25.5.linux-s390x.tar.gz", "9f6b69d0723fe44c36581c7940531ec4d08c3c27aa58b673b4601742d89c2662"),
-        "windows_amd64": ("go1.25.5.windows-amd64.tar.gz", "613eb70d80a1367c61f824f07ad6b72041dde0e50dea0ee809ab282e2b0e299e"),
+        "darwin_arm64": ("go1.26.2.darwin-arm64.tar.gz", "bb3d80463ad10ea8376a38723a4b3ed2c4ee40a45718f5deb00392def418d3a3"),
+        "linux_amd64": ("go1.26.2.linux-amd64.tar.gz", "67c9282c68bdfced031f4c522ba435fb9bcaeb59a267aa8cb6a457596934e84c"),
+        "linux_arm64": ("go1.26.2.linux-arm64.tar.gz", "0715a51a6213839ea8e9e353e8e483ca3d420ed381d04e0d6a7dbcb83f7f8022"),
+        "linux_s390x": ("go1.26.2.linux-s390x.tar.gz", "b1b1f2ce755e262e39ba6fc99da5f38692ad8f8037c485fe44d084adee2d7906"),
+        "windows_amd64": ("go1.26.2.windows-amd64.tar.gz", "7323b6b7b3a2f480eb3acd17b38001058c5a3bbe637bcc0d9e822d02ab7b791d"),
     },
-    urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/20260107-215417/{}"],
-    version = "1.25.5",
+    urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/20260414-195718/{}"],
+    version = "1.26.2",
 )
 
 # To point to a local SDK path, use the following instead. We'll call the
@@ -249,9 +301,9 @@ http_archive(
 # Do this AFTER, not BEFORE, upgrading the library.
 http_archive(
     name = "aspect_bazel_lib",
-    sha256 = "349aabd3c2b96caeda6181eb0ae1f14f2a1d9f3cd3c8b05d57f709ceb12e9fb3",
-    strip_prefix = "bazel-lib-2.9.4",
-    url = "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazel-lib-v2.9.4.tar.gz",
+    sha256 = "94e192033ca8027f26de71c9000a67ef9c73695c2b88e2c559045170917ead0c",
+    strip_prefix = "bazel-lib-2.22.5",
+    url = "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazel-lib-v2.22.5.tar.gz",
 )
 
 # Load custom toolchains.
@@ -543,12 +595,14 @@ rules_pkg_dependencies()
 register_toolchains(
     "//build/toolchains:cross_x86_64_linux_toolchain",
     "//build/toolchains:cross_x86_64_linux_arm_toolchain",
+    "//build/toolchains:cross_x86_64_ppc64le_toolchain",
     "//build/toolchains:cross_x86_64_s390x_toolchain",
     "//build/toolchains:cross_x86_64_macos_toolchain",
     "//build/toolchains:cross_x86_64_macos_arm_toolchain",
     "//build/toolchains:cross_x86_64_windows_toolchain",
     "//build/toolchains:cross_arm64_linux_toolchain",
     "//build/toolchains:cross_arm64_linux_arm_toolchain",
+    "//build/toolchains:cross_arm64_ppc64le_toolchain",
     "//build/toolchains:cross_arm64_s390x_toolchain",
     "//build/toolchains:cross_arm64_windows_toolchain",
     "//build/toolchains:cross_arm64_macos_toolchain",
@@ -556,26 +610,38 @@ register_toolchains(
     "@bsd_tar_toolchains//:darwin_arm64_toolchain",
     "@bsd_tar_toolchains//:linux_amd64_toolchain",
     "@bsd_tar_toolchains//:linux_arm64_toolchain",
+    "@bsd_tar_toolchains//:linux_ppc64le_toolchain",
+    "@bsd_tar_toolchains//:linux_s390x_toolchain",
     "@bsd_tar_toolchains//:windows_amd64_toolchain",
     "@coreutils_toolchains//:darwin_arm64_toolchain",
     "@coreutils_toolchains//:linux_amd64_toolchain",
     "@coreutils_toolchains//:linux_arm64_toolchain",
+    "@coreutils_toolchains//:linux_ppc64le_toolchain",
+    "@coreutils_toolchains//:linux_s390x_toolchain",
     "@coreutils_toolchains//:windows_amd64_toolchain",
     "@copy_directory_toolchains//:darwin_arm64_toolchain",
     "@copy_directory_toolchains//:linux_amd64_toolchain",
     "@copy_directory_toolchains//:linux_arm64_toolchain",
+    "@copy_directory_toolchains//:linux_ppc64le_toolchain",
+    "@copy_directory_toolchains//:linux_s390x_toolchain",
     "@copy_directory_toolchains//:windows_amd64_toolchain",
     "@copy_to_directory_toolchains//:darwin_arm64_toolchain",
     "@copy_to_directory_toolchains//:linux_amd64_toolchain",
     "@copy_to_directory_toolchains//:linux_arm64_toolchain",
+    "@copy_to_directory_toolchains//:linux_ppc64le_toolchain",
+    "@copy_to_directory_toolchains//:linux_s390x_toolchain",
     "@copy_to_directory_toolchains//:windows_amd64_toolchain",
     "@nodejs_toolchains//:darwin_arm64_toolchain",
     "@nodejs_toolchains//:linux_amd64_toolchain",
     "@nodejs_toolchains//:linux_arm64_toolchain",
+    "@nodejs_toolchains//:linux_ppc64le_toolchain",
+    "@nodejs_toolchains//:linux_s390x_toolchain",
     "@nodejs_toolchains//:windows_amd64_toolchain",
     "@yq_toolchains//:darwin_arm64_toolchain",
     "@yq_toolchains//:linux_amd64_toolchain",
     "@yq_toolchains//:linux_arm64_toolchain",
+    "@yq_toolchains//:linux_ppc64le_toolchain",
+    "@yq_toolchains//:linux_s390x_toolchain",
     "@yq_toolchains//:windows_amd64_toolchain",
 )
 
@@ -626,6 +692,6 @@ load("//build:pgo.bzl", "pgo_profile")
 
 pgo_profile(
     name = "pgo_profile",
-    sha256 = "5a23c5b33325d5fc3dfa4e67d872aa8371756f8e4f8f159509e8cc522c298cb2",
-    url = "https://storage.googleapis.com/cockroach-profiles/20251204202750-818ff5108cdb1f16f69b3d915acdb4f669b848eb.pb.gz",
+    sha256 = "d0d862680e57e20dfcd17072dee36e9ca424620120a3ca43e20002d283efceda",
+    url = "https://storage.googleapis.com/cockroach-profiles/20260318200320-da91cf2be917bbc3bac07ad6e6e214d5d1628c26.pb.gz",
 )

@@ -410,6 +410,14 @@ func (pb payloadBuilder) build(b buildCtx) logpb.EventPayload {
 				TypeName: fullyQualifiedName(b, e),
 			}
 		}
+	case *scpb.DomainType:
+		if pb.TargetStatus == scpb.Status_PUBLIC {
+			return nil
+		} else {
+			return &eventpb.DropType{
+				TypeName: fullyQualifiedName(b, e),
+			}
+		}
 	case *scpb.SecondaryIndex:
 		if pb.TargetStatus == scpb.Status_PUBLIC {
 			return &eventpb.CreateIndex{
@@ -548,6 +556,31 @@ func (pb payloadBuilder) build(b buildCtx) logpb.EventPayload {
 			MutationID:          mutationID,
 			CascadeDroppedViews: pb.cascadeDroppedViews(b),
 		}
+	}
+	if _, _, seq := scpb.FindSequence(b.QueryByID(screl.GetDescID(pb.Element()))); seq != nil {
+		// If the sequence has a payload attached use that instead of ALTER SEQUENCE.
+		if pb.maybePayload != nil {
+			return pb.maybePayload
+		}
+		return &eventpb.AlterSequence{
+			SequenceName: fullyQualifiedName(b, seq),
+		}
+	}
+	if _, _, e := scpb.FindEnumType(b.QueryByID(screl.GetDescID(pb.Element()))); e != nil {
+		if pb.maybePayload == nil {
+			panic(errors.AssertionFailedf(
+				"missing event payload for ALTER TYPE on enum %s", fullyQualifiedName(b, e),
+			))
+		}
+		return pb.maybePayload
+	}
+	if _, _, e := scpb.FindAliasType(b.QueryByID(screl.GetDescID(pb.Element()))); e != nil {
+		if pb.maybePayload == nil {
+			panic(errors.AssertionFailedf(
+				"missing event payload for ALTER TYPE on alias type %s", fullyQualifiedName(b, e),
+			))
+		}
+		return pb.maybePayload
 	}
 	return nil
 }

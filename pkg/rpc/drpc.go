@@ -22,6 +22,7 @@ import (
 	"storj.io/drpc"
 	"storj.io/drpc/drpcclient"
 	"storj.io/drpc/drpcmanager"
+	"storj.io/drpc/drpcmetrics"
 	"storj.io/drpc/drpcmigrate"
 	"storj.io/drpc/drpcmux"
 	"storj.io/drpc/drpcpool"
@@ -42,22 +43,36 @@ func (d *drpcCloseNotifier) CloseNotify(ctx context.Context) <-chan struct{} {
 
 // TODO(server): unexport this once dial methods are added in rpccontext.
 func DialDRPC(
-	rpcCtx *Context,
+	rpcCtx *Context, cm *drpcmetrics.ClientMetrics,
 ) func(ctx context.Context, target string, class rpcbase.ConnectionClass) (drpc.Conn, error) {
 	return func(ctx context.Context, target string, class rpcbase.ConnectionClass) (drpc.Conn, error) {
 		transport := tcpTransport
 		if rpcCtx.ContextOptions.AdvertiseAddr == target && rpcCtx.canLoopbackDial() {
 			transport = loopbackTransport
 		}
+
 		drpcDialOptions, err := rpcCtx.drpcDialOptionsInternal(ctx, target, class, transport)
 		if err != nil {
 			return nil, err
 		}
 
+		shouldRecordFunc := func() bool {
+			return ShouldRecordRequestMetricsDRPC(rpcCtx.Settings)
+		}
+
+		drpcDialOptions = append(drpcDialOptions, drpcclient.WithMetrics(cm))
+		drpcDialOptions = append(drpcDialOptions,
+			drpcclient.WithShouldRecordFunc(shouldRecordFunc))
+
+		drpcPoolMetrics := rpcCtx.DRPCPoolMetrics()
 		// TODO(server): could use connection class instead of empty key here.
 		pool := drpcpool.New[struct{}, drpcpool.Conn](drpcpool.Options{
-			Expiration: defaultDRPCConnIdleTimeout,
+			Expiration:   defaultDRPCConnIdleTimeout,
+			Metrics:      drpcPoolMetrics,
+			Labels:       map[string]string{"target": target, "class": class.String()},
+			ShouldRecord: shouldRecordFunc,
 		})
+
 		pooledConn := pool.Get(ctx /* unused */, struct{}{}, func(ctx context.Context,
 			_ struct{}) (drpcpool.Conn, error) {
 			return drpcclient.DialContext(ctx, target, drpcDialOptions...)
@@ -118,18 +133,24 @@ func (rpcCtx *Context) drpcDialOptsCommon(
 		drpcDialOpts = append(drpcDialOpts, drpcclient.WithPerRPCMetadata(map[string]string{key: value}))
 	}
 
+	// Bound capacity so that the append below cannot race with concurrent
+	// dials on the same rpcCtx by writing into a shared backing array. The
+	// gRPC sibling in dialOptsCommon does the same.
 	unaryInterceptors := rpcCtx.clientUnaryInterceptorsDRPC
+	unaryInterceptors = unaryInterceptors[:len(unaryInterceptors):len(unaryInterceptors)]
 	if rpcCtx.Knobs.UnaryClientInterceptorDRPC != nil {
-		interceptor := rpcCtx.Knobs.UnaryClientInterceptorDRPC(target, rpcbase.DefaultClass)
+		interceptor := rpcCtx.Knobs.UnaryClientInterceptorDRPC(target, class)
 		if interceptor != nil {
 			unaryInterceptors = append(unaryInterceptors, interceptor)
 		}
 	}
+
 	drpcDialOpts = append(drpcDialOpts, drpcclient.WithChainUnaryInterceptor(unaryInterceptors...))
 
 	streamInterceptors := rpcCtx.clientStreamInterceptorsDRPC
+	streamInterceptors = streamInterceptors[:len(streamInterceptors):len(streamInterceptors)]
 	if rpcCtx.Knobs.StreamClientInterceptorDRPC != nil {
-		interceptor := rpcCtx.Knobs.StreamClientInterceptorDRPC(target, rpcbase.DefaultClass)
+		interceptor := rpcCtx.Knobs.StreamClientInterceptorDRPC(target, class)
 		if interceptor != nil {
 			streamInterceptors = append(streamInterceptors, interceptor)
 		}
@@ -139,7 +160,7 @@ func (rpcCtx *Context) drpcDialOptsCommon(
 	return drpcDialOpts, nil
 }
 
-// drpcDialOptsLocal is simialar to dialOptsLocal but for drpc connections.
+// drpcDialOptsLocal is similar to dialOptsLocal but for drpc connections.
 func (rpcCtx *Context) drpcDialOptsLocal() ([]drpcclient.DialOption, error) {
 	drpcDialOpts, err := rpcCtx.drpcDialOptsNetworkCredentials()
 	if err != nil {
@@ -217,6 +238,45 @@ func (c *closeEntirePoolConn) Close() (err error) {
 }
 
 type DRPCConnection = Connection[drpc.Conn]
+
+// DRPCDialbackAdapter implements Dialbacker[drpc.Conn] by delegating
+// to the corresponding methods on *Context.
+type DRPCDialbackAdapter struct {
+	rpcCtx *Context
+}
+
+// NewDRPCDialbackAdapter creates a new DRPCDialbackAdapter.
+func NewDRPCDialbackAdapter(rpcCtx *Context) *DRPCDialbackAdapter {
+	return &DRPCDialbackAdapter{rpcCtx: rpcCtx}
+}
+
+func (a *DRPCDialbackAdapter) UnvalidatedDial(
+	target string, locality roachpb.Locality,
+) *DRPCConnection {
+	return a.rpcCtx.DRPCUnvalidatedDial(target, locality)
+}
+
+func (a *DRPCDialbackAdapter) DialNode(
+	target string, nodeID roachpb.NodeID, locality roachpb.Locality, class rpcbase.ConnectionClass,
+) *DRPCConnection {
+	return a.rpcCtx.DRPCDialNode(target, nodeID, locality, class)
+}
+
+func (a *DRPCDialbackAdapter) DialRaw(
+	ctx context.Context, target string, class rpcbase.ConnectionClass,
+) error {
+	conn, err := a.rpcCtx.drpcDialRaw(ctx, target, class)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	return err
+}
+
+func (a *DRPCDialbackAdapter) WrapCtx(
+	ctx context.Context, target string, remoteNodeID roachpb.NodeID, class rpcbase.ConnectionClass,
+) context.Context {
+	return a.rpcCtx.wrapCtx(ctx, target, remoteNodeID, class)
+}
 
 // ErrDRPCDisabled is returned from hosts that in principle could but do not
 // have the DRPC server enabled.
@@ -298,8 +358,13 @@ func NewDRPCServer(_ context.Context, rpcCtx *Context, opts ...ServerOption) (DR
 
 	// If the metrics interceptor is set, it should be registered second so
 	// that all other interceptors are included in the response time durations.
-	if o.drpcRequestMetricsInterceptor != nil {
-		unaryInterceptors = append(unaryInterceptors, drpcmux.UnaryServerInterceptor(o.drpcRequestMetricsInterceptor))
+	if o.drpcUnaryRequestMetricsInterceptor != nil {
+		unaryInterceptors = append(unaryInterceptors,
+			drpcmux.UnaryServerInterceptor(o.drpcUnaryRequestMetricsInterceptor))
+	}
+	if o.drpcStreamRequestMetricsInterceptor != nil {
+		streamInterceptors = append(streamInterceptors,
+			drpcmux.StreamServerInterceptor(o.drpcStreamRequestMetricsInterceptor))
 	}
 
 	if !rpcCtx.ContextOptions.Insecure {
@@ -344,9 +409,6 @@ func NewDRPCServer(_ context.Context, rpcCtx *Context, opts ...ServerOption) (DR
 	mux := drpcmux.NewWithInterceptors(unaryInterceptors, streamInterceptors)
 
 	d.Server = drpcserver.NewWithOptions(mux, drpcserver.Options{
-		Log: func(err error) {
-			log.Dev.Warningf(context.Background(), "drpc server error %v", err)
-		},
 		// The reader's max buffer size defaults to 4mb, and if it is exceeded (such
 		// as happens with AddSSTable) the RPCs fail.
 		Manager: drpcmanager.Options{
@@ -354,6 +416,9 @@ func NewDRPCServer(_ context.Context, rpcCtx *Context, opts ...ServerOption) (DR
 			// Enable grpc compabitility for metadata
 			GRPCMetadataCompatMode: true,
 		},
+		TLSConfig:         o.tlsConfig,
+		TLSCipherRestrict: o.tlsCipherRestrict,
+		Metrics:           o.drpcServerMetrics,
 	})
 	d.Mux = mux
 
@@ -392,12 +457,16 @@ func (srv *drpcOffServer) Register(interface{}, drpc.Description) error {
 func newDRPCPeerOptions(
 	rpcCtx *Context, k peerKey, locality roachpb.Locality,
 ) *peerOptions[drpc.Conn] {
-	pm, _ := rpcCtx.metrics.acquire(k, locality)
+	pm, lm := rpcCtx.metrics.acquire(k, locality, rpcProtocolDRPC)
+	clientMetrics := &drpcmetrics.ClientMetrics{
+		BytesSent: lm.ConnectionBytesSent,
+		BytesRecv: lm.ConnectionBytesRecv,
+	}
 	return &peerOptions[drpc.Conn]{
 		locality: locality,
 		peers:    &rpcCtx.drpcPeers,
 		connOptions: &ConnectionOptions[drpc.Conn]{
-			dial: DialDRPC(rpcCtx),
+			dial: DialDRPC(rpcCtx, clientMetrics),
 			connEquals: func(a, b drpc.Conn) bool {
 				return a == b
 			},
